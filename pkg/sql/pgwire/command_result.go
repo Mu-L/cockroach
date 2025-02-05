@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire
 
@@ -216,6 +211,29 @@ func (r *commandResult) SetError(err error) {
 	r.err = err
 }
 
+// GetFormatCode is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) GetFormatCode(colIdx int) (pgwirebase.FormatCode, error) {
+	fmtCode := pgwirebase.FormatText
+	if r.formatCodes != nil {
+		if colIdx >= len(r.formatCodes) {
+			if len(r.formatCodes) == 1 && r.cmdCompleteTag == "EXPLAIN" {
+				// For EXPLAIN ANALYZE statements the format codes describe how
+				// to serialize the EXPLAIN ANALYZE output (which has just one
+				// column) and not the result of the query being executed (which
+				// can have any number of columns). In such a scenario we won't
+				// serialize the data rows (since we will produce stringified
+				// EXPLAIN ANALYZE output and the rows will be actually
+				// discarded by the DistSQLReceiver), so the format code here
+				// doesn't matter.
+				return fmtCode, nil
+			}
+			return 0, errors.AssertionFailedf("could not find format code for column %d in %v", colIdx, r.formatCodes)
+		}
+		fmtCode = r.formatCodes[colIdx]
+	}
+	return fmtCode, nil
+}
+
 // beforeAdd should be called before rows are buffered.
 func (r *commandResult) beforeAdd() error {
 	r.assertNotReleased()
@@ -264,6 +282,11 @@ func (r *commandResult) AddBatch(ctx context.Context, batch coldata.Batch) error
 	return r.conn.bufferBatch(ctx, batch, r)
 }
 
+// SupportsAddBatch is part of the sql.RestrictedCommandResult interface.
+func (r *commandResult) SupportsAddBatch() bool {
+	return true
+}
+
 // BufferedResultsLen is part of the sql.RestrictedCommandResult interface.
 func (r *commandResult) BufferedResultsLen() int {
 	return r.conn.writerState.buf.Len()
@@ -282,11 +305,6 @@ func (r *commandResult) TruncateBufferedResults(idx int) bool {
 		return true
 	}
 	r.conn.writerState.buf.Truncate(idx)
-	return true
-}
-
-// SupportsAddBatch is part of the sql.RestrictedCommandResult interface.
-func (r *commandResult) SupportsAddBatch() bool {
 	return true
 }
 
@@ -537,16 +555,16 @@ func (r *limitedCommandResult) AddRow(ctx context.Context, row tree.Datums) erro
 	return nil
 }
 
-// RevokePortalPausability is part of the sql.RestrictedCommandResult interface.
-func (r *limitedCommandResult) RevokePortalPausability() error {
-	r.portalPausablity = sql.NotPausablePortalForUnsupportedStmt
-	return nil
-}
-
 // SupportsAddBatch is part of the sql.RestrictedCommandResult interface.
 // TODO(yuzefovich): implement limiting behavior for AddBatch.
 func (r *limitedCommandResult) SupportsAddBatch() bool {
 	return false
+}
+
+// RevokePortalPausability is part of the sql.RestrictedCommandResult interface.
+func (r *limitedCommandResult) RevokePortalPausability() error {
+	r.portalPausablity = sql.NotPausablePortalForUnsupportedStmt
+	return nil
 }
 
 // moreResultsNeeded is a restricted connection handler that waits for more

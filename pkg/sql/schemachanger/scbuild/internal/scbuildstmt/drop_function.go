@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scbuildstmt
 
@@ -21,18 +16,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
-func DropFunction(b BuildCtx, n *tree.DropFunction) {
+func DropFunction(b BuildCtx, n *tree.DropRoutine) {
 	if n.DropBehavior == tree.DropCascade {
 		// TODO(chengxiong): remove this when we allow UDF usage.
 		panic(scerrors.NotImplementedErrorf(n, "cascade dropping functions"))
 	}
 
+	routineType := tree.UDFRoutine
+	if n.Procedure {
+		routineType = tree.ProcedureRoutine
+	}
+
 	var toCheckBackRefs []catid.DescID
 	var toCheckBackRefsNames []*scpb.FunctionName
-	for _, f := range n.Functions {
-		elts := b.ResolveUDF(&f, ResolveParams{
+	for _, f := range n.Routines {
+		elts := b.ResolveRoutine(&f, ResolveParams{
 			IsExistenceOptional: n.IfExists,
-		})
+			InDropContext:       true,
+			RequireOwnership:    true,
+		}, routineType)
 		_, _, fn := scpb.FindFunction(elts)
 		if fn == nil {
 			continue

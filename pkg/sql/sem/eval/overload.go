@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package eval
 
@@ -100,10 +95,10 @@ func (wo WindowOverload) Window() {}
 // Sanity check all builtin overloads.
 func init() {
 	builtinsregistry.AddSubscription(func(name string, _ *tree.FunctionProperties, overloads []tree.Overload) {
-		for _, fn := range overloads {
-			if fn.IsUDF {
-				panic(errors.AssertionFailedf("%s: IsUDF is set for a builtin in the registry: %v", name, fn))
-			}
+		for i := range overloads {
+			fn := &overloads[i]
+			// Set the routine type for each overload.
+			fn.Type = tree.BuiltinRoutine
 			var numSet int
 			if fn.AggregateFunc != nil {
 				numSet++

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -48,7 +43,7 @@ func installSessionsFileSink(sc *TestLogScope, t *testing.T) func() {
 
 	// Apply the configuration.
 	TestingResetActive()
-	cleanup, err := ApplyConfig(cfg)
+	cleanup, err := ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +66,7 @@ func TestSecondaryLog(t *testing.T) {
 	Infof(context.Background(), "test2")
 
 	// Make sure the content made it to disk.
-	Flush()
+	FlushFiles()
 
 	// Check that the messages indeed made it to different files.
 
@@ -151,7 +146,7 @@ func TestListLogFilesIncludeSecondaryLogs(t *testing.T) {
 	// Emit some logging and ensure the files gets created.
 	ctx := context.Background()
 	Sessions.Infof(ctx, "story time")
-	Flush()
+	FlushFiles()
 
 	results, err := ListLogFiles()
 	if err != nil {

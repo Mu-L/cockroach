@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,11 +13,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
 var sequelizeCockroachDBReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
+
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
 var supportedSequelizeCockroachDBRelease = "v6.0.5"
 
 // This test runs sequelize's full test suite against a single cockroach node.
@@ -38,8 +37,9 @@ func registerSequelize(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+		startOpts := option.NewStartOpts(sqlClientsInMemoryDB)
+		roachtestutil.SetDefaultSQLPort(c, &startOpts.RoachprodOpts)
+		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(install.SecureOption(false)), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
@@ -84,33 +84,45 @@ func registerSequelize(r registry.Registry) {
 			c,
 			node,
 			"install dependencies",
-			`sudo apt-get -qq install make python3 libpq-dev python-dev gcc g++ `+
+			`sudo apt-get -qq install make python3 libpq-dev gcc g++ `+
 				`software-properties-common build-essential`,
 		); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := repeatRunE(
-			ctx,
-			t,
-			c,
-			node,
-			"add nodesource repository",
-			`sudo apt install ca-certificates && curl -sL https://deb.nodesource.com/setup_16.x | sudo -E bash -`,
+		// In case we are running into a state where machines are being reused, we first check to see if we
+		// can use npm to reduce the potential of trying to add another nodesource key
+		// (preventing gpg: dearmoring failed: File exists) errors.
+		if err := c.RunE(
+			ctx, option.WithNodes(node), `sudo npm i -g npm`,
 		); err != nil {
-			t.Fatal(err)
-		}
+			if err := repeatRunE(
+				ctx,
+				t,
+				c,
+				node,
+				"add nodesource key and deb repository",
+				`
+sudo apt-get update && \
+sudo apt-get install -y ca-certificates curl gnupg && \
+sudo mkdir -p /etc/apt/keyrings && \
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --batch --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list`,
+			); err != nil {
+				t.Fatal(err)
+			}
 
-		if err := repeatRunE(
-			ctx, t, c, node, "install nodejs and npm", `sudo apt-get -qq install nodejs`,
-		); err != nil {
-			t.Fatal(err)
-		}
+			if err := repeatRunE(
+				ctx, t, c, node, "install nodejs and npm", `sudo apt-get update && sudo apt-get -qq install nodejs`,
+			); err != nil {
+				t.Fatal(err)
+			}
 
-		if err := repeatRunE(
-			ctx, t, c, node, "update npm", `sudo npm i -g npm`,
-		); err != nil {
-			t.Fatal(err)
+			if err := repeatRunE(
+				ctx, t, c, node, "update npm", `sudo npm i -g npm`,
+			); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		if err := repeatRunE(
@@ -139,7 +151,7 @@ func registerSequelize(r registry.Registry) {
 
 		// Version telemetry is already disabled in the sequelize-cockroachdb test suite.
 		t.Status("running Sequelize test suite")
-		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node,
+		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(node),
 			fmt.Sprintf(`cd /mnt/data1/sequelize/ && npm test --crdb_version=%s`, version),
 		)
 		rawResultsStr := result.Stdout + result.Stderr
@@ -154,12 +166,13 @@ func registerSequelize(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:       "sequelize",
-		Owner:      registry.OwnerSQLFoundations,
-		Cluster:    r.MakeClusterSpec(1),
-		Leases:     registry.MetamorphicLeases,
-		NativeLibs: registry.LibGEOS,
-		Tags:       registry.Tags(`default`, `orm`),
+		Name:             "sequelize",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		NativeLibs:       registry.LibGEOS,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.ORM),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runSequelize(ctx, t, c)
 		},

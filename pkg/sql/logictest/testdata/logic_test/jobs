@@ -2,7 +2,7 @@
 statement ok
 SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';
 
-statement ok;
+statement ok
 SET use_declarative_schema_changer = 'off';
 
 # These test verify that a user's job are visible via
@@ -28,6 +28,7 @@ AND job_type LIKE 'SCHEMA CHANGE%' ORDER BY 1, 2, 3
 ----
 SCHEMA CHANGE     CREATE INDEX ON test.public.t (x)                  root
 SCHEMA CHANGE     updating privileges for database 104               root
+SCHEMA CHANGE     updating version for role membership table         root
 SCHEMA CHANGE     updating version for role options table            root
 SCHEMA CHANGE     updating version for users table                   root
 SCHEMA CHANGE GC  GC for temporary index used during index backfill  root
@@ -38,6 +39,7 @@ AND job_type LIKE 'SCHEMA CHANGE%' ORDER BY 1, 2, 3
 ----
 SCHEMA CHANGE     CREATE INDEX ON test.public.t (x)                  root
 SCHEMA CHANGE     updating privileges for database 104               root
+SCHEMA CHANGE     updating version for role membership table         root
 SCHEMA CHANGE     updating version for role options table            root
 SCHEMA CHANGE     updating version for users table                   root
 SCHEMA CHANGE GC  GC for temporary index used during index backfill  root
@@ -92,6 +94,7 @@ AND job_type LIKE 'SCHEMA CHANGE%' ORDER BY 1, 2, 3
 SCHEMA CHANGE     CREATE INDEX ON test.public.t (x)                  root
 SCHEMA CHANGE     CREATE INDEX ON test.public.u (x)                  testuser
 SCHEMA CHANGE     updating privileges for database 104               root
+SCHEMA CHANGE     updating version for role membership table         root
 SCHEMA CHANGE     updating version for role options table            root
 SCHEMA CHANGE     updating version for users table                   root
 SCHEMA CHANGE GC  GC for temporary index used during index backfill  root
@@ -105,6 +108,7 @@ AUTO SPAN CONFIG RECONCILIATION  reconciling span configurations                
 SCHEMA CHANGE                    CREATE INDEX ON test.public.t (x)                  root
 SCHEMA CHANGE                    CREATE INDEX ON test.public.u (x)                  testuser
 SCHEMA CHANGE                    updating privileges for database 104               root
+SCHEMA CHANGE                    updating version for role membership table         root
 SCHEMA CHANGE                    updating version for role options table            root
 SCHEMA CHANGE                    updating version for users table                   root
 SCHEMA CHANGE GC                 GC for temporary index used during index backfill  root
@@ -158,7 +162,7 @@ SELECT job_id FROM [SHOW JOBS] WHERE user_name = 'root' AND job_type = 'SCHEMA C
 
 user testuser
 
-statement error pq: only admins can control jobs owned by other admins
+statement error only admins can control jobs owned by other admins
 PAUSE JOB (SELECT $job_id)
 
 user root
@@ -173,28 +177,22 @@ SELECT job_id FROM [SHOW JOBS] WHERE user_name = 'testuser2' AND job_type = 'SCH
 user testuser
 
 # testuser should no longer have the ability to control jobs.
-statement error pq: user testuser does not have privileges for job
+statement error user testuser does not have privileges for job
 PAUSE JOB (SELECT $job_id)
 
-statement error pq: user testuser does not have privileges for job
+statement error user testuser does not have privileges for job
 CANCEL JOB (SELECT $job_id)
 
-statement error pq: user testuser does not have privileges for job
+statement error user testuser does not have privileges for job
 RESUME JOB (SELECT $job_id)
 
 user root
 
-skipif config local-mixed-22.2-23.1
 statement ok
-GRANT SYSTEM VIEWJOB TO testuser
-
-onlyif config local-mixed-22.2-23.1
-statement error upgrade must be finalized before using VIEWJOB system privilege
 GRANT SYSTEM VIEWJOB TO testuser
 
 user testuser
 
-skipif config local-mixed-22.2-23.1
 # testuser should be able to see all jobs
 query TTT
 SELECT job_type, description, user_name FROM crdb_internal.jobs WHERE job_type = 'SCHEMA CHANGE GC' ORDER BY 1, 2, 3
@@ -207,7 +205,6 @@ SCHEMA CHANGE GC  GC for temporary index used during index backfill  testuser2
 
 user root
 
-skipif config local-mixed-22.2-23.1
 statement ok
 REVOKE SYSTEM VIEWJOB FROM testuser
 
@@ -224,7 +221,6 @@ user root
 statement ok
 CREATE ROLE jobviewer
 
-skipif config local-mixed-22.2-23.1
 statement ok
 GRANT SYSTEM VIEWJOB TO jobviewer
 
@@ -233,7 +229,6 @@ GRANT jobviewer TO testuser
 
 user testuser
 
-skipif config local-mixed-22.2-23.1
 # testuser should be able to see all jobs
 query TTT
 SELECT job_type, description, user_name FROM crdb_internal.jobs WHERE job_type = 'SCHEMA CHANGE GC' ORDER BY 1, 2, 3
@@ -268,15 +263,99 @@ ORDER BY feature_name DESC
 job.schema_change.successful
 
 # Ensure one POLL JOBS STATS job is running
-skipif config local-mixed-22.2-23.1
 query I
 SELECT count(*) FROM [SHOW AUTOMATIC JOBS] WHERE job_type = 'POLL JOBS STATS' AND status = 'running'
 ----
 1
 
-# Ensure one AUTO CONFIG RUNNER job is running
-skipif config local-mixed-22.2-23.1
-query I
-SELECT count(*) FROM [SHOW AUTOMATIC JOBS] WHERE job_type = 'AUTO CONFIG RUNNER' AND status = 'running'
-----
-1
+subtest control_job_priv
+
+user testuser2
+
+statement ok
+CREATE TABLE t_control_job_priv(x INT)
+
+# Add a row into the table so that the GC job does not complete immediately;
+# it must wait for the table data gc.ttl before removing the descriptor.
+statement ok
+INSERT INTO t_control_job_priv VALUES (1)
+
+statement ok
+DROP TABLE t_control_job_priv
+
+let $job_id
+SELECT job_id FROM [SHOW JOBS] WHERE user_name = 'testuser2' AND job_type = 'SCHEMA CHANGE GC' AND description LIKE 'GC for DROP TABLE test.public.t_control_job_priv'
+
+user testuser
+
+statement error user testuser does not have privileges for job
+PAUSE JOB (SELECT $job_id)
+
+user root
+
+statement ok
+GRANT SYSTEM CONTROLJOB TO testuser
+
+user testuser
+
+statement ok
+PAUSE JOB (SELECT $job_id)
+
+user root
+
+statement ok
+REVOKE SYSTEM CONTROLJOB FROM testuser
+
+subtest end
+
+subtest control_job_priv_inherited
+
+user testuser2
+
+statement ok
+CREATE TABLE t_control_job_priv_inherited(x INT)
+
+# Add a row into the table so that the GC job does not complete immediately;
+# it must wait for the table data gc.ttl before removing the descriptor.
+statement ok
+INSERT INTO t_control_job_priv_inherited VALUES (1)
+
+statement ok
+DROP TABLE t_control_job_priv_inherited
+
+let $job_id
+SELECT job_id FROM [SHOW JOBS] WHERE user_name = 'testuser2' AND job_type = 'SCHEMA CHANGE GC' AND description LIKE 'GC for DROP TABLE test.public.t_control_job_priv_inherited'
+
+user testuser
+
+statement error user testuser does not have privileges for job
+PAUSE JOB (SELECT $job_id)
+
+user root
+
+statement ok
+CREATE ROLE jobcontroller
+
+statement ok
+GRANT SYSTEM CONTROLJOB TO jobcontroller
+
+statement ok
+GRANT jobcontroller TO testuser
+
+user testuser
+
+statement ok
+PAUSE JOB (SELECT $job_id)
+
+user root
+
+statement ok
+REVOKE SYSTEM CONTROLJOB FROM jobcontroller
+
+statement ok
+REVOKE jobcontroller FROM testuser
+
+statement ok
+DROP ROLE jobcontroller
+
+subtest end

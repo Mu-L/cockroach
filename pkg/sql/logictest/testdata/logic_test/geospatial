@@ -117,16 +117,16 @@ geog    GEOGRAPHY(GEOMETRY,4326)  true   NULL  ·  {geo_table_geog_idx,geo_table
 geom    GEOMETRY(POINT)           true   NULL  ·  {geo_table_geom_idx,geo_table_pkey}                     false
 orphan  GEOGRAPHY                 true   NULL  ·  {geo_table_pkey}                                        false
 
-statement error column bad_pk is of type geography and thus is not indexable
+statement error column bad_pk has type geography, which is not indexable in a non-inverted index\nHINT: you may want to create an inverted index instead. See the documentation for inverted indexes: https://www.cockroachlabs.com/docs/dev/inverted-indexes.html
 CREATE TABLE bad_geog_table(bad_pk geography primary key)
 
-statement error column bad_pk is of type geometry and thus is not indexable
+statement error column bad_pk has type geometry, which is not indexable in a non-inverted index\nHINT: you may want to create an inverted index instead. See the documentation for inverted indexes: https://www.cockroachlabs.com/docs/dev/inverted-indexes.html
 CREATE TABLE bad_geom_table(bad_pk geometry primary key)
 
-statement error column geog is of type geography and thus is not indexable
+statement error column geog has type geography, which is not indexable
 CREATE INDEX geog_idx ON geo_table(geog)
 
-statement error column geom is of type geometry and thus is not indexable
+statement error column geom has type geometry, which is not indexable
 CREATE INDEX geom_idx ON geo_table(geom)
 
 statement ok
@@ -257,6 +257,37 @@ true  true
 true  true
 true  true
 true  true
+
+# Regression test for #124175. Allow full precision for encoding JSON instead of the old default limit of 9.
+query FFT nosort
+SELECT
+  st_x(g), st_y(g), to_json(g)
+FROM ( VALUES
+  ('SRID=4326;POINT (-123.45 12.3456)'::GEOMETRY),
+  ('SRID=4326;POINT (-123.45678901234 12.3456789012)'::GEOMETRY),
+  ('SRID=4326;POINT (-123.4567890123456789 12.34567890123456789)'::GEOMETRY)
+) tbl(g)
+----
+-123.45 12.3456 {"coordinates": [-123.45, 12.3456], "type": "Point"}
+-123.45678901234 12.3456789012 {"coordinates": [-123.45678901234, 12.3456789012], "type": "Point"}
+-123.45678901234568 12.345678901234567 {"coordinates": [-123.45678901234568, 12.345678901234567], "type": "Point"}
+
+# st_asgeojson uses a default of 9 decimal digit precision.
+query TTTT nosort
+SELECT
+  st_asgeojson(tbl.*)::JSONB->'geometry'->'coordinates',
+  st_asgeojson(g)::JSONB->'coordinates',
+  st_asgeojson(tbl.*, 'g')::JSONB->'geometry'->'coordinates',
+  st_asgeojson(tbl.*, 'g', 4)::JSONB->'geometry'->'coordinates'
+FROM ( VALUES
+  ('SRID=4326;POINT (-123.45 12.3456)'::GEOMETRY),
+  ('SRID=4326;POINT (-123.45678901234 12.3456789012)'::GEOMETRY),
+  ('SRID=4326;POINT (-123.4567890123456789 12.34567890123456789)'::GEOMETRY)
+) tbl(g)
+----
+[-123.45, 12.3456]              [-123.45, 12.3456]              [-123.45, 12.3456]              [-123.45, 12.3456]
+[-123.456789012, 12.345678901]  [-123.456789012, 12.345678901]  [-123.456789012, 12.345678901]  [-123.4568, 12.3457]
+[-123.456789012, 12.345678901]  [-123.456789012, 12.345678901]  [-123.456789012, 12.345678901]  [-123.4568, 12.3457]
 
 subtest cast_test
 
@@ -5393,7 +5424,7 @@ SELECT public.ST_AsText('POINT(10.5 20.25)'::geometry)
 ----
 POINT (10.5 20.25)
 
-statement error pq: unknown function: public.log\(\): function undefined
+statement error pq: unknown function: public.log\(\)
 SELECT public.log(10)
 
 query TT
@@ -6019,5 +6050,302 @@ SELECT st_asmvtgeom(
 ) AS regression_109113
 ----
 NULL
+
+subtest end
+
+subtest regression_103616
+
+# Regression test for #103616
+statement ok
+CREATE TABLE t103616 (
+  tag string,
+  geog GEOGRAPHY,
+  geom GEOMETRY,
+  INVERTED INDEX geog_idx (geog),
+  INVERTED INDEX geom_idx (geom)
+);
+
+statement ok
+insert into t103616 values ('null', null, null);
+
+statement ok
+insert into t103616 values ('point (0 0)', 'POINT(0 0)'::GEOGRAPHY, 'POINT(0 0)'::GEOMETRY);
+
+statement ok
+insert into t103616 values ('point (10 10)', 'POINT(10 10)'::GEOGRAPHY, 'POINT(10 10)'::GEOMETRY);
+
+statement ok
+insert into t103616 values ('empty 1', ST_GeogFromText('POLYGON EMPTY'), ST_GeomFromText('POLYGON EMPTY'));
+
+statement ok
+insert into t103616 values ('empty 2', ST_GeogFromText('GEOMETRYCOLLECTION EMPTY'), ST_GeomFromText('GEOMETRYCOLLECTION EMPTY'));
+
+# Null and empty geog values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616@geog_idx
+WHERE
+    st_distance(geog, 'POINT(0 0)'::GEOGRAPHY, false) = 0;
+----
+point (0 0)
+
+# Null and empty geog values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616@geog_idx
+WHERE
+    st_distance(geog, 'POINT(0 0)'::GEOGRAPHY, false) = 0;
+----
+point (0 0)
+
+# Null and empty geog values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616@geog_idx
+WHERE
+    NOT 1.2345678901234566e-43 < st_distance(geog, 'POINT(0 0)'::GEOGRAPHY);
+----
+point (0 0)
+
+# Null and empty geog values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    NOT 1.2345678901234566e-43 > st_distance(geog, 'POINT(0 0)'::GEOGRAPHY);
+----
+point (10 10)
+
+# Null and empty geog values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616@geog_idx
+WHERE
+    1.2345678901234566e-43 > st_distance(geog, 'POINT(0 0)'::GEOGRAPHY);
+----
+point (0 0)
+
+# Null and empty geog values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    1.2345678901234566e-43 < st_distance(geog, 'POINT(0 0)'::GEOGRAPHY);
+----
+point (10 10)
+
+# Null and empty geog values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    0 <= st_distance(geog, 'POINT(0 0)'::GEOGRAPHY);
+----
+point (0 0)
+point (10 10)
+
+# Only null and empty geog values should appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    (st_distance(geog, 'POINT(0 0)'::GEOGRAPHY, false) = 0) IS NULL;
+----
+null
+empty 1
+empty 2
+
+# Only null and empty geog values should appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    (0 <= st_distance(geog, 'POINT(0 0)'::GEOGRAPHY)) IS NULL;
+----
+null
+empty 1
+empty 2
+
+# Null and empty geom values should appear in the output.
+query T rowsort
+SELECT tag FROM t103616@geom_idx
+WHERE
+    NOT 1.2345678901234566e-43 < st_maxdistance(geom, 'POINT(0 0)'::GEOMETRY);
+----
+point (0 0)
+
+# Null and empty geom values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    NOT 1.2345678901234566e-43 > st_maxdistance(geom, 'POINT(0 0)'::GEOMETRY);
+----
+point (10 10)
+
+# Null and empty geom values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616@geom_idx
+WHERE
+    1.2345678901234566e-43 > st_maxdistance(geom, 'POINT(0 0)'::GEOMETRY);
+----
+point (0 0)
+
+# Null and empty geom values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    1.2345678901234566e-43 < st_maxdistance(geom, 'POINT(0 0)'::GEOMETRY);
+----
+point (10 10)
+
+# Null and empty geom values should not appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    0 <= st_maxdistance(geom, 'POINT(0 0)'::GEOMETRY);
+----
+point (0 0)
+point (10 10)
+
+# Only null and empty geog values should appear in the output.
+query T rowsort
+SELECT tag FROM t103616
+WHERE
+    (0 <= st_maxdistance(geom, 'POINT(0 0)'::GEOMETRY)) IS NULL;
+----
+null
+empty 1
+empty 2
+
+# Regression test for #111556. st_union produces different results depending on
+# the number of duplicate values, so it should not ignore duplicate values. This
+# test ensures that the optimizer does not eliminate joins and change the number
+# of input values to an st_union aggregate.
+subtest regression_111556
+
+# Create a table for input and a table for results of the st_union aggregate.
+statement ok
+CREATE TABLE t111556_in (g GEOMETRY NOT NULL);
+CREATE TABLE t111556_res (g GEOMETRY);
+
+# Insert two identical values in the input table
+statement ok
+INSERT INTO t111556_in(g)
+SELECT '0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000'
+FROM generate_series(1, 2)
+
+# Perform an st_union aggregate and insert the results into the table.
+statement ok
+INSERT INTO t111556_res
+SELECT st_union(t2.g) FROM t111556_in t1 JOIN t111556_in t2 ON t1.g = t2.g
+
+# Turn off all optimizations.
+statement ok
+SET testing_optimizer_disable_rule_probability = 1.0
+
+# Perform the same st_union aggregate and insert the results into the table.
+statement ok
+INSERT INTO t111556_res
+SELECT st_union(t2.g) FROM t111556_in t1 JOIN t111556_in t2 ON t1.g = t2.g
+
+# Count the number of distinct values in the results table. It should be 1
+# because the INSERTS above should insert the same value.
+query I
+SELECT count(DISTINCT g) FROM t111556_res
+----
+1
+
+statement ok
+SET testing_optimizer_disable_rule_probability = 0
+
+subtest end
+
+
+subtest regressions
+
+# Regression test for #111157
+query T
+SELECT ST_Extent(ST_GeomFromGeoHash('C'::TEXT, NULL::INT4)::GEOMETRY);
+----
+BOX(-135 45,-90 90)
+
+query T
+SELECT ST_Extent(ST_GeomFromGeoHash(NULL::TEXT, 1::INT4)::GEOMETRY);
+----
+NULL
+
+query T
+SELECT ST_Extent(ST_PointFromGeoHash('C'::TEXT, NULL::INT4)::GEOMETRY);
+----
+BOX(-112.5 67.5,-112.5 67.5)
+
+query T
+SELECT ST_Extent(ST_PointFromGeoHash(NULL::TEXT, 1::INT4)::GEOMETRY);
+----
+NULL
+
+# X min > X max
+query T
+SELECT ST_AsEWKT(ST_MakeEnvelope(8.0::FLOAT8, 2.0::FLOAT8, 5.0::FLOAT8, 4.0::FLOAT8)::GEOMETRY);
+----
+POLYGON ((8 2, 8 4, 5 4, 5 2, 8 2))
+
+# Y min > Y max
+query T
+SELECT ST_AsEWKT(ST_MakeEnvelope(5.0::FLOAT8, 4.0::FLOAT8, 8.0::FLOAT8, 2.0::FLOAT8)::GEOMETRY);
+----
+POLYGON ((5 4, 5 2, 8 2, 8 4, 5 4))
+
+subtest end
+
+subtest st_tileenvelope
+
+query T
+SELECT ST_TileEnvelope(NULL, NULL, NULL);
+----
+NULL
+
+query T
+SELECT ST_AsText(ST_TileEnvelope(8, 1, 2));
+----
+POLYGON ((-19880965.308861203491688 19567879.241005122661591, -19880965.308861203491688 19724422.274933163076639, -19724422.274933163076639 19724422.274933163076639, -19724422.274933163076639 19567879.241005122661591, -19880965.308861203491688 19567879.241005122661591))
+
+query T
+SELECT ST_TileEnvelope(8, 1, 2, NULL);
+----
+NULL
+
+query T
+SELECT ST_AsText(ST_TileEnvelope(3, 1, 1, ST_MakeEnvelope(-180, -90, 180, 90, 4326)) );
+----
+POLYGON ((-135 45, -135 67.5, -90 67.5, -90 45, -135 45))
+
+query T
+SELECT ST_TileEnvelope(3, 1, 1, ST_MakeEnvelope(-180, -90, 180, 90, 4326), NULL);
+----
+NULL
+
+query T
+SELECT ST_AsText(ST_TileEnvelope(3, 1, 1, ST_MakeEnvelope(-180, -90, 180, 90, 4326), 0.125));
+----
+POLYGON ((-140.625 42.1875, -140.625 70.3125, -84.375 70.3125, -84.375 42.1875, -140.625 42.1875))
+
+statement error pgcode 22023 pq: st_tileenvelope\(\): Unable to compute bbox
+SELECT st_tileenvelope(0, 0, 0, '010500000000000000');
+
+subtest end
+
+# Regression test for not respecting max_decimal_digits argument of the
+# st_geojson builtin function (#124368).
+query T
+SELECT st_asgeojson(tbl.*, 'g', 4)::JSONB->'geometry'->'coordinates'
+  FROM (VALUES ('SRID=4326;POINT (-123.45678901234 12.3456789012)'::GEOMETRY)) tbl(g);
+----
+[-123.4568, 12.3457]
+
+# Regression test for parsing arrays of spatial types. Arrays for these types
+# are special since they use ':' as a delimiter instead of ','.
+subtest array_delimiter
+
+query T
+SELECT '{0101000020e6100000cdcccccccc4c1b40cdcccccccc8c4740:0101000020e6100000333333333333fd3fcdcccccccc0c4640}'::geometry[];
+----
+{0101000020E6100000CDCCCCCCCC4C1B40CDCCCCCCCC8C4740:0101000020E6100000333333333333FD3FCDCCCCCCCC0C4640}
+
+query T
+SELECT '{0101000020e6100000cdcccccccc4c1b40cdcccccccc8c4740:0101000020e6100000333333333333fd3fcdcccccccc0c4640}'::geography[];
+----
+{0101000020E6100000CDCCCCCCCC4C1B40CDCCCCCCCC8C4740:0101000020E6100000333333333333FD3FCDCCCCCCCC0C4640}
 
 subtest end

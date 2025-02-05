@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package insights
 
@@ -16,19 +11,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
+	"github.com/cockroachdb/redact"
 )
 
 // This registry is the central object in the insights subsystem. It observes
 // statement execution to determine which statements are outliers and
 // writes insights into the provided sink.
 type lockingRegistry struct {
-	statements map[clusterunique.ID]*statementBuf
-	detector   detector
-	causes     *causes
-	sink       sink
+	statements   map[clusterunique.ID]*statementBuf
+	detector     detector
+	causes       *causes
+	store        *LockingStore
+	testingKnobs *TestingKnobs
 }
 
-var _ Writer = &lockingRegistry{}
+func (r *lockingRegistry) Clear() {
+	r.statements = make(map[clusterunique.ID]*statementBuf)
+}
 
 func (r *lockingRegistry) ObserveStatement(sessionID clusterunique.ID, statement *Statement) {
 	if !r.enabled() {
@@ -90,11 +89,20 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 	if !r.enabled() {
 		return
 	}
-	statements, ok := r.statements[sessionID]
+	if transaction.ID.String() == "00000000-0000-0000-0000-000000000000" {
+		return
+	}
+	statements, ok := func() (*statementBuf, bool) {
+		statements, ok := r.statements[sessionID]
+		if !ok {
+			return nil, false
+		}
+		delete(r.statements, sessionID)
+		return statements, true
+	}()
 	if !ok {
 		return
 	}
-	delete(r.statements, sessionID)
 	defer statements.release()
 
 	// Mark statements which are detected as slow or have a failed status.
@@ -113,8 +121,9 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 		highContention = transaction.Contention.Seconds() >= LatencyThreshold.Get(&r.causes.st.SV).Seconds()
 	}
 
-	if slowOrFailedStatements.Empty() && !highContention {
-		// We only record an insight if we have slow or failed statements or high txn contention.
+	txnFailed := transaction.Status == Transaction_Failed
+	if slowOrFailedStatements.Empty() && !highContention && !txnFailed {
+		// We only record an insight if we have slow statements, high txn contention, or failed executions.
 		return
 	}
 
@@ -127,11 +136,15 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 		insight.Transaction.Causes = addCause(insight.Transaction.Causes, Cause_HighContention)
 	}
 
-	var lastErrorCode string
+	if txnFailed {
+		insight.Transaction.Problems = addProblem(insight.Transaction.Problems, Problem_FailedExecution)
+	}
+
 	// The transaction status will reflect the status of its statements; it will
 	// default to completed unless a failed statement status is found. Note that
 	// this does not take into account the "Cancelled" transaction status.
-	var lastStatus = Transaction_Completed
+	var lastStmtErr redact.RedactableString
+	var lastStmtErrCode string
 	for i, s := range *statements {
 		if slowOrFailedStatements.Contains(i) {
 			switch s.Status {
@@ -139,9 +152,11 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 				s.Problem = Problem_SlowExecution
 				s.Causes = r.causes.examine(s.Causes, s)
 			case Statement_Failed:
-				lastErrorCode = s.ErrorCode
-				lastStatus = Transaction_Status(s.Status)
 				s.Problem = Problem_FailedExecution
+				if transaction.LastErrorCode == "" {
+					lastStmtErr = s.ErrorMsg
+					lastStmtErrCode = s.ErrorCode
+				}
 			}
 
 			// Bubble up stmt problems and causes.
@@ -155,9 +170,27 @@ func (r *lockingRegistry) ObserveTransaction(sessionID clusterunique.ID, transac
 		insight.Statements = append(insight.Statements, s)
 	}
 
-	insight.Transaction.LastErrorCode = lastErrorCode
-	insight.Transaction.Status = lastStatus
-	r.sink.AddInsight(insight)
+	if transaction.LastErrorCode == "" && lastStmtErrCode != "" {
+		// Stmt failure equates to transaction failure. Sometimes we
+		// can't propagate the error up to the transaction level so
+		// we manually set the transaction's failure info here.
+		transaction.LastErrorMsg = lastStmtErr
+		transaction.LastErrorCode = lastStmtErrCode
+	}
+
+	r.store.addInsight(insight)
+}
+
+// clearSession removes the session from the registry and releases the
+// associated statement buffer.
+func (r *lockingRegistry) clearSession(sessionID clusterunique.ID) {
+	if b, ok := r.statements[sessionID]; ok {
+		delete(r.statements, sessionID)
+		b.release()
+		if r.testingKnobs != nil && r.testingKnobs.OnSessionClear != nil {
+			r.testingKnobs.OnSessionClear(sessionID)
+		}
+	}
 }
 
 // TODO(todd):
@@ -170,11 +203,14 @@ func (r *lockingRegistry) enabled() bool {
 	return r.detector.enabled()
 }
 
-func newRegistry(st *cluster.Settings, detector detector, sink sink) *lockingRegistry {
+func newRegistry(
+	st *cluster.Settings, detector detector, store *LockingStore, knobs *TestingKnobs,
+) *lockingRegistry {
 	return &lockingRegistry{
-		statements: make(map[clusterunique.ID]*statementBuf),
-		detector:   detector,
-		causes:     &causes{st: st},
-		sink:       sink,
+		statements:   make(map[clusterunique.ID]*statementBuf),
+		detector:     detector,
+		causes:       &causes{st: st},
+		store:        store,
+		testingKnobs: knobs,
 	}
 }

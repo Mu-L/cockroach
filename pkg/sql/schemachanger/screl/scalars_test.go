@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package screl
 
@@ -15,6 +10,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
@@ -32,7 +28,7 @@ func TestAllElementsHaveDescID(t *testing.T) {
 func TestAllElementsHaveMinVersion(t *testing.T) {
 	forEachNewElementType(t, func(elem scpb.Element) {
 		// If `elem` does not have a min version, the following function call will panic.
-		MinElementVersion(elem)
+		VersionSupportsElementUse(elem, clusterversion.ClusterVersion{})
 	})
 }
 

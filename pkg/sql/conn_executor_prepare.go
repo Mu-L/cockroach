@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -28,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 )
 
@@ -47,7 +43,7 @@ func (ex *connExecutor) execPrepare(
 		// information about the previous transaction. We expect to execute
 		// this command in NoTxn.
 		if _, ok := parseCmd.AST.(*tree.ShowCommitTimestamp); !ok {
-			return ex.beginImplicitTxn(ctx, parseCmd.AST)
+			return ex.beginImplicitTxn(ctx, parseCmd.AST, ex.QualityOfService())
 		}
 	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
 		if !ex.isAllowedInAbortedTxn(parseCmd.AST) {
@@ -55,7 +51,12 @@ func (ex *connExecutor) execPrepare(
 		}
 	}
 
-	ctx, sp := tracing.EnsureChildSpan(ctx, ex.server.cfg.AmbientCtx.Tracer, "prepare stmt")
+	// Check if we need to auto-commit the transaction due to DDL.
+	if ev, payload := ex.maybeAutoCommitBeforeDDL(ctx, parseCmd.AST); ev != nil {
+		return ev, payload
+	}
+
+	ctx, sp := tracing.ChildSpan(ctx, "prepare stmt")
 	defer sp.Finish()
 
 	// The anonymous statement can be overwritten.
@@ -72,7 +73,8 @@ func (ex *connExecutor) execPrepare(
 		ex.deletePreparedStmt(ctx, "")
 	}
 
-	stmt := makeStatement(parseCmd.Statement, ex.server.cfg.GenerateID())
+	stmt := makeStatement(parseCmd.Statement, ex.server.cfg.GenerateID(),
+		tree.FmtFlags(queryFormattingForFingerprintsMask.Get(ex.server.cfg.SV())))
 	_, err := ex.addPreparedStmt(
 		ctx,
 		parseCmd.Name,
@@ -165,7 +167,8 @@ func (ex *connExecutor) addPreparedStmt(
 	return prepared, nil
 }
 
-// prepare prepares the given statement.
+// prepare prepares the given statement. This is used to create the plan in the
+// "extended" pgwire protocol.
 //
 // placeholderHints may contain partial type information for placeholders.
 // prepare will populate the missing types. It can be nil.
@@ -222,6 +225,11 @@ func (ex *connExecutor) prepare(
 			ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime())
 		}
 
+		if err := ex.maybeUpgradeToSerializable(ctx, stmt); err != nil {
+			return err
+		}
+		// TODO(yuzefovich): consider disabling buffered writes on a DDL.
+
 		if placeholderHints == nil {
 			placeholderHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 		} else if rawTypeHints != nil {
@@ -268,6 +276,7 @@ func (ex *connExecutor) prepare(
 
 		p.stmt = stmt
 		p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
+		p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
 		flags, err = ex.populatePrepared(ctx, txn, placeholderHints, p, origin)
 		return err
 	}
@@ -277,7 +286,10 @@ func (ex *connExecutor) prepare(
 		if origin != PreparedStatementOriginSessionMigration {
 			return nil, err
 		} else {
-			log.Warningf(ctx, "could not prepare statement during session migration: %v", err)
+			f := tree.NewFmtCtx(tree.FmtMarkRedactionNode | tree.FmtSimple)
+			f.FormatNode(stmt.AST)
+			redactableStmt := redact.SafeString(f.CloseAndGetString())
+			log.Warningf(ctx, "could not prepare statement during session migration (%s): %v", redactableStmt, err)
 		}
 	}
 
@@ -305,9 +317,7 @@ func (ex *connExecutor) populatePrepared(
 	}
 	stmt := &p.stmt
 
-	if err := p.semaCtx.Placeholders.Init(stmt.NumPlaceholders, placeholderHints); err != nil {
-		return 0, err
-	}
+	p.semaCtx.Placeholders.Init(stmt.NumPlaceholders, placeholderHints)
 	p.extendedEvalCtx.PrepareOnly = true
 	// If the statement is being prepared by a session migration, then we should
 	// not evaluate the AS OF SYSTEM TIME timestamp. During session migration,
@@ -327,7 +337,7 @@ func (ex *connExecutor) populatePrepared(
 	// However, we must be able to handle every type of statement below because
 	// the Postgres extended protocol requires running statements via the prepare
 	// and execute paths.
-	flags, err := p.prepareUsingOptimizer(ctx)
+	flags, err := p.prepareUsingOptimizer(ctx, origin)
 	if err != nil {
 		log.VEventf(ctx, 1, "optimizer prepare failed: %v", err)
 		return 0, err
@@ -373,7 +383,7 @@ func (ex *connExecutor) execBind(
 		// executing SHOW COMMIT TIMESTAMP as it would destroy the information
 		// about the previously committed transaction.
 		if _, ok := ps.AST.(*tree.ShowCommitTimestamp); !ok {
-			return ex.beginImplicitTxn(ctx, ps.AST)
+			return ex.beginImplicitTxn(ctx, ps.AST, ex.QualityOfService())
 		}
 	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
 		if !ex.isAllowedInAbortedTxn(ps.AST) {
@@ -487,6 +497,7 @@ func (ex *connExecutor) execBind(
 						typ,
 						qArgFormatCodes[i],
 						arg,
+						p.datumAlloc,
 					)
 					if err != nil {
 						return pgerror.Wrapf(err, pgcode.ProtocolViolation, "error in argument for %s", k)
@@ -701,7 +712,8 @@ func (ex *connExecutor) execDescribe(
 // prepared and executed inside of an aborted transaction.
 func (ex *connExecutor) isAllowedInAbortedTxn(ast tree.Statement) bool {
 	switch s := ast.(type) {
-	case *tree.CommitTransaction, *tree.RollbackTransaction, *tree.RollbackToSavepoint:
+	case *tree.CommitTransaction, *tree.PrepareTransaction,
+		*tree.RollbackTransaction, *tree.RollbackToSavepoint:
 		return true
 	case *tree.Savepoint:
 		if ex.isCommitOnReleaseSavepoint(s.Name) {

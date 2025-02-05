@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -34,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -87,6 +83,18 @@ func (r *Replica) executeWriteBatch(
 	pErr *kvpb.Error,
 ) {
 	startTime := timeutil.Now()
+
+	spanName := "executeWriteBatch"
+	// Customize the span name for requests for which the aggregate timing of many
+	// spans is often examined so that they'll roll-up separately from the spans
+	// for other request types. This is a switch to select one of n constants,
+	// rather than sprintf, to avoid allocating a new string for every request.
+	if ba.IsSingleAddSSTableRequest() {
+		spanName = "executeWriteBatchAddSSTable"
+	}
+	var sp *tracing.Span
+	ctx, sp = tracing.ChildSpan(ctx, spanName)
+	defer sp.Finish()
 
 	// Even though we're not a read-only operation by definition, we have to
 	// take out a read lock on readOnlyCmdMu while performing any reads during
@@ -144,7 +152,8 @@ func (r *Replica) executeWriteBatch(
 	// Examine the timestamp cache for preceding commands which require this
 	// command to move its timestamp forward. Or, in the case of a transactional
 	// write, the txn timestamp and possible write-too-old bool.
-	if bumped := r.applyTimestampCache(ctx, ba, minTS); bumped {
+	var bumped bool
+	if ba, bumped = r.applyTimestampCache(ctx, ba, minTS); bumped {
 		// If we bump the transaction's timestamp, we must absolutely
 		// tell the client in a response transaction (for otherwise it
 		// doesn't know about the incremented timestamp). Response
@@ -176,7 +185,7 @@ func (r *Replica) executeWriteBatch(
 	// the concurrency guard will be assumed by Raft, so provide the guard to
 	// evalAndPropose. If we return with an error from executeWriteBatch, we
 	// also return the guard which the caller reassumes ownership of.
-	ch, abandon, _, writeBytes, pErr := r.evalAndPropose(ctx, ba, g, &st, ui, tok.Move(ctx))
+	ch, abandonTok, _, writeBytes, pErr := r.evalAndPropose(ctx, ba, g, &st, ui, tok.Move(ctx))
 	if pErr != nil {
 		if cErr, ok := pErr.GetDetail().(*kvpb.ReplicaCorruptionError); ok {
 			// Need to unlock here because setCorruptRaftMuLock needs readOnlyCmdMu not held.
@@ -207,8 +216,12 @@ func (r *Replica) executeWriteBatch(
 			// Semi-synchronously process any intents that need resolving here in
 			// order to apply back pressure on the client which generated them. The
 			// resolution is semi-synchronous in that there is a limited number of
-			// outstanding asynchronous resolution tasks allowed after which
-			// further calls will block.
+			// outstanding asynchronous resolution tasks allowed after which further
+			// calls will block. The limited number of asynchronous resolution tasks
+			// ensures that the number of goroutines doing intent resolution does
+			// not diverge from the number of workload goroutines (see
+			// https://github.com/cockroachdb/cockroach/issues/4925#issuecomment-193015586
+			// for an old problem predating such a limit).
 			if len(propResult.EndTxns) > 0 {
 				if err := r.store.intentResolver.CleanupTxnIntentsAsync(
 					ctx, r.RangeID, propResult.EndTxns, true, /* allowSync */
@@ -218,7 +231,7 @@ func (r *Replica) executeWriteBatch(
 			}
 			if len(propResult.EncounteredIntents) > 0 {
 				if err := r.store.intentResolver.CleanupIntentsAsync(
-					ctx, propResult.EncounteredIntents, true, /* allowSync */
+					ctx, ba.AdmissionHeader, propResult.EncounteredIntents, true, /* allowSync */
 				); err != nil {
 					log.Warningf(ctx, "intent cleanup failed: %v", err)
 				}
@@ -327,7 +340,7 @@ func (r *Replica) executeWriteBatch(
 						}
 					})
 			}
-			abandon()
+			r.abandon(abandonTok)
 			dur := timeutil.Since(startTime)
 			log.VEventf(ctx, 2, "context cancellation after %.2fs of attempting command %s",
 				dur.Seconds(), ba)
@@ -338,7 +351,7 @@ func (r *Replica) executeWriteBatch(
 		case <-shouldQuiesce:
 			// If shutting down, return an AmbiguousResultError, which indicates
 			// to the caller that the command may have executed.
-			abandon()
+			r.abandon(abandonTok)
 			log.VEventf(ctx, 2, "shutdown cancellation after %0.1fs of attempting command %s",
 				timeutil.Since(startTime).Seconds(), ba)
 			return nil, nil, nil, kvpb.NewError(kvpb.NewAmbiguousResultErrorf(
@@ -349,11 +362,15 @@ func (r *Replica) executeWriteBatch(
 
 // canAttempt1PCEvaluation looks at the batch and decides whether it can be
 // executed as 1PC.
+//
+// The function may need to adjust the batch's timestamps in order to make it
+// possible to evaluate the batch as 1PC. If it does so, it will return the
+// updated batch request, which is shallow-copied on write.
 func (r *Replica) canAttempt1PCEvaluation(
 	ctx context.Context, ba *kvpb.BatchRequest, g *concurrency.Guard,
-) bool {
+) (*kvpb.BatchRequest, bool) {
 	if !isOnePhaseCommit(ba) {
-		return false
+		return ba, false
 	}
 
 	// isOnePhaseCommit ensured that the transaction has a non-skewed read/write
@@ -375,16 +392,17 @@ func (r *Replica) canAttempt1PCEvaluation(
 	// to check for an existing record.
 	ok, _ := r.CanCreateTxnRecord(ctx, ba.Txn.ID, ba.Txn.Key, ba.Txn.MinTimestamp)
 	if !ok {
-		return false
+		return ba, false
 	}
 	minCommitTS := r.MinTxnCommitTS(ctx, ba.Txn.ID, ba.Txn.Key)
 	if ba.Timestamp.Less(minCommitTS) {
+		ba = ba.ShallowCopy()
 		ba.Txn.WriteTimestamp = minCommitTS
 		// We can only evaluate at the new timestamp if we manage to bump the read
 		// timestamp.
 		return maybeBumpReadTimestampToWriteTimestamp(ctx, ba, g)
 	}
-	return true
+	return ba, true
 }
 
 // evaluateWriteBatch evaluates the supplied batch.
@@ -403,27 +421,34 @@ func (r *Replica) evaluateWriteBatch(
 	g *concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
-) (storage.Batch, enginepb.MVCCStats, *kvpb.BatchResponse, result.Result, *kvpb.Error) {
+) (
+	*kvpb.BatchRequest,
+	storage.Batch,
+	enginepb.MVCCStats,
+	*kvpb.BatchResponse,
+	result.Result,
+	*kvpb.Error,
+) {
 	log.Event(ctx, "executing read-write batch")
 
 	// If the transaction has been pushed but it can be forwarded to the higher
 	// timestamp, let's evaluate the batch at the bumped timestamp. This will
 	// allow serializable transactions to commit. It will also allow transactions
 	// with any isolation level to attempt the 1PC code path.
-	maybeBumpReadTimestampToWriteTimestamp(ctx, ba, g)
-
+	ba, _ = maybeBumpReadTimestampToWriteTimestamp(ctx, ba, g)
+	var ok bool
 	// Attempt 1PC execution, if applicable. If not transactional or there are
 	// indications that the batch's txn will require retry, execute as normal.
-	if r.canAttempt1PCEvaluation(ctx, ba, g) {
+	if ba, ok = r.canAttempt1PCEvaluation(ctx, ba, g); ok {
 		res := r.evaluate1PC(ctx, idKey, ba, g, st)
 		switch res.success {
 		case onePCSucceeded:
-			return res.batch, res.stats, res.br, res.res, nil
+			return ba, res.batch, res.stats, res.br, res.res, nil
 		case onePCFailed:
 			if res.pErr == nil {
 				log.Fatalf(ctx, "1PC failed but no err. ba: %s", ba.String())
 			}
-			return nil, enginepb.MVCCStats{}, nil, result.Result{}, res.pErr
+			return ba, nil, enginepb.MVCCStats{}, nil, result.Result{}, res.pErr
 		case onePCFallbackToTransactionalEvaluation:
 			// Fallthrough to transactional evaluation.
 		}
@@ -434,7 +459,7 @@ func (r *Replica) evaluateWriteBatch(
 		// terminate this request early.
 		arg, ok := ba.GetArg(kvpb.EndTxn)
 		if ok && arg.(*kvpb.EndTxnRequest).Require1PC {
-			return nil, enginepb.MVCCStats{}, nil, result.Result{}, kvpb.NewError(kv.OnePCNotAllowedError{})
+			return ba, nil, enginepb.MVCCStats{}, nil, result.Result{}, kvpb.NewError(kv.OnePCNotAllowedError{})
 		}
 	}
 
@@ -445,11 +470,15 @@ func (r *Replica) evaluateWriteBatch(
 
 	ms := newMVCCStats()
 	defer releaseMVCCStats(ms)
-	rec := NewReplicaEvalContext(ctx, r, g.LatchSpans(), ba.RequiresClosedTSOlderThanStorageSnapshot())
+	rec := NewReplicaEvalContext(
+		ctx, r, g.LatchSpans(), ba.RequiresClosedTSOlderThanStorageSnapshot(), ba.AdmissionHeader)
 	defer rec.Release()
-	batch, br, res, pErr := r.evaluateWriteBatchWithServersideRefreshes(
-		ctx, idKey, rec, ms, ba, g, st, ui, hlc.Timestamp{} /* deadline */)
-	return batch, *ms, br, res, pErr
+	// For non-transactional writes, omitInRangefeeds should always be false.
+	// For transactional writes, we propagate the flag from the txn.
+	omitInRangefeeds := ba.Txn != nil && ba.Txn.OmitInRangefeeds
+	ba, batch, br, res, pErr := r.evaluateWriteBatchWithServersideRefreshes(
+		ctx, idKey, rec, ms, ba, g, st, ui, hlc.Timestamp{} /* deadline */, omitInRangefeeds)
+	return ba, batch, *ms, br, res, pErr
 }
 
 type onePCSuccess int
@@ -499,9 +528,12 @@ func (r *Replica) evaluate1PC(
 	var batch storage.Batch
 	defer func() {
 		// Close the batch unless it's passed to the caller (when the evaluation
-		// succeeds).
+		// succeeds). Also increment metrics.
 		if onePCRes.success != onePCSucceeded {
 			batch.Close()
+			r.store.Metrics().OnePhaseCommitFailure.Inc(1)
+		} else {
+			r.store.Metrics().OnePhaseCommitSuccess.Inc(1)
 		}
 	}()
 
@@ -515,7 +547,8 @@ func (r *Replica) evaluate1PC(
 	// Is this relying on the batch being write-only?
 	ui := uncertainty.Interval{}
 
-	rec := NewReplicaEvalContext(ctx, r, g.LatchSpans(), ba.RequiresClosedTSOlderThanStorageSnapshot())
+	rec := NewReplicaEvalContext(
+		ctx, r, g.LatchSpans(), ba.RequiresClosedTSOlderThanStorageSnapshot(), ba.AdmissionHeader)
 	defer rec.Release()
 	var br *kvpb.BatchResponse
 	var res result.Result
@@ -528,11 +561,11 @@ func (r *Replica) evaluate1PC(
 	ms := newMVCCStats()
 	defer releaseMVCCStats(ms)
 	if ba.CanForwardReadTimestamp {
-		batch, br, res, pErr = r.evaluateWriteBatchWithServersideRefreshes(
-			ctx, idKey, rec, ms, &strippedBa, g, st, ui, etArg.Deadline)
+		_, batch, br, res, pErr = r.evaluateWriteBatchWithServersideRefreshes(
+			ctx, idKey, rec, ms, &strippedBa, g, st, ui, etArg.Deadline, ba.Txn.OmitInRangefeeds)
 	} else {
 		batch, br, res, pErr = r.evaluateWriteBatchWrapper(
-			ctx, idKey, rec, ms, &strippedBa, g, st, ui)
+			ctx, idKey, rec, ms, &strippedBa, g, st, ui, ba.Txn.OmitInRangefeeds)
 	}
 
 	if pErr != nil || (!ba.CanForwardReadTimestamp && ba.Timestamp != br.Timestamp) {
@@ -661,7 +694,14 @@ func (r *Replica) evaluateWriteBatchWithServersideRefreshes(
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 	deadline hlc.Timestamp,
-) (batch storage.Batch, br *kvpb.BatchResponse, res result.Result, pErr *kvpb.Error) {
+	omitInRangefeeds bool,
+) (
+	_ *kvpb.BatchRequest,
+	batch storage.Batch,
+	br *kvpb.BatchResponse,
+	res result.Result,
+	pErr *kvpb.Error,
+) {
 	goldenMS := *ms
 	for retries := 0; ; retries++ {
 		if retries > 0 {
@@ -673,7 +713,7 @@ func (r *Replica) evaluateWriteBatchWithServersideRefreshes(
 			batch.Close()
 		}
 
-		batch, br, res, pErr = r.evaluateWriteBatchWrapper(ctx, idKey, rec, ms, ba, g, st, ui)
+		batch, br, res, pErr = r.evaluateWriteBatchWrapper(ctx, idKey, rec, ms, ba, g, st, ui, omitInRangefeeds)
 
 		// Allow one retry only; a non-txn batch containing overlapping
 		// spans will always experience WriteTooOldError.
@@ -681,14 +721,16 @@ func (r *Replica) evaluateWriteBatchWithServersideRefreshes(
 			break
 		}
 		// If we can retry, set a higher batch timestamp and continue.
-		if !canDoServersideRetry(ctx, pErr, ba, g, deadline) {
+		var ok bool
+		ba, ok = canDoServersideRetry(ctx, pErr, ba, g, deadline)
+		if !ok {
 			r.store.Metrics().WriteEvaluationServerSideRetryFailure.Inc(1)
 			break
 		} else {
 			r.store.Metrics().WriteEvaluationServerSideRetrySuccess.Inc(1)
 		}
 	}
-	return batch, br, res, pErr
+	return ba, batch, br, res, pErr
 }
 
 // evaluateWriteBatchWrapper is a wrapper on top of evaluateBatch() which deals
@@ -702,10 +744,11 @@ func (r *Replica) evaluateWriteBatchWrapper(
 	g *concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
+	omitInRangefeeds bool,
 ) (storage.Batch, *kvpb.BatchResponse, result.Result, *kvpb.Error) {
 	batch, opLogger := r.newBatchedEngine(ba, g)
 	now := timeutil.Now()
-	br, res, pErr := evaluateBatch(ctx, idKey, batch, rec, ms, ba, g, st, ui, readWrite)
+	br, res, pErr := evaluateBatch(ctx, idKey, batch, rec, ms, ba, g, st, ui, readWrite, omitInRangefeeds)
 	r.store.metrics.ReplicaWriteBatchEvaluationLatency.RecordValue(timeutil.Since(now).Nanoseconds())
 	if pErr == nil {
 		if opLogger != nil {
@@ -788,6 +831,7 @@ func (r *Replica) newBatchedEngine(
 //     condition is isolation level dependent.
 //  3. the transaction is not in its first epoch and the EndTxn request does
 //     not require one phase commit.
+//  4. the EndTxn request explicitly disables one phase commit.
 func isOnePhaseCommit(ba *kvpb.BatchRequest) bool {
 	if ba.Txn == nil {
 		return false
@@ -810,6 +854,9 @@ func isOnePhaseCommit(ba *kvpb.BatchRequest) bool {
 	}
 	arg, _ := ba.GetArg(kvpb.EndTxn)
 	etArg := arg.(*kvpb.EndTxnRequest)
+	if etArg.Disable1PC {
+		return false // explicitly disabled
+	}
 	if retry, _, _ := batcheval.IsEndTxnTriggeringRetryError(ba.Txn, etArg.Deadline); retry {
 		return false
 	}

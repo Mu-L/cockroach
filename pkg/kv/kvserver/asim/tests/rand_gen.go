@@ -1,22 +1,26 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
 	"fmt"
 	"math/rand"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/assertion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/event"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/gen"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/state"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 )
 
 // randomClusterInfoGen returns a randomly picked predefined configuration.
@@ -49,6 +53,10 @@ type RandomizedBasicRanges struct {
 
 var _ gen.RangeGen = &RandomizedBasicRanges{}
 
+func (r RandomizedBasicRanges) String() string {
+	return fmt.Sprintf("randomized ranges with placement_type=%v, %v", r.placementType, r.BaseRanges)
+}
+
 func (r RandomizedBasicRanges) Generate(
 	seed int64, settings *config.SimulationSettings, s state.State,
 ) state.State {
@@ -71,11 +79,18 @@ type WeightedRandomizedBasicRanges struct {
 
 var _ gen.RangeGen = &WeightedRandomizedBasicRanges{}
 
+func (wr WeightedRandomizedBasicRanges) String() string {
+	return fmt.Sprintf("weighted randomized ranges with placement_type=%v, weighted_rand=%v, %v", wr.placementType, wr.weightedRand, wr.BaseRanges)
+}
+
 func (wr WeightedRandomizedBasicRanges) Generate(
 	seed int64, settings *config.SimulationSettings, s state.State,
 ) state.State {
 	if wr.placementType != gen.WeightedRandom || len(wr.weightedRand) == 0 {
 		panic("RandomizedBasicRanges generate only weighted randomized distributions with non-empty weightedRand")
+	}
+	if len(s.Stores()) != len(wr.weightedRand) {
+		panic("mismatch: len(weighted_rand) != stores count")
 	}
 	rangesInfo := wr.GetRangesInfo(wr.placementType, len(s.Stores()), wr.randSource, wr.weightedRand)
 	wr.LoadRangeInfo(s, rangesInfo)
@@ -249,3 +264,189 @@ func (c clusterGenSettings) String() string {
 const (
 	defaultClusterGenType = multiRegion
 )
+
+type eventSeriesType int
+
+const (
+	// Cycle through predefined region and zone survival configurations. Note
+	// that only cluster_gen_type=multi_region can execute this event.
+	cycleViaHardcodedSurvivalGoals eventSeriesType = iota
+	// Cycle through randomly generated region and zone survival configurations.
+	// Note that only cluster_gen_type=multi_region can execute this event.
+	cycleViaRandomSurvivalGoals
+)
+
+type eventGenSettings struct {
+	durationToAssertOnEvent time.Duration
+	eventsType              eventSeriesType
+}
+
+const (
+	defaultEventsType              = cycleViaHardcodedSurvivalGoals
+	defaultDurationToAssertOnEvent = 10 * time.Minute
+)
+
+func (e eventSeriesType) String() string {
+	switch e {
+	case cycleViaHardcodedSurvivalGoals:
+		return "cycle_via_hardcoded_survival_goals"
+	case cycleViaRandomSurvivalGoals:
+		return "cycle_via_random_survival_goals"
+	default:
+		panic("unknown event series type")
+	}
+}
+
+func getEventSeriesType(s string) eventSeriesType {
+	switch s {
+	case "cycle_via_hardcoded_survival_goals":
+		return cycleViaHardcodedSurvivalGoals
+	case "cycle_via_random_survival_goals":
+		return cycleViaRandomSurvivalGoals
+	default:
+		panic(fmt.Sprintf("unknown event series type: %s", s))
+	}
+}
+
+func (e eventGenSettings) String() string {
+	return fmt.Sprintf("duration_to_assert_on_event=%s, type=%v",
+		e.durationToAssertOnEvent, e.eventsType)
+}
+
+func constructSetZoneConfigEventWithConformanceAssertion(
+	span roachpb.Span, config zonepb.ZoneConfig, durationToAssert time.Duration,
+) event.MutationWithAssertionEvent {
+	return event.MutationWithAssertionEvent{
+		MutationEvent: event.SetSpanConfigEvent{
+			Span:   span,
+			Config: config.AsSpanConfig(),
+		},
+		AssertionEvent: event.NewAssertionEvent([]assertion.SimulationAssertion{
+			assertion.ConformanceAssertion{
+				Underreplicated:      0,
+				Overreplicated:       0,
+				ViolatingConstraints: 0,
+				Unavailable:          0,
+			},
+		}),
+		DurationToAssert: durationToAssert,
+	}
+}
+
+// generateHardcodedSurvivalGoalsEvents sets up two MutationWithAssertionEvents.
+// The first mutation event starts at the beginning, followed by an assertion
+// event after some time (durationToAssert). Right after that, the second
+// MutationWithAssertionEvent happens. Both of these mutation events are
+// SetSpanConfig events which use two hardcoded zone configurations.
+func generateHardcodedSurvivalGoalsEvents(
+	regions []state.Region, startTime time.Time, durationToAssert time.Duration,
+) gen.StaticEvents {
+	if len(regions) < 3 {
+		panic("only multi-region cluster with more than three regions can use cycle_via_hardcoded_survival_goals")
+	}
+
+	eventGen := gen.NewStaticEventsWithNoEvents()
+	regionsOne, regionTwo, regionThree := regions[0].Name, regions[1].Name, regions[2].Name
+	const numOfConfigs = 2
+	configs := [numOfConfigs]zonepb.ZoneConfig{state.GetZoneSurvivalConfig(regionsOne, regionTwo, regionThree),
+		state.GetRegionSurvivalConfig(regionsOne, regionTwo, regionThree)}
+
+	span := roachpb.Span{
+		Key:    state.MinKey.ToRKey().AsRawKey(),
+		EndKey: state.MaxKey.ToRKey().AsRawKey(),
+	}
+
+	delay := time.Duration(0)
+	// TODO(wenyihu6): enable adding event name tag when registering events for better format span config in output
+	for _, eachConfig := range configs {
+		eventGen.ScheduleMutationWithAssertionEvent(startTime, delay,
+			constructSetZoneConfigEventWithConformanceAssertion(span, eachConfig, durationToAssert))
+		delay += durationToAssert
+	}
+	return eventGen
+}
+
+// getRegionNames takes a list of regions and returns the extracted region names
+// in the catpb.RegionNames format.
+func getRegionNames(regions []state.Region) (regionNames catpb.RegionNames) {
+	for _, r := range regions {
+		regionNames = append(regionNames, catpb.RegionName(r.Name))
+	}
+	return regionNames
+}
+
+// randomlySelectSurvivalGoal randomly selects between SurvivalGoal_ZONE_FAILURE
+// and SurvivalGoal_REGION_FAILURE.
+func randomlySelectSurvivalGoal(randSource *rand.Rand) descpb.SurvivalGoal {
+	if randBool(randSource) {
+		return descpb.SurvivalGoal_ZONE_FAILURE
+	} else {
+		return descpb.SurvivalGoal_REGION_FAILURE
+	}
+}
+
+// randomlySelectDataPlacement randomly selects between DataPlacement_DEFAULT
+// and DataPlacement_RESTRICTED.
+func randomlySelectDataPlacement(randSource *rand.Rand) descpb.DataPlacement {
+	if randBool(randSource) {
+		return descpb.DataPlacement_DEFAULT
+	} else {
+		return descpb.DataPlacement_RESTRICTED
+	}
+}
+
+// generateRandomSurvivalGoalsEvents generates SetSpanConfig events spaced at
+// intervals defined by durationToAssert from the start time. These events apply
+// a randomly generated zone configuration followed by an assertion event. Note
+// that these random configurations might be unsatisfiable under the cluster
+// setup.
+func generateRandomSurvivalGoalsEvents(
+	regions []state.Region,
+	startTime time.Time,
+	durationToAssert time.Duration,
+	duration time.Duration,
+	randSource *rand.Rand,
+) gen.StaticEvents {
+	if len(regions) < 3 {
+		panic("iterate all zone configs is only possible for clusters with > 3 regions")
+	}
+	eventGen := gen.NewStaticEventsWithNoEvents()
+	delay := time.Duration(0)
+
+	span := roachpb.Span{
+		Key:    state.MinKey.ToRKey().AsRawKey(),
+		EndKey: state.MaxKey.ToRKey().AsRawKey(),
+	}
+
+	regionNames := getRegionNames(regions)
+	for delay < duration {
+		randomRegionIndex := randIndex(randSource, len(regions))
+		randomPrimaryRegion := regions[randomRegionIndex].Name
+		randomSurvivalGoal := randomlySelectSurvivalGoal(randSource)
+		randomDataPlacement := randomlySelectDataPlacement(randSource)
+		rc := multiregion.MakeRegionConfig(
+			regionNames,
+			catpb.RegionName(randomPrimaryRegion),
+			randomSurvivalGoal,
+			descpb.InvalidID,
+			randomDataPlacement,
+			nil,
+			descpb.ZoneConfigExtensions{},
+		)
+
+		zoneConfig, convertErr := sql.TestingConvertRegionToZoneConfig(rc)
+		if convertErr != nil {
+			panic(fmt.Sprintf("failed to convert region to zone config %s", convertErr.Error()))
+		}
+		if validateErr := zoneConfig.Validate(); validateErr != nil {
+			panic(fmt.Sprintf("zone config generated is invalid %s", validateErr.Error()))
+		}
+		if validateErr := zoneConfig.EnsureFullyHydrated(); validateErr != nil {
+			panic(fmt.Sprintf("zone config generated is not fully hydrated %s", validateErr.Error()))
+		}
+		eventGen.ScheduleMutationWithAssertionEvent(startTime, delay,
+			constructSetZoneConfigEventWithConformanceAssertion(span, zoneConfig, durationToAssert))
+		delay += durationToAssert
+	}
+	return eventGen
+}

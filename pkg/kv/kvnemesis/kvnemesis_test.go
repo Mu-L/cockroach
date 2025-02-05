@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -23,8 +18,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -39,9 +39,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var defaultNumSteps = envutil.EnvOrDefaultInt("COCKROACH_KVNEMESIS_STEPS", 50)
+var defaultNumSteps = envutil.EnvOrDefaultInt("COCKROACH_KVNEMESIS_STEPS", 100)
 
-func (cfg kvnemesisTestCfg) testClusterArgs(tr *SeqTracker) base.TestClusterArgs {
+func (cfg kvnemesisTestCfg) testClusterArgs(
+	ctx context.Context, tr *SeqTracker,
+) base.TestClusterArgs {
 	storeKnobs := &kvserver.StoreTestingKnobs{
 		// Drop the clock MaxOffset to reduce commit-wait time for
 		// transactions that write to global_read ranges.
@@ -102,12 +104,16 @@ func (cfg kvnemesisTestCfg) testClusterArgs(tr *SeqTracker) base.TestClusterArgs
 		}
 	}
 
-	if p := cfg.injectReproposalErrorProb; p > 0 {
+	if p := cfg.invalidLeaseAppliedIndexProb; p > 0 {
 		var mu syncutil.Mutex
 		seen := map[string]int{}
 		storeKnobs.LeaseIndexFilter = func(pd *kvserver.ProposalData) kvpb.LeaseAppliedIndex {
 			key, n, ok := isOurCommand(pd.Request)
 			if !ok {
+				return 0
+			}
+			// Lease requests never assign a LAI.
+			if pd.Request.IsSingleRequestLeaseRequest() {
 				return 0
 			}
 
@@ -120,11 +126,41 @@ func (cfg kvnemesisTestCfg) testClusterArgs(tr *SeqTracker) base.TestClusterArgs
 			log.Infof(context.Background(), "inserting illegal lease index for %s (seen %d times)", roachpb.Key(key), seen[key])
 			// LAI 1 is always going to fail because the LAI is initialized when the lease
 			// comes into existence. (It's important that we pick one here that reliably
-			// fails because otherwise we may accidentally regress the closed timestamp[^1].
+			// fails because otherwise we may accidentally regress the closed timestamp[^1][^2].
 			//
 			// [^1]: https://github.com/cockroachdb/cockroach/issues/70894#issuecomment-1433244880
+			// [^2]: https://github.com/cockroachdb/cockroach/issues/70894#issuecomment-1881165404
 			return 1
 		}
+	}
+
+	if cfg.assertRaftApply {
+		asserter := apply.NewAsserter()
+		storeKnobs.TestingProposalSubmitFilter = func(args kvserverbase.ProposalFilterArgs) (bool, error) {
+			asserter.Propose(args.RangeID, args.ReplicaID, args.CmdID, args.SeedID, args.Cmd, args.Req)
+			return false /* drop */, nil
+		}
+		storeKnobs.TestingApplyCalledTwiceFilter = func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
+			if !args.Ephemeral {
+				asserter.Apply(args.RangeID, args.ReplicaID, args.CmdID, args.Entry, args.Cmd.MaxLeaseIndex,
+					*args.Cmd.ClosedTimestamp)
+			}
+			return 0, nil
+		}
+		storeKnobs.AfterSnapshotApplication = func(
+			desc roachpb.ReplicaDescriptor, state kvserverpb.ReplicaState, snap kvserver.IncomingSnapshot,
+		) {
+			asserter.ApplySnapshot(snap.Desc.RangeID, desc.ReplicaID, snap.FromReplica.ReplicaID,
+				state.RaftAppliedIndex, state.RaftAppliedIndexTerm, state.LeaseAppliedIndex,
+				state.RaftClosedTimestamp)
+		}
+	}
+
+	st := cluster.MakeTestingClusterSettings()
+	// TODO(mira): Remove this cluster setting once the default is set to true.
+	kvcoord.KeepRefreshSpansOnSavepointRollback.Override(ctx, &st.SV, true)
+	if cfg.leaseTypeOverride != 0 {
+		kvserver.OverrideDefaultLeaseType(ctx, &st.SV, cfg.leaseTypeOverride)
 	}
 
 	return base.TestClusterArgs{
@@ -150,6 +186,7 @@ func (cfg kvnemesisTestCfg) testClusterArgs(tr *SeqTracker) base.TestClusterArgs
 					},
 				},
 			},
+			Settings: st,
 		},
 	}
 }
@@ -184,9 +221,9 @@ type tBridge struct {
 func newTBridge(t *testing.T) *tBridge {
 	// NB: we're not using t.TempDir() because we want these to survive
 	// on failure.
-	td, err := os.MkdirTemp("", "kvnemesis")
+	td, err := os.MkdirTemp(datapathutils.DebuggableTempDir(), "kvnemesis")
 	if err != nil {
-		td = os.TempDir()
+		td = datapathutils.DebuggableTempDir()
 	}
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -224,6 +261,12 @@ type kvnemesisTestCfg struct {
 	// considered truly random, but is random enough for the desired purpose.
 	invalidLeaseAppliedIndexProb float64 // [0,1)
 	injectReproposalErrorProb    float64 // [0,1)
+	// If enabled, track Raft proposals and command application, and assert
+	// invariants (in particular that we don't double-apply a request or
+	// proposal).
+	assertRaftApply bool
+	// If set, overrides the default lease type for ranges.
+	leaseTypeOverride roachpb.LeaseType
 }
 
 func TestKVNemesisSingleNode(t *testing.T) {
@@ -235,8 +278,9 @@ func TestKVNemesisSingleNode(t *testing.T) {
 		numSteps:                     defaultNumSteps,
 		concurrency:                  5,
 		seedOverride:                 0,
-		invalidLeaseAppliedIndexProb: 0.1,
-		injectReproposalErrorProb:    0.1,
+		invalidLeaseAppliedIndexProb: 0.2,
+		injectReproposalErrorProb:    0.2,
+		assertRaftApply:              true,
 	})
 }
 
@@ -251,6 +295,7 @@ func TestKVNemesisSingleNode_ReproposalChaos(t *testing.T) {
 		seedOverride:                 0,
 		invalidLeaseAppliedIndexProb: 0.9,
 		injectReproposalErrorProb:    0.5,
+		assertRaftApply:              true,
 	})
 }
 
@@ -263,8 +308,25 @@ func TestKVNemesisMultiNode(t *testing.T) {
 		numSteps:                     defaultNumSteps,
 		concurrency:                  5,
 		seedOverride:                 0,
-		invalidLeaseAppliedIndexProb: 0.1,
-		injectReproposalErrorProb:    0.1,
+		invalidLeaseAppliedIndexProb: 0.2,
+		injectReproposalErrorProb:    0.2,
+		assertRaftApply:              true,
+	})
+}
+
+func TestKVNemesisMultiNode_LeaderLeases(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testKVNemesisImpl(t, kvnemesisTestCfg{
+		numNodes:                     4,
+		numSteps:                     defaultNumSteps,
+		concurrency:                  5,
+		seedOverride:                 0,
+		invalidLeaseAppliedIndexProb: 0.2,
+		injectReproposalErrorProb:    0.2,
+		assertRaftApply:              true,
+		leaseTypeOverride:            roachpb.LeaseLeader,
 	})
 }
 
@@ -285,7 +347,7 @@ func testKVNemesisImpl(t *testing.T, cfg kvnemesisTestCfg) {
 	// 4 nodes so we have somewhere to move 3x replicated ranges to.
 	ctx := context.Background()
 	tr := &SeqTracker{}
-	tc := testcluster.StartTestCluster(t, cfg.numNodes, cfg.testClusterArgs(tr))
+	tc := testcluster.StartTestCluster(t, cfg.numNodes, cfg.testClusterArgs(ctx, tr))
 	defer tc.Stopper().Stop(ctx)
 	dbs, sqlDBs := make([]*kv.DB, cfg.numNodes), make([]*gosql.DB, cfg.numNodes)
 	for i := 0; i < cfg.numNodes; i++ {
@@ -306,6 +368,16 @@ func testKVNemesisImpl(t *testing.T, cfg kvnemesisTestCfg) {
 	logger := newTBridge(t)
 	env := &Env{SQLDBs: sqlDBs, Tracker: tr, L: logger}
 	failures, err := RunNemesis(ctx, rng, env, config, cfg.concurrency, cfg.numSteps, dbs...)
+
+	for i := 0; i < cfg.numNodes; i++ {
+		t.Logf("[%d] proposed: %d", i,
+			tc.GetFirstStoreFromServer(t, i).Metrics().RaftCommandsProposed.Count())
+		t.Logf("[%d] reproposed unchanged: %d", i,
+			tc.GetFirstStoreFromServer(t, i).Metrics().RaftCommandsReproposed.Count())
+		t.Logf("[%d] reproposed with new LAI: %d", i,
+			tc.GetFirstStoreFromServer(t, i).Metrics().RaftCommandsReproposedLAI.Count())
+	}
+
 	require.NoError(t, err, `%+v`, err)
 	require.Zero(t, len(failures), "kvnemesis detected failures") // they've been logged already
 }

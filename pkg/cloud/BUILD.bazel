@@ -22,6 +22,7 @@ go_library(
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql/isql",
+        "//pkg/util/cidr",
         "//pkg/util/ctxgroup",
         "//pkg/util/ioctx",
         "//pkg/util/log",
@@ -38,10 +39,14 @@ go_library(
 
 go_test(
     name = "cloud_test",
-    srcs = ["cloud_io_test.go"],
-    args = ["-test.timeout=295s"],
+    srcs = [
+        "cloud_io_test.go",
+        "options_test.go",
+        "uris_test.go",
+    ],
     embed = [":cloud"],
     deps = [
+        "//pkg/cloud/cloudpb",
         "//pkg/util/ioctx",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",

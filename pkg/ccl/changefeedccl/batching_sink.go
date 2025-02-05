@@ -1,10 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -16,29 +13,38 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
 // SinkClient is an interface to an external sink, where messages are written
 // into batches as they arrive and once ready are flushed out.
 type SinkClient interface {
-	MakeResolvedPayload(body []byte, topic string) (SinkPayload, error)
-	// Batches can only hold messages for one unique topic
 	MakeBatchBuffer(topic string) BatchBuffer
+	// FlushResolvedPayload flushes the resolved payload to the sink. It takes
+	// an iterator over the set of topics in case the client chooses to emit
+	// the payload to multiple topics.
+	FlushResolvedPayload(context.Context, []byte, func(func(topic string) error) error, retry.Options) error
 	Flush(context.Context, SinkPayload) error
 	Close() error
+	// CheckConnection checks if the sink can connect to its destination. It is
+	// optional. It will be called in batchingSink.Dial(), which will be called
+	// during evaluation of the CREATE CHANGEFEED statement, in order to give
+	// users quick feedback.
+	CheckConnection(ctx context.Context) error
 }
 
 // BatchBuffer is an interface to aggregate KVs into a payload that can be sent
 // to the sink.
 type BatchBuffer interface {
-	Append(key []byte, value []byte)
+	Append(key []byte, value []byte, attributes attributes)
 	ShouldFlush() bool
 
 	// Once all data has been Append'ed, Close can be called to return a finalized
@@ -65,9 +71,10 @@ type batchingSink struct {
 	minFlushFrequency time.Duration
 	retryOpts         retry.Options
 
-	ts      timeutil.TimeSource
-	metrics metricsRecorder
-	knobs   batchingSinkKnobs
+	ts       timeutil.TimeSource
+	metrics  metricsRecorder
+	settings *cluster.Settings
+	knobs    batchingSinkKnobs
 
 	// eventCh is the channel used to send requests from the Sink caller routines
 	// to the batching routine.  Messages can either be a flushReq or a rowEvent.
@@ -88,6 +95,12 @@ type batchingSinkKnobs struct {
 
 type flushReq struct {
 	waiter chan struct{}
+}
+
+// attributes contain additional metadata which may be emitted alongside a row
+// but separate from the encoded keys and values.
+type attributes struct {
+	tableName string
 }
 
 type rowEvent struct {
@@ -132,11 +145,22 @@ func (s *batchingSink) Flush(ctx context.Context) error {
 
 var _ Sink = (*batchingSink)(nil)
 
+// Topics gives the names of all topics that have been initialized
+// and will receive resolved timestamps.
+func (s *batchingSink) Topics() []string {
+	if s.topicNamer == nil {
+		return nil
+	}
+	return s.topicNamer.DisplayNamesSlice()
+}
+
+var _ SinkWithTopics = (*batchingSink)(nil)
+
 // Event structs and batch structs which are transferred across routines (and
 // therefore escape to the heap) can both be incredibly frequent (every event
 // may be its own batch) and temporary, so to avoid GC thrashing they are both
 // claimed and freed from object pools.
-var eventPool sync.Pool = sync.Pool{
+var eventPool = sync.Pool{
 	New: func() interface{} {
 		return new(rowEvent)
 	},
@@ -150,7 +174,7 @@ func freeRowEvent(e *rowEvent) {
 	eventPool.Put(e)
 }
 
-var batchPool sync.Pool = sync.Pool{
+var batchPool = sync.Pool{
 	New: func() interface{} {
 		return new(sinkBatch)
 	},
@@ -199,17 +223,12 @@ func (s *batchingSink) EmitResolvedTimestamp(
 	if err != nil {
 		return err
 	}
-	payload, err := s.client.MakeResolvedPayload(data, "")
-	if err != nil {
-		return err
-	}
-
+	// Flush the buffered rows.
 	if err = s.Flush(ctx); err != nil {
 		return err
 	}
-	return retry.WithMaxAttempts(ctx, s.retryOpts, s.retryOpts.MaxRetries+1, func() error {
-		return s.client.Flush(ctx, payload)
-	})
+
+	return s.client.FlushResolvedPayload(ctx, data, s.topicNamer.Each, s.retryOpts)
 }
 
 // Close implements the Sink interface.
@@ -222,7 +241,8 @@ func (s *batchingSink) Close() error {
 
 // Dial implements the Sink interface.
 func (s *batchingSink) Dial() error {
-	return nil
+	// I don't want to change the Sink interface just to give this a context, but it probably deserves one.
+	return s.client.CheckConnection(context.TODO())
 }
 
 // getConcreteType implements the Sink interface.
@@ -262,6 +282,11 @@ func (sb *sinkBatch) Keys() intsets.Fast {
 	return sb.keys
 }
 
+// NumMessages implements the IORequest interface.
+func (sb *sinkBatch) NumMessages() int {
+	return sb.numMessages
+}
+
 func (sb *sinkBatch) isEmpty() bool {
 	return sb.numMessages == 0
 }
@@ -278,7 +303,9 @@ func (sb *sinkBatch) Append(e *rowEvent) {
 		sb.bufferTime = timeutil.Now()
 	}
 
-	sb.buffer.Append(e.key, e.val)
+	sb.buffer.Append(e.key, e.val, attributes{
+		tableName: e.topicDescriptor.GetTableName(),
+	})
 
 	sb.keys.Add(hashToInt(sb.hasher, e.key))
 	sb.numMessages += 1
@@ -320,9 +347,11 @@ func (s *batchingSink) runBatchingWorker(ctx context.Context) {
 		batch, _ := req.(*sinkBatch)
 		defer s.metrics.recordSinkIOInflightChange(int64(-batch.numMessages))
 		s.metrics.recordSinkIOInflightChange(int64(batch.numMessages))
+		defer s.metrics.timers().DownstreamClientSend.Start()()
+
 		return s.client.Flush(ctx, batch.payload)
 	}
-	ioEmitter := newParallelIO(ctx, s.retryOpts, s.ioWorkers, ioHandler, s.metrics)
+	ioEmitter := NewParallelIO(ctx, s.retryOpts, s.ioWorkers, ioHandler, s.metrics, s.settings)
 	defer ioEmitter.Close()
 
 	// Flushing requires tracking the number of inflight messages and confirming
@@ -330,11 +359,12 @@ func (s *batchingSink) runBatchingWorker(ctx context.Context) {
 	inflight := 0
 	var sinkFlushWaiter chan struct{}
 
-	handleResult := func(result *ioResult) {
-		batch, _ := result.request.(*sinkBatch)
+	handleResult := func(result IOResult) {
+		req, err := result.Consume()
+		batch, _ := req.(*sinkBatch)
 
-		if result.err != nil {
-			s.handleError(result.err)
+		if err != nil {
+			s.handleError(err)
 		} else {
 			s.metrics.recordEmittedBatch(
 				batch.bufferTime, batch.numMessages, batch.mvcc, batch.numKVBytes, sinkDoesNotCompress,
@@ -343,12 +373,11 @@ func (s *batchingSink) runBatchingWorker(ctx context.Context) {
 
 		inflight -= batch.numMessages
 
-		if (result.err != nil || inflight == 0) && sinkFlushWaiter != nil {
+		if (err != nil || inflight == 0) && sinkFlushWaiter != nil {
 			close(sinkFlushWaiter)
 			sinkFlushWaiter = nil
 		}
 
-		freeIOResult(result)
 		batch.alloc.Release(ctx)
 		freeSinkBatchEvent(batch)
 	}
@@ -364,22 +393,41 @@ func (s *batchingSink) runBatchingWorker(ctx context.Context) {
 			return err
 		}
 
-		// Emitting needs to also handle any incoming results to avoid a deadlock
-		// with trying to emit while the emitter is blocked on returning a result.
-		for {
+		req, send, err := ioEmitter.AdmitRequest(ctx, batchBuffer)
+		if errors.Is(err, ErrNotEnoughQuota) {
+			// Quota can only be freed by consuming a result.
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case ioEmitter.requestCh <- batchBuffer:
-			case result := <-ioEmitter.resultCh:
-				handleResult(result)
-				continue
 			case <-s.doneCh:
+				return nil
+			case result := <-ioEmitter.GetResult():
+				handleResult(result)
 			}
-			break
+
+			// The request should be emitted after freeing quota since this is
+			// a single producer scenario.
+			req, send, err = ioEmitter.AdmitRequest(ctx, batchBuffer)
+			if errors.Is(err, ErrNotEnoughQuota) {
+				logcrash.ReportOrPanic(ctx, &s.settings.SV, "expected request to be emitted after waiting for quota")
+				return errors.AssertionFailedf("expected request to be emitted after waiting for quota")
+			} else if err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
 		}
 
-		return nil
+		// The request was admitted, it must be sent. There are no concurrent requests being sent which
+		// would use up the quota.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.doneCh:
+			return nil
+		case send <- req:
+			return nil
+		}
 	}
 
 	flushAll := func() error {
@@ -402,11 +450,12 @@ func (s *batchingSink) runBatchingWorker(ctx context.Context) {
 	for {
 		select {
 		case req := <-s.eventCh:
-			if err := s.pacer.Pace(ctx); err != nil {
-				if pacerLogEvery.ShouldLog() {
-					log.Errorf(ctx, "automatic sink batcher pacing: %v", err)
-				}
-			}
+			// Swallow pacer error -- it happens only if context is canceled,
+			// and that's handled below.
+			// TODO(yevgeniy): rework this function: this function should simply
+			// return an error, and not rely on "handleError".
+			// It's hard to reason about this functions correctness otherwise.
+			_ = s.pacer.Pace(ctx)
 
 			switch r := req.(type) {
 			case *rowEvent:
@@ -468,7 +517,7 @@ func (s *batchingSink) runBatchingWorker(ctx context.Context) {
 			default:
 				s.handleError(fmt.Errorf("received unknown request of unknown type: %v", r))
 			}
-		case result := <-ioEmitter.resultCh:
+		case result := <-ioEmitter.GetResult():
 			handleResult(result)
 		case <-flushTimer.Ch():
 			flushTimer.MarkRead()
@@ -495,6 +544,7 @@ func makeBatchingSink(
 	pacerFactory func() *admission.Pacer,
 	timeSource timeutil.TimeSource,
 	metrics metricsRecorder,
+	settings *cluster.Settings,
 ) Sink {
 	sink := &batchingSink{
 		client:            client,
@@ -505,6 +555,7 @@ func makeBatchingSink(
 		retryOpts:         retryOpts,
 		ts:                timeSource,
 		metrics:           metrics,
+		settings:          settings,
 		eventCh:           make(chan interface{}, flushQueueDepth),
 		wg:                ctxgroup.WithContext(ctx),
 		hasher:            makeHasher(),

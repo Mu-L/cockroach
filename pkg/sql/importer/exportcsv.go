@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package importer
 
@@ -24,11 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/unique"
 	"github.com/cockroachdb/errors"
 )
 
@@ -144,8 +139,8 @@ func newCSVWriterProcessor(
 		spec:        spec,
 		input:       input,
 	}
-	semaCtx := tree.MakeSemaContext()
-	if err := c.out.Init(ctx, post, colinfo.ExportColumnTypes, &semaCtx, flowCtx.NewEvalCtx()); err != nil {
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
+	if err := c.out.Init(ctx, post, colinfo.ExportColumnTypes, &semaCtx, flowCtx.EvalCtx, flowCtx); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -174,7 +169,7 @@ func (sp *csvWriter) Run(ctx context.Context, output execinfra.RowReceiver) {
 	defer span.Finish()
 
 	instanceID := sp.flowCtx.EvalCtx.NodeID.SQLInstanceID()
-	uniqueID := builtins.GenerateUniqueInt(builtins.ProcessUniqueID(instanceID))
+	uniqueID := unique.GenerateUniqueInt(unique.ProcessUniqueID(instanceID))
 
 	err := func() error {
 		typs := sp.input.OutputTypes()
@@ -302,15 +297,16 @@ func (sp *csvWriter) Run(ctx context.Context, output execinfra.RowReceiver) {
 		return nil
 	}()
 
-	// TODO(dt): pick up tracing info in trailing meta
-	execinfra.DrainAndClose(
-		ctx, output, err, func(context.Context, execinfra.RowReceiver) {} /* pushTrailingMeta */, sp.input)
+	execinfra.DrainAndClose(ctx, sp.flowCtx, sp.input, output, err)
 }
 
 // Resume is part of the execinfra.Processor interface.
 func (sp *csvWriter) Resume(output execinfra.RowReceiver) {
 	panic("not implemented")
 }
+
+// Close is part of the execinfra.Processor interface.
+func (*csvWriter) Close(context.Context) {}
 
 func init() {
 	rowexec.NewCSVWriterProcessor = newCSVWriterProcessor

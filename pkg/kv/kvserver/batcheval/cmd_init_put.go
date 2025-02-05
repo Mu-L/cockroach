@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,7 +10,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 )
 
 func init() {
@@ -32,26 +29,31 @@ func InitPut(
 	args := cArgs.Args.(*kvpb.InitPutRequest)
 	h := cArgs.Header
 
-	if args.FailOnTombstones && cArgs.EvalCtx.EvalKnobs().DisableInitPutFailOnTombstones {
-		args.FailOnTombstones = false
-	}
-
+	failOnTombstones := args.FailOnTombstones && !cArgs.EvalCtx.EvalKnobs().DisableInitPutFailOnTombstones
 	opts := storage.MVCCWriteOptions{
-		Txn:            h.Txn,
-		LocalTimestamp: cArgs.Now,
-		Stats:          cArgs.Stats,
+		Txn:                            h.Txn,
+		LocalTimestamp:                 cArgs.Now,
+		Stats:                          cArgs.Stats,
+		ReplayWriteTimestampProtection: h.AmbiguousReplayProtection,
+		OmitInRangefeeds:               cArgs.OmitInRangefeeds,
+		OriginID:                       h.WriteOptions.GetOriginID(),
+		OriginTimestamp:                h.WriteOptions.GetOriginTimestamp(),
+		MaxLockConflicts:               storage.MaxConflictsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
+		TargetLockConflictBytes:        storage.TargetBytesPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
+		Category:                       fs.BatchEvalReadCategory,
 	}
 
 	var err error
+	var acq roachpb.LockAcquisition
 	if args.Blind {
-		err = storage.MVCCBlindInitPut(
-			ctx, readWriter, args.Key, h.Timestamp, args.Value, args.FailOnTombstones, opts)
+		acq, err = storage.MVCCBlindInitPut(
+			ctx, readWriter, args.Key, h.Timestamp, args.Value, failOnTombstones, opts)
 	} else {
-		err = storage.MVCCInitPut(
-			ctx, readWriter, args.Key, h.Timestamp, args.Value, args.FailOnTombstones, opts)
+		acq, err = storage.MVCCInitPut(
+			ctx, readWriter, args.Key, h.Timestamp, args.Value, failOnTombstones, opts)
 	}
 	if err != nil {
 		return result.Result{}, err
 	}
-	return result.FromAcquiredLocks(h.Txn, args.Key), nil
+	return result.WithAcquiredLocks(acq), nil
 }

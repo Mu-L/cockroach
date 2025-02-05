@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcostserver_test
 
@@ -62,7 +59,8 @@ func TestDataDriven(t *testing.T) {
 }
 
 type testState struct {
-	s           serverutils.TestServerInterface
+	srv         serverutils.TestServerInterface
+	s           serverutils.ApplicationLayerInterface
 	db          *gosql.DB
 	kvDB        *kv.DB
 	r           *sqlutils.SQLRunner
@@ -78,7 +76,10 @@ var t0 = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 func (ts *testState) start(t *testing.T) {
 	// Set up a server that we use only for the system tables.
-	ts.s, ts.db, ts.kvDB = serverutils.StartServer(t, base.TestServerArgs{})
+	ts.srv, ts.db, ts.kvDB = serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
+	ts.s = ts.srv.ApplicationLayer()
 	ts.r = sqlutils.MakeSQLRunner(ts.db)
 
 	ts.clock = timeutil.NewManualTime(t0)
@@ -93,7 +94,7 @@ func (ts *testState) start(t *testing.T) {
 }
 
 func (ts *testState) stop() {
-	ts.s.Stopper().Stop(context.Background())
+	ts.srv.Stopper().Stop(context.Background())
 }
 
 func (ts *testState) formatTime(tm time.Time) string {
@@ -150,16 +151,20 @@ func (ts *testState) tokenBucketRequest(t *testing.T, d *datadriven.TestData) st
 			WriteBatches           uint64  `yaml:"write_batches"`
 			WriteReq               uint64  `yaml:"write_req"`
 			WriteBytes             uint64  `yaml:"write_bytes"`
-			SQLPodsCPUUsage        float64 `yaml:"sql_pods_cpu_usage"`
+			SQLPodsCPUSeconds      float64 `yaml:"sql_pods_cpu_seconds"`
 			PGWireEgressBytes      uint64  `yaml:"pgwire_egress_bytes"`
 			ExternalIOIngressBytes uint64  `yaml:"external_io_ingress_bytes"`
 			ExternalIOEgressBytes  uint64  `yaml:"external_io_egress_bytes"`
+			CrossRegionNetworkRU   float64 `yaml:"cross_region_network_ru"`
+			EstimatedCPUSeconds    float64 `yaml:"estimated_cpu_seconds"`
 		}
-		RU     float64 `yaml:"ru"`
-		Period string  `yaml:"period"`
+		ConsumptionPeriod string  `yaml:"consumption_period"`
+		Tokens            float64 `yaml:"tokens"`
+		RequestPeriod     string  `yaml:"request_period"`
 	}
 	args.SeqNum = -1
-	args.Period = "10s"
+	args.ConsumptionPeriod = "10s"
+	args.RequestPeriod = "10s"
 	args.InstanceLease = "foo"
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &args); err != nil {
 		d.Fatalf(t, "failed to parse request yaml: %v", err)
@@ -169,9 +174,13 @@ func (ts *testState) tokenBucketRequest(t *testing.T, d *datadriven.TestData) st
 		ts.autoSeqNum++
 		args.SeqNum = ts.autoSeqNum
 	}
-	period, err := time.ParseDuration(args.Period)
+	consumptionPeriod, err := time.ParseDuration(args.ConsumptionPeriod)
 	if err != nil {
-		d.Fatalf(t, "failed to parse duration: %v", args.Period)
+		d.Fatalf(t, "failed to parse duration: %v", args.ConsumptionPeriod)
+	}
+	requestPeriod, err := time.ParseDuration(args.RequestPeriod)
+	if err != nil {
+		d.Fatalf(t, "failed to parse duration: %v", args.RequestPeriod)
 	}
 	req := kvpb.TokenBucketRequest{
 		TenantID:           tenantID,
@@ -188,13 +197,16 @@ func (ts *testState) tokenBucketRequest(t *testing.T, d *datadriven.TestData) st
 			WriteBatches:           args.Consumption.WriteBatches,
 			WriteRequests:          args.Consumption.WriteReq,
 			WriteBytes:             args.Consumption.WriteBytes,
-			SQLPodsCPUSeconds:      args.Consumption.SQLPodsCPUUsage,
+			SQLPodsCPUSeconds:      args.Consumption.SQLPodsCPUSeconds,
 			PGWireEgressBytes:      args.Consumption.PGWireEgressBytes,
 			ExternalIOIngressBytes: args.Consumption.ExternalIOIngressBytes,
 			ExternalIOEgressBytes:  args.Consumption.ExternalIOEgressBytes,
+			CrossRegionNetworkRU:   args.Consumption.CrossRegionNetworkRU,
+			EstimatedCPUSeconds:    args.Consumption.EstimatedCPUSeconds,
 		},
-		RequestedRU:         args.RU,
-		TargetRequestPeriod: period,
+		ConsumptionPeriod:   consumptionPeriod,
+		RequestedTokens:     args.Tokens,
+		TargetRequestPeriod: requestPeriod,
 	}
 	res := ts.tenantUsage.TokenBucketRequest(
 		context.Background(), roachpb.MustMakeTenantID(tenantID), &req,
@@ -202,9 +214,9 @@ func (ts *testState) tokenBucketRequest(t *testing.T, d *datadriven.TestData) st
 	if res.Error != (errors.EncodedError{}) {
 		return fmt.Sprintf("error: %v", errors.DecodeError(context.Background(), res.Error))
 	}
-	if res.GrantedRU == 0 {
+	if res.GrantedTokens == 0 {
 		if res.TrickleDuration != 0 {
-			d.Fatalf(t, "trickle duration set with 0 granted RUs")
+			d.Fatalf(t, "trickle duration set with 0 granted tokens")
 		}
 		return ""
 	}
@@ -213,8 +225,8 @@ func (ts *testState) tokenBucketRequest(t *testing.T, d *datadriven.TestData) st
 		trickleStr = fmt.Sprintf("over %s", res.TrickleDuration)
 	}
 	return fmt.Sprintf(
-		"%.10g RUs granted %s. Fallback rate: %.10g RU/s\n",
-		res.GrantedRU, trickleStr, res.FallbackRate,
+		"%.10g tokens granted %s. Fallback rate: %.10g tokens/s\n",
+		res.GrantedTokens, trickleStr, res.FallbackRate,
 	)
 }
 
@@ -236,10 +248,9 @@ func (ts *testState) metrics(t *testing.T, d *datadriven.TestData) string {
 func (ts *testState) configure(t *testing.T, d *datadriven.TestData) string {
 	tenantID := ts.tenantID(t, d)
 	var args struct {
-		AvailableRU float64 `yaml:"available_ru"`
-		RefillRate  float64 `yaml:"refill_rate"`
-		MaxBurstRU  float64 `yaml:"max_burst_ru"`
-		// TODO(radu): Add AsOf/AsOfConsumedRU.
+		AvailableTokens float64 `yaml:"available_tokens"`
+		RefillRate      float64 `yaml:"refill_rate"`
+		MaxBurstTokens  float64 `yaml:"max_burst_tokens"`
 	}
 	if err := yaml.UnmarshalStrict([]byte(d.Input), &args); err != nil {
 		d.Fatalf(t, "failed to parse request yaml: %v", err)
@@ -252,11 +263,9 @@ func (ts *testState) configure(t *testing.T, d *datadriven.TestData) string {
 			ctx,
 			txn,
 			roachpb.MustMakeTenantID(tenantID),
-			args.AvailableRU,
+			args.AvailableTokens,
 			args.RefillRate,
-			args.MaxBurstRU,
-			time.Time{},
-			0,
+			args.MaxBurstTokens,
 		)
 	}); err != nil {
 		d.Fatalf(t, "reconfigure error: %v", err)
@@ -321,6 +330,7 @@ func (ts *testState) advance(t *testing.T, d *datadriven.TestData) string {
 // up with a changing live set.
 func TestInstanceCleanup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	var ts testState
 	ts.start(t)

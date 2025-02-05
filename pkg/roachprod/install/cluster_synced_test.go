@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package install
 
@@ -85,7 +80,7 @@ func TestRoachprodEnv(t *testing.T) {
 }
 
 func TestRunWithMaybeRetry(t *testing.T) {
-	var testRetryOpts = retry.Options{
+	var testRetryOpts = &retry.Options{
 		InitialBackoff: 10 * time.Millisecond,
 		Multiplier:     2,
 		MaxBackoff:     1 * time.Second,
@@ -97,13 +92,14 @@ func TestRunWithMaybeRetry(t *testing.T) {
 
 	attempt := 0
 	cases := []struct {
+		retryOpts        *retry.Options
 		f                func(ctx context.Context) (*RunResultDetails, error)
 		shouldRetryFn    func(*RunResultDetails) bool
-		nilRetryOpts     bool
 		expectedAttempts int
 		shouldError      bool
 	}{
 		{ // 1. Happy path: no error, no retry required
+			retryOpts: testRetryOpts,
 			f: func(ctx context.Context) (*RunResultDetails, error) {
 				return newResult(0), nil
 			},
@@ -111,6 +107,7 @@ func TestRunWithMaybeRetry(t *testing.T) {
 			shouldError:      false,
 		},
 		{ // 2. Error, but with no retries
+			retryOpts: testRetryOpts,
 			f: func(ctx context.Context) (*RunResultDetails, error) {
 				return newResult(1), nil
 			},
@@ -121,6 +118,7 @@ func TestRunWithMaybeRetry(t *testing.T) {
 			shouldError:      true,
 		},
 		{ // 3. Error, but no retry function specified
+			retryOpts: testRetryOpts,
 			f: func(ctx context.Context) (*RunResultDetails, error) {
 				return newResult(1), nil
 			},
@@ -128,6 +126,7 @@ func TestRunWithMaybeRetry(t *testing.T) {
 			shouldError:      true,
 		},
 		{ // 4. Error, with retries exhausted
+			retryOpts: testRetryOpts,
 			f: func(ctx context.Context) (*RunResultDetails, error) {
 				return newResult(255), nil
 			},
@@ -136,6 +135,7 @@ func TestRunWithMaybeRetry(t *testing.T) {
 			shouldError:      true,
 		},
 		{ // 5. Eventual success after retries
+			retryOpts: testRetryOpts,
 			f: func(ctx context.Context) (*RunResultDetails, error) {
 				attempt++
 				if attempt == 3 {
@@ -147,11 +147,11 @@ func TestRunWithMaybeRetry(t *testing.T) {
 			expectedAttempts: 3,
 			shouldError:      false,
 		},
-		{ // 6. Error, runs once because nil retryOpts
+		{ // 6. Error, runs once because nil RetryOpts
+			retryOpts: nil,
 			f: func(ctx context.Context) (*RunResultDetails, error) {
 				return newResult(255), nil
 			},
-			nilRetryOpts:     true,
 			expectedAttempts: 1,
 			shouldError:      true,
 		},
@@ -160,11 +160,7 @@ func TestRunWithMaybeRetry(t *testing.T) {
 	for idx, tc := range cases {
 		attempt = 0
 		t.Run(fmt.Sprintf("%d", idx+1), func(t *testing.T) {
-			var retryOpts *RunRetryOpts
-			if !tc.nilRetryOpts {
-				retryOpts = newRunRetryOpts(testRetryOpts, tc.shouldRetryFn)
-			}
-			res, _ := runWithMaybeRetry(context.Background(), l, retryOpts, tc.f)
+			res, _ := runWithMaybeRetry(context.Background(), l, tc.retryOpts, tc.shouldRetryFn, tc.f)
 
 			require.Equal(t, tc.shouldError, res.Err != nil)
 			require.Equal(t, tc.expectedAttempts, res.Attempt)

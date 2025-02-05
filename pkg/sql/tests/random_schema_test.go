@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests_test
 
@@ -15,10 +10,10 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math"
-	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
@@ -26,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
 func setDb(t *testing.T, db *gosql.DB, name string) {
@@ -38,6 +33,7 @@ func setDb(t *testing.T, db *gosql.DB, name string) {
 func TestCreateRandomSchema(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()() // allow usage of partitions
 
 	ctx := context.Background()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
@@ -59,9 +55,9 @@ func TestCreateRandomSchema(t *testing.T) {
 		return tree.AsStringWithFlags(c, tree.FmtParsable)
 	}
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng, _ := randutil.NewTestRand()
 	for i := 0; i < 100; i++ {
-		createTable := randgen.RandCreateTable(rng, "table", i, false /* isMultiRegion */)
+		createTable := randgen.RandCreateTable(ctx, rng, "table", i, randgen.TableOptNone)
 		setDb(t, db, "test")
 		_, err := db.Exec(toStr(createTable))
 		if err != nil {

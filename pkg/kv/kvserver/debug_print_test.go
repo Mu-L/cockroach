@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -32,7 +27,7 @@ func TestStringifyWriteBatch(t *testing.T) {
 
 	wb := &kvserverpb.WriteBatch{}
 	_, err := decodeWriteBatch(wb)
-	require.ErrorContains(t, err, "batch repr too small: 0 < 12")
+	require.ErrorContains(t, err, "batch invalid: too small: 0 bytes")
 
 	batch := pebble.Batch{}
 	require.NoError(t, batch.Set(storage.EncodeMVCCKey(storage.MVCCKey{
@@ -52,7 +47,7 @@ func TestStringifyWriteBatch(t *testing.T) {
 	wb.Data = batch.Repr()
 	s, err = decodeWriteBatch(wb)
 	require.NoError(t, err)
-	require.Equal(t, "Single Delete: /Local/Lock/Intent/Table/56/1/1169/5/3054/0 "+
+	require.Equal(t, "Single Delete: /Local/Lock/Table/56/1/1169/5/3054/0 "+
 		"03623a9318c0384d07a6f22b858594df60 (0x017a6b12c089f704918df70bee8800010003623a9318c0384d07a6f22b858594df6012): \n",
 		s)
 

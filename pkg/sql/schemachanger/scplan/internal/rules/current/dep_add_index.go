@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package current
 
@@ -86,9 +81,25 @@ func init() {
 			}
 		},
 	)
+	registerDepRule(
+		"secondary index named before public (with index swap)",
+		scgraph.Precedence,
+		"index", "index-name",
+		func(from, to NodeVars) rel.Clauses {
+			return rel.Clauses{
+				to.Type((*scpb.IndexName)(nil)),
+				from.Type(
+					(*scpb.SecondaryIndex)(nil),
+				),
+				JoinOnIndexID(from, to, "table-id", "index-id"),
+				StatusesToPublicOrTransient(from, scpb.Status_VALIDATED, to, scpb.Status_PUBLIC),
+				rel.And(IsPotentialSecondaryIndexSwap("index-id", "table-id")...),
+			}
+		},
+	)
 
 	registerDepRule(
-		"secondary index named before validation",
+		"secondary index named before validation (without index swap)",
 		scgraph.Precedence,
 		"index-name", "index",
 		func(from, to NodeVars) rel.Clauses {
@@ -98,6 +109,7 @@ func init() {
 					(*scpb.SecondaryIndex)(nil),
 				),
 				JoinOnIndexID(from, to, "table-id", "index-id"),
+				IsNotPotentialSecondaryIndexSwap("table-id", "index-id"),
 				StatusesToPublicOrTransient(from, scpb.Status_PUBLIC, to, scpb.Status_VALIDATED),
 			}
 		},

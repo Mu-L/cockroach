@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -14,10 +9,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb"
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	rafttracker "github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/raft/v3"
-	rafttracker "go.etcd.io/raft/v3/tracker"
 )
 
 // replicaFlowControl is a concrete implementation of the replicaForFlowControl
@@ -60,12 +56,15 @@ func (rf *replicaFlowControl) getPausedFollowers() map[roachpb.ReplicaID]struct{
 
 func (rf *replicaFlowControl) getBehindFollowers() map[roachpb.ReplicaID]struct{} {
 	rf.assertLocked()
-	behindFollowers := make(map[roachpb.ReplicaID]struct{})
-	rf.mu.internalRaftGroup.WithProgress(func(id uint64, _ raft.ProgressType, progress rafttracker.Progress) {
+	// Lazily allocate the map, since expected to be empty.
+	var behindFollowers map[roachpb.ReplicaID]struct{}
+	rf.mu.internalRaftGroup.WithProgress(func(id raftpb.PeerID, _ raft.ProgressType, progress rafttracker.Progress) {
 		if progress.State == rafttracker.StateReplicate {
 			return
 		}
-
+		if behindFollowers == nil {
+			behindFollowers = make(map[roachpb.ReplicaID]struct{})
+		}
 		replID := roachpb.ReplicaID(id)
 		behindFollowers[replID] = struct{}{}
 
@@ -82,7 +81,7 @@ func (rf *replicaFlowControl) getBehindFollowers() map[roachpb.ReplicaID]struct{
 		// time for it to catch up and then later return those tokens to us.
 		// This is I3a again; do it as part of #95563.
 		_ = progress.RecentActive
-		_ = progress.MsgAppFlowPaused
+		_ = progress.MsgAppProbesPaused
 		_ = progress.Match
 	})
 	return behindFollowers
@@ -90,12 +89,16 @@ func (rf *replicaFlowControl) getBehindFollowers() map[roachpb.ReplicaID]struct{
 
 func (rf *replicaFlowControl) getInactiveFollowers() map[roachpb.ReplicaID]struct{} {
 	rf.assertLocked()
-	inactiveFollowers := make(map[roachpb.ReplicaID]struct{})
+	// Lazily allocate the map, since expected to be empty.
+	var inactiveFollowers map[roachpb.ReplicaID]struct{}
 	for _, desc := range rf.getDescriptor().Replicas().Descriptors() {
 		if desc.ReplicaID == rf.getReplicaID() {
 			continue
 		}
 		if !rf.mu.lastUpdateTimes.isFollowerActiveSince(desc.ReplicaID, timeutil.Now(), rf.store.cfg.RangeLeaseDuration) {
+			if inactiveFollowers == nil {
+				inactiveFollowers = make(map[roachpb.ReplicaID]struct{})
+			}
 			inactiveFollowers[desc.ReplicaID] = struct{}{}
 		}
 	}
@@ -104,12 +107,16 @@ func (rf *replicaFlowControl) getInactiveFollowers() map[roachpb.ReplicaID]struc
 
 func (rf *replicaFlowControl) getDisconnectedFollowers() map[roachpb.ReplicaID]struct{} {
 	rf.assertLocked()
-	disconnectedFollowers := make(map[roachpb.ReplicaID]struct{})
+	// Lazily allocate the map, since expected to be empty.
+	var disconnectedFollowers map[roachpb.ReplicaID]struct{}
 	for _, desc := range rf.getDescriptor().Replicas().Descriptors() {
 		if desc.ReplicaID == rf.getReplicaID() {
 			continue
 		}
 		if !rf.store.raftTransportForFlowControl.isConnectedTo(desc.StoreID) {
+			if disconnectedFollowers == nil {
+				disconnectedFollowers = make(map[roachpb.ReplicaID]struct{})
+			}
 			disconnectedFollowers[desc.ReplicaID] = struct{}{}
 		}
 	}

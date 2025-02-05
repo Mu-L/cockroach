@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvtenant_test
 
@@ -30,18 +25,14 @@ func setup(
 	t *testing.T, ctx context.Context,
 ) (*testcluster.TestCluster, serverutils.ApplicationLayerInterface, rangedesc.IteratorFactory) {
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			DefaultTestTenant: base.TestControlsTenantsExplicitly,
-			Knobs: base.TestingKnobs{
-				Store: &kvserver.StoreTestingKnobs{
-					DisableMergeQueue: true,
-				},
-			},
 		},
 	})
 
 	ten2ID := roachpb.MustMakeTenantID(2)
-	tenant2, err := tc.Server(0).StartTenant(ctx, base.TestTenantArgs{
+	tenant2, err := tc.Server(0).TenantController().StartTenant(ctx, base.TestTenantArgs{
 		TenantID: ten2ID,
 	})
 	require.NoError(t, err)
@@ -65,7 +56,7 @@ func TestScanRangeDescriptors(t *testing.T) {
 	{
 		tc.SplitRangeOrFatal(t, ten2Split1)
 		tc.SplitRangeOrFatal(t, ten2Split2)
-		tc.SplitRangeOrFatal(t, ten2Codec.TenantPrefix().PrefixEnd()) // Last range
+		tc.SplitRangeOrFatal(t, ten2Codec.TenantEndKey()) // Last range
 	}
 
 	iter, err := iteratorFactory.NewIterator(ctx, ten2Codec.TenantSpan())
@@ -119,7 +110,7 @@ func TestScanRangeDescriptors(t *testing.T) {
 	// Last range we created above.
 	require.Equal(
 		t,
-		keys.MustAddr(ten2Codec.TenantPrefix().PrefixEnd()),
+		keys.MustAddr(ten2Codec.TenantEndKey()),
 		rangeDescs[numRanges-1].StartKey,
 	)
 }

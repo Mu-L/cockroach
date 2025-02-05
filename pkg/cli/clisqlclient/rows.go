@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient
 
@@ -14,13 +9,13 @@ import (
 	"database/sql/driver"
 	"io"
 
-	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type sqlRows struct {
 	rows     pgx.Rows
-	connInfo *pgtype.ConnInfo
+	typeMap  *pgtype.Map
 	conn     *sqlConn
 	colNames []string
 }
@@ -32,7 +27,7 @@ func (r *sqlRows) Columns() []string {
 		fields := r.rows.FieldDescriptions()
 		r.colNames = make([]string, len(fields))
 		for i, fd := range fields {
-			r.colNames[i] = string(fd.Name)
+			r.colNames[i] = fd.Name
 		}
 	}
 	return r.colNames
@@ -88,5 +83,5 @@ func (r *sqlRows) NextResultSet() (bool, error) {
 
 func (r *sqlRows) ColumnTypeDatabaseTypeName(index int) string {
 	fieldOID := r.rows.FieldDescriptions()[index].DataTypeOID
-	return databaseTypeName(r.connInfo, fieldOID)
+	return databaseTypeName(r.typeMap, fieldOID)
 }

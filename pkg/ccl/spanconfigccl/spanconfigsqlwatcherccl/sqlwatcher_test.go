@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfigsqlwatcherccl
 
@@ -16,8 +13,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/cockroachdb/cockroach/pkg/backup"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -300,11 +297,9 @@ func TestSQLWatcherMultiple(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	ts := tc.Server(0 /* idx */)
 	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0 /* idx */))
-	sdb := sqlutils.MakeSQLRunner(tc.SystemLayer(0).SQLConn(t, ""))
+	sdb := sqlutils.MakeSQLRunner(tc.SystemLayer(0).SQLConn(t))
 	sdb.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
-	sdb.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING kv.rangefeed.enabled = true`)
 	sdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
-	sdb.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
 
 	noopCheckpointDuration := 100 * time.Millisecond
 	sqlWatcher := spanconfigsqlwatcher.New(

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 //
 //
@@ -122,8 +117,10 @@ type eventTxnStartPayload struct {
 	historicalTimestamp *hlc.Timestamp
 	// qualityOfService denotes the user-level admission queue priority to use for
 	// any new Txn started using this payload.
-	qualityOfService sessiondatapb.QoSLevel
-	isoLevel         isolation.Level
+	qualityOfService      sessiondatapb.QoSLevel
+	isoLevel              isolation.Level
+	omitInRangefeeds      bool
+	bufferedWritesEnabled bool
 }
 
 // makeEventTxnStartPayload creates an eventTxnStartPayload.
@@ -135,15 +132,19 @@ func makeEventTxnStartPayload(
 	tranCtx transitionCtx,
 	qualityOfService sessiondatapb.QoSLevel,
 	isoLevel isolation.Level,
+	omitInRangefeeds bool,
+	bufferedWritesEnabled bool,
 ) eventTxnStartPayload {
 	return eventTxnStartPayload{
-		pri:                 pri,
-		readOnly:            readOnly,
-		txnSQLTimestamp:     txnSQLTimestamp,
-		historicalTimestamp: historicalTimestamp,
-		tranCtx:             tranCtx,
-		qualityOfService:    qualityOfService,
-		isoLevel:            isoLevel,
+		pri:                   pri,
+		readOnly:              readOnly,
+		txnSQLTimestamp:       txnSQLTimestamp,
+		historicalTimestamp:   historicalTimestamp,
+		tranCtx:               tranCtx,
+		qualityOfService:      qualityOfService,
+		isoLevel:              isoLevel,
+		omitInRangefeeds:      omitInRangefeeds,
+		bufferedWritesEnabled: bufferedWritesEnabled,
 	}
 }
 
@@ -152,11 +153,35 @@ type eventTxnUpgradeToExplicit struct{}
 type eventTxnFinishCommitted struct{}
 type eventTxnFinishAborted struct{}
 
+// eventTxnFinishCommittedPLpgSQL and eventTxnFinishAbortedPLpgSQL are generated
+// when a PL/pgSQL stored procedure executes a COMMIT or ROLLBACK statement. The
+// current transaction is finished, but the statement buffer is not advanced,
+// since the current stored procedure resumes execution in the new transaction.
+type eventTxnFinishCommittedPLpgSQL struct{}
+type eventTxnFinishAbortedPLpgSQL struct{}
+
 // eventSavepointRollback is generated when we want to move from Aborted to Open
 // through a ROLLBACK TO SAVEPOINT <not cockroach_restart>. Note that it is not
 // generated when such a savepoint is rolled back to from the Open state. In
 // that case no event is necessary.
 type eventSavepointRollback struct{}
+
+// eventTxnFinishPrepared is generated when a PREPARE TRANSACTION statement is
+// executed. The current transaction is dissociated with the current session.
+type eventTxnFinishPrepared struct{}
+
+// eventTxnFinishPreparedErrPayload represents the payload for
+// eventTxnFinishPrepared, if the PREPARE TRANSACTION statement encountered an
+// error. No payload is used if the statement was successful.
+type eventTxnFinishPreparedErrPayload struct {
+	// err is the error encountered during the prepare.
+	err error
+}
+
+// errorCause implements the payloadWithError interface.
+func (p eventTxnFinishPreparedErrPayload) errorCause() error {
+	return p.err
+}
 
 type eventNonRetriableErr struct {
 	IsCommit fsm.Bool
@@ -212,6 +237,11 @@ type eventTxnReleased struct{}
 // CommitWait.
 type eventTxnCommittedWithShowCommitTimestamp struct{}
 
+// eventTxnCommittedDueToDDL is generated when a DDL statement is received
+// in an explicit transaction, and the autocommit_before_ddl session variable
+// is enabled. It moves the state to NoTxn.
+type eventTxnCommittedDueToDDL struct{}
+
 // payloadWithError is a common interface for the payloads that wrap an error.
 type payloadWithError interface {
 	errorCause() error
@@ -220,6 +250,9 @@ type payloadWithError interface {
 func (eventTxnStart) Event()                            {}
 func (eventTxnFinishCommitted) Event()                  {}
 func (eventTxnFinishAborted) Event()                    {}
+func (eventTxnFinishPrepared) Event()                   {}
+func (eventTxnFinishCommittedPLpgSQL) Event()           {}
+func (eventTxnFinishAbortedPLpgSQL) Event()             {}
 func (eventSavepointRollback) Event()                   {}
 func (eventNonRetriableErr) Event()                     {}
 func (eventRetriableErr) Event()                        {}
@@ -227,6 +260,7 @@ func (eventTxnRestart) Event()                          {}
 func (eventTxnReleased) Event()                         {}
 func (eventTxnCommittedWithShowCommitTimestamp) Event() {}
 func (eventTxnUpgradeToExplicit) Event()                {}
+func (eventTxnCommittedDueToDDL) Event()                {}
 
 // TxnStateTransitions describe the transitions used by a connExecutor's
 // fsm.Machine. Args.Extended is a txnState, which is muted by the Actions.
@@ -274,7 +308,7 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Action: func(args fsm.Args) error {
 				// Note that the KV txn has been committed by the statement execution by
 				// this point.
-				return args.Extended.(*txnState).finishTxn(txnCommit)
+				return args.Extended.(*txnState).finishTxn(txnCommit, advanceOne)
 			},
 		},
 		eventTxnFinishAborted{}: {
@@ -283,7 +317,7 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Action: func(args fsm.Args) error {
 				// Note that the KV txn has been rolled back by the statement execution
 				// by this point.
-				return args.Extended.(*txnState).finishTxn(txnRollback)
+				return args.Extended.(*txnState).finishTxn(txnRollback, advanceOne)
 			},
 		},
 		// Handle the error on COMMIT cases: we move to NoTxn as per Postgres error
@@ -296,6 +330,18 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 		eventNonRetriableErr{IsCommit: fsm.True}: {
 			Next:   stateNoTxn{},
 			Action: cleanupAndFinishOnError,
+		},
+		eventTxnCommittedDueToDDL{}: {
+			Description: "auto-commit before DDL",
+			Next:        stateNoTxn{},
+			Action: func(args fsm.Args) error {
+				ts := args.Extended.(*txnState)
+				finishedTxnID, commitTimestamp := ts.finishSQLTxn()
+				ts.setAdvanceInfo(stayInPlace, noRewind, txnEvent{
+					eventType: txnCommit, txnID: finishedTxnID, commitTimestamp: commitTimestamp,
+				})
+				return nil
+			},
 		},
 	},
 	stateOpen{ImplicitTxn: fsm.True, WasUpgraded: fsm.False}: {
@@ -327,8 +373,40 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 				return nil
 			},
 		},
+		// Handle transaction management from PL/pgSQL. Note that these statements
+		// are not valid within the context of an explicit transaction, so we only
+		// have to handle implicit transactions.
+		//
+		// Use stayInPlace so that the statement buffer doesn't advance. This will
+		// allow the stored procedure to resume execution.
+		eventTxnFinishCommittedPLpgSQL{}: {
+			Description: "COMMIT statement called via PL/pgSQL",
+			Next:        stateNoTxn{},
+			Action: func(args fsm.Args) error {
+				return args.Extended.(*txnState).finishTxn(txnCommit, stayInPlace)
+			},
+		},
+		eventTxnFinishAbortedPLpgSQL{}: {
+			Description: "ROLLBACK statement called via PL/pgSQL",
+			Next:        stateNoTxn{},
+			Action: func(args fsm.Args) error {
+				return args.Extended.(*txnState).finishTxn(txnRollback, stayInPlace)
+			},
+		},
 	},
 	stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.Var("wasUpgraded")}: {
+		// Handle prepared transactions. Note that this statement is only valid in
+		// the context of an explicit transaction, so we don't need to handle
+		// implicit transactions.
+		eventTxnFinishPrepared{}: {
+			Description: "PREPARE TRANSACTION",
+			Next:        stateNoTxn{},
+			Action: func(args fsm.Args) error {
+				// Note that the KV txn has been prepared by the statement execution by
+				// this point and is being dissociated from the session.
+				return args.Extended.(*txnState).finishTxn(txnPrepare, advanceOne)
+			},
+		},
 		// Handle the errors in explicit txns.
 		eventNonRetriableErr{IsCommit: fsm.False}: {
 			Next: stateAborted{WasUpgraded: fsm.Var("wasUpgraded")},
@@ -393,7 +471,7 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 				ts.txnAbortCount.Inc(1)
 				// Note that the KV txn has been rolled back by now by statement
 				// execution.
-				return ts.finishTxn(txnRollback)
+				return ts.finishTxn(txnRollback, advanceOne)
 			},
 		},
 		// Any statement.
@@ -464,7 +542,7 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Action: func(args fsm.Args) error {
 				// A txnCommit event has been previously generated when we entered
 				// stateCommitWait.
-				return args.Extended.(*txnState).finishTxn(noEvent)
+				return args.Extended.(*txnState).finishTxn(noEvent, advanceOne)
 			},
 		},
 		eventNonRetriableErr{IsCommit: fsm.Any}: {
@@ -514,6 +592,8 @@ func noTxnToOpen(args fsm.Args) error {
 		payload.tranCtx,
 		payload.qualityOfService,
 		payload.isoLevel,
+		payload.omitInRangefeeds,
+		payload.bufferedWritesEnabled,
 	)
 	ts.setAdvanceInfo(
 		advCode,
@@ -525,9 +605,13 @@ func noTxnToOpen(args fsm.Args) error {
 
 // finishTxn finishes the transaction. It also calls setAdvanceInfo() with the
 // given event.
-func (ts *txnState) finishTxn(ev txnEventType) error {
+//
+// - advance indicates what action the statement buffer should take. This allows
+// normal COMMIT/ROLLBACK to move to the next statement, and PL/pgSQL
+// COMMIT/ROLLBACK to resume execution of the calling stored procedure.
+func (ts *txnState) finishTxn(ev txnEventType, advance advanceCode) error {
 	finishedTxnID, commitTimestamp := ts.finishSQLTxn()
-	ts.setAdvanceInfo(advanceOne, noRewind, txnEvent{
+	ts.setAdvanceInfo(advance, noRewind, txnEvent{
 		eventType: ev, txnID: finishedTxnID, commitTimestamp: commitTimestamp,
 	})
 	return nil

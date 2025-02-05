@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -82,6 +77,10 @@ func (d fakeExecResumer) OnFailOrCancel(ctx context.Context, _ interface{}, _ er
 	return nil
 }
 
+func (d fakeExecResumer) CollectProfile(_ context.Context, _ interface{}) error {
+	return nil
+}
+
 // checkForPlanDiagram is a method used in tests to wait for the existence of a
 // DSP diagram for the provided jobID.
 func checkForPlanDiagrams(
@@ -107,9 +106,7 @@ func checkForPlanDiagrams(
 	})
 }
 
-// TestJobsExecutionDetails tests that a job's execution details are retrieved
-// and rendered correctly.
-func TestJobsExecutionDetails(t *testing.T) {
+func TestShowJobsWithExecutionDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -126,18 +123,18 @@ func TestJobsExecutionDetails(t *testing.T) {
 
 	runner := sqlutils.MakeSQLRunner(sqlDB)
 
-	jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 		return fakeExecResumer{
 			OnResume: func(ctx context.Context) error {
 				p := sql.PhysicalPlan{}
-				infra := physicalplan.NewPhysicalInfrastructure(uuid.FastMakeV4(), base.SQLInstanceID(1))
+				infra := physicalplan.NewPhysicalInfrastructure(uuid.MakeV4(), base.SQLInstanceID(1))
 				p.PhysicalInfrastructure = infra
 				jobsprofiler.StorePlanDiagram(ctx, s.Stopper(), &p, s.InternalDB().(isql.DB), j.ID())
 				checkForPlanDiagrams(ctx, t, s.InternalDB().(isql.DB), j.ID(), 1)
 				return nil
 			},
 		}
-	}, jobs.UsesTenantCostControl)
+	}, jobs.UsesTenantCostControl)()
 
 	runner.Exec(t, `CREATE TABLE t (id INT)`)
 	runner.Exec(t, `INSERT INTO t SELECT generate_series(1, 100)`)
@@ -173,27 +170,34 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 	runner.Exec(t, `CREATE TABLE t (id INT)`)
 	runner.Exec(t, `INSERT INTO t SELECT generate_series(1, 100)`)
 
+	isRunning := make(chan struct{})
+	defer close(isRunning)
+	continueRunning := make(chan struct{})
 	t.Run("read/write DistSQL diagram", func(t *testing.T) {
-		jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+		defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return fakeExecResumer{
 				OnResume: func(ctx context.Context) error {
 					p := sql.PhysicalPlan{}
-					infra := physicalplan.NewPhysicalInfrastructure(uuid.FastMakeV4(), base.SQLInstanceID(1))
+					infra := physicalplan.NewPhysicalInfrastructure(uuid.MakeV4(), base.SQLInstanceID(1))
 					p.PhysicalInfrastructure = infra
 					jobsprofiler.StorePlanDiagram(ctx, s.Stopper(), &p, s.InternalDB().(isql.DB), j.ID())
 					checkForPlanDiagrams(ctx, t, s.InternalDB().(isql.DB), j.ID(), 1)
+					isRunning <- struct{}{}
+					<-continueRunning
 					return nil
 				},
 			}
-		}, jobs.UsesTenantCostControl)
+		}, jobs.UsesTenantCostControl)()
 
 		var importJobID int
 		runner.QueryRow(t, `IMPORT INTO t CSV DATA ('nodelocal://1/foo') WITH DETACHED`).Scan(&importJobID)
-		jobutils.WaitForJobToSucceed(t, runner, jobspb.JobID(importJobID))
-
+		<-isRunning
 		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
-		distSQLDiagram := checkExecutionDetails(t, s, jobspb.JobID(importJobID), "distsql")
+		distSQLDiagram, err := checkExecutionDetails(t, s, jobspb.JobID(importJobID), "distsql")
+		require.NoError(t, err)
 		require.Regexp(t, "<meta http-equiv=\"Refresh\" content=\"0\\; url=https://cockroachdb\\.github\\.io/distsqlplan/decode.html.*>", string(distSQLDiagram))
+		close(continueRunning)
+		jobutils.WaitForJobToSucceed(t, runner, jobspb.JobID(importJobID))
 	})
 
 	t.Run("read/write goroutines", func(t *testing.T) {
@@ -201,7 +205,7 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 		continueCh := make(chan struct{})
 		defer close(blockCh)
 		defer close(continueCh)
-		jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+		defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return fakeExecResumer{
 				OnResume: func(ctx context.Context) error {
 					pprof.Do(ctx, pprof.Labels("foo", "bar"), func(ctx2 context.Context) {
@@ -211,12 +215,13 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 					return nil
 				},
 			}
-		}, jobs.UsesTenantCostControl)
+		}, jobs.UsesTenantCostControl)()
 		var importJobID int
 		runner.QueryRow(t, `IMPORT INTO t CSV DATA ('nodelocal://1/foo') WITH DETACHED`).Scan(&importJobID)
 		<-blockCh
 		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
-		goroutines := checkExecutionDetails(t, s, jobspb.JobID(importJobID), "goroutines")
+		goroutines, err := checkExecutionDetails(t, s, jobspb.JobID(importJobID), "goroutines")
+		require.NoError(t, err)
 		continueCh <- struct{}{}
 		jobutils.WaitForJobToSucceed(t, runner, jobspb.JobID(importJobID))
 		require.True(t, strings.Contains(string(goroutines), fmt.Sprintf("labels: {\"foo\":\"bar\", \"job\":\"IMPORT id=%d\", \"n\":\"1\"}", importJobID)))
@@ -224,11 +229,11 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 	})
 
 	t.Run("execution details for invalid job ID", func(t *testing.T) {
-		runner.ExpectErr(t, `job -123 not found; cannot request execution details`, `SELECT crdb_internal.request_job_execution_details(-123)`)
+		runner.ExpectErr(t, `coordinator not found for job -123`, `SELECT crdb_internal.request_job_execution_details(-123)`)
 	})
 
 	t.Run("read/write terminal trace", func(t *testing.T) {
-		jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+		defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return fakeExecResumer{
 				OnResume: func(ctx context.Context) error {
 					sp := tracing.SpanFromContext(ctx)
@@ -237,12 +242,18 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 					return nil
 				},
 			}
-		}, jobs.UsesTenantCostControl)
+		}, jobs.UsesTenantCostControl)()
 		var importJobID int
 		runner.QueryRow(t, `IMPORT INTO t CSV DATA ('nodelocal://1/foo') WITH DETACHED`).Scan(&importJobID)
 		jobutils.WaitForJobToSucceed(t, runner, jobspb.JobID(importJobID))
-		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
-		trace := checkExecutionDetails(t, s, jobspb.JobID(importJobID), "resumer-trace")
+		var trace []byte
+		// There may be some delay between the job finishing and the trace being
+		// persisted.
+		testutils.SucceedsSoon(t, func() error {
+			var err error
+			trace, err = checkExecutionDetails(t, s, jobspb.JobID(importJobID), "resumer-trace")
+			return err
+		})
 		require.Contains(t, string(trace), "should see this")
 	})
 
@@ -251,7 +262,7 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 		continueCh := make(chan struct{})
 		defer close(blockCh)
 		defer close(continueCh)
-		jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+		defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return fakeExecResumer{
 				OnResume: func(ctx context.Context) error {
 					_, childSp := tracing.ChildSpan(ctx, "child")
@@ -261,12 +272,13 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 					return nil
 				},
 			}
-		}, jobs.UsesTenantCostControl)
+		}, jobs.UsesTenantCostControl)()
 		var importJobID int
 		runner.QueryRow(t, `IMPORT INTO t CSV DATA ('nodelocal://1/foo') WITH DETACHED`).Scan(&importJobID)
 		<-blockCh
 		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
-		activeTraces := checkExecutionDetails(t, s, jobspb.JobID(importJobID), "trace")
+		activeTraces, err := checkExecutionDetails(t, s, jobspb.JobID(importJobID), "trace")
+		require.NoError(t, err)
 		continueCh <- struct{}{}
 		jobutils.WaitForJobToSucceed(t, runner, jobspb.JobID(importJobID))
 		unzip, err := zip.NewReader(bytes.NewReader(activeTraces), int64(len(activeTraces)))
@@ -321,21 +333,27 @@ func TestListProfilerExecutionDetails(t *testing.T) {
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 
 	expectedDiagrams := 1
-	jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+	writtenDiagram := make(chan struct{})
+	defer close(writtenDiagram)
+	continueCh := make(chan struct{})
+	defer close(continueCh)
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 		return fakeExecResumer{
 			OnResume: func(ctx context.Context) error {
 				p := sql.PhysicalPlan{}
-				infra := physicalplan.NewPhysicalInfrastructure(uuid.FastMakeV4(), base.SQLInstanceID(1))
+				infra := physicalplan.NewPhysicalInfrastructure(uuid.MakeV4(), base.SQLInstanceID(1))
 				p.PhysicalInfrastructure = infra
 				jobsprofiler.StorePlanDiagram(ctx, s.Stopper(), &p, s.InternalDB().(isql.DB), j.ID())
 				checkForPlanDiagrams(ctx, t, s.InternalDB().(isql.DB), j.ID(), expectedDiagrams)
+				writtenDiagram <- struct{}{}
+				<-continueCh
 				if err := execCfg.JobRegistry.CheckPausepoint("fakeresumer.pause"); err != nil {
 					return err
 				}
 				return nil
 			},
 		}
-	}, jobs.UsesTenantCostControl)
+	}, jobs.UsesTenantCostControl)()
 
 	runner.Exec(t, `CREATE TABLE t (id INT)`)
 	runner.Exec(t, `INSERT INTO t SELECT generate_series(1, 100)`)
@@ -344,26 +362,42 @@ func TestListProfilerExecutionDetails(t *testing.T) {
 		runner.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = 'fakeresumer.pause'`)
 		var importJobID int
 		runner.QueryRow(t, `IMPORT INTO t CSV DATA ('nodelocal://1/foo') WITH DETACHED`).Scan(&importJobID)
-		jobutils.WaitForJobToPause(t, runner, jobspb.JobID(importJobID))
+		<-writtenDiagram
 
 		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
 		files := listExecutionDetails(t, s, jobspb.JobID(importJobID))
-		require.Len(t, files, 5)
-		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[0])
-		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[1])
-		require.Regexp(t, "distsql\\..*\\.html", files[2])
-		require.Regexp(t, "goroutines\\..*\\.txt", files[3])
-		require.Regexp(t, "trace\\..*\\.zip", files[4])
+		require.Len(t, files, 3)
+		require.Regexp(t, "distsql\\..*\\.html", files[0])
+		require.Regexp(t, "goroutines\\..*\\.txt", files[1])
+		require.Regexp(t, "trace\\..*\\.zip", files[2])
+
+		continueCh <- struct{}{}
+		jobutils.WaitForJobToPause(t, runner, jobspb.JobID(importJobID))
+
+		testutils.SucceedsSoon(t, func() error {
+			files = listExecutionDetails(t, s, jobspb.JobID(importJobID))
+			if len(files) != 5 {
+				return errors.Newf("expected 5 files, got %d: %v", len(files), files)
+			}
+			return nil
+		})
 
 		// Resume the job, so it can write another DistSQL diagram and goroutine
 		// snapshot.
 		runner.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = ''`)
 		expectedDiagrams = 2
 		runner.Exec(t, `RESUME JOB $1`, importJobID)
-		jobutils.WaitForJobToSucceed(t, runner, jobspb.JobID(importJobID))
+		<-writtenDiagram
 		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
-		files = listExecutionDetails(t, s, jobspb.JobID(importJobID))
-		require.Len(t, files, 10)
+		continueCh <- struct{}{}
+		jobutils.WaitForJobToSucceed(t, runner, jobspb.JobID(importJobID))
+		testutils.SucceedsSoon(t, func() error {
+			files = listExecutionDetails(t, s, jobspb.JobID(importJobID))
+			if len(files) != 10 {
+				return errors.Newf("expected 10 files, got %d: %v", len(files), files)
+			}
+			return nil
+		})
 		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[0])
 		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb.txt", files[1])
 		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[2])
@@ -385,7 +419,7 @@ func listExecutionDetails(
 	client, err := s.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	url := s.AdminURL().String() + fmt.Sprintf("/_status/list_job_profiler_execution_details/%d", jobID)
+	url := s.AdminURL().WithPath(fmt.Sprintf("/_status/list_job_profiler_execution_details/%d", jobID)).String()
 	req, err := http.NewRequest("GET", url, nil)
 	require.NoError(t, err)
 
@@ -407,30 +441,44 @@ func listExecutionDetails(
 
 func checkExecutionDetails(
 	t *testing.T, s serverutils.TestServerInterface, jobID jobspb.JobID, filename string,
-) []byte {
+) ([]byte, error) {
 	t.Helper()
 
 	client, err := s.GetAdminHTTPClient()
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 
-	url := s.AdminURL().String() + fmt.Sprintf("/_status/job_profiler_execution_details/%d?%s", jobID, filename)
+	url := s.AdminURL().WithPath(fmt.Sprintf("/_status/job_profiler_execution_details/%d?%s", jobID, filename)).String()
 	req, err := http.NewRequest("GET", url, nil)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 
 	req.Header.Set("Content-Type", httputil.ProtoContentType)
 	resp, err := client.Do(req)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	edResp := serverpb.GetJobProfilerExecutionDetailResponse{}
-	require.NoError(t, protoutil.Unmarshal(body, &edResp))
+	if err := protoutil.Unmarshal(body, &edResp); err != nil {
+		return nil, err
+	}
 
 	r := bytes.NewReader(edResp.Data)
 	data, err := io.ReadAll(r)
-	require.NoError(t, err)
-	require.NotEmpty(t, data)
-	return data
+	if err != nil {
+		return data, err
+	}
+	if len(data) == 0 {
+		return data, errors.New("no data returned")
+	}
+	return data, nil
 }

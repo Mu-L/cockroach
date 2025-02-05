@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -79,7 +74,7 @@ CREATE FUNCTION f(INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT a FROM t $
 	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
+			"resolve-index", txn.KV(), username.NodeUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
 		)
 		defer cleanup()
 		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
@@ -91,7 +86,11 @@ CREATE FUNCTION f(INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT a FROM t $
 		fname := tree.UnresolvedName{NumParts: 1, Star: false}
 		fname.Parts[0] = "f"
 		path := sessiondata.MakeSearchPath(searchPathArray)
-		funcDef, err := funcResolver.ResolveFunction(ctx, &fname, &path)
+		funcDef, err := funcResolver.ResolveFunction(
+			ctx,
+			tree.MakeUnresolvedFunctionName(&fname),
+			&path,
+		)
 		require.NoError(t, err)
 		require.Equal(t, 3, len(funcDef.Overloads))
 
@@ -101,7 +100,7 @@ CREATE FUNCTION f(INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT a FROM t $
 		})
 		require.Equal(t, 100110, int(funcDef.Overloads[0].Oid))
 		require.True(t, funcDef.Overloads[0].UDFContainsOnlySignature)
-		require.True(t, funcDef.Overloads[0].IsUDF)
+		require.Equal(t, funcDef.Overloads[0].Type, tree.UDFRoutine)
 		require.Equal(t, 1, len(funcDef.Overloads[0].Types.Types()))
 		require.NotZero(t, funcDef.Overloads[0].Types.Types()[0].TypeMeta)
 		require.Equal(t, types.EnumFamily, funcDef.Overloads[0].Types.Types()[0].Family())
@@ -109,13 +108,13 @@ CREATE FUNCTION f(INT) RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT a FROM t $
 
 		require.Equal(t, 100111, int(funcDef.Overloads[1].Oid))
 		require.True(t, funcDef.Overloads[1].UDFContainsOnlySignature)
-		require.True(t, funcDef.Overloads[1].IsUDF)
+		require.Equal(t, funcDef.Overloads[1].Type, tree.UDFRoutine)
 		require.Equal(t, 0, len(funcDef.Overloads[1].Types.Types()))
 		require.Equal(t, types.Void, funcDef.Overloads[1].ReturnType([]tree.TypedExpr{}))
 
 		require.Equal(t, 100112, int(funcDef.Overloads[2].Oid))
 		require.True(t, funcDef.Overloads[2].UDFContainsOnlySignature)
-		require.True(t, funcDef.Overloads[2].IsUDF)
+		require.Equal(t, funcDef.Overloads[2].Type, tree.UDFRoutine)
 		require.Equal(t, 1, len(funcDef.Overloads[2].Types.Types()))
 		require.Equal(t, types.Int, funcDef.Overloads[2].Types.Types()[0])
 		require.Equal(t, types.Int, funcDef.Overloads[2].ReturnType([]tree.TypedExpr{}))
@@ -127,7 +126,7 @@ SELECT b FROM defaultdb.public.t@t_idx_b;
 SELECT c FROM defaultdb.public.t@t_idx_c;
 SELECT a FROM defaultdb.public.v;
 SELECT nextval(105:::REGCLASS);`, overload.Body)
-		require.True(t, overload.IsUDF)
+		require.Equal(t, overload.Type, tree.UDFRoutine)
 		require.False(t, overload.UDFContainsOnlySignature)
 		require.Equal(t, 1, len(overload.Types.Types()))
 		require.NotEqual(t, overload.Types.Types()[0].TypeMeta, types.UserDefinedTypeMetadata{})
@@ -137,7 +136,7 @@ SELECT nextval(105:::REGCLASS);`, overload.Body)
 		_, overload, err = funcResolver.ResolveFunctionByOID(ctx, funcDef.Overloads[1].Oid)
 		require.NoError(t, err)
 		require.Equal(t, `SELECT 1;`, overload.Body)
-		require.True(t, overload.IsUDF)
+		require.Equal(t, overload.Type, tree.UDFRoutine)
 		require.False(t, overload.UDFContainsOnlySignature)
 		require.Equal(t, 0, len(overload.Types.Types()))
 		require.Equal(t, types.Void, overload.ReturnType([]tree.TypedExpr{}))
@@ -145,7 +144,7 @@ SELECT nextval(105:::REGCLASS);`, overload.Body)
 		_, overload, err = funcResolver.ResolveFunctionByOID(ctx, funcDef.Overloads[2].Oid)
 		require.NoError(t, err)
 		require.Equal(t, `SELECT a FROM defaultdb.public.t;`, overload.Body)
-		require.True(t, overload.IsUDF)
+		require.Equal(t, overload.Type, tree.UDFRoutine)
 		require.False(t, overload.UDFContainsOnlySignature)
 		require.Equal(t, 1, len(overload.Types.Types()))
 		require.Equal(t, types.Int, overload.Types.Types()[0])
@@ -257,7 +256,7 @@ CREATE FUNCTION sc1.lower() RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 3 $$;
 	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
+			"resolve-index", txn.KV(), username.NodeUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
 		)
 		defer cleanup()
 		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
@@ -269,7 +268,11 @@ CREATE FUNCTION sc1.lower() RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 3 $$;
 		for _, tc := range testCases {
 			t.Run(tc.testName, func(t *testing.T) {
 				path := sessiondata.MakeSearchPath(tc.searchPath)
-				funcDef, err := funcResolver.ResolveFunction(ctx, &tc.funName, &path)
+				funcDef, err := funcResolver.ResolveFunction(
+					ctx,
+					tree.MakeUnresolvedFunctionName(&tc.funName),
+					&path,
+				)
 				if tc.expectedErr != "" {
 					require.Regexp(t, tc.expectedErr, err.Error())
 					return
@@ -286,7 +289,7 @@ CREATE FUNCTION sc1.lower() RETURNS INT VOLATILE LANGUAGE SQL AS $$ SELECT 3 $$;
 					require.NoError(t, err)
 					bodies[i] = overload.Body
 					schemas[i] = o.Schema
-					isUDF[i] = o.IsUDF
+					isUDF[i] = o.Type == tree.UDFRoutine
 				}
 				require.Equal(t, tc.expectedBody, bodies)
 				require.Equal(t, tc.expectedSchema, schemas)
@@ -396,16 +399,14 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING VOLATILE LANGUAGE SQL AS $$ S
 	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		planner, cleanup := sql.NewInternalPlanner(
-			"resolve-index", txn.KV(), username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
+			"resolve-index", txn.KV(), username.NodeUserName(), &sql.MemoryMetrics{}, &execCfg, sd,
 		)
 		defer cleanup()
 		ec := planner.(interface{ EvalContext() *eval.Context }).EvalContext()
 		// Set "defaultdb" as current database.
 		ec.SessionData().Database = "defaultdb"
 
-		funcResolver := planner.(tree.FunctionReferenceResolver)
-		semaCtx := tree.MakeSemaContext()
-		semaCtx.FunctionResolver = funcResolver
+		semaCtx := tree.MakeSemaContext(planner)
 
 		for _, tc := range testCases {
 			t.Run(tc.testName, func(t *testing.T) {
@@ -427,13 +428,14 @@ CREATE FUNCTION sc1.lower(a STRING) RETURNS STRING VOLATILE LANGUAGE SQL AS $$ S
 				require.NotNil(t, funcExpr.ResolvedOverload())
 				require.Equal(t, tc.expectedFuncBody, funcExpr.ResolvedOverload().Body)
 				if tc.expectedFuncBody != "" {
-					require.True(t, funcExpr.ResolvedOverload().IsUDF)
+					require.Equal(t, funcExpr.ResolvedOverload().Type, tree.UDFRoutine)
 				} else {
-					require.False(t, funcExpr.ResolvedOverload().IsUDF)
+					require.NotEqual(t, funcExpr.ResolvedOverload().Type, tree.UDFRoutine)
 				}
 				require.False(t, funcExpr.ResolvedOverload().UDFContainsOnlySignature)
 				require.Equal(t, tc.expectedFuncOID, int(funcExpr.ResolvedOverload().Oid))
-				require.Equal(t, funcExpr.ResolvedOverload().IsUDF, funcdesc.IsOIDUserDefinedFunc(funcExpr.ResolvedOverload().Oid))
+				require.Equal(t, funcExpr.ResolvedOverload().Type == tree.UDFRoutine,
+					funcdesc.IsOIDUserDefinedFunc(funcExpr.ResolvedOverload().Oid))
 				require.Equal(t, tc.expectedFuncBody, funcExpr.ResolvedOverload().Body)
 			})
 		}

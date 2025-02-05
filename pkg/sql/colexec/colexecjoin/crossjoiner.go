@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecjoin
 
@@ -39,7 +34,7 @@ func NewCrossJoiner(
 	leftTypes []*types.T,
 	rightTypes []*types.T,
 	diskAcc *mon.BoundAccount,
-	converterMemAcc *mon.BoundAccount,
+	diskQueueMemAcc *mon.BoundAccount,
 ) colexecop.ClosableOperator {
 	c := &crossJoiner{
 		crossJoinerBase: newCrossJoinerBase(
@@ -51,7 +46,7 @@ func NewCrossJoiner(
 			diskQueueCfg,
 			fdSemaphore,
 			diskAcc,
-			converterMemAcc,
+			diskQueueMemAcc,
 		),
 		TwoInputInitHelper: colexecop.MakeTwoInputInitHelper(left, right),
 		outputTypes:        joinType.MakeOutputTypes(leftTypes, rightTypes),
@@ -147,16 +142,16 @@ func (c *crossJoiner) readNextLeftBatch() int {
 // on the join type.
 func (c *crossJoiner) consumeRightInput(ctx context.Context) {
 	c.rightInputConsumed = true
+
+	// Figure out how to consume the right input.
 	var needRightTuples, needOnlyNumRightTuples bool
 	switch c.joinType {
 	case descpb.InnerJoin, descpb.LeftOuterJoin, descpb.RightOuterJoin, descpb.FullOuterJoin:
-		c.needLeftTuples = true
 		needRightTuples = true
 	case descpb.LeftSemiJoin:
 		// With LEFT SEMI join we only need to know whether the right input is
 		// empty or not.
 		c.numRightTuples = c.InputTwo.Next().Length()
-		c.needLeftTuples = c.numRightTuples != 0
 	case descpb.RightSemiJoin:
 		// With RIGHT SEMI join we only need to know whether the left input is
 		// empty or not.
@@ -165,7 +160,6 @@ func (c *crossJoiner) consumeRightInput(ctx context.Context) {
 		// With LEFT ANTI join we only need to know whether the right input is
 		// empty or not.
 		c.numRightTuples = c.InputTwo.Next().Length()
-		c.needLeftTuples = c.numRightTuples == 0
 	case descpb.RightAntiJoin:
 		// With RIGHT ANTI join we only need to know whether the left input is
 		// empty or not.
@@ -173,11 +167,12 @@ func (c *crossJoiner) consumeRightInput(ctx context.Context) {
 	case descpb.IntersectAllJoin, descpb.ExceptAllJoin:
 		// With set-operation joins we only need the number of tuples from the
 		// right input.
-		c.needLeftTuples = true
 		needOnlyNumRightTuples = true
 	default:
 		colexecerror.InternalError(errors.AssertionFailedf("unexpected join type %s", c.joinType.String()))
 	}
+
+	// Consume the right input if necessary.
 	if needRightTuples || needOnlyNumRightTuples {
 		for {
 			batch := c.InputTwo.Next()
@@ -189,6 +184,23 @@ func (c *crossJoiner) consumeRightInput(ctx context.Context) {
 			}
 			c.numRightTuples += batch.Length()
 		}
+	}
+
+	// Figure out whether we need tuples from the left source.
+	switch c.joinType {
+	case descpb.InnerJoin, descpb.RightOuterJoin, descpb.LeftSemiJoin, descpb.IntersectAllJoin:
+		c.needLeftTuples = c.numRightTuples != 0
+	case descpb.LeftOuterJoin, descpb.FullOuterJoin, descpb.ExceptAllJoin:
+		c.needLeftTuples = true
+	case descpb.LeftAntiJoin:
+		c.needLeftTuples = c.numRightTuples == 0
+	case descpb.RightSemiJoin, descpb.RightAntiJoin:
+		// With RIGHT SEMI and RIGHT ANTI joins we only need to know whether the
+		// left input is empty or not, and we already determined that in the
+		// switch above.
+		c.needLeftTuples = false
+	default:
+		colexecerror.InternalError(errors.AssertionFailedf("unexpected join type %s", c.joinType.String()))
 	}
 }
 
@@ -258,6 +270,11 @@ func (c *crossJoiner) willEmit() int {
 		return c.canEmit()
 	}
 	switch c.joinType {
+	case descpb.InnerJoin, descpb.RightOuterJoin, descpb.IntersectAllJoin:
+		// We don't need the left tuples, and in case of INNER, RIGHT OUTER, and
+		// INTERSECT ALL joins this means that the right input was empty, so the
+		// cross join is empty.
+		return 0
 	case descpb.LeftSemiJoin, descpb.LeftAntiJoin:
 		// We don't need the left tuples, and in case of LEFT SEMI/ANTI this
 		// means that the right input was empty/non-empty, so the cross join
@@ -282,7 +299,7 @@ func (c *crossJoiner) willEmit() int {
 
 // setAllNulls sets all tuples in vecs with indices in [0, length) range to
 // null.
-func setAllNulls(vecs []coldata.Vec, length int) {
+func setAllNulls(vecs []*coldata.Vec, length int) {
 	for i := range vecs {
 		vecs[i].Nulls().SetNullRange(0 /* startIdx */, length)
 	}
@@ -305,7 +322,7 @@ func newCrossJoinerBase(
 	cfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAcc *mon.BoundAccount,
-	converterMemAcc *mon.BoundAccount,
+	diskQueueMemAcc *mon.BoundAccount,
 ) *crossJoinerBase {
 	base := &crossJoinerBase{
 		joinType: joinType,
@@ -327,7 +344,7 @@ func newCrossJoinerBase(
 				DiskQueueCfg:       cfg,
 				FDSemaphore:        fdSemaphore,
 				DiskAcc:            diskAcc,
-				ConverterMemAcc:    converterMemAcc,
+				DiskQueueMemAcc:    diskQueueMemAcc,
 			},
 		),
 	}

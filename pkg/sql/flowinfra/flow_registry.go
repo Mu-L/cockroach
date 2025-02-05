@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
@@ -16,7 +11,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -40,7 +34,7 @@ func IsNoInboundStreamConnectionError(err error) bool {
 // SettingFlowStreamTimeout is a cluster setting that sets the default flow
 // stream timeout.
 var SettingFlowStreamTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.distsql.flow_stream_timeout",
 	"amount of time incoming streams wait for a flow to be set up before erroring out",
 	10*time.Second,
@@ -575,8 +569,6 @@ func (fr *FlowRegistry) ConnectInboundStream(
 			Handshake: &execinfrapb.ConsumerHandshake{
 				ConsumerScheduled:        false,
 				ConsumerScheduleDeadline: &deadline,
-				Version:                  execinfra.Version,
-				MinAcceptedVersion:       execinfra.MinAcceptedVersion,
 			},
 		}); err != nil {
 			return nil, nil, nil, err
@@ -607,9 +599,7 @@ func (fr *FlowRegistry) ConnectInboundStream(
 	// Don't mark s as connected until after the handshake succeeds.
 	handshakeErr := stream.Send(&execinfrapb.ConsumerSignal{
 		Handshake: &execinfrapb.ConsumerHandshake{
-			ConsumerScheduled:  true,
-			Version:            execinfra.Version,
-			MinAcceptedVersion: execinfra.MinAcceptedVersion,
+			ConsumerScheduled: true,
 		},
 	})
 

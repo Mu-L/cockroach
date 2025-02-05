@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -47,9 +42,9 @@ func registerCopy(r registry.Registry) {
 		const rowOverheadEstimate = 160
 		const rowEstimate = rowOverheadEstimate + payload
 
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.All())
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+
+		copyTimeout := 10 * time.Minute
 
 		m := c.NewMonitor(ctx, c.All())
 		m.Go(func(ctx context.Context) error {
@@ -64,15 +59,15 @@ func registerCopy(r registry.Registry) {
 			}
 
 			t.Status("importing Bank fixture")
-			c.Run(ctx, c.Node(1), fmt.Sprintf(
-				"./workload fixtures load bank --rows=%d --payload-bytes=%d --seed %d {pgurl:1}",
+			c.Run(ctx, option.WithNodes(c.Node(1)), fmt.Sprintf(
+				"./cockroach workload fixtures load bank --rows=%d --payload-bytes=%d --seed %d {pgurl:1}",
 				rows, payload, fixturesRandomSeed))
 			if _, err := db.Exec("ALTER TABLE bank.bank RENAME TO bank.bank_orig"); err != nil {
 				t.Fatalf("failed to rename table: %v", err)
 			}
 
 			t.Status("create copy of Bank schema")
-			c.Run(ctx, c.Node(1), "./workload init bank --rows=0 --ranges=0 {pgurl:1}")
+			c.Run(ctx, option.WithNodes(c.Node(1)), "./cockroach workload init bank --rows=0 --ranges=0 {pgurl:1}")
 
 			rangeCount := func() int {
 				var count int
@@ -100,7 +95,7 @@ func registerCopy(r registry.Registry) {
 				QueryRowContext(ctx context.Context, query string, args ...interface{}) *gosql.Row
 			}
 			runCopy := func(ctx context.Context, qu querier) error {
-				ctx, cancel := context.WithTimeout(ctx, 10*time.Minute) // avoid infinite internal retries
+				ctx, cancel := context.WithTimeout(ctx, copyTimeout) // avoid infinite internal retries
 				defer cancel()
 
 				for lastID := -1; lastID+1 < rows; {
@@ -183,11 +178,12 @@ func registerCopy(r registry.Registry) {
 			Name:    fmt.Sprintf("copy/bank/rows=%d,nodes=%d,txn=%t", tc.rows, tc.nodes, tc.txn),
 			Owner:   registry.OwnerKV,
 			Cluster: r.MakeClusterSpec(tc.nodes),
-			Leases:  registry.MetamorphicLeases,
+			// Uses gs://cockroach-fixtures-us-east1. See:
+			// https://github.com/cockroachdb/cockroach/issues/105968
+			CompatibleClouds: registry.Clouds(spec.GCE, spec.Local),
+			Suites:           registry.Suites(registry.Nightly),
+			Leases:           registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				if c.Spec().Cloud != spec.GCE {
-					t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
-				}
 				runCopy(ctx, t, c, tc.rows, tc.txn)
 			},
 		})

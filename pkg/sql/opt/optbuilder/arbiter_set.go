@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -105,8 +100,18 @@ func (a *arbiterSet) ContainsUniqueConstraint(uniq cat.UniqueOrdinal) bool {
 //     pred is nil.
 //   - canaryOrd is the table column ordinal of a not-null column in the
 //     constraint's table.
+//   - uniqueWithoutIndex is true if this is a unique constraint enforced
+//     without an index.
+//   - uniqueOrd is the ordinal of the unique constraint (-1 for index arbiters).
 func (a *arbiterSet) ForEach(
-	f func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int),
+	f func(
+		name string,
+		conflictOrds intsets.Fast,
+		pred tree.Expr,
+		canaryOrd int,
+		uniqueWithoutIndex bool,
+		uniqueOrd int,
+	),
 ) {
 	// Call the callback for each index arbiter.
 	a.indexes.ForEach(func(i int) {
@@ -120,7 +125,7 @@ func (a *arbiterSet) ForEach(
 			pred = a.mb.parsePartialIndexPredicateExpr(i)
 		}
 
-		f(string(index.Name()), conflictOrds, pred, canaryOrd)
+		f(string(index.Name()), conflictOrds, pred, canaryOrd, false, -1)
 	})
 
 	// Call the callback for each unique constraint arbiter.
@@ -135,7 +140,7 @@ func (a *arbiterSet) ForEach(
 			pred = a.mb.parseUniqueConstraintPredicateExpr(i)
 		}
 
-		f(uniqueConstraint.Name(), conflictOrds, pred, canaryOrd)
+		f(uniqueConstraint.Name(), conflictOrds, pred, canaryOrd, uniqueConstraint.WithoutIndex(), i)
 	})
 }
 

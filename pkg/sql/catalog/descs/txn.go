@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs
 
@@ -14,12 +9,15 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/regionliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
@@ -53,8 +51,11 @@ import (
 func CheckTwoVersionInvariant(
 	ctx context.Context,
 	clock *hlc.Clock,
-	noTxnExec isql.Executor,
+	db isql.DB,
+	codec keys.SQLCodec,
 	descsCol *Collection,
+	regions regionliveness.CachedDatabaseRegions,
+	settings *clustersettings.Settings,
 	txn *kv.Txn,
 	onRetryBackoff func(),
 ) error {
@@ -88,7 +89,7 @@ func CheckTwoVersionInvariant(
 	// transaction ends up committing then there won't have been any created
 	// in the meantime.
 	count, err := lease.CountLeases(
-		ctx, noTxnExec, withNewVersion, txn.ProvisionalCommitTimestamp(),
+		ctx, db, codec, regions, settings, withNewVersion, txn.ProvisionalCommitTimestamp(), false, /*forAnyVersion*/
 	)
 	if err != nil {
 		return err
@@ -111,11 +112,15 @@ func CheckTwoVersionInvariant(
 	// up schema changes there and potentially create a deadlock.
 	descsCol.ReleaseLeases(ctx)
 
+	// Increment the long wait gauge for two version invariant violations, if this
+	// function takes longer than the lease duration.
+	decAfterWait := descsCol.leased.lm.IncGaugeAfterLeaseDuration(lease.GaugeWaitForTwoVersionViolation)
+	defer decAfterWait()
 	// Wait until all older version leases have been released or expired.
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
 		// Use the current clock time.
 		now := clock.Now()
-		count, err := lease.CountLeases(ctx, noTxnExec, withNewVersion, now)
+		count, err := lease.CountLeases(ctx, db, codec, regions, settings, withNewVersion, now, false /*forAnyVersion*/)
 		if err != nil {
 			return err
 		}

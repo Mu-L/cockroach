@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,19 +10,22 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/errors"
 )
 
 type controlSchedulesNode struct {
-	rows    planNode
+	singleInputPlanNode
 	command tree.ScheduleCommand
 	numRows int
 }
@@ -92,14 +90,14 @@ func loadSchedule(params runParams, scheduleID tree.Datum) (*jobs.ScheduledJob, 
 
 // DeleteSchedule deletes specified schedule.
 func DeleteSchedule(
-	ctx context.Context, execCfg *ExecutorConfig, txn isql.Txn, scheduleID int64,
+	ctx context.Context, execCfg *ExecutorConfig, txn isql.Txn, scheduleID jobspb.ScheduleID,
 ) error {
 	env := JobSchedulerEnv(execCfg.JobsKnobs())
 	_, err := txn.ExecEx(
 		ctx,
 		"delete-schedule",
 		txn.KV(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf(
 			"DELETE FROM %s WHERE schedule_id = $1",
 			env.ScheduledJobsTableName(),
@@ -112,7 +110,7 @@ func DeleteSchedule(
 // startExec implements planNode interface.
 func (n *controlSchedulesNode) startExec(params runParams) error {
 	for {
-		ok, err := n.rows.Next(params)
+		ok, err := n.input.Next(params)
 		if err != nil {
 			return err
 		}
@@ -120,7 +118,7 @@ func (n *controlSchedulesNode) startExec(params runParams) error {
 			break
 		}
 
-		schedule, err := loadSchedule(params, n.rows.Values()[0])
+		schedule, err := loadSchedule(params, n.input.Values()[0])
 		if err != nil {
 			return err
 		}
@@ -129,14 +127,17 @@ func (n *controlSchedulesNode) startExec(params runParams) error {
 			continue // not an error if schedule does not exist
 		}
 
-		isAdmin, err := params.p.UserHasAdminRole(params.ctx, params.p.User())
+		// Check that the user has privileges or is the owner of the schedules being altered.
+		hasPriv, err := params.p.HasPrivilege(
+			params.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER, params.p.User(),
+		)
 		if err != nil {
 			return err
 		}
 		isOwner := schedule.Owner() == params.p.User()
-		if !isAdmin && !isOwner {
-			return pgerror.Newf(pgcode.InsufficientPrivilege, "must be admin or owner of the "+
-				"schedule %d to %s it", schedule.ScheduleID(), n.command.String())
+		if !hasPriv && !isOwner {
+			return pgerror.Newf(pgcode.InsufficientPrivilege, "must have %s privilege or be owner of the "+
+				"schedule %d to %s it", privilege.REPAIRCLUSTER, schedule.ScheduleID(), n.command.String())
 		}
 
 		switch n.command {
@@ -202,5 +203,5 @@ func (*controlSchedulesNode) Values() tree.Datums { return nil }
 
 // Close implements planNode interface.
 func (n *controlSchedulesNode) Close(ctx context.Context) {
-	n.rows.Close(ctx)
+	n.input.Close(ctx)
 }

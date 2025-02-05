@@ -1,19 +1,21 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { Format, Identifier, Join, SQL } from "./safesql";
+import {
+  Format,
+  Identifier,
+  Join,
+  QuoteIdentifier,
+  SQL,
+  SqlFormatArg,
+} from "./safesql";
 
 describe("safesql", () => {
   test("format", () => {
-    type customString = string;
-    type customNum = number;
+    type CustomString = string;
+    type CustomNum = number;
 
     const testCases: {
       expected: string;
@@ -65,11 +67,11 @@ describe("safesql", () => {
       },
       {
         expected: `hello 'world'`,
-        formatted: Format(`hello %1`, ["world" as customString]),
+        formatted: Format(`hello %1`, ["world" as CustomString]),
       },
       {
         expected: `hello 1`,
-        formatted: Format(`hello %1`, [1 as customNum]),
+        formatted: Format(`hello %1`, [1 as CustomNum]),
       },
     ];
 
@@ -82,7 +84,7 @@ describe("safesql", () => {
     const testCases: {
       expected: string;
       format: string;
-      args: any[];
+      args: SqlFormatArg[];
     }[] = [
       { format: `hello %s`, args: null, expected: `invalid placeholder: %s` },
       { format: `hello %`, args: null, expected: `invalid placeholder: %` },
@@ -94,7 +96,7 @@ describe("safesql", () => {
       },
       {
         format: `hello %1`,
-        args: [new Date()],
+        args: [new Date() as any],
         expected: `bad argument 1: unsupported type: object`,
       },
     ];
@@ -141,7 +143,30 @@ describe("safesql", () => {
     ];
 
     testCases.forEach(tc => {
-      expect(tc.got.SQLString()).toEqual(tc.expected);
+      expect(tc.got.sqlString()).toEqual(tc.expected);
     });
+  });
+
+  // https://www.cockroachlabs.com/docs/stable/keywords-and-identifiers#rules-for-identifiers
+  // https://www.postgresql.org/docs/15/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
+  test("QuoteIdentifier", () => {
+    const testCases = [
+      ["foobar", '"foobar"'],
+      ['weird"table', '"weird""table"'],
+      ['"quoted"', '"""quoted"""'],
+
+      // Anti-test cases: The following cases document the inputs that
+      // QuoteIdentifier can not deal with.
+      // 1. A fully qualified name that is not comprised of quoted identifiers.
+      // 2. A fully qualified name that is already made of quoted identifiers.
+      ["schema.table", '"schema.table"'], // Invalid SQL output.
+      ['"schema"."table"', '"""schema"".""table"""'], // Invalid SQL output.
+    ];
+
+    for (const tcase of testCases) {
+      const res = QuoteIdentifier(tcase[0]);
+      const expected = tcase[1];
+      expect(res).toEqual(expected);
+    }
   });
 });

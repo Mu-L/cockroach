@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package types
 
@@ -14,7 +9,6 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
-	"runtime/debug"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
@@ -23,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -100,6 +95,7 @@ import (
 // | VARCHAR(N)        | STRING         | T_varchar     | 0         | N     |
 // | CHAR              | STRING         | T_bpchar      | 0         | 1     |
 // | CHAR(N)           | STRING         | T_bpchar      | 0         | N     |
+// | BPCHAR            | STRING         | T_bpchar      | 0         | 0     |
 // | "char"            | STRING         | T_char        | 0         | 0     |
 // | NAME              | STRING         | T_name        | 0         | 0     |
 // |                   |                |               |           |       |
@@ -119,6 +115,7 @@ import (
 // | FLOAT4            | FLOAT          | T_float4      | 0         | 0     |
 // |                   |                |               |           |       |
 // | BIT               | BIT            | T_bit         | 0         | 1     |
+// | BIT(0)            | BIT            | T_bit         | 0         | 0     |
 // | BIT(N)            | BIT            | T_bit         | 0         | N     |
 // | VARBIT            | BIT            | T_varbit      | 0         | 0     |
 // | VARBIT(N)         | BIT            | T_varbit      | 0         | N     |
@@ -186,18 +183,38 @@ type T struct {
 	TypeMeta UserDefinedTypeMetadata
 }
 
+// CopyForHydrate returns a copy of the type that can be safely hydrated.
+// Recursive type references (as for tuples or arrays) are copied, but other
+// pointer fields are not deeply copied.
+//
+// Copy should be kept in alignment with the struct fields.
+func (t *T) CopyForHydrate() *T {
+	newT := *t
+	if t.InternalType.TupleContents != nil {
+		newTupleContents := make([]*T, len(t.InternalType.TupleContents))
+		for i := range t.InternalType.TupleContents {
+			newTupleContents[i] = t.InternalType.TupleContents[i].CopyForHydrate()
+		}
+		newT.InternalType.TupleContents = newTupleContents
+	}
+	if t.InternalType.ArrayContents != nil {
+		newT.InternalType.ArrayContents = t.InternalType.ArrayContents.CopyForHydrate()
+	}
+	return &newT
+}
+
 // UserDefinedTypeMetadata contains metadata needed for runtime
 // operations on user defined types. The metadata must be read only.
 type UserDefinedTypeMetadata struct {
 	// Name is the resolved name of this type.
 	Name *UserDefinedTypeName
 
+	// EnumData is non-nil iff the metadata is for an ENUM type.
+	EnumData *EnumMetadata
+
 	// Version is the descriptor version of the descriptor used to construct
 	// this version of the type metadata.
 	Version uint32
-
-	// EnumData is non-nil iff the metadata is for an ENUM type.
-	EnumData *EnumMetadata
 
 	// ImplicitRecordType is true if the metadata is for an implicit record type
 	// for a table. Note: this can be deleted if we migrate implicit record types
@@ -247,8 +264,8 @@ func (u UserDefinedTypeName) Basename() string {
 }
 
 // FQName returns the fully qualified name.
-func (u UserDefinedTypeName) FQName() string {
-	return FormatTypeName(u)
+func (u UserDefinedTypeName) FQName(explicitCatalog bool) string {
+	return FormatTypeName(u, explicitCatalog)
 }
 
 // Convenience list of pre-constructed types. Caller code can use any of these
@@ -304,6 +321,14 @@ var (
 	// compatibility with PostgreSQL.
 	String = &T{InternalType: InternalType{
 		Family: StringFamily, Oid: oid.T_text, Locale: &emptyLocale}}
+
+	// BPChar is a CHAR type with an unspecified width. "BP" stands for
+	// "blank padded".
+	//
+	// It is reported as BPCHAR in SHOW CREATE and "character" in introspection
+	// for compatibility with PostgreSQL.
+	BPChar = &T{InternalType: InternalType{
+		Family: StringFamily, Oid: oid.T_bpchar, Locale: &emptyLocale}}
 
 	// VarChar is equivalent to String, but has a differing OID (T_varchar),
 	// which makes it show up differently when displayed. It is reported as
@@ -467,6 +492,15 @@ var (
 		},
 	}
 
+	// PGVector is the type representing a PGVector object.
+	PGVector = &T{
+		InternalType: InternalType{
+			Family: PGVectorFamily,
+			Oid:    oidext.T_pgvector,
+			Locale: &emptyLocale,
+		},
+	}
+
 	// Void is the type representing void.
 	Void = &T{
 		InternalType: InternalType{
@@ -507,6 +541,16 @@ var (
 		},
 	}
 
+	// RefCursor is the type for a variable representing the name of a cursor in a
+	// PLpgSQL routine. The underlying value is a string.
+	RefCursor = &T{
+		InternalType: InternalType{
+			Family: RefCursorFamily,
+			Oid:    oid.T_refcursor,
+			Locale: &emptyLocale,
+		},
+	}
+
 	// Scalar contains all types that meet this criteria:
 	//
 	//   1. Scalar type (no ArrayFamily or TupleFamily types).
@@ -531,6 +575,7 @@ var (
 		Uuid,
 		INet,
 		PGLSN,
+		RefCursor,
 		Time,
 		TimeTZ,
 		Jsonb,
@@ -580,6 +625,11 @@ var (
 	EmptyTuple = &T{InternalType: InternalType{
 		Family: TupleFamily, Oid: oid.T_record, Locale: &emptyLocale}}
 
+	// Trigger is a special type used for trigger functions, which return a row of
+	// their target table.
+	Trigger = &T{InternalType: InternalType{
+		Family: TriggerFamily, Oid: oid.T_trigger, Locale: &emptyLocale}}
+
 	// StringArray is the type of an array value having String-typed elements.
 	StringArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: String, Oid: oid.T__text, Locale: &emptyLocale}}
@@ -615,6 +665,14 @@ var (
 	// PGLSNArray is the type of an array value having PGLSN-typed elements.
 	PGLSNArray = &T{InternalType: InternalType{
 		Family: ArrayFamily, ArrayContents: PGLSN, Oid: oid.T__pg_lsn, Locale: &emptyLocale}}
+
+	// PGVectorArray is the type of an array value having PGVector-typed elements.
+	PGVectorArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: PGVector, Oid: oidext.T__pgvector, Locale: &emptyLocale}}
+
+	// RefCursorArray is the type of an array value having REFCURSOR-typed elements.
+	RefCursorArray = &T{InternalType: InternalType{
+		Family: ArrayFamily, ArrayContents: RefCursor, Oid: oid.T__refcursor, Locale: &emptyLocale}}
 
 	// TimeArray is the type of an array value having Time-typed elements.
 	TimeArray = &T{InternalType: InternalType{
@@ -667,20 +725,12 @@ var (
 
 // Unexported wrapper types.
 var (
-	// typeBit is the SQL BIT type. It is not exported to avoid confusion with
-	// the VarBit type, and confusion over whether its default Width is
-	// unspecified or is 1. More commonly used instead is the VarBit type.
+	// typeBit is the SQL BIT type with an unspecified width. It is not exported
+	// to avoid confusion with the VarBit type, and confusion over whether its
+	// default Width is unspecified or is 1. More commonly used instead is the
+	// VarBit type.
 	typeBit = &T{InternalType: InternalType{
 		Family: BitFamily, Oid: oid.T_bit, Locale: &emptyLocale}}
-
-	// typeBpChar is a CHAR type with an unspecified width. "bp" stands for
-	// "blank padded". It is not exported to avoid confusion with QChar, as well
-	// as confusion over CHAR's default width of 1.
-	//
-	// It is reported as CHAR in SHOW CREATE and "character" in introspection for
-	// compatibility with PostgreSQL.
-	typeBpChar = &T{InternalType: InternalType{
-		Family: StringFamily, Oid: oid.T_bpchar, Locale: &emptyLocale}}
 
 	// typeQChar is a "char" type with an unspecified width. It is not exported
 	// to avoid confusion with QChar. The "char" type should always have a width
@@ -889,7 +939,7 @@ func MakeVarChar(width int32) *T {
 // the given max # characters (0 = unspecified number).
 func MakeChar(width int32) *T {
 	if width == 0 {
-		return typeBpChar
+		return BPChar
 	}
 	if width < 0 {
 		panic(errors.AssertionFailedf("width %d cannot be negative", width))
@@ -919,6 +969,21 @@ func MakeCollatedString(strType *T, locale string) *T {
 			Family: CollatedStringFamily, Oid: strType.Oid(), Width: strType.Width(), Locale: &locale}}
 	}
 	panic(errors.AssertionFailedf("cannot apply collation to non-string type: %s", strType))
+}
+
+// MakeCollatedType is like MakeCollatedString but also handles NULL and arrays
+// of string types that need to become arrays of collated string types.
+//
+// UNKNOWN  => STRING COLLATE EN
+// []STRING => []STRING COLLATE EN
+func MakeCollatedType(typ *T, locale string) *T {
+	if typ.Family() == ArrayFamily {
+		return MakeArray(MakeCollatedType(typ.ArrayContents(), locale))
+	}
+	if typ.Family() == UnknownFamily {
+		return MakeCollatedType(String, locale)
+	}
+	return MakeCollatedString(typ, locale)
 }
 
 // MakeDecimal constructs a new instance of a DECIMAL type (oid = T_numeric)
@@ -1183,6 +1248,17 @@ func MakeLabeledTuple(contents []*T, labels []string) *T {
 	}}
 }
 
+// MakePGVector constructs a new instance of a VECTOR type (pg_vector) that has
+// the given number of dimensions.
+func MakePGVector(dims int32) *T {
+	return &T{InternalType: InternalType{
+		Family: PGVectorFamily,
+		Oid:    oidext.T_pgvector,
+		Width:  dims,
+		Locale: &emptyLocale,
+	}}
+}
+
 // NewCompositeType constructs a new instance of a TupleFamily type with the
 // given field types and labels, and the given user-defined type OIDs.
 func NewCompositeType(typeOID, arrayTypeOID oid.Oid, contents []*T, labels []string) *T {
@@ -1259,6 +1335,7 @@ func (t *T) Locale() string {
 //	STRING        : max # of characters
 //	COLLATEDSTRING: max # of characters
 //	BIT           : max # of bits
+//	VECTOR        : # of dimensions
 //
 // Width is always 0 for other types.
 func (t *T) Width() int32 {
@@ -1309,10 +1386,16 @@ func (t *T) TypeModifier() int32 {
 			// var header size.
 			return width + 4
 		}
-	case BitFamily:
+	case BitFamily, PGVectorFamily:
 		if width := t.Width(); width != 0 {
 			return width
 		}
+	case TimestampFamily, TimestampTZFamily, TimeFamily, TimeTZFamily, IntervalFamily:
+		// For timestamp the precision is the type modifier value.
+		if !t.InternalType.TimePrecisionIsSet {
+			return -1
+		}
+		return t.Precision()
 	case DecimalFamily:
 		// attTypMod is calculated by putting the precision in the upper
 		// bits and the scale in the lower bits of a 32-bit int, and adding
@@ -1352,6 +1435,9 @@ func (t *T) WithoutTypeModifiers() *T {
 		}
 		if !changed {
 			return t
+		}
+		if l := t.TupleLabels(); l != nil {
+			return MakeLabeledTuple(newContents, l)
 		}
 		return MakeTuple(newContents)
 	case EnumFamily:
@@ -1446,7 +1532,7 @@ func IsOIDUserDefinedType(o oid.Oid) bool {
 	return catid.IsOIDUserDefined(o)
 }
 
-var familyNames = map[Family]string{
+var familyNames = map[Family]redact.SafeString{
 	AnyFamily:            "any",
 	ArrayFamily:          "array",
 	BitFamily:            "bit",
@@ -1466,11 +1552,14 @@ var familyNames = map[Family]string{
 	JsonFamily:           "jsonb",
 	OidFamily:            "oid",
 	PGLSNFamily:          "pg_lsn",
+	PGVectorFamily:       "vector",
+	RefCursorFamily:      "refcursor",
 	StringFamily:         "string",
 	TimeFamily:           "time",
 	TimestampFamily:      "timestamp",
 	TimestampTZFamily:    "timestamptz",
 	TimeTZFamily:         "timetz",
+	TriggerFamily:        "trigger",
 	TSQueryFamily:        "tsquery",
 	TSVectorFamily:       "tsvector",
 	TupleFamily:          "tuple",
@@ -1484,7 +1573,7 @@ var familyNames = map[Family]string{
 //
 // TODO(radu): investigate whether anything breaks if we use
 // enumvalue_customname and use String() instead.
-func (f Family) Name() string {
+func (f Family) Name() redact.SafeString {
 	ret, ok := familyNames[f]
 	if !ok {
 		panic(errors.AssertionFailedf("unexpected Family: %d", f))
@@ -1509,6 +1598,8 @@ func (t *T) Name() string {
 			return "oidvector"
 		case oid.T_int2vector:
 			return "int2vector"
+		case oid.T_anyarray:
+			return "anyarray"
 		}
 		return t.ArrayContents().Name() + "[]"
 
@@ -1548,6 +1639,9 @@ func (t *T) Name() string {
 		case oid.T_text:
 			return "string"
 		case oid.T_bpchar:
+			if t.Width() == 0 {
+				return "bpchar"
+			}
 			return "char"
 		case oid.T_char:
 			// Yes, that's the name. The ways of PostgreSQL are inscrutable.
@@ -1573,7 +1667,7 @@ func (t *T) Name() string {
 		return t.TypeMeta.Name.Basename()
 
 	default:
-		return fam.Name()
+		return string(fam.Name())
 	}
 }
 
@@ -1646,8 +1740,17 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 			return "oidvector"
 		case oid.T_int2vector:
 			return "int2vector"
+		case oid.T_anyarray:
+			return "anyarray"
 		}
-		return t.ArrayContents().SQLStandardName() + "[]"
+		// If we have a typemod specified then pass it down when
+		// formatting the array type.
+		if !haveTypmod {
+			return t.ArrayContents().SQLStandardName() + "[]"
+		} else {
+			ac := t.ArrayContents()
+			return ac.SQLStandardNameWithTypmod(haveTypmod, typmod) + "[]"
+		}
 	case BitFamily:
 		if t.Oid() == oid.T_varbit {
 			buf.WriteString("bit varying")
@@ -1707,10 +1810,10 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 			panic(errors.AssertionFailedf("programming error: unknown int width: %d", t.Width()))
 		}
 	case IntervalFamily:
-		// TODO(jordan): intervals can have typmods, but we don't support them in the same way.
-		// Masking is used to extract the precision (src/include/utils/timestamp.h), whereas
-		// we store it as `IntervalDurationField`.
-		return "interval"
+		if !haveTypmod || typmod < 0 {
+			return "interval"
+		}
+		return fmt.Sprintf("interval(%d)", typmod)
 	case JsonFamily:
 		// Only binary JSON is currently supported.
 		return "jsonb"
@@ -1735,6 +1838,10 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 		}
 	case PGLSNFamily:
 		return "pg_lsn"
+	case PGVectorFamily:
+		return "vector"
+	case RefCursorFamily:
+		return "refcursor"
 	case StringFamily, CollatedStringFamily:
 		switch t.Oid() {
 		case oid.T_text:
@@ -1792,6 +1899,8 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 			return "timestamp with time zone"
 		}
 		return fmt.Sprintf("timestamp(%d) with time zone", typmod)
+	case TriggerFamily:
+		return "trigger"
 	case TSQueryFamily:
 		return "tsquery"
 	case TSVectorFamily:
@@ -1838,17 +1947,27 @@ func (t *T) InformationSchemaName() string {
 func (t *T) SQLString() string {
 	switch t.Family() {
 	case BitFamily:
-		o := t.Oid()
-		typName := "BIT"
-		if o == oid.T_varbit {
-			typName = "VARBIT"
+		switch t.Oid() {
+		case oid.T_bit:
+			typName := "BIT"
+			// BIT(1) pretty-prints as just BIT.
+			// BIT(0) represents a BIT type with unspecified length. This is a
+			// divergence from Postgres which does not allow this type and has
+			// no way to represent it in SQL. It is required in order for it to
+			// be correctly serialized into SQL and evaluated during distributed
+			// query execution. VARBIT cannot be used because it has a different
+			// OID.
+			if t.Width() != 1 {
+				typName = fmt.Sprintf("%s(%d)", typName, t.Width())
+			}
+			return typName
+		default:
+			typName := "VARBIT"
+			if t.Width() > 0 {
+				typName = fmt.Sprintf("%s(%d)", typName, t.Width())
+			}
+			return typName
 		}
-		// BIT(1) pretty-prints as just BIT.
-		if (o != oid.T_varbit && t.Width() > 1) ||
-			(o == oid.T_varbit && t.Width() > 0) {
-			typName = fmt.Sprintf("%s(%d)", typName, t.Width())
-		}
-		return typName
 	case IntFamily:
 		switch t.Width() {
 		case 16:
@@ -1936,14 +2055,63 @@ func (t *T) SQLString() string {
 		if t.TypeMeta.Name == nil {
 			return fmt.Sprintf("@%d", t.Oid())
 		}
-		return t.TypeMeta.Name.FQName()
+		// Do not include the catalog name. We do not allow a table to reference
+		// a type in another database, so it will always be for the current database.
+		// Removing the catalog name makes the output more portable for other
+		// databases when this function is called to produce DDL like in SHOW
+		// CREATE.
+		return t.TypeMeta.Name.FQName(false /* explicitCatalog */)
+	case TupleFamily:
+		if t.UserDefined() {
+			// We do not expect to be in a situation where we want to format a
+			// user-defined type to a string and do not have the TypeMeta hydrated,
+			// but there have been bugs in the past, and returning a less informative
+			// string is better than a nil-pointer panic.
+			if t.TypeMeta.Name == nil {
+				return fmt.Sprintf("@%d", t.Oid())
+			}
+			// Do not include the catalog name. We do not allow a table to reference
+			// a type in another database, so it will always be for the current database.
+			// Removing the catalog name makes the output more portable for other
+			// databases when this function is called to produce DDL like in SHOW
+			// CREATE.
+			return t.TypeMeta.Name.FQName(false /* explicitCatalog */)
+		}
+		return strings.ToUpper(t.Name())
+	case PGVectorFamily:
+		if t.Width() == 0 {
+			return "VECTOR"
+		}
+		return fmt.Sprintf("VECTOR(%d)", t.Width())
 	}
 	return strings.ToUpper(t.Name())
+}
+
+// SQLStringFullyQualified is a wrapper for SQLString() for when we need the
+// type name to be a fully-qualified 3-part name.
+func (t *T) SQLStringFullyQualified() string {
+	if t.UserDefined() {
+		switch t.Family() {
+		case ArrayFamily:
+			return t.ArrayContents().SQLStringFullyQualified() + "[]"
+		default:
+			if t.TypeMeta.Name != nil {
+				// Include the catalog in the type name. This is necessary to properly
+				// resolve the type, as some code paths require the database name to
+				// correctly distinguish cross-database references.
+				return t.TypeMeta.Name.FQName(true /* explicitCatalog */)
+			}
+		}
+	}
+	return t.SQLString()
 }
 
 // SQLStringForError returns a version of SQLString that will preserve safe
 // information during redaction. It is suitable for usage in error messages.
 func (t *T) SQLStringForError() redact.RedactableString {
+	if t == nil {
+		return "<nil>"
+	}
 	if t.UserDefined() {
 		// Show the redacted SQLString output with an un-redacted prefix to indicate
 		// that the type is user defined (and possibly enum or record).
@@ -1968,7 +2136,7 @@ func (t *T) SQLStringForError() redact.RedactableString {
 		IntervalFamily, StringFamily, BytesFamily, TimestampTZFamily, CollatedStringFamily, OidFamily,
 		UnknownFamily, UuidFamily, INetFamily, TimeFamily, JsonFamily, TimeTZFamily, BitFamily,
 		GeometryFamily, GeographyFamily, Box2DFamily, VoidFamily, EncodedKeyFamily, TSQueryFamily,
-		TSVectorFamily, AnyFamily, PGLSNFamily:
+		TSVectorFamily, AnyFamily, PGLSNFamily, PGVectorFamily, RefCursorFamily:
 		// These types do not contain other types, and do not require redaction.
 		return redact.Sprint(redact.SafeString(t.SQLString()))
 	}
@@ -1980,7 +2148,7 @@ func (t *T) SQLStringForError() redact.RedactableString {
 // type name. The logic for proper formatting lives in the tree package.
 var FormatTypeName = fallbackFormatTypeName
 
-func fallbackFormatTypeName(UserDefinedTypeName) string {
+func fallbackFormatTypeName(UserDefinedTypeName, bool) string {
 	return "formatting logic has not been injected from tree"
 }
 
@@ -2100,6 +2268,38 @@ func (t *T) Identical(other *T) bool {
 // Equal is for use in generated protocol buffer code only.
 func (t *T) Equal(other *T) bool {
 	return t.Identical(other)
+}
+
+// IsWildcardType returns true if the type is only used as a wildcard during
+// static analysis, and cannot be used during execution.
+func (t *T) IsWildcardType() bool {
+	for _, wildcard := range []*T{
+		Any, AnyArray, AnyCollatedString, AnyEnum, AnyEnumArray, AnyTuple, AnyTupleArray,
+	} {
+		// Note that pointer comparison is insufficient since we might have
+		// deserialized t from disk.
+		if t.Identical(wildcard) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsPolymorphicType returns true if the type can be used as the parameter or
+// return-type of a polymorphic function. Note that this does not include RECORD
+// (AnyTuple) or RECORD[].
+func (t *T) IsPolymorphicType() bool {
+	for _, poly := range []*T{Any, AnyArray, AnyEnum, AnyEnumArray} {
+		if t.Identical(poly) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsPseudoType returns true if the type is a pseudotype.
+func (t *T) IsPseudoType() bool {
+	return t.Identical(Trigger) || t.IsPolymorphicType()
 }
 
 // Size returns the size, in bytes, of this type once it has been marshaled to
@@ -2639,6 +2839,8 @@ func (t *T) IsNumeric() bool {
 	}
 }
 
+var EnumValueNotFound = errors.New("could not find enum value")
+
 // EnumGetIdxOfPhysical returns the index within the TypeMeta's slice of
 // enum physical representations that matches the input byte slice.
 func (t *T) EnumGetIdxOfPhysical(phys []byte) (int, error) {
@@ -2651,15 +2853,18 @@ func (t *T) EnumGetIdxOfPhysical(phys []byte) (int, error) {
 			return i, nil
 		}
 	}
-	err := errors.Newf(
+	err := errors.Wrapf(EnumValueNotFound,
 		"could not find %v in enum %q representation %s %s",
 		phys,
-		t.TypeMeta.Name.FQName(),
+		t.TypeMeta.Name.FQName(true /* explicitCatalog */),
 		t.TypeMeta.EnumData.debugString(),
-		debug.Stack(),
+		debugutil.Stack(),
 	)
 	return 0, err
 }
+
+// EnumValueNotYetPublicError enum value is not public yet.
+var EnumValueNotYetPublicError = pgerror.New(pgcode.InvalidParameterValue, "enum value is not yet public")
 
 // EnumGetIdxOfLogical returns the index within the TypeMeta's slice of
 // enum logical representations that matches the input string.
@@ -2673,7 +2878,7 @@ func (t *T) EnumGetIdxOfLogical(logical string) (int, error) {
 			// written until all nodes in the cluster are able to decode the
 			// physical representation.
 			if t.TypeMeta.EnumData.IsMemberReadOnly[i] {
-				return 0, errors.Newf("enum value %q is not yet public", logical)
+				return 0, errors.WithMessagef(EnumValueNotYetPublicError, "cannot use enum value %q", logical)
 			}
 			return i, nil
 		}
@@ -2708,6 +2913,8 @@ func IsValidArrayElementType(t *T) (valid bool, issueNum int) {
 		return false, 90886
 	case TSVectorFamily:
 		return false, 90886
+	case PGVectorFamily:
+		return false, 121432
 	default:
 		return true, 0
 	}
@@ -2764,13 +2971,6 @@ func IsWildcardTupleType(t *T) bool {
 	return len(t.TupleContents()) == 1 && t.TupleContents()[0].Family() == AnyFamily
 }
 
-// IsRecordType returns true if this is a RECORD type. This should only be used
-// when processing UDFs. A record differs from AnyTuple in that the tuple
-// contents may contain types other than Any.
-func IsRecordType(typ *T) bool {
-	return typ.Family() == TupleFamily && typ.Oid() == oid.T_record
-}
-
 // collatedStringTypeSQL returns the string representation of a COLLATEDSTRING
 // or []COLLATEDSTRING type. This is tricky in the case of an array of collated
 // string, since brackets must precede the COLLATE identifier:
@@ -2797,6 +2997,9 @@ func (t *T) stringTypeSQL() string {
 	case oid.T_varchar:
 		typName = "VARCHAR"
 	case oid.T_bpchar:
+		if t.Width() == 0 {
+			return "BPCHAR"
+		}
 		typName = "CHAR"
 	case oid.T_char:
 		// Yes, that's the name. The ways of PostgreSQL are inscrutable.
@@ -2934,7 +3137,6 @@ var postgresPredefinedTypeIssues = map[string]int{
 	"macaddr8":      45813,
 	"money":         41578,
 	"path":          21286,
-	"pg_lsn":        -1,
 	"txid_snapshot": -1,
 	"xml":           43355,
 }
@@ -2960,6 +3162,11 @@ func (t *T) Delimiter() string {
 	switch t.Family() {
 	case Geometry.Family(), Geography.Family():
 		return ":"
+	case ArrayFamily:
+		if t.Oid() == oidext.T__geometry || t.Oid() == oidext.T__geography {
+			return ":"
+		}
+		return ","
 	default:
 		return ","
 	}

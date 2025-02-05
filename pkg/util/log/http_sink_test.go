@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -14,20 +9,23 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
-	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -53,18 +51,17 @@ func testBase(
 	fn func(header http.Header, body string) error,
 	hangServer bool,
 	deadline time.Duration,
+	recall time.Duration,
 ) {
 	sc := ScopeWithoutShowLogs(t)
 	defer sc.Close(t)
 
-	// cancelCh ensures that async goroutines terminate if the test
-	// goroutine terminates due to a Fatal call or a panic.
-	cancelCh := make(chan struct{})
-	defer func() { close(cancelCh) }()
+	logHangWg := sync.WaitGroup{}
+	logHangWg.Add(1)
 
 	// seenMessage is true after the request predicate
 	// has seen the expected message from the client.
-	var seenMessage syncutil.AtomicBool
+	var seenMessage atomic.Bool
 
 	handler := func(rw http.ResponseWriter, r *http.Request) {
 		buf := make([]byte, 5000)
@@ -78,57 +75,23 @@ func testBase(
 		if hangServer {
 			// The test is requesting the server to simulate a timeout. Just
 			// do nothing until the test terminates.
-			<-cancelCh
+			logHangWg.Wait()
 		} else {
 			// The test is expecting some message via a predicate.
 			if err := fn(r.Header, string(buf)); err != nil {
 				// non-failing, in case there are extra log messages generated
 				t.Log(err)
 			} else {
-				seenMessage.Set(true)
+				seenMessage.Store(true)
 			}
 		}
 	}
 
-	{
-		// Start the HTTP server that receives the logging events from the
-		// test.
-
-		l, err := net.Listen("tcp", "127.0.0.1:")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, port, err := addr.SplitHostPort(l.Addr().String(), "port")
-		if err != nil {
-			t.Fatal(err)
-		}
-		*defaults.Address += ":" + port
-		s := http.Server{Handler: http.HandlerFunc(handler)}
-
-		// serverErrCh collects errors and signals the termination of the
-		// server async goroutine.
-		serverErrCh := make(chan error, 1)
-		go func() {
-			defer func() { close(serverErrCh) }()
-			err := s.Serve(l)
-			if !errors.Is(err, http.ErrServerClosed) {
-				select {
-				case serverErrCh <- err:
-				case <-cancelCh:
-				}
-			}
-		}()
-
-		// At the end of this function, close the server
-		// allowing the above goroutine to finish and close serverClosedCh
-		// allowing the deferred read to proceed and this function to return.
-		// (Basically, it's a WaitGroup of one.)
-		defer func() {
-			require.NoError(t, s.Close())
-			serverErr := <-serverErrCh
-			require.NoError(t, serverErr)
-		}()
-	}
+	// Start the HTTP server that receives the logging events from the
+	// test.
+	s2 := httptest.NewServer(http.HandlerFunc(handler))
+	defer s2.Close()
+	defaults.Address = &s2.URL
 
 	// Set up a logging configuration with the server we've just set up
 	// as target for the OPS channel.
@@ -144,7 +107,7 @@ func testBase(
 
 	// Apply the configuration.
 	TestingResetActive()
-	cleanup, err := ApplyConfig(cfg)
+	cleanup, err := ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	require.NoError(t, err)
 	defer cleanup()
 
@@ -153,21 +116,35 @@ func testBase(
 	Ops.Infof(context.Background(), "hello world")
 	logDuration := timeutil.Since(logStart)
 
-	// Note: deadline is passed by the caller and already contains slack
-	// to accommodate for the overhead of the logging call compared to
-	// the timeout in the HTTP request.
-	if deadline > 0 && logDuration > deadline {
-		t.Error("Log call exceeded timeout")
+	if deadline > 0 {
+		// Note: deadline is passed by the caller and already contains slack
+		// to accommodate for the overhead of the logging call compared to
+		// the timeout in the HTTP request.
+		require.LessOrEqualf(t, logDuration, deadline,
+			"Log call exceeded timeout, expected to be less than %s, got %s", deadline.String(), logDuration.String())
+		// If we don't properly hang in the handler when we want to test a
+		// timeout, we'll just log very quickly. This check ensures that we
+		// catch that testing error.
+		require.Greaterf(t, logDuration, *defaults.Timeout,
+			"Log call was too fast, expected to be greater than %s, got %s", defaults.Timeout.String(), logDuration.String())
 	}
 
 	if hangServer {
+		logHangWg.Done()
 		return
+	}
+
+	// Issue a second log event if recall is specified so that the test can be
+	// run again.
+	if recall > 0 {
+		time.Sleep(recall)
+		Ops.Infof(context.Background(), "hello world")
 	}
 
 	// If the test was not requiring a timeout, it was requiring some
 	// logging message to match the predicate. If we don't see the
 	// predicate match, it is a test failure.
-	if !seenMessage.Get() {
+	if !seenMessage.Load() {
 		t.Error("expected message matching predicate, found none")
 	}
 }
@@ -176,11 +153,9 @@ func testBase(
 func TestMessageReceived(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	address := "http://localhost" // testBase appends the port
 	timeout := 5 * time.Second
 	tb := true
 	defaults := logconfig.HTTPDefaults{
-		Address:     &address,
 		Timeout:     &timeout,
 		Compression: &logconfig.NoneCompression,
 
@@ -200,7 +175,7 @@ func TestMessageReceived(t *testing.T) {
 		return nil
 	}
 
-	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0))
+	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0), time.Duration(0))
 }
 
 // TestHTTPSinkTimeout verifies that a log call to a hanging server doesn't last
@@ -208,11 +183,9 @@ func TestMessageReceived(t *testing.T) {
 func TestHTTPSinkTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	address := "http://localhost" // testBase appends the port
-	timeout := time.Millisecond
+	timeout := time.Millisecond * 100
 	tb := true
 	defaults := logconfig.HTTPDefaults{
-		Address: &address,
 		Timeout: &timeout,
 
 		// We need to disable keepalives otherwise the HTTP server in the
@@ -223,7 +196,7 @@ func TestHTTPSinkTimeout(t *testing.T) {
 		},
 	}
 
-	testBase(t, defaults, nil /* testFn */, true /* hangServer */, 500*time.Millisecond)
+	testBase(t, defaults, nil /* testFn */, true /* hangServer */, 10*time.Second, time.Duration(0))
 }
 
 // TestHTTPSinkContentTypeJSON verifies that the HTTP sink content type
@@ -231,13 +204,11 @@ func TestHTTPSinkTimeout(t *testing.T) {
 func TestHTTPSinkContentTypeJSON(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	address := "http://localhost" // testBase appends the port
 	timeout := 5 * time.Second
 	tb := true
 	format := "json-fluent"
 	expectedContentType := "application/json"
 	defaults := logconfig.HTTPDefaults{
-		Address: &address,
 		Timeout: &timeout,
 
 		// We need to disable keepalives otherwise the HTTP server in the
@@ -258,7 +229,7 @@ func TestHTTPSinkContentTypeJSON(t *testing.T) {
 		return nil
 	}
 
-	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0))
+	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0), time.Duration(0))
 }
 
 // TestHTTPSinkContentTypePlainText verifies that the HTTP sink content type
@@ -266,13 +237,11 @@ func TestHTTPSinkContentTypeJSON(t *testing.T) {
 func TestHTTPSinkContentTypePlainText(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	address := "http://localhost" // testBase appends the port
 	timeout := 5 * time.Second
 	tb := true
 	format := "crdb-v1"
 	expectedContentType := "text/plain"
 	defaults := logconfig.HTTPDefaults{
-		Address: &address,
 		Timeout: &timeout,
 
 		// We need to disable keepalives otherwise the HTTP server in the
@@ -293,20 +262,25 @@ func TestHTTPSinkContentTypePlainText(t *testing.T) {
 		return nil
 	}
 
-	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0))
+	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0), time.Duration(0))
 }
 
 func TestHTTPSinkHeadersAndCompression(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	address := "http://localhost" // testBase appends the port
 	timeout := 5 * time.Second
 	tb := true
 	format := "json"
 	expectedContentType := "application/json"
 	expectedContentEncoding := logconfig.GzipCompression
+	val := "secret-value"
+	filepathVal := "another-secret-value"
+	filepathReplaceVal := "third-secret-value"
+	// Test filepath method of providing header values.
+	tempDir := t.TempDir()
+	filename := filepath.Join(tempDir, "filepath_test.txt")
+	require.NoError(t, os.WriteFile(filename, []byte(filepathVal), 0777))
 	defaults := logconfig.HTTPDefaults{
-		Address: &address,
 		Timeout: &timeout,
 
 		// We need to disable keepalives otherwise the HTTP server in the
@@ -318,9 +292,12 @@ func TestHTTPSinkHeadersAndCompression(t *testing.T) {
 		},
 
 		Compression: &logconfig.GzipCompression,
-		Headers:     map[string]string{"X-CRDB-TEST": "secret-value"},
+		// Provide both the old format and new format in order to test backwards compatability.
+		Headers:          map[string]string{"X-CRDB-TEST": val},
+		FileBasedHeaders: map[string]string{"X-CRDB-TEST-2": filename},
 	}
 
+	var callCt int
 	testFn := func(header http.Header, body string) error {
 		t.Log(body)
 		contentType := header.Get("Content-Type")
@@ -340,17 +317,36 @@ func TestHTTPSinkHeadersAndCompression(t *testing.T) {
 		if !isGzipped([]byte(body)) {
 			return errors.New("expected gzipped body")
 		}
+		var matchCount int
+		filepathExpectedVal := filepathVal
+		if callCt > 0 {
+			filepathExpectedVal = filepathReplaceVal
+		}
 		for k, v := range header {
-			if k == "X-Crdb-Test" {
+			if k == "X-Crdb-Test" || k == "X-Crdb-Test-2" {
 				for _, vv := range v {
-					if vv == "secret-value" {
-						return nil
+					if vv == "secret-value" || vv == filepathExpectedVal {
+						matchCount++
 					}
 				}
 			}
 		}
-		return errors.New("expected to find special header in request")
+		if matchCount != 2 {
+			return errors.New("expected to find special header in request")
+		}
+		// If this is the first time the testFn has been called, update file contents and send SIGHUP.
+		if callCt == 0 {
+			callCt++
+			if err := os.WriteFile(filename, []byte(filepathReplaceVal), 0777); err != nil {
+				return err
+			}
+			t.Log("issuing SIGHUP")
+			if err := unix.Kill(unix.Getpid(), unix.SIGHUP); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nil
 	}
 
-	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0))
+	testBase(t, defaults, testFn, false /* hangServer */, time.Duration(0), 1*time.Second)
 }

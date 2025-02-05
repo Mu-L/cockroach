@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package span
 
@@ -16,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
@@ -44,20 +40,36 @@ func NoopSplitter() Splitter {
 // MakeSplitter returns a Splitter that splits spans into more specific spans
 // for the needed families. If span splitting is not possible/useful, returns
 // the NoopSplitter (which never splits).
-// Note: this splitter should **not** be used for deletes.
+// Note: this splitter should **not** be used for deletes or locking reads.
 func MakeSplitter(
 	table catalog.TableDescriptor, index catalog.Index, neededColOrdinals intsets.Fast,
 ) Splitter {
-	return MakeSplitterForDelete(table, index, neededColOrdinals, false /* forDelete */)
+	return MakeSplitterBase(table, index, neededColOrdinals, false, /* forDelete */
+		false /* forSideEffect */)
 }
 
-// MakeSplitterForDelete is the same as MakeSplitter but additionally specifies
-// whether the splitter will be used for deletes.
+func MakeSplitterForSideEffect(
+	table catalog.TableDescriptor, index catalog.Index, neededColOrdinals intsets.Fast,
+) Splitter {
+	return MakeSplitterBase(table, index, neededColOrdinals, false, /* forDelete */
+		true /* forSideEffect */)
+}
+
 func MakeSplitterForDelete(
+	table catalog.TableDescriptor, index catalog.Index, neededColOrdinals intsets.Fast,
+) Splitter {
+	return MakeSplitterBase(table, index, neededColOrdinals, true, /* forDelete */
+		false /* forSideEffect */)
+}
+
+// MakeSplitterBase is the same as MakeSplitter but additionally specifies
+// whether the splitter will be used for deletes and/or side effects.
+func MakeSplitterBase(
 	table catalog.TableDescriptor,
 	index catalog.Index,
 	neededColOrdinals intsets.Fast,
 	forDelete bool,
+	forSideEffect bool,
 ) Splitter {
 	// We can only split a span into separate family specific point lookups if:
 	//
@@ -75,8 +87,8 @@ func MakeSplitterForDelete(
 	// If we're looking at a secondary index...
 	if index.GetID() != table.GetPrimaryIndexID() {
 
-		// * The index cannot be inverted.
-		if index.GetType() != descpb.IndexDescriptor_FORWARD {
+		// * The index must be a forward index.
+		if index.GetType() != idxtype.FORWARD {
 			return NoopSplitter()
 		}
 
@@ -86,7 +98,7 @@ func MakeSplitterForDelete(
 		}
 	}
 
-	neededFamilies := rowenc.NeededColumnFamilyIDs(neededColOrdinals, table, index)
+	neededFamilies := rowenc.NeededColumnFamilyIDs(neededColOrdinals, table, index, forSideEffect)
 
 	// Sanity check.
 	for i := range neededFamilies[1:] {

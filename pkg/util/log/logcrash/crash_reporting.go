@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package logcrash
 
@@ -53,15 +48,16 @@ var (
 	// Doing this, rather than just using a default of `true`, means that a node
 	// will not errantly send a report using a default before loading settings.
 	DiagnosticsReportingEnabled = settings.RegisterBoolSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"diagnostics.reporting.enabled",
-		"enable reporting diagnostic metrics to cockroach labs",
-		false,
-		settings.WithPublic)
+		"enable reporting diagnostic metrics to cockroach labs, but is ignored for Trial or Free licenses",
+		true,
+		settings.WithPublic,
+	)
 
 	// CrashReports wraps "diagnostics.reporting.send_crash_reports.enabled".
 	CrashReports = settings.RegisterBoolSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"diagnostics.reporting.send_crash_reports",
 		"send crash and panic reports",
 		true,
@@ -70,7 +66,7 @@ var (
 
 	// PanicOnAssertions wraps "debug.panic_on_failed_assertions.enabled"
 	PanicOnAssertions = settings.RegisterBoolSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"debug.panic_on_failed_assertions",
 		"panic when an assertion fails rather than reporting",
 		false,
@@ -91,6 +87,11 @@ var (
 	// used for code paths where the container is not available.
 	globalSettings atomic.Value
 )
+
+func init() {
+	// Inject ReportOrPanic into the log package.
+	log.SetReportOrPanicFn(ReportOrPanic)
+}
 
 // SetGlobalSettings sets the *settings.Values container that will be refreshed
 // at runtime -- ideally we should have no other *Values containers floating
@@ -195,7 +196,7 @@ func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth 
 
 	// Ensure that the logs are flushed before letting a panic
 	// terminate the server.
-	log.Flush()
+	log.FlushAllSync()
 }
 
 // PanicAsError turns r into an error if it is not one already.

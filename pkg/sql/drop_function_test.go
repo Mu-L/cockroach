@@ -1,17 +1,13 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
 import (
 	"context"
+	"regexp"
 	"sort"
 	"strconv"
 	"testing"
@@ -147,7 +143,7 @@ SELECT nextval(105:::REGCLASS);`,
 	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 		_, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, 109)
 		require.Error(t, err)
-		require.Regexp(t, "function undefined", err.Error())
+		require.Regexp(t, regexp.MustCompile(`function \d+ does not exist`), err.Error())
 
 		// Make sure columns and indexes has correct back references.
 		tn := tree.MakeTableNameWithSchema("defaultdb", "public", "t")
@@ -398,7 +394,7 @@ $$;
 			err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 				_, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, 113)
 				require.Error(t, err)
-				require.Regexp(t, "function undefined", err.Error())
+				require.Regexp(t, regexp.MustCompile(`function \d+ does not exist`), err.Error())
 				return nil
 			})
 			require.NoError(t, err)
@@ -431,7 +427,7 @@ $$;
 			err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
 				_, err := col.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, 113)
 				require.Error(t, err)
-				require.Regexp(t, "function undefined", err.Error())
+				require.Regexp(t, regexp.MustCompile(`function \d+ does not exist`), err.Error())
 				return nil
 			})
 			require.NoError(t, err)

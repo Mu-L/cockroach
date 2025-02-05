@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package concurrency_test
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/poison"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -85,6 +81,10 @@ func scanUserPriority(t *testing.T, d *datadriven.TestData) roachpb.UserPriority
 func scanLockDurability(t *testing.T, d *datadriven.TestData) lock.Durability {
 	var durS string
 	d.ScanArgs(t, "dur", &durS)
+	return getLockDurability(t, d, durS)
+}
+
+func getLockDurability(t *testing.T, d *datadriven.TestData, durS string) lock.Durability {
 	switch durS {
 	case "r":
 		return lock.Replicated
@@ -94,6 +94,12 @@ func scanLockDurability(t *testing.T, d *datadriven.TestData) lock.Durability {
 		d.Fatalf(t, "unknown lock durability: %s", durS)
 		return 0
 	}
+}
+
+func scanLockStrength(t *testing.T, d *datadriven.TestData) lock.Strength {
+	var strS string
+	d.ScanArgs(t, "str", &strS)
+	return concurrency.GetStrength(t, d, strS)
 }
 
 func scanWaitPolicy(t *testing.T, d *datadriven.TestData, required bool) lock.WaitPolicy {
@@ -114,6 +120,13 @@ func scanWaitPolicy(t *testing.T, d *datadriven.TestData, required bool) lock.Wa
 		d.Fatalf(t, "unknown wait policy: %s", policy)
 		return 0
 	}
+}
+
+func scanIgnoredSeqNumbers(t *testing.T, d *datadriven.TestData) []enginepb.IgnoredSeqNumRange {
+	if !d.HasArg("ignored-seqs") {
+		return nil
+	}
+	return concurrency.ScanIgnoredSeqNumbers(t, d)
 }
 
 func scanPoisonPolicy(t *testing.T, d *datadriven.TestData) poison.Policy {
@@ -169,12 +182,28 @@ func scanSingleRequest(
 		}
 		return enginepb.TxnSeq(n)
 	}
+	maybeGetStr := func() lock.Strength {
+		s, ok := fields["str"]
+		if !ok {
+			return lock.None
+		}
+		return concurrency.GetStrength(t, d, s)
+	}
+	maybeGetDur := func() lock.Durability {
+		s, ok := fields["dur"]
+		if !ok {
+			return lock.Unreplicated
+		}
+		return getLockDurability(t, d, s)
+	}
 
 	switch cmd {
 	case "get":
 		var r kvpb.GetRequest
 		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
+		r.KeyLockingStrength = maybeGetStr()
+		r.KeyLockingDurability = maybeGetDur()
 		return &r
 
 	case "scan":
@@ -184,6 +213,8 @@ func scanSingleRequest(
 		if v, ok := fields["endkey"]; ok {
 			r.EndKey = roachpb.Key(v)
 		}
+		r.KeyLockingStrength = maybeGetStr()
+		r.KeyLockingDurability = maybeGetDur()
 		return &r
 
 	case "put":
@@ -210,6 +241,11 @@ func scanSingleRequest(
 		if v, ok := fields["endkey"]; ok {
 			r.EndKey = roachpb.Key(v)
 		}
+		return &r
+
+	case "refresh":
+		var r kvpb.RefreshRequest
+		r.Key = roachpb.Key(mustGetField("key"))
 		return &r
 
 	default:

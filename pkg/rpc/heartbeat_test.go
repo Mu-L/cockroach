@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rpc
 
@@ -22,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -56,7 +50,7 @@ func TestHeartbeatReply(t *testing.T) {
 
 	request := &PingRequest{
 		Ping:          "testPing",
-		ServerVersion: st.Version.BinaryVersion(),
+		ServerVersion: st.Version.LatestVersion(),
 	}
 	response, err := heartbeat.Ping(context.Background(), request)
 	if err != nil {
@@ -140,7 +134,7 @@ func TestManualHeartbeat(t *testing.T) {
 
 	request := &PingRequest{
 		Ping:          "testManual",
-		ServerVersion: st.Version.BinaryVersion(),
+		ServerVersion: st.Version.LatestVersion(),
 	}
 	manualHeartbeat.ready <- nil
 	ctx := context.Background()
@@ -196,7 +190,7 @@ func TestClusterIDCompare(t *testing.T) {
 			request := &PingRequest{
 				Ping:          "testPing",
 				ClusterID:     &td.clientClusterID,
-				ServerVersion: st.Version.BinaryVersion(),
+				ServerVersion: st.Version.LatestVersion(),
 			}
 			_, err := heartbeat.Ping(context.Background(), request)
 			if td.expectError && err == nil {
@@ -241,7 +235,7 @@ func TestNodeIDCompare(t *testing.T) {
 			request := &PingRequest{
 				Ping:          "testPing",
 				TargetNodeID:  td.clientNodeID,
-				ServerVersion: st.Version.BinaryVersion(),
+				ServerVersion: st.Version.LatestVersion(),
 			}
 			_, err := heartbeat.Ping(context.Background(), request)
 			if td.expectError && err == nil {
@@ -262,8 +256,8 @@ func TestTenantVersionCheck(t *testing.T) {
 	clock := timeutil.NewManualTime(timeutil.Unix(0, 5))
 	maxOffset := time.Nanosecond
 	st := cluster.MakeTestingClusterSettingsWithVersions(
-		clusterversion.TestingBinaryVersion,
-		clusterversion.TestingBinaryMinSupportedVersion,
+		clusterversion.Latest.Version(),
+		clusterversion.MinSupported.Version(),
 		true /* initialize */)
 	heartbeat := &HeartbeatService{
 		clock:              clock,
@@ -274,7 +268,7 @@ func TestTenantVersionCheck(t *testing.T) {
 
 	request := &PingRequest{
 		Ping:          "testPing",
-		ServerVersion: st.Version.BinaryMinSupportedVersion(),
+		ServerVersion: st.Version.MinSupportedVersion(),
 	}
 	const failedRE = `version compatibility check failed on ping request:` +
 		` cluster requires at least version .*, but peer has version .*`
@@ -295,84 +289,4 @@ func TestTenantVersionCheck(t *testing.T) {
 		_, err := heartbeat.Ping(tenantCtx, request)
 		require.NoError(t, err)
 	})
-}
-
-// HeartbeatStreamService is like HeartbeatService, but it implements the
-// TestingHeartbeatStreamServer interface in addition to the HeartbeatServer
-// interface. Instead of providing a request-response model, the service reads
-// on its input stream and periodically sends on its output stream with its
-// latest ping response. This means that even if the service stops receiving
-// requests, it will continue to send responses.
-type HeartbeatStreamService struct {
-	HeartbeatService
-	interval time.Duration
-}
-
-func (hss *HeartbeatStreamService) PingStream(
-	stream TestingHeartbeatStream_PingStreamServer,
-) error {
-	ctx := stream.Context()
-
-	// Launch a goroutine to read from the stream and construct responses.
-	respC := make(chan *PingResponse)
-	recvErrC := make(chan error, 1)
-	sendErrC := make(chan struct{})
-	go func() {
-		for {
-			ping, err := stream.Recv()
-			if err != nil {
-				recvErrC <- err
-				return
-			}
-			resp, err := hss.Ping(ctx, ping)
-			if err != nil {
-				recvErrC <- err
-				return
-			}
-			select {
-			case respC <- resp:
-				continue
-			case <-sendErrC:
-				return
-			}
-		}
-	}()
-
-	// Launch a timer to periodically send the ping responses, even if the
-	// response has not been updated.
-	t := time.NewTicker(hss.interval)
-	defer t.Stop()
-
-	var resp *PingResponse
-	for {
-		select {
-		case <-t.C:
-			if resp != nil {
-				err := stream.Send(resp)
-				if err != nil {
-					close(sendErrC)
-					return err
-				}
-			}
-		case resp = <-respC:
-			// Update resp.
-		case err := <-recvErrC:
-			return err
-		}
-	}
-}
-
-// lockedPingStreamClient is an implementation of
-// HeartbeatStream_PingStreamClient which provides support for concurrent calls
-// to Send. Note that the default implementation of grpc.Stream for server
-// responses (grpc.serverStream) is not safe for concurrent calls to Send.
-type lockedPingStreamClient struct {
-	TestingHeartbeatStream_PingStreamClient
-	sendMu syncutil.Mutex
-}
-
-func (c *lockedPingStreamClient) Send(req *PingRequest) error {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	return c.TestingHeartbeatStream_PingStreamClient.Send(req)
 }

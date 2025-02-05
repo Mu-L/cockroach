@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package contention
 
@@ -199,15 +194,16 @@ func (s *eventStore) startEventIntake(ctx context.Context, stopper *stop.Stopper
 }
 
 func (s *eventStore) startResolver(ctx context.Context, stopper *stop.Stopper) {
+	// Handles resolution interval changes.
+	var resolutionIntervalChanged = make(chan struct{}, 1)
+	TxnIDResolutionInterval.SetOnChange(&s.st.SV, func(ctx context.Context) {
+		resolutionIntervalChanged <- struct{}{}
+	})
+
 	_ = stopper.RunAsyncTask(ctx, "contention-event-resolver", func(ctx context.Context) {
-		// Handles resolution interval changes.
-		var resolutionIntervalChanged = make(chan struct{}, 1)
-		TxnIDResolutionInterval.SetOnChange(&s.st.SV, func(ctx context.Context) {
-			resolutionIntervalChanged <- struct{}{}
-		})
 
 		initialDelay := s.resolutionIntervalWithJitter()
-		timer := timeutil.NewTimer()
+		var timer timeutil.Timer
 		defer timer.Stop()
 
 		timer.Reset(initialDelay)
@@ -244,10 +240,10 @@ func (s *eventStore) addEvent(e contentionpb.ExtendedContentionEvent) {
 
 	// If the duration threshold is set, we only collect contention events whose
 	// duration exceeds the threshold.
-	if threshold := DurationThreshold.Get(&s.st.SV); threshold > 0 {
-		if e.BlockingEvent.Duration < threshold {
-			return
-		}
+	threshold := DurationThreshold.Get(&s.st.SV)
+	if e.ContentionType != contentionpb.ContentionType_SERIALIZATION_CONFLICT &&
+		threshold > 0 && e.BlockingEvent.Duration < threshold {
+		return
 	}
 
 	s.guard.AtomicWrite(func(writerIdx int64) {

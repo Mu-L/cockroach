@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 
+# Copyright 2022 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -xeuo pipefail
 
 dir="$(dirname $(dirname $(dirname $(dirname "${0}"))))"
 source "$dir/teamcity-support.sh"  # For log_into_gcloud
 
-bazel build //pkg/cmd/bazci --config=ci
-BAZEL_BIN=$(bazel info bazel-bin --config=ci)
+bazel build //pkg/cmd/bazci
+BAZEL_BIN=$(bazel info bazel-bin)
 
 ARTIFACTS_DIR=/artifacts
 
@@ -51,6 +57,7 @@ bazel_test_env=(--test_env=GO_TEST_WRAP_TESTV=1 \
   --test_env=AZURE_CLIENT_SECRET="$AZURE_CLIENT_SECRET" \
   --test_env=AZURE_TENANT_ID="$AZURE_TENANT_ID" \
   --test_env=AZURE_VAULT_NAME="$AZURE_VAULT_NAME" \
+  --test_env=AZURE_LIMITED_VAULT_NAME="$AZURE_LIMITED_VAULT_NAME" \
   --test_env=AZURE_KMS_KEY_NAME="$AZURE_KMS_KEY_NAME" \
   --test_env=AZURE_KMS_KEY_VERSION="$AZURE_KMS_KEY_VERSION")
 exit_status=0
@@ -63,7 +70,7 @@ $BAZEL_BIN/pkg/cmd/bazci/bazci_/bazci -- test --config=ci \
     || exit_status=$?
 
 $BAZEL_BIN/pkg/cmd/bazci/bazci_/bazci -- test --config=ci \
-    //pkg/ccl/backupccl:backupccl_test --test_filter='^TestCloudBackupRestore' \
+    //pkg/backup:backup_test --test_filter='^TestCloudBackupRestore' \
     "${bazel_test_env[@]}" \
     --test_timeout=900 \
     || exit_status=$?

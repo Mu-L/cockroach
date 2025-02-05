@@ -1,20 +1,18 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/errors"
 )
 
 // RoutinePlanGenerator generates a plan for the execution of each statement
@@ -28,12 +26,15 @@ type RoutinePlanGenerator func(
 ) error
 
 // RoutinePlanGeneratedFunc is the function type that is called for each plan
-// enumerated by a RoutinePlanGenerator. isFinalPlan is true if no more plans
-// will be generated after the current plan.
-type RoutinePlanGeneratedFunc func(plan RoutinePlan, isFinalPlan bool) error
+// enumerated by a RoutinePlanGenerator.
+// - stmtForDistSQLDiagram, if set, will be used when generating DistSQL diagram
+// to specify the SQL stmt corresponding to the plan.
+// - isFinalPlan is true if no more plans will be generated after the current
+// plan.
+type RoutinePlanGeneratedFunc func(plan RoutinePlan, stmtForDistSQLDiagram string, isFinalPlan bool) error
 
 // RoutinePlan represents a plan for a statement in a routine. It currently maps
-// to exec.Plan. We use the empty interface here rather then exec.Plan to avoid
+// to exec.Plan. We use the empty interface here rather than exec.Plan to avoid
 // import cycles.
 type RoutinePlan interface{}
 
@@ -120,9 +121,26 @@ type RoutineExpr struct {
 	// to avoid nesting execution. This is necessary for performant PLpgSQL loops.
 	TailCall bool
 
-	// ExceptionHandler holds the information needed to handle errors if an
-	// exception block was defined.
-	ExceptionHandler *RoutineExceptionHandler
+	// Procedure is true if the routine is a procedure being invoked by CALL.
+	Procedure bool
+
+	// TriggerFunc is true if this routine is a trigger function. Note that it is
+	// only set for the outermost routine, and not any sub-routines used to
+	// implement the PL/pgSQL body.
+	TriggerFunc bool
+
+	// BlockStart is true if this routine marks the start of a PL/pgSQL block with
+	// an exception handler. It determines when to initialize the state shared
+	// between sub-routines for the block.
+	BlockStart bool
+
+	// BlockState holds the information needed to coordinate error-handling
+	// between the sub-routines that make up a PLpgSQL exception block.
+	BlockState *BlockState
+
+	// CursorDeclaration contains the information needed to open a SQL cursor with
+	// the result of the *first* body statement. It may be unset.
+	CursorDeclaration *RoutineOpenCursor
 }
 
 // NewTypedRoutineExpr returns a new RoutineExpr that is well-typed.
@@ -136,7 +154,11 @@ func NewTypedRoutineExpr(
 	multiColOutput bool,
 	generator bool,
 	tailCall bool,
-	exceptionHandler *RoutineExceptionHandler,
+	procedure bool,
+	triggerFunc bool,
+	blockStart bool,
+	blockState *BlockState,
+	cursorDeclaration *RoutineOpenCursor,
 ) *RoutineExpr {
 	return &RoutineExpr{
 		Args:              args,
@@ -148,7 +170,11 @@ func NewTypedRoutineExpr(
 		MultiColOutput:    multiColOutput,
 		Generator:         generator,
 		TailCall:          tailCall,
-		ExceptionHandler:  exceptionHandler,
+		Procedure:         procedure,
+		TriggerFunc:       triggerFunc,
+		BlockStart:        blockStart,
+		BlockState:        blockState,
+		CursorDeclaration: cursorDeclaration,
 	}
 }
 
@@ -166,7 +192,8 @@ func (node *RoutineExpr) ResolvedType() *types.T {
 
 // Format is part of the Expr interface.
 func (node *RoutineExpr) Format(ctx *FmtCtx) {
-	ctx.Printf("%s(", node.Name)
+	ctx.FormatName(node.Name)
+	ctx.WriteByte('(')
 	ctx.FormatNode(&node.Args)
 	ctx.WriteByte(')')
 }
@@ -180,9 +207,173 @@ func (node *RoutineExpr) Walk(v Visitor) Expr {
 // RoutineExceptionHandler encapsulates the information needed to match and
 // handle errors for the exception block of a routine defined with PLpgSQL.
 type RoutineExceptionHandler struct {
-	// Codes is a list of pgcode strings used to match exceptions.
+	// Codes is a list of pgcode strings used to match exceptions. Note that as a
+	// special case, the code may be "OTHERS", which matches most error codes.
 	Codes []pgcode.Code
 
 	// Actions contains a routine to handle each error code.
 	Actions []*RoutineExpr
+}
+
+// RoutineOpenCursor stores the information needed to correctly open a cursor
+// with the output of a routine.
+type RoutineOpenCursor struct {
+	// NameArgIdx is the index of the routine argument that contains the name of
+	// the cursor that will be created.
+	NameArgIdx int
+
+	// Scroll is the scroll option for the cursor, if one was specified. The other
+	// cursor options are not valid in PLpgSQL.
+	Scroll CursorScrollOption
+
+	// CursorSQL is a formatted string used to associate the original SQL
+	// statement with the cursor.
+	CursorSQL string
+}
+
+// BlockState is shared state between all routines that make up a PLpgSQL block.
+// It allows for coordination between the routines for exception handling.
+type BlockState struct {
+	// Parent is a pointer to this block's parent, if any. Note that this refers
+	// to a parent within the same routine; nested routine calls currently do not
+	// interact with one another directly (e.g. through TCO, see #119956).
+	Parent *BlockState
+
+	// VariableCount tracks the number of variables that are in scope for this
+	// block, so that the correct arguments can be supplied to an exception
+	// handler when an error originates from a "descendant" block. Example:
+	//
+	// DECLARE
+	//   x INT := 0;
+	// BEGIN
+	//   DECLARE
+	//     y INT := 1;
+	//   BEGIN
+	//     y = 1 // 0;
+	//   END;
+	// EXCEPTION WHEN division_by_zero THEN
+	//   RETURN 0;
+	// END
+	//
+	// In this example, the error is thrown from the inner block, where variables
+	// "x" and "y" are both in scope. Therefore, we will have access to values for
+	// both variables. However, the error will be caught by the outer block, for
+	// which only "x" is in scope. Therefore, the outer block must truncate the
+	// values before supplying them to its exception handler as arguments.
+	//
+	// NOTE: the list of variables in an outer block *always* form a prefix of the
+	// variables in a nested block.
+	VariableCount int
+
+	// ExceptionHandler is the exception handler for the current block, if any.
+	ExceptionHandler *RoutineExceptionHandler
+
+	// SavepointTok allows the exception handler to roll-back changes to database
+	// state if an error occurs during its execution. It currently maps to
+	// kv.SavepointToken. We use the empty interface here rather than
+	// kv.SavepointToken to avoid import cycles.
+	SavepointTok interface{}
+
+	// CursorTimestamp is the timestamp at which control transitioned into this
+	// PL/pgSQL block. It is used to close (only) cursors which were opened within
+	// the scope of the block when an exception is caught.
+	CursorTimestamp *time.Time
+}
+
+// StoredProcTxnOp indicates whether a stored procedure has requested that the
+// current transaction be committed or aborted.
+type StoredProcTxnOp uint8
+
+const (
+	StoredProcTxnNoOp StoredProcTxnOp = iota
+	StoredProcTxnCommit
+	StoredProcTxnRollback
+)
+
+// String returns a string representation of the transaction control statement.
+func (txnOp StoredProcTxnOp) String() string {
+	switch txnOp {
+	case StoredProcTxnNoOp:
+		return "NO-OP"
+	case StoredProcTxnCommit:
+		return "COMMIT"
+	case StoredProcTxnRollback:
+		return "ROLLBACK"
+	default:
+		panic(errors.AssertionFailedf("unknown txn control op: %d", txnOp))
+	}
+}
+
+// StoredProcContinuation represents the plan for a CALL statement that resumes
+// execution of a stored procedure that paused in order to execute a COMMIT or
+// ROLLBACK statement. Currently maps to *memo.Memo.
+type StoredProcContinuation interface{}
+
+// TxnControlPlanGenerator builds the plan for a StoredProcContinuation.
+type TxnControlPlanGenerator func(
+	ctx context.Context, args Datums,
+) (StoredProcContinuation, error)
+
+// TxnControlExpr implements PL/pgSQL COMMIT and ROLLBACK statements. It directs
+// the session to end the current transaction, and provides a plan to resume
+// execution in a new transaction in the form of StoredProcContinuation.
+type TxnControlExpr struct {
+	Op    StoredProcTxnOp
+	Modes TransactionModes
+	Args  TypedExprs
+	Gen   TxnControlPlanGenerator
+
+	Name string
+	Typ  *types.T
+}
+
+var _ Expr = &TxnControlExpr{}
+
+// NewTxnControlExpr returns a new TxnControlExpr that is well-typed.
+func NewTxnControlExpr(
+	opType StoredProcTxnOp,
+	txnModes TransactionModes,
+	args TypedExprs,
+	gen TxnControlPlanGenerator,
+	name string,
+	typ *types.T,
+) *TxnControlExpr {
+	return &TxnControlExpr{
+		Op:    opType,
+		Modes: txnModes,
+		Args:  args,
+		Gen:   gen,
+		Name:  name,
+		Typ:   typ,
+	}
+}
+
+// TypeCheck is part of the Expr interface.
+func (node *TxnControlExpr) TypeCheck(
+	ctx context.Context, semaCtx *SemaContext, desired *types.T,
+) (TypedExpr, error) {
+	return node, nil
+}
+
+// ResolvedType is part of the TypedExpr interface.
+func (node *TxnControlExpr) ResolvedType() *types.T {
+	return node.Typ
+}
+
+// Format is part of the Expr interface.
+func (node *TxnControlExpr) Format(ctx *FmtCtx) {
+	if buildutil.CrdbTestBuild {
+		if node.Op == StoredProcTxnNoOp {
+			panic(errors.AssertionFailedf("called Format for no-op txn control expr"))
+		}
+	}
+	ctx.Printf("%s; CALL %s(", node.Op, node.Name)
+	ctx.FormatNode(&node.Args)
+	ctx.WriteByte(')')
+}
+
+// Walk is part of the Expr interface.
+func (node *TxnControlExpr) Walk(v Visitor) Expr {
+	// Cannot walk into a TxnOp, so this is a no-op.
+	return node
 }

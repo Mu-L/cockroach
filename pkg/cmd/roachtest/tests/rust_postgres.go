@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -31,9 +26,15 @@ func registerRustPostgres(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
 
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+		// We hardcode port 5433 since that's the port rust-postgres expects.
+		startOpts := option.NewStartOpts(sqlClientsInMemoryDB)
+		startOpts.RoachprodOpts.SQLPort = 5433
+		// rust-postgres currently doesn't support changing the config through
+		// the environment, which means we can't pass it ssl connection details
+		// and must run the cluster in insecure mode.
+		// See: https://github.com/sfackler/rust-postgres/issues/654
+		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(install.SecureOption(false)), c.All())
 		db := c.Conn(ctx, t.L(), 1)
 		_, err := db.Exec("create user postgres with createdb createlogin createrole cancelquery")
 		if err != nil {
@@ -123,22 +124,12 @@ func registerRustPostgres(r registry.Registry) {
 		}
 		t.L().Printf("%s", status)
 
-		// We stop the cluster and restart with a port of 5433 since Rust postgres
-		// has all of it's test hardcoded to use that port.
-		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.All())
-
-		// Don't restart the cluster with automatic scheduled backups because roachprod's internal sql
-		// interface, through which the scheduled backup executes, is naive to the port change.
-		startOpts := option.DefaultStartOptsNoBackups()
-		startOpts.RoachprodOpts.ExtraArgs = []string{"--port=5433"}
-		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.All())
-
 		t.Status("Running rust-postgres test suite")
 
 		result, err := c.RunWithDetailsSingleNode(
 			ctx,
 			t.L(),
-			node,
+			option.WithNodes(node),
 			`cd /mnt/data1/rust-postgres && /home/ubuntu/.cargo/bin/cargo test 2>&1 > rustpostgres.stdout --no-fail-fast`)
 		if err != nil {
 			t.L().Printf("error during rust postgres run (may be ok): %v\n", err)
@@ -146,7 +137,7 @@ func registerRustPostgres(r registry.Registry) {
 
 		t.L().Printf("Test stdout for rust-postgres")
 		result, err = c.RunWithDetailsSingleNode(
-			ctx, t.L(), node, "cd /mnt/data1/rust-postgres && cat rustpostgres.stdout",
+			ctx, t.L(), option.WithNodes(node), "cd /mnt/data1/rust-postgres && cat rustpostgres.stdout",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -162,11 +153,6 @@ func registerRustPostgres(r registry.Registry) {
 		results.summarizeAll(
 			t, "rust-postgres" /* ormName */, blocklistName, expectedFailures, version, "",
 		)
-
-		// We restart the cluster with the default port again so that any post-test
-		// validation will be able to connect using the default port.
-		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.All())
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
 	}
 
 	r.Add(registry.TestSpec{
@@ -174,7 +160,10 @@ func registerRustPostgres(r registry.Registry) {
 		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1, spec.CPU(16)),
 		Leases:  registry.MetamorphicLeases,
-		Tags:    registry.Tags(`default`, `orm`),
+		// This test requires custom ports but service registration is
+		// currently only supported on GCE.
+		CompatibleClouds: registry.OnlyGCE,
+		Suites:           registry.Suites(registry.Nightly, registry.ORM),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runRustPostgres(ctx, t, c)
 		},

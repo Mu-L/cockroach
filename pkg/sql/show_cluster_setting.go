@@ -1,19 +1,13 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -25,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -33,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // getCurrentEncodedVersionSettingValue returns the encoded value of
@@ -53,7 +49,7 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 	// the same time guaranteeing that a node reporting a certain version has
 	// also processed the corresponding version bump (which is important as only
 	// then does the node update its persisted state; see #22796).
-	if err := timeutil.RunWithTimeout(ctx, fmt.Sprintf("show cluster setting %s", name), 2*time.Minute,
+	if err := timeutil.RunWithTimeout(ctx, redact.Sprintf("show cluster setting %s", name), 2*time.Minute,
 		func(ctx context.Context) error {
 			tBegin := timeutil.Now()
 
@@ -63,7 +59,7 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 					datums, err := txn.QueryRowEx(
 						ctx, "read-setting",
 						txn.KV(),
-						sessiondata.RootUserSessionDataOverride,
+						sessiondata.NodeUserSessionDataOverride,
 						"SELECT value FROM system.settings WHERE name = $1", key,
 					)
 					if err != nil {
@@ -95,9 +91,9 @@ func (p *planner) getCurrentEncodedVersionSettingValue(
 						return errors.AssertionFailedf("no value found for version setting")
 					}
 
-					localRawVal := []byte(s.Get(&st.SV))
+					localVal := s.GetInternal(&st.SV)
 					if err := checkClusterSettingValuesAreEquivalent(
-						localRawVal, kvRawVal,
+						localVal.Encode(), kvRawVal,
 					); err != nil {
 						// NB: errors.Wrapf(nil, ...) returns nil.
 						// nolint:errwrap
@@ -140,10 +136,15 @@ func checkClusterSettingValuesAreEquivalent(localRawVal, kvRawVal []byte) error 
 	}
 	decodedLocal, localVal, localOk := maybeDecodeVersion(localRawVal)
 	decodedKV, kvVal, kvOk := maybeDecodeVersion(kvRawVal)
-	if localOk && kvOk && decodedLocal.Internal%2 == 1 /* isFence */ {
-		predecessor := decodedLocal
-		predecessor.Internal--
-		if predecessor.Equal(decodedKV) {
+	if localOk && kvOk && decodedLocal.IsFence() {
+		// NB: The internal version is -1 for the fence version of all final cluster
+		// versions. In these cases, we cannot simply check that the local version
+		// is off-by-one from the KV version, since (for example's sake) we would be
+		// comparing (24,1,12) to (24,2,-1). Instead, we can use ListBetween to
+		// verify that there are no cluster versions in between the local and KV
+		// versions.
+		versionsBetween := clusterversion.ListBetween(decodedKV.Version, decodedLocal.Version)
+		if len(versionsBetween) == 0 {
 			return nil
 		}
 	}
@@ -152,20 +153,24 @@ func checkClusterSettingValuesAreEquivalent(localRawVal, kvRawVal []byte) error 
 		localVal, kvVal)
 }
 
-func settingNameDeprecationNotice(oldName, newName settings.SettingName) pgnotice.Notice {
-	return pgnotice.Newf("the name %q is deprecated; use %q instead", oldName, newName)
+func settingAlternateNameNotice(oldName, newName settings.SettingName) pgnotice.Notice {
+	return pgnotice.Newf("%q is now an alias for %q, the preferred setting name", oldName, newName)
 }
 
 func (p *planner) ShowClusterSetting(
 	ctx context.Context, n *tree.ShowClusterSetting,
 ) (planNode, error) {
 	name := settings.SettingName(strings.ToLower(n.Name))
-	setting, ok, nameStatus := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
+	hasModify, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYCLUSTERSETTING)
+	if err != nil {
+		return nil, err
+	}
+	setting, ok, nameStatus := settings.LookupForDisplay(name, p.ExecCfg().Codec.ForSystemTenant(), hasModify)
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
 	}
 	if nameStatus != settings.NameActive {
-		p.BufferClientNotice(ctx, settingNameDeprecationNotice(name, setting.Name()))
+		p.BufferClientNotice(ctx, settingAlternateNameNotice(name, setting.Name()))
 		name = setting.Name()
 	}
 
@@ -194,20 +199,26 @@ func (p *planner) ShowClusterSetting(
 			if verSetting, ok := setting.(*settings.VersionSetting); ok {
 				encoded, err := p.getCurrentEncodedVersionSettingValue(ctx, verSetting, setting.InternalKey(), name)
 				return true, encoded, err
+			} else if nonMasked, ok := setting.(settings.NonMaskedSetting); ok {
+				return true, nonMasked.Encoded(&p.ExecCfg().Settings.SV), nil
+			} else if masked, ok := setting.(*settings.MaskedSetting); ok {
+				// Masked settings need to be redacted, so we can skip the
+				// encoding/decoding steps.
+				return true, masked.String(&p.ExecCfg().Settings.SV), nil
 			}
-			return true, setting.Encoded(&p.ExecCfg().Settings.SV), nil
+			return false, "", nil
 		},
 	)
 }
 
 func getShowClusterSettingPlanColumns(
-	val settings.NonMaskedSetting, name settings.SettingName,
+	val settings.Setting, name settings.SettingName,
 ) (colinfo.ResultColumns, error) {
 	var dType *types.T
 	switch val.(type) {
 	case *settings.IntSetting:
 		dType = types.Int
-	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.VersionSetting, *settings.EnumSetting, *settings.ProtobufSetting:
+	case *settings.StringSetting, *settings.ByteSizeSetting, *settings.VersionSetting, settings.AnyEnumSetting, *settings.ProtobufSetting:
 		dType = types.String
 	case *settings.BoolSetting:
 		dType = types.Bool
@@ -217,6 +228,8 @@ func getShowClusterSettingPlanColumns(
 		dType = types.Interval
 	case *settings.DurationSettingWithExplicitUnit:
 		dType = types.Interval
+	case *settings.MaskedSetting:
+		dType = types.String
 	default:
 		return nil, errors.Errorf("unknown setting type for %s: %s", name, val.Typ())
 	}
@@ -224,7 +237,7 @@ func getShowClusterSettingPlanColumns(
 }
 
 func planShowClusterSetting(
-	val settings.NonMaskedSetting,
+	val settings.Setting,
 	name settings.SettingName,
 	columns colinfo.ResultColumns,
 	getEncodedValue func(ctx context.Context, p *planner) (bool, string, error),
@@ -243,18 +256,11 @@ func planShowClusterSetting(
 			if isNotNull {
 				switch s := val.(type) {
 				case *settings.IntSetting:
-					v, err := s.DecodeValue(encoded)
+					v, err := s.DecodeNumericValue(encoded)
 					if err != nil {
 						return nil, err
 					}
 					d = tree.NewDInt(tree.DInt(v))
-				case *settings.StringSetting, *settings.EnumSetting,
-					*settings.ByteSizeSetting, *settings.VersionSetting, *settings.ProtobufSetting:
-					v, err := val.DecodeToString(encoded)
-					if err != nil {
-						return nil, err
-					}
-					d = tree.NewDString(v)
 				case *settings.BoolSetting:
 					v, err := s.DecodeValue(encoded)
 					if err != nil {
@@ -279,12 +285,22 @@ func planShowClusterSetting(
 						return nil, err
 					}
 					d = &tree.DInterval{Duration: duration.MakeDuration(v.Nanoseconds(), 0, 0)}
+				case settings.NonMaskedSetting:
+					// This includes StringSetting, EnumSetting, ByteSizeSetting,
+					// VersionSetting, and ProtobufSetting:
+					v, err := s.DecodeToString(encoded)
+					if err != nil {
+						return nil, err
+					}
+					d = tree.NewDString(v)
+				case *settings.MaskedSetting:
+					d = tree.NewDString(encoded)
 				default:
 					return nil, errors.AssertionFailedf("unknown setting type for %s: %s (%T)", name, val.Typ(), val)
 				}
 			}
 
-			v := p.newContainerValuesNode(columns, 0)
+			v := p.newContainerValuesNode(columns, 1)
 			if _, err := v.rows.AddRow(ctx, tree.Datums{d}); err != nil {
 				v.rows.Close(ctx)
 				return nil, err

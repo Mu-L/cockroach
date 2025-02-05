@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package spanconfigstore exposes utilities for storing and retrieving
 // SpanConfigs associated with a single span.
@@ -23,20 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-)
-
-// EnabledSetting is a hidden cluster setting to enable the use of the span
-// configs infrastructure in KV. It switches each store in the cluster from
-// using the gossip backed system config span to instead using the span configs
-// infrastructure. It has no effect if COCKROACH_DISABLE_SPAN_CONFIGS
-// is set.
-//
-// TODO(irfansharif): We should remove this.
-var EnabledSetting = settings.RegisterBoolSetting(
-	settings.SystemOnly,
-	"spanconfig.store.enabled",
-	`use the span config infrastructure in KV instead of the system config span`,
-	true,
 )
 
 // FallbackConfigOverride is a hidden cluster setting to override the fallback
@@ -137,10 +118,9 @@ func (s *Store) ComputeSplitKey(
 // GetSpanConfigForKey is part of the spanconfig.StoreReader interface.
 func (s *Store) GetSpanConfigForKey(
 	ctx context.Context, key roachpb.RKey,
-) (roachpb.SpanConfig, error) {
+) (roachpb.SpanConfig, roachpb.Span, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	return s.getSpanConfigForKeyRLocked(ctx, key)
 }
 
@@ -148,34 +128,34 @@ func (s *Store) GetSpanConfigForKey(
 // caller to hold the Store read lock.
 func (s *Store) getSpanConfigForKeyRLocked(
 	ctx context.Context, key roachpb.RKey,
-) (roachpb.SpanConfig, error) {
-	conf, found := s.mu.spanConfigStore.getSpanConfigForKey(ctx, key)
+) (roachpb.SpanConfig, roachpb.Span, error) {
+	conf, confSpan, found := s.mu.spanConfigStore.getSpanConfigForKey(ctx, key)
 	if !found {
 		conf = s.getFallbackConfig()
 	}
 	var err error
 	conf, err = s.mu.systemSpanConfigStore.combine(key, conf)
 	if err != nil {
-		return roachpb.SpanConfig{}, err
+		return roachpb.SpanConfig{}, roachpb.Span{}, err
 	}
 
 	// No need to perform clamping if SpanConfigBounds are not enabled.
 	if !boundsEnabled.Get(&s.settings.SV) {
-		return conf, nil
+		return conf, confSpan, nil
 	}
 
 	_, tenID, err := keys.DecodeTenantPrefix(roachpb.Key(key))
 	if err != nil {
-		return roachpb.SpanConfig{}, err
+		return roachpb.SpanConfig{}, roachpb.Span{}, err
 	}
 	if tenID.IsSystem() {
 		// SpanConfig bounds do not apply to the system tenant.
-		return conf, nil
+		return conf, confSpan, nil
 	}
 
 	bounds, found := s.boundsReader.Bounds(tenID)
 	if !found {
-		return conf, nil
+		return conf, confSpan, nil
 	}
 
 	clamped := bounds.Clamp(&conf)
@@ -183,21 +163,34 @@ func (s *Store) getSpanConfigForKeyRLocked(
 	if clamped {
 		log.VInfof(ctx, 3, "span config for tenant clamped to %v", conf)
 	}
-	return conf, nil
+	return conf, confSpan, nil
 }
 
 func (s *Store) getFallbackConfig() roachpb.SpanConfig {
 	if conf := FallbackConfigOverride.Get(&s.settings.SV).(*roachpb.SpanConfig); !conf.IsEmpty() {
 		return *conf
 	}
+	if s.knobs != nil && s.knobs.OverrideFallbackConf != nil {
+		return s.knobs.OverrideFallbackConf(s.fallback)
+	}
 	return s.fallback
 }
 
 // Apply is part of the spanconfig.StoreWriter interface.
 func (s *Store) Apply(
-	ctx context.Context, dryrun bool, updates ...spanconfig.Update,
+	ctx context.Context, updates ...spanconfig.Update,
 ) (deleted []spanconfig.Target, added []spanconfig.Record) {
-	deleted, added, err := s.applyInternal(ctx, dryrun, updates...)
+
+	// Log the potential span config changes.
+	for _, update := range updates {
+		err := s.maybeLogUpdate(ctx, &update)
+		if err != nil {
+			log.KvDistribution.Warningf(ctx, "attempted to log a spanconfig update to "+
+				"target:%+v, but got the following error:%+v", update.GetTarget(), err)
+		}
+	}
+
+	deleted, added, err := s.applyInternal(ctx, updates...)
 	if err != nil {
 		log.Fatalf(ctx, "%v", err)
 	}
@@ -210,13 +203,37 @@ func (s *Store) ForEachOverlappingSpanConfig(
 ) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.mu.spanConfigStore.forEachOverlapping(span, func(sp roachpb.Span, conf roachpb.SpanConfig) error {
-		config, err := s.getSpanConfigForKeyRLocked(ctx, roachpb.RKey(sp.Key))
+	var foundOverlapping bool
+	err := s.mu.spanConfigStore.forEachOverlapping(span, func(sp roachpb.Span, conf roachpb.SpanConfig) error {
+		foundOverlapping = true
+		config, _, err := s.getSpanConfigForKeyRLocked(ctx, roachpb.RKey(sp.Key))
 		if err != nil {
 			return err
 		}
 		return f(sp, config)
 	})
+	if err != nil {
+		return err
+	}
+	// For a span that doesn't overlap with any span configs, we use the fallback
+	// config combined with the system span configs that may be applicable to the
+	// span.
+	//
+	// For example, when a table is dropped and all of its data (including the
+	// range deletion tombstone installed by the drop) is GC'ed, the associated
+	// schema change GC job will delete the table's span config. In this case, we
+	// will not find any overlapping span configs for the table's span, but a
+	// system span config, such as a cluster wide protection policy, may still be
+	// applicable to the replica with the empty table span.
+	if !foundOverlapping {
+		log.VInfof(ctx, 3, "no overlapping span config found for span %s", span)
+		config, _, err := s.getSpanConfigForKeyRLocked(ctx, roachpb.RKey(span.Key))
+		if err != nil {
+			return err
+		}
+		return f(span, config)
+	}
+	return nil
 }
 
 // Clone returns a copy of the Store.
@@ -231,7 +248,7 @@ func (s *Store) Clone() *Store {
 }
 
 func (s *Store) applyInternal(
-	ctx context.Context, dryrun bool, updates ...spanconfig.Update,
+	ctx context.Context, updates ...spanconfig.Update,
 ) (deleted []spanconfig.Target, added []spanconfig.Record, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -251,7 +268,7 @@ func (s *Store) applyInternal(
 			return nil, nil, errors.AssertionFailedf("unknown target type")
 		}
 	}
-	deletedSpans, addedEntries, err := s.mu.spanConfigStore.apply(ctx, dryrun, spanStoreUpdates...)
+	deletedSpans, addedEntries, err := s.mu.spanConfigStore.apply(ctx, spanStoreUpdates...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -302,4 +319,51 @@ func (s *Store) Iterate(f func(spanconfig.Record) error) error {
 			}
 			return f(record)
 		})
+}
+
+// maybeLogUpdate logs the SpanConfig changes to the distribution channel. It
+// also logs changes to the span boundaries. It doesn't log the changes to the
+// SpanConfig for high churn fields like protected timestamps.
+func (s *Store) maybeLogUpdate(ctx context.Context, update *spanconfig.Update) error {
+	nextSC := update.GetConfig()
+	target := update.GetTarget()
+
+	// Return early from SystemTarget updates because they correspond to PTS
+	// updates.
+	if !target.IsSpanTarget() {
+		return nil
+	}
+
+	rKey, err := keys.Addr(target.GetSpan().Key)
+	if err != nil {
+		return err
+	}
+
+	var curSpanConfig roachpb.SpanConfig
+	var curSpan roachpb.Span
+	var found bool
+	func() {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		curSpanConfig, curSpan, found = s.mu.spanConfigStore.getSpanConfigForKey(ctx, rKey)
+	}()
+
+	// Check if the span bounds have changed.
+	if found &&
+		(!curSpan.Key.Equal(target.GetSpan().Key) ||
+			!curSpan.EndKey.Equal(target.GetSpan().EndKey)) {
+		log.KvDistribution.Infof(ctx,
+			"changing the span boundaries for span:%+v from:[%+v:%+v) to:[%+v:%+v) "+
+				"with config: %+v", target, curSpan.Key, curSpan.EndKey, target.GetSpan().Key,
+			target.GetSpan().EndKey, nextSC)
+	}
+
+	// Log if there is a SpanConfig change in any field other than
+	// ProtectedTimestamps to avoid logging PTS updates.
+	if log.V(2) || (found && curSpanConfig.HasConfigurationChange(nextSC)) {
+		log.KvDistribution.Infof(ctx,
+			"changing the spanconfig for span:%+v from:%+v to:%+v",
+			target, curSpanConfig, nextSC)
+	}
+	return nil
 }

@@ -1,22 +1,22 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package securitytest
 
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 )
+
+// EmbeddedTenantIDs lists the tenants we embed certs for.
+// See 'test_certs/regenerate.sh'.
+func EmbeddedTenantIDs() []uint64 { return []uint64{10, 11, 20, 2} }
 
 // CreateTestCerts populates the test certificates in the given directory.
 func CreateTestCerts(certsDir string) (cleanup func() error) {
@@ -34,6 +34,13 @@ func CreateTestCerts(certsDir string) (cleanup func() error) {
 		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedRootCert),
 		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedRootKey),
 		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedTenantCACert),
+	}
+	for _, tenantID := range EmbeddedTenantIDs() {
+		st := strconv.Itoa(int(tenantID))
+		assets = append(assets,
+			filepath.Join(certnames.EmbeddedCertsDir, certnames.TenantCertFilename(st)),
+			filepath.Join(certnames.EmbeddedCertsDir, certnames.TenantKeyFilename(st)),
+		)
 	}
 
 	for _, a := range assets {

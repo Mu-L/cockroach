@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package logcrash_test
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/redact"
 	sentry "github.com/getsentry/sentry-go"
@@ -55,6 +51,7 @@ func (it interceptingTransport) Configure(sentry.ClientOptions) {}
 
 func TestCrashReportingPacket(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	var packets []*sentry.Event
@@ -98,7 +95,7 @@ func TestCrashReportingPacket(t *testing.T) {
 	func() {
 		defer expectPanic("after server start")
 		defer logcrash.RecoverAndReportPanic(ctx, &st.SV)
-		s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{DefaultTestTenant: base.TestNeedsTightIntegrationBetweenAPIsAndTestingKnobs})
 		s.Stopper().Stop(ctx)
 		panic(redact.Safe(panicPost))
 	}()
@@ -117,20 +114,20 @@ func TestCrashReportingPacket(t *testing.T) {
 			if runtime.Compiler == "gccgo" {
 				message += "[0-9]+" // TODO(bdarnell): verify on gccgo
 			} else {
-				message += "1058"
+				message += "1059"
 			}
 			message += " (TestCrashReportingPacket)"
 			return message
 		}(),
 			regexp.MustCompile(`crash_reporting_packet_test.go:\d+: panic: boom`),
 		},
-		{regexp.MustCompile(`^[a-z0-9]{8}-1$`), 14, func() string {
+		{regexp.MustCompile(`^[a-z0-9]{8}-1$`), 13, func() string {
 			message := prefix
 			// gccgo stack traces are different in the presence of function literals.
 			if runtime.Compiler == "gccgo" {
 				message += "[0-9]+" // TODO(bdarnell): verify on gccgo
 			} else {
-				message += "1066"
+				message += "1067"
 			}
 			message += " (TestCrashReportingPacket)"
 			return message
@@ -189,6 +186,7 @@ func TestCrashReportingPacket(t *testing.T) {
 
 func TestInternalErrorReporting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	var packets []*sentry.Event
@@ -214,10 +212,6 @@ func TestInternalErrorReporting(t *testing.T) {
 
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = true;`)
-	if err != nil {
-		t.Errorf("failed to enable plan collection due to %s", err.Error())
-	}
 
 	if _, err := sqlDB.Exec("SELECT crdb_internal.force_assertion_error('woo')"); !testutils.IsError(err, "internal error") {
 		t.Fatalf("expected internal error, got %v", err)

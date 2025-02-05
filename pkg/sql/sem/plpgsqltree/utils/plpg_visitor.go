@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package utils
 
@@ -18,14 +13,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/plpgsql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	unimp "github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
-	"github.com/cockroachdb/errors"
 )
 
 // PLpgSQLStmtCounter is used to accurately report telemetry for plpgsql
-// statements test . We can not use the telemetry counters due to them needing
+// statements test. We can not use the telemetry counters due to them needing
 // to be reset after every statement using reporter.ReportDiagnostics.
 type PLpgSQLStmtCounter map[string]int
 
@@ -58,16 +50,14 @@ type telemetryVisitor struct {
 var _ plpgsqltree.StatementVisitor = &telemetryVisitor{}
 
 // Visit implements the StatementVisitor interface
-func (v *telemetryVisitor) Visit(stmt plpgsqltree.Statement) {
-	taggedStmt, ok := stmt.(plpgsqltree.TaggedStatement)
-	if !ok {
-		v.Err = errors.AssertionFailedf("no tag found for stmt %q", stmt)
-	}
-	tag := taggedStmt.PlpgSQLStatementTag()
+func (v *telemetryVisitor) Visit(
+	stmt plpgsqltree.Statement,
+) (newStmt plpgsqltree.Statement, recurse bool) {
+	tag := stmt.PlpgSQLStatementTag()
 	sqltelemetry.IncrementPlpgsqlStmtCounter(tag)
 
 	//Capturing telemetry for tests
-	_, ok = v.StmtCnt[tag]
+	_, ok := v.StmtCnt[tag]
 	if !ok {
 		v.StmtCnt[tag] = 1
 	} else {
@@ -75,6 +65,7 @@ func (v *telemetryVisitor) Visit(stmt plpgsqltree.Statement) {
 	}
 	v.Err = nil
 
+	return stmt, true
 }
 
 // MakePLpgSQLTelemetryVisitor makes a plpgsql telemetry visitor, for capturing
@@ -95,22 +86,4 @@ func CountPLpgSQLStmt(sql string) (PLpgSQLStmtCounter, error) {
 	plpgsqltree.Walk(&v, stmt.AST)
 
 	return v.StmtCnt, v.Err
-}
-
-// ParseAndCollectTelemetryForPLpgSQLFunc takes a plpgsql function and parses and collects
-// telemetry on the parsable statements.
-func ParseAndCollectTelemetryForPLpgSQLFunc(stmt *tree.CreateRoutine) error {
-	// Assert that the function language is PLPGSQL.
-	var funcBodyStr string
-	for _, option := range stmt.Options {
-		switch opt := option.(type) {
-		case tree.RoutineBodyStr:
-			funcBodyStr = string(opt)
-		}
-	}
-
-	if _, err := CountPLpgSQLStmt(funcBodyStr); err != nil {
-		return errors.Wrap(err, "plpgsql not supported in user-defined functions")
-	}
-	return unimp.New("plpgsql", "plpgsql not supported in user-defined functions")
 }

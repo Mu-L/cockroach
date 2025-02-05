@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvstreamer
 
@@ -17,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -52,8 +48,8 @@ type resultsBuffer interface {
 	get(context.Context) (_ []Result, allComplete bool, _ error)
 
 	// wait blocks until there is at least one Result available to be returned
-	// to the client.
-	wait()
+	// to the client or the passed-in context is canceled.
+	wait(context.Context) error
 
 	// releaseOne decrements the number of unreleased Results by one.
 	releaseOne()
@@ -96,7 +92,10 @@ type resultsBuffer interface {
 	// goroutine blocked in wait(), the goroutine is woken up.
 	//
 	// It is assumed that the budget's mutex is already being held.
-	doneAddingLocked(context.Context)
+	//
+	// doneAddingLocked returns the number of results that have been added but
+	// not yet returned to the client, and whether the client goroutine was woken.
+	doneAddingLocked(context.Context) (int, bool)
 
 	///////////////////////////////////////////////////////////////////////////
 	//                                                                       //
@@ -178,7 +177,10 @@ func newResultsBufferBase(budget *budget) *resultsBufferBase {
 func (b *resultsBufferBase) initLocked(isEmpty bool, numExpectedResponses int) error {
 	b.Mutex.AssertHeld()
 	if b.numExpectedResponses != b.numCompleteResponses {
-		b.setErrorLocked(errors.AssertionFailedf("Enqueue is called before the previous requests have been completed"))
+		b.setErrorLocked(errors.AssertionFailedf(
+			"Enqueue is called before the previous requests have been completed (expected %d, complete %d)",
+			b.numExpectedResponses, b.numCompleteResponses,
+		))
 		return b.err
 	}
 	if !isEmpty {
@@ -186,7 +188,7 @@ func (b *resultsBufferBase) initLocked(isEmpty bool, numExpectedResponses int) e
 		return b.err
 	}
 	if b.numUnreleasedResults > 0 {
-		b.setErrorLocked(errors.AssertionFailedf("unexpectedly there are some unreleased Results"))
+		b.setErrorLocked(errors.AssertionFailedf("unexpectedly there are %d unreleased Results", b.numUnreleasedResults))
 		return b.err
 	}
 	b.numExpectedResponses = numExpectedResponses
@@ -219,16 +221,23 @@ func (b *resultsBufferBase) accountForOverheadLocked(ctx context.Context, overhe
 	b.overheadAccountedFor = overheadMemUsage
 }
 
-// signal non-blockingly sends on hasResults channel.
-func (b *resultsBufferBase) signal() {
+// signal non-blockingly sends on hasResults channel and returns whether sent.
+func (b *resultsBufferBase) signal() bool {
 	select {
 	case b.hasResults <- struct{}{}:
+		return true
 	default:
+		return false
 	}
 }
 
-func (b *resultsBufferBase) wait() {
-	<-b.hasResults
+func (b *resultsBufferBase) wait(ctx context.Context) error {
+	select {
+	case <-b.hasResults:
+		return b.error()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (b *resultsBufferBase) numUnreleased() int {
@@ -300,9 +309,9 @@ func (b *outOfOrderResultsBuffer) addLocked(r Result) {
 
 const resultSize = int64(unsafe.Sizeof(Result{}))
 
-func (b *outOfOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
+func (b *outOfOrderResultsBuffer) doneAddingLocked(ctx context.Context) (int, bool) {
 	b.accountForOverheadLocked(ctx, int64(cap(b.results))*resultSize)
-	b.signal()
+	return len(b.results), b.signal()
 }
 
 func (b *outOfOrderResultsBuffer) clearOverhead(ctx context.Context) {
@@ -324,6 +333,12 @@ func (b *outOfOrderResultsBuffer) get(context.Context) ([]Result, bool, error) {
 	// is done as a way of "amortizing" the reservation.
 	b.results = nil
 	allComplete := b.numCompleteResponses == b.numExpectedResponses
+	if b.err == nil && b.numCompleteResponses > b.numExpectedResponses {
+		b.err = errors.AssertionFailedf(
+			"received %d complete responses when only %d were expected",
+			b.numCompleteResponses, b.numExpectedResponses,
+		)
+	}
 	return results, allComplete, b.err
 }
 
@@ -362,7 +377,7 @@ type ResultDiskBuffer interface {
 // TestResultDiskBufferConstructor constructs a ResultDiskBuffer for tests. It
 // is injected to be rowcontainer.NewKVStreamerResultDiskBuffer in order to
 // avoid an import cycle.
-var TestResultDiskBufferConstructor func(diskmap.Factory, *mon.BytesMonitor) ResultDiskBuffer
+var TestResultDiskBufferConstructor func(_ diskmap.Factory, memAcc mon.BoundAccount, diskMonitor *mon.BytesMonitor) ResultDiskBuffer
 
 // inOrderResultsBuffer is a resultsBuffer that returns the Results in the same
 // order as the original requests were Enqueued into the Streamer (in other
@@ -506,13 +521,14 @@ func (b *inOrderResultsBuffer) addLocked(r Result) {
 
 const inOrderBufferedResultSize = int64(unsafe.Sizeof(inOrderBufferedResult{}))
 
-func (b *inOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
+func (b *inOrderResultsBuffer) doneAddingLocked(ctx context.Context) (int, bool) {
 	overhead := int64(cap(b.buffered))*inOrderBufferedResultSize + // b.buffered
 		int64(cap(b.resultScratch))*resultSize // b.resultsScratch
 	b.accountForOverheadLocked(ctx, overhead)
 	if len(b.buffered) > 0 && b.buffered[0].Position == b.headOfLinePosition && b.buffered[0].subRequestIdx == b.headOfLineSubRequestIdx {
-		b.signal()
+		return len(b.buffered), b.signal()
 	}
+	return len(b.buffered), false
 }
 
 func (b *inOrderResultsBuffer) clearOverhead(ctx context.Context) {
@@ -535,34 +551,27 @@ func (b *inOrderResultsBuffer) get(ctx context.Context) ([]Result, bool, error) 
 	defer b.Unlock()
 	res := b.resultScratch[:0]
 	for len(b.buffered) > 0 && b.buffered[0].Position == b.headOfLinePosition && b.buffered[0].subRequestIdx == b.headOfLineSubRequestIdx {
-		result, toConsume, err := b.buffered[0].get(ctx, b)
-		if err != nil {
-			b.setErrorLocked(err)
-			return nil, false, err
-		}
-		if toConsume > 0 {
-			if err = b.budget.consumeLocked(ctx, toConsume, len(res) == 0 /* allowDebt */); err != nil {
+		if r := &b.buffered[0]; r.onDisk {
+			// The buffered result is currently on disk. Ensure that we have
+			// enough budget to keep it in memory before deserializing it.
+			if err := b.budget.consumeLocked(ctx, r.memoryTok.toRelease, len(res) == 0 /* allowDebt */); err != nil {
 				if len(res) > 0 {
 					// Most likely this error means that we'd put the budget in
 					// debt if we kept this result in-memory. However, there are
 					// already some results to return to the client, so we'll
 					// return them and attempt to proceed with the current
 					// result the next time the client asks.
-
-					// The buffered result has been updated in-place to hold the
-					// deserialized Result, but since we didn't have the budget
-					// to keep it in-memory, we need to spill it. Note that we
-					// don't need to update the disk buffer since the
-					// serialized Result is still stored with the same resultID,
-					// we only need to make sure to lose the references to
-					// Get/Scan responses.
-					b.buffered[0].spill(b.buffered[0].diskResultID)
 					break
 				}
 				b.setErrorLocked(err)
 				return nil, false, err
 			}
+			if err := b.diskBuffer.Deserialize(ctx, &r.Result, r.diskResultID); err != nil {
+				b.setErrorLocked(err)
+				return nil, false, err
+			}
 		}
+		result := b.buffered[0].Result
 		res = append(res, result)
 		b.heapRemoveFirst()
 		if result.subRequestDone {
@@ -583,6 +592,12 @@ func (b *inOrderResultsBuffer) get(ctx context.Context) ([]Result, bool, error) 
 	// All requests are complete IFF we have received the complete responses for
 	// all requests and there no buffered Results.
 	allComplete := b.numCompleteResponses == b.numExpectedResponses && len(b.buffered) == 0
+	if b.err == nil && b.numCompleteResponses > b.numExpectedResponses {
+		b.err = errors.AssertionFailedf(
+			"received %d complete responses when only %d were expected",
+			b.numCompleteResponses, b.numExpectedResponses,
+		)
+	}
 	b.resultScratch = res
 	return res, allComplete, b.err
 }
@@ -635,6 +650,14 @@ func (b *inOrderResultsBuffer) spill(
 	//
 	// Iterate in reverse order so that the results with higher priority values
 	// are spilled first (this could matter if the query has a LIMIT).
+	defer func(origAtLeastBytes int64, origSpilled int) {
+		if b.numSpilled != origSpilled {
+			log.VEventf(ctx, 2,
+				"spilled %d results to release %d bytes (asked for %d bytes)",
+				b.numSpilled-origSpilled, origAtLeastBytes-atLeastBytes, origAtLeastBytes,
+			)
+		}
+	}(atLeastBytes, b.numSpilled)
 	for idx := len(b.buffered) - 1; idx >= 0; idx-- {
 		if r := &b.buffered[idx]; !r.onDisk && r.Position > spillingPriority {
 			diskResultID, err := b.diskBuffer.Serialize(ctx, &b.buffered[idx].Result)
@@ -708,19 +731,4 @@ func (r *inOrderBufferedResult) spill(diskResultID int) {
 		onDisk:       true,
 		diskResultID: diskResultID,
 	}
-}
-
-// get returns the Result, deserializing it from disk if necessary. toConsume
-// indicates how much memory needs to be consumed from the budget to hold this
-// Result in-memory.
-func (r *inOrderBufferedResult) get(
-	ctx context.Context, b *inOrderResultsBuffer,
-) (_ Result, toConsume int64, _ error) {
-	if !r.onDisk {
-		return r.Result, 0, nil
-	}
-	if err := b.diskBuffer.Deserialize(ctx, &r.Result, r.diskResultID); err != nil {
-		return Result{}, 0, err
-	}
-	return r.Result, r.memoryTok.toRelease, nil
 }

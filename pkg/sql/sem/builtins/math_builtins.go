@@ -1,19 +1,13 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
 import (
 	"context"
 	"math"
-	"time"
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -22,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -611,7 +604,7 @@ var mathBuiltins = map[string]builtinDefinition{
 				}
 
 				for i, v := range thresholds.Array {
-					if cmp, err := operand.CompareError(evalCtx, v); err != nil {
+					if cmp, err := operand.Compare(ctx, evalCtx, v); err != nil {
 						return tree.NewDInt(0), err
 					} else if cmp < 0 {
 						return tree.NewDInt(tree.DInt(i)), nil
@@ -776,13 +769,6 @@ func roundDecimal(x *apd.Decimal, scale int32) (tree.Datum, error) {
 	}
 	return dd, err
 }
-
-var uniqueIntState struct {
-	syncutil.Mutex
-	timestamp uint64
-}
-
-var uniqueIntEpoch = time.Date(2015, time.January, 1, 0, 0, 0, 0, time.UTC).UnixNano()
 
 // widthBucket returns the bucket number to which operand would be assigned in a histogram having count
 // equal-width buckets spanning the range b1 to b2

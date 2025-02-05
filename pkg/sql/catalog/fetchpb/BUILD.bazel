@@ -24,9 +24,11 @@ proto_library(
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/geo/geoindex:geoindex_proto",
+        "//pkg/geo/geopb:geopb_proto",
+        "//pkg/roachpb:roachpb_proto",
         "//pkg/sql/catalog/catenumpb:catenumpb_proto",
         "//pkg/sql/types:types_proto",
+        "//pkg/util/hlc:hlc_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
     ],
 )
@@ -38,9 +40,11 @@ go_proto_library(
     proto = ":fetchpb_proto",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/geo/geoindex",
+        "//pkg/geo/geopb",
+        "//pkg/roachpb",
         "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/types",
+        "//pkg/util/hlc",
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )

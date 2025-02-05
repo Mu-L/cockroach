@@ -20,8 +20,10 @@ go_library(
         "//pkg/build",
         "//pkg/server/serverpb",
         "//pkg/settings",
+        "//pkg/settings/cluster",
         "//pkg/util/httputil",
         "//pkg/util/log",
+        "//pkg/util/timeutil",
     ],
 )
 
@@ -44,7 +46,6 @@ test_suite(
 go_test(
     name = "ui_test",
     srcs = ["ui_test.go"],
-    args = ["-test.timeout=295s"],
     embed = [":ui"],
     deps = [
         "//pkg/base",

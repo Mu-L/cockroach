@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -28,9 +23,19 @@ type sinkOutputOptions struct {
 	extraFlush bool
 	// ignoreErrors disables internal error handling (i.e. fail fast).
 	ignoreErrors bool
-	// forceSync forces synchronous operation of this output operation.
-	// That is, it will block until the output has been handled.
-	forceSync bool
+	// tryForceSync attempts to force a synchronous operation of this
+	// output operation. That is, it will block until the output has been
+	// handled, so long as the underlying sink can support the operation at
+	// that moment.
+	//
+	// This isn't an ironclad guarantee, but in the vast majority of
+	// scenarios, this option will be honored.
+	//
+	// If a sink can't support a synchronous flush, it should do its
+	// best to ensure a flush is imminent which will include the log
+	// message that accompanies the tryForceSync option. It should also
+	// give some indication that it was unable to do so.
+	tryForceSync bool
 }
 
 // logSink abstracts the destination of logging events, after all

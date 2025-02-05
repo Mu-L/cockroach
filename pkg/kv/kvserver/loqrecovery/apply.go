@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package loqrecovery
 
@@ -266,7 +261,7 @@ func applyReplicaUpdate(
 		// A crude form of the intent resolution process: abort the
 		// transaction by deleting its record.
 		txnKey := keys.TransactionKey(res.Intent.Txn.Key, res.Intent.Txn.ID)
-		if _, err := storage.MVCCDelete(ctx, readWriter, txnKey, hlc.Timestamp{}, storage.MVCCWriteOptions{Stats: &ms}); err != nil {
+		if _, _, err := storage.MVCCDelete(ctx, readWriter, txnKey, hlc.Timestamp{}, storage.MVCCWriteOptions{Stats: &ms}); err != nil {
 			return PrepareReplicaReport{}, err
 		}
 		update := roachpb.LockUpdate{
@@ -274,7 +269,7 @@ func applyReplicaUpdate(
 			Txn:    res.Intent.Txn,
 			Status: roachpb.ABORTED,
 		}
-		if _, _, _, err := storage.MVCCResolveWriteIntent(ctx, readWriter, &ms, update, storage.MVCCResolveWriteIntentOptions{}); err != nil {
+		if _, _, _, _, err := storage.MVCCResolveWriteIntent(ctx, readWriter, &ms, update, storage.MVCCResolveWriteIntentOptions{}); err != nil {
 			return PrepareReplicaReport{}, err
 		}
 		report.AbortedTransaction = true
@@ -311,6 +306,19 @@ func applyReplicaUpdate(
 	// Refresh stats
 	if err := sl.SetMVCCStats(ctx, readWriter, &ms); err != nil {
 		return PrepareReplicaReport{}, errors.Wrap(err, "updating MVCCStats")
+	}
+
+	// Update the HardState to clear the LeadEpoch, as otherwise we may risk
+	// seeing an epoch regression in raft. See #136908 for more details.
+	hs, err := sl.LoadHardState(ctx, readWriter)
+	if err != nil {
+		return PrepareReplicaReport{}, errors.Wrap(err, "loading HardState")
+	}
+
+	hs.LeadEpoch = 0
+
+	if err := sl.SetHardState(ctx, readWriter, hs); err != nil {
+		return PrepareReplicaReport{}, errors.Wrap(err, "setting HardState")
 	}
 
 	return report, nil
@@ -448,8 +456,8 @@ func CheckEnginesVersion(
 	plan loqrecoverypb.ReplicaUpdatePlan,
 	ignoreInternal bool,
 ) error {
-	binaryVersion := clusterversion.ByKey(clusterversion.BinaryVersionKey)
-	binaryMinSupportedVersion := clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
+	binaryVersion := clusterversion.Latest.Version()
+	binaryMinSupportedVersion := clusterversion.MinSupported.Version()
 	clusterVersion, err := kvstorage.SynthesizeClusterVersionFromEngines(
 		ctx, engines, binaryVersion, binaryMinSupportedVersion,
 	)

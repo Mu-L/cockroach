@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -18,22 +13,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
-var showCreateTableColumns = colinfo.ResultColumns{
+var showCreateScheduleColumns = colinfo.ResultColumns{
 	{Name: "schedule_id", Typ: types.Int},
 	{Name: "create_statement", Typ: types.String},
 }
 
 const (
-	scheduleID = iota
-	createStmt
+	scheduleIDIdx = iota
+	createStmtIdx
 )
 
 func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.ScheduledJob, error) {
@@ -51,7 +46,7 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 		datums, columns, err := params.p.InternalSQLTxn().QueryRowExWithCols(
 			params.ctx,
 			"load-schedules",
-			params.p.Txn(), sessiondata.RootUserSessionDataOverride,
+			params.p.Txn(), sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf("SELECT * FROM %s WHERE schedule_id = $1", env.ScheduledJobsTableName()),
 			tree.NewDInt(tree.DInt(sjID)))
 		if err != nil {
@@ -63,7 +58,7 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 		datums, columns, err := params.p.InternalSQLTxn().QueryBufferedExWithCols(
 			params.ctx,
 			"load-schedules",
-			params.p.Txn(), sessiondata.RootUserSessionDataOverride,
+			params.p.Txn(), sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf("SELECT * FROM %s", env.ScheduledJobsTableName()))
 		if err != nil {
 			return nil, err
@@ -85,19 +80,16 @@ func loadSchedules(params runParams, n *tree.ShowCreateSchedules) ([]*jobs.Sched
 func (p *planner) ShowCreateSchedule(
 	ctx context.Context, n *tree.ShowCreateSchedules,
 ) (planNode, error) {
-	// Only admin users can execute SHOW CREATE SCHEDULE
-	if userIsAdmin, err := p.UserHasAdminRole(ctx, p.User()); err != nil {
+	// Only privileged users can execute SHOW CREATE SCHEDULE
+	if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERMETADATA); err != nil {
 		return nil, err
-	} else if !userIsAdmin {
-		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-			"user %s does not have admin role", p.User())
 	}
 
 	sqltelemetry.IncrementShowCounter(sqltelemetry.CreateSchedule)
 
 	return &delayedNode{
 		name:    fmt.Sprintf("SHOW CREATE SCHEDULE %d", n.ScheduleID),
-		columns: showCreateTableColumns,
+		columns: showCreateScheduleColumns,
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
 			scheduledJobs, err := loadSchedules(
 				runParams{ctx: ctx, p: p, extendedEvalCtx: &p.extendedEvalCtx}, n)
@@ -118,13 +110,13 @@ func (p *planner) ShowCreateSchedule(
 				}
 
 				row := tree.Datums{
-					scheduleID: tree.NewDInt(tree.DInt(sj.ScheduleID())),
-					createStmt: tree.NewDString(createStmtStr),
+					scheduleIDIdx: tree.NewDInt(tree.DInt(sj.ScheduleID())),
+					createStmtIdx: tree.NewDString(createStmtStr),
 				}
 				rows = append(rows, row)
 			}
 
-			v := p.newContainerValuesNode(showCreateTableColumns, len(rows))
+			v := p.newContainerValuesNode(showCreateScheduleColumns, len(rows))
 			for _, row := range rows {
 				if _, err := v.rows.AddRow(ctx, row); err != nil {
 					v.Close(ctx)

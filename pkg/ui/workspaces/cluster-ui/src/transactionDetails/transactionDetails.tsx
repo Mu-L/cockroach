@@ -1,63 +1,43 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import React, { useContext } from "react";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
-import classNames from "classnames/bind";
-import _ from "lodash";
-import { RouteComponentProps } from "react-router-dom";
-import { Helmet } from "react-helmet";
-import moment from "moment-timezone";
-
-import statementsStyles from "../statementsPage/statementsPage.module.scss";
+import { ArrowLeft } from "@cockroachlabs/icons";
 import {
-  SortedTable,
-  ISortedTablePagination,
-  SortSetting,
-} from "../sortedtable";
+  InlineAlert,
+  Tooltip,
+  Text,
+  Heading,
+} from "@cockroachlabs/ui-components";
+import { Col, Row } from "antd";
+import classNames from "classnames/bind";
+import get from "lodash/get";
+import Long from "long";
+import moment from "moment-timezone";
+import React, { useContext } from "react";
+import { Helmet } from "react-helmet";
+import { RouteComponentProps } from "react-router-dom";
+
+import { SqlStatsSortType } from "src/api/statementsApi";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
-import { InlineAlert, Tooltip } from "@cockroachlabs/ui-components";
-import { Pagination } from "../pagination";
-import { TableStatistics } from "../tableStatistics";
-import { baseHeadingClasses } from "../transactionsPage/transactionsPageClasses";
-import { Button } from "../button";
-import { tableClasses } from "../transactionsTable/transactionsTableClasses";
-import { SqlBox } from "../sql";
-import { aggregateStatements } from "../transactionsPage/utils";
-import { Loading } from "../loading";
-import { SummaryCard, SummaryCardItem } from "../summaryCard";
+import {
+  populateRegionNodeForStatements,
+  makeStatementsColumns,
+} from "src/statementsTable/statementsTable";
+import { TimeScaleLabel } from "src/timeScaleDropdown/timeScaleLabel";
+import { Transaction } from "src/transactionsTable";
 import {
   Bytes,
   calculateTotalWorkload,
   FixFingerprintHexValue,
   Duration,
   formatNumberForDisplay,
+  queryByName,
+  appNamesAttr,
   unset,
 } from "src/util";
-import { UIConfigState } from "../store";
-import LoadingError from "../sqlActivity/errorComponent";
 
-import summaryCardStyles from "../summaryCard/summaryCard.module.scss";
-import transactionDetailsStyles from "./transactionDetails.modules.scss";
-import { Col, Row } from "antd";
-import "antd/lib/col/style";
-import "antd/lib/row/style";
-import { Text, Heading } from "@cockroachlabs/ui-components";
-import { formatTwoPlaces } from "../barCharts";
-import { ArrowLeft } from "@cockroachlabs/icons";
-import {
-  populateRegionNodeForStatements,
-  makeStatementsColumns,
-} from "src/statementsTable/statementsTable";
-import { Transaction } from "src/transactionsTable";
-import Long from "long";
 import {
   createCombinedStmtsRequest,
   InsightRecommendation,
@@ -66,11 +46,33 @@ import {
   StatementsRequest,
   TxnInsightsRequest,
 } from "../api";
+import { formatTwoPlaces } from "../barCharts";
+import { Button } from "../button";
+import { CockroachCloudContext } from "../contexts";
 import {
   getTxnInsightRecommendations,
   InsightType,
   TxnInsightEvent,
 } from "../insights";
+import {
+  InsightsSortedTable,
+  makeInsightsColumns,
+} from "../insightsTable/insightsTable";
+import insightTableStyles from "../insightsTable/insightsTable.module.scss";
+import { Loading } from "../loading";
+import { Pagination } from "../pagination";
+import {
+  SortedTable,
+  ISortedTablePagination,
+  SortSetting,
+} from "../sortedtable";
+import { SqlBox } from "../sql";
+import LoadingError from "../sqlActivity/errorComponent";
+import statementsStyles from "../statementsPage/statementsPage.module.scss";
+import { UIConfigState } from "../store";
+import { SummaryCard, SummaryCardItem } from "../summaryCard";
+import summaryCardStyles from "../summaryCard/summaryCard.module.scss";
+import { TableStatistics } from "../tableStatistics";
 import {
   getValidOption,
   TimeScale,
@@ -79,21 +81,18 @@ import {
   timeScaleRangeToObj,
   toRoundedDateRange,
 } from "../timeScaleDropdown";
-
 import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
-import insightTableStyles from "../insightsTable/insightsTable.module.scss";
-import {
-  InsightsSortedTable,
-  makeInsightsColumns,
-} from "../insightsTable/insightsTable";
-import { CockroachCloudContext } from "../contexts";
-import { SqlStatsSortType } from "src/api/statementsApi";
-import { FormattedTimescale } from "../timeScaleDropdown/formattedTimeScale";
+import { baseHeadingClasses } from "../transactionsPage/transactionsPageClasses";
+import { aggregateStatements } from "../transactionsPage/utils";
+import { tableClasses } from "../transactionsTable/transactionsTableClasses";
+
+import transactionDetailsStyles from "./transactionDetails.modules.scss";
 import {
   getStatementsForTransaction,
   getTxnFromSqlStatsMemoized,
   getTxnQueryString,
 } from "./transactionDetailsUtils";
+
 const { containerClass } = tableClasses;
 const cx = classNames.bind(statementsStyles);
 const timeScaleStylesCx = classNames.bind(timeScaleStyles);
@@ -138,6 +137,7 @@ interface TState {
   latestTransactionText: string;
   txnDetails: Transaction | null;
   statements: Statement[] | null;
+  appsAsStr: string | null;
 }
 
 function statementsRequestFromProps(
@@ -159,14 +159,17 @@ export class TransactionDetails extends React.Component<
   constructor(props: TransactionDetailsProps) {
     super(props);
 
+    const appsAsStr = queryByName(this.props.location, appNamesAttr) || null;
     const txnDetails = getTxnFromSqlStatsMemoized(
       this.props.txnStatsResp?.data,
       this.props.match,
-      this.props.location,
+      appsAsStr,
     );
 
+    const apps = appsAsStr?.split(",").map(s => s.trim());
     const stmts = getStatementsForTransaction(
-      txnDetails,
+      txnDetails?.stats_data?.transaction_fingerprint_id.toString(),
+      apps,
       this.props.txnStatsResp?.data?.statements,
     );
 
@@ -183,6 +186,7 @@ export class TransactionDetails extends React.Component<
       latestTransactionText: getTxnQueryString(txnDetails, stmts),
       txnDetails,
       statements: stmts,
+      appsAsStr,
     };
 
     // In case the user selected a option not available on this page,
@@ -195,14 +199,16 @@ export class TransactionDetails extends React.Component<
   }
 
   setTxnDetails = (): void => {
+    const appsAsStr = queryByName(this.props.location, appNamesAttr) || null;
     const txnDetails = getTxnFromSqlStatsMemoized(
       this.props.txnStatsResp?.data,
       this.props.match,
-      this.props.location,
+      appsAsStr,
     );
 
     const statements = getStatementsForTransaction(
-      txnDetails,
+      txnDetails?.stats_data?.transaction_fingerprint_id.toString(),
+      appsAsStr?.split(",").map(s => s.trim()),
       this.props.txnStatsResp?.data?.statements,
     );
 
@@ -221,6 +227,7 @@ export class TransactionDetails extends React.Component<
         latestTransactionText: transactionText,
         txnDetails,
         statements,
+        appsAsStr,
       });
     }
   };
@@ -257,7 +264,8 @@ export class TransactionDetails extends React.Component<
     if (
       prevProps.transactionFingerprintId !==
         this.props.transactionFingerprintId ||
-      prevProps.txnStatsResp !== this.props.txnStatsResp
+      prevProps.txnStatsResp !== this.props.txnStatsResp ||
+      prevProps.location?.search !== this.props.location?.search
     ) {
       this.setTxnDetails();
     }
@@ -289,12 +297,11 @@ export class TransactionDetails extends React.Component<
     const error = this.props.txnStatsResp?.error;
     const { latestTransactionText, statements } = this.state;
     const transactionStats = transaction?.stats_data?.stats;
-    const period = (
-      <FormattedTimescale
-        ts={this.props.timeScale}
-        requestTime={moment(this.props.requestTime)}
-      />
-    );
+    const visibleApps = Array.from(
+      new Set(
+        statements.map(s => (s.key.key_data.app ? s.key.key_data.app : unset)),
+      ),
+    )?.join(", ");
 
     return (
       <div>
@@ -324,8 +331,10 @@ export class TransactionDetails extends React.Component<
         <p
           className={timeScaleStylesCx("time-label", "label-no-margin-bottom")}
         >
-          Showing aggregated stats from{" "}
-          <span className={timeScaleStylesCx("bold")}>{period}</span>
+          <TimeScaleLabel
+            timeScale={this.props.timeScale}
+            requestTime={moment(this.props.requestTime)}
+          />
         </p>
         <Loading
           error={error}
@@ -385,15 +394,21 @@ export class TransactionDetails extends React.Component<
                 <span className={cx("tooltip-info")}>unavailable</span>
               </Tooltip>
             );
-            const meanIdleLatency = transactionSampled ? (
+            const meanIdleLatency = (
               <Text>
                 {formatNumberForDisplay(
-                  _.get(transactionStats, "idle_lat.mean", 0),
+                  get(transactionStats, "idle_lat.mean", 0),
                   duration,
                 )}
               </Text>
-            ) : (
-              unavailableTooltip
+            );
+            const meanCommitLatency = (
+              <Text>
+                {formatNumberForDisplay(
+                  get(transactionStats, "commit_lat.mean", 0),
+                  duration,
+                )}
+              </Text>
             );
             const meansRows = `${formatNumberForDisplay(
               transactionStats.rows_read.mean,
@@ -423,7 +438,7 @@ export class TransactionDetails extends React.Component<
             const maxDisc = transactionSampled ? (
               <Text>
                 {formatNumberForDisplay(
-                  _.get(transactionStats, "exec_stats.max_disk_usage.mean", 0),
+                  get(transactionStats, "exec_stats.max_disk_usage.mean", 0),
                   Bytes,
                 )}
               </Text>
@@ -479,11 +494,7 @@ export class TransactionDetails extends React.Component<
                         />
                         <SummaryCardItem
                           label="Application name"
-                          value={
-                            transaction?.stats_data?.app?.length > 0
-                              ? transaction?.stats_data?.app
-                              : unset
-                          }
+                          value={visibleApps}
                         />
                         <SummaryCardItem
                           label="Fingerprint ID"
@@ -508,6 +519,10 @@ export class TransactionDetails extends React.Component<
                         <SummaryCardItem
                           label="Idle latency"
                           value={meanIdleLatency}
+                        />
+                        <SummaryCardItem
+                          label="Commit latency"
+                          value={meanCommitLatency}
                         />
                         <SummaryCardItem
                           label="Mean rows/bytes read"

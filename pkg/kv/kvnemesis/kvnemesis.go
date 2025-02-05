@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -22,6 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -58,7 +54,7 @@ func l(ctx context.Context, basename string, format string, args ...interface{})
 	var logger Logger
 	logger, _ = ctx.Value(loggerKey{}).(Logger)
 	if logger == nil {
-		logger = &logLogger{dir: os.TempDir()}
+		logger = &logLogger{dir: datapathutils.DebuggableTempDir()}
 	}
 	logger.Helper()
 
@@ -110,9 +106,19 @@ func RunNemesis(
 		for atomic.AddInt64(&stepsStartedAtomic, 1) <= int64(numSteps) {
 			stepIdx++
 			step := g.RandStep(rng)
-			trace, err := a.Apply(ctx, &step)
 
 			stepPrefix := fmt.Sprintf("w%d_step%d", workerIdx, stepIdx)
+			basename := fmt.Sprintf("%s_%T", stepPrefix, reflect.Indirect(reflect.ValueOf(step.Op.GetValue())).Interface())
+
+			{
+				// Write next step into file so we know steps if test deadlock and has
+				// to be killed.
+				var buf strings.Builder
+				step.format(&buf, formatCtx{indent: `  ` + workerName + ` PRE `})
+				l(ctx, basename, "%s", &buf)
+			}
+
+			trace, err := a.Apply(ctx, &step)
 			step.Trace = l(ctx, fmt.Sprintf("%s_trace", stepPrefix), "%s", trace.String())
 
 			stepsByWorker[workerIdx] = append(stepsByWorker[workerIdx], step)
@@ -127,7 +133,6 @@ func RunNemesis(
 				fmt.Fprintf(&buf, "  before: %s", step.Before)
 				step.format(&buf, formatCtx{indent: `  ` + workerName + prefix})
 				fmt.Fprintf(&buf, "\n  after: %s", step.After)
-				basename := fmt.Sprintf("%s_%T", stepPrefix, reflect.Indirect(reflect.ValueOf(step.Op.GetValue())).Interface())
 				l(ctx, basename, "%s", &buf)
 			}
 

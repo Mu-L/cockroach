@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -13,14 +10,13 @@ import (
 	"hash"
 	"hash/crc32"
 	"runtime"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -31,15 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/span"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
-
-// pacerLogEvery is used for logging errors instead of returning terminal
-// errors when pacer.Pace returns an error.
-var pacerLogEvery log.EveryN = log.Every(100 * time.Millisecond)
 
 // eventContext holds metadata pertaining to event.
 type eventContext struct {
@@ -72,6 +64,7 @@ type kvEventToRowConsumer struct {
 	topicNamer           *TopicNamer
 
 	metrics *sliMetrics
+	sv      *settings.Values
 
 	// This pacer is used to incorporate event consumption to elastic CPU
 	// control. This helps ensure that event encoding/decoding does not throttle
@@ -90,7 +83,7 @@ func newEventConsumer(
 	cfg *execinfra.ServerConfig,
 	spec execinfrapb.ChangeAggregatorSpec,
 	feed ChangefeedConfig,
-	spanFrontier *span.Frontier,
+	spanFrontier frontier,
 	cursor hlc.Timestamp,
 	sink EventSink,
 	metrics *Metrics,
@@ -107,7 +100,7 @@ func newEventConsumer(
 
 	makeConsumer := func(s EventSink, frontier frontier) (eventConsumer, error) {
 		var err error
-		encoder, err := getEncoder(encodingOpts, feed.Targets, spec.Select.Expr != "",
+		encoder, err := getEncoder(ctx, encodingOpts, feed.Targets, spec.Select.Expr != "",
 			makeExternalConnectionProvider(ctx, cfg.DB), sliMetrics)
 		if err != nil {
 			return nil, err
@@ -259,6 +252,7 @@ func newKVEventToRowConsumer(
 		encodingOpts:         encodingOpts,
 		metrics:              metrics,
 		pacer:                pacer,
+		sv:                   cfg.SV(),
 	}, nil
 }
 
@@ -275,8 +269,7 @@ func newEvaluator(
 
 	sd := sql.NewInternalSessionData(ctx, cfg.Settings, "changefeed-evaluator")
 	if spec.Feed.SessionData == nil {
-		// This changefeed was created prior to
-		// clusterversion.V23_1_ChangefeedExpressionProductionReady; thus we must
+		// This changefeed was created prior to 23.1; thus we must
 		// rewrite expression to comply with current cluster version.
 		newExpr, err := cdceval.RewritePreviewExpression(sc)
 		if err != nil {
@@ -286,9 +279,8 @@ func newEvaluator(
 		}
 		if newExpr != sc {
 			log.Warningf(ctx,
-				"changefeed expression %s (job %d) created prior to %s rewritten as %s",
+				"changefeed expression %s (job %d) created prior to 22.2-30 rewritten as %s",
 				tree.AsString(sc), spec.JobID,
-				clusterversion.V23_1_ChangefeedExpressionProductionReady.String(),
 				tree.AsString(newExpr))
 			sc = newExpr
 		}
@@ -328,9 +320,7 @@ func (c *kvEventToRowConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Even
 	// unavailable. If there is unused CPU time left from the last call to
 	// Pace, then use that time instead of blocking.
 	if err := c.pacer.Pace(ctx); err != nil {
-		if pacerLogEvery.ShouldLog() {
-			log.Errorf(ctx, "automatic pacing: %v", err)
-		}
+		return err
 	}
 
 	schemaTimestamp := ev.KV().Value.Timestamp
@@ -402,11 +392,10 @@ func (c *kvEventToRowConsumer) encodeAndEmit(
 	// being tracked by the local span frontier. The poller should not be forwarding
 	// r updates that have timestamps less than or equal to any resolved timestamp
 	// it's forwarded before.
-	// TODO(dan): This should be an assertion once we're confident this can never
-	// happen under any circumstance.
 	if schemaTS.LessEq(c.frontier.Frontier()) && !schemaTS.Equal(c.cursor) {
-		log.Errorf(ctx, "cdc ux violation: detected timestamp %s that is less than "+
-			"or equal to the local frontier %s.", schemaTS, c.frontier.Frontier())
+		logcrash.ReportOrPanic(ctx, c.sv,
+			"cdc ux violation: detected timestamp %s that is less than or equal to the local frontier %s.",
+			schemaTS, c.frontier.Frontier())
 		return nil
 	}
 
@@ -429,6 +418,7 @@ func (c *kvEventToRowConsumer) encodeAndEmit(
 		}
 	}
 
+	stop := c.metrics.Timers.Encode.Start()
 	if c.encodingOpts.Format == changefeedbase.OptFormatParquet {
 		return c.encodeForParquet(
 			ctx, updatedRow, prevRow, topic, schemaTS, updatedRow.MvccTimestamp,
@@ -452,10 +442,18 @@ func (c *kvEventToRowConsumer) encodeAndEmit(
 	// Since we're done processing/converting this event, and will not use much more
 	// than len(key)+len(bytes) worth of resources, adjust allocation to match.
 	alloc.AdjustBytesToTarget(ctx, int64(len(keyCopy)+len(valueCopy)))
+	stop()
 
-	if err := c.sink.EmitRow(
-		ctx, topic, keyCopy, valueCopy, schemaTS, updatedRow.MvccTimestamp, alloc,
-	); err != nil {
+	c.metrics.Timers.EmitRow.Time(func() {
+		err = c.sink.EmitRow(
+			ctx, topic, keyCopy, valueCopy, schemaTS, updatedRow.MvccTimestamp, alloc,
+		)
+	})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			log.Warningf(ctx, `sink failed to emit row: %v`, err)
+			c.metrics.SinkErrors.Inc(1)
+		}
 		return err
 	}
 	if log.V(3) {
@@ -526,7 +524,7 @@ type parallelEventConsumer struct {
 
 	// spanFrontier stores the frontier for the aggregator
 	// that spawned this event consumer.
-	spanFrontier *span.Frontier
+	spanFrontier frontier
 
 	// termErr and termCh are used to save the first error that occurs
 	// in any worker and signal all workers to stop.
@@ -644,9 +642,9 @@ func (c *parallelEventConsumer) workerLoop(
 
 func (c *parallelEventConsumer) incInFlight() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.mu.inFlight++
 	c.metrics.ParallelConsumerInFlightEvents.Update(int64(c.mu.inFlight))
-	c.mu.Unlock()
 }
 
 func (c *parallelEventConsumer) decInFlight() {
@@ -704,9 +702,9 @@ func (c *parallelEventConsumer) Flush(ctx context.Context) error {
 		return c.mu.termErr
 	case <-c.flushCh:
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.mu.waiting = false
 		c.mu.flushFrontier = c.spanFrontier.Frontier()
-		c.mu.Unlock()
 		return nil
 	}
 }

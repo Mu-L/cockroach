@@ -60,7 +60,6 @@ vectorized: true
 ·
 • top-k
 │ columns: (c, b)
-│ ordering: +b
 │ estimated row count: 2 (missing stats)
 │ order: +b
 │ k: 2
@@ -130,7 +129,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -148,7 +146,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -166,7 +163,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -184,7 +180,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -239,7 +234,6 @@ vectorized: true
 ·
 • sort
 │ columns: (r)
-│ ordering: +r
 │ estimated row count: 1,000 (missing stats)
 │ order: +r
 │
@@ -262,7 +256,6 @@ vectorized: true
 ·
 • sort
 │ columns: (y)
-│ ordering: +y
 │ estimated row count: 1,000 (missing stats)
 │ order: +y
 │
@@ -300,10 +293,10 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /abc/abc_pkey/1/2/3 -> <undecoded>
-fetched: /abc/abc_pkey/1/2/3/d -> 'one'
-fetched: /abc/abc_pkey/4/5/6 -> <undecoded>
-fetched: /abc/abc_pkey/4/5/6/d -> 'Two'
+fetched: /abc/abc_pkey/1/2/3:cf=0 -> <undecoded>
+fetched: /abc/abc_pkey/1/2/3/d:cf=1 -> 'one'
+fetched: /abc/abc_pkey/4/5/6:cf=0 -> <undecoded>
+fetched: /abc/abc_pkey/4/5/6/d:cf=1 -> 'Two'
 output row: [1 2 3 'one']
 output row: [4 5 6 'Two']
 
@@ -390,7 +383,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c, d)
-│ ordering: +b,+a,+c
 │ estimated row count: 333 (missing stats)
 │ order: +b,+a,+c
 │
@@ -488,10 +480,10 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /abc/abc_pkey/4/?/? -> <undecoded>
-fetched: /abc/abc_pkey/4/?/? -> <undecoded>
-fetched: /abc/abc_pkey/1/?/? -> <undecoded>
-fetched: /abc/abc_pkey/1/?/? -> <undecoded>
+fetched: /abc/abc_pkey/4/?/?:cf=1 -> <undecoded>
+fetched: /abc/abc_pkey/4/?/?:cf=0 -> <undecoded>
+fetched: /abc/abc_pkey/1/?/?:cf=1 -> <undecoded>
+fetched: /abc/abc_pkey/1/?/?:cf=0 -> <undecoded>
 output row: [4]
 output row: [1]
 
@@ -694,7 +686,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (column1)
-    │ ordering: +column1
     │ estimated row count: 3
     │ order: +column1
     │
@@ -745,6 +736,7 @@ vectorized: true
           estimated row count: 1 (missing stats)
           table: t@t_pkey
           spans: /3/0
+          locking strength: for update
 
 query T
 EXPLAIN (VERBOSE) UPDATE t SET c = TRUE RETURNING b
@@ -852,15 +844,14 @@ vectorized: true
 │ columns: (b, a)
 │
 └── • render
-    │ columns: (column6, a, b)
+    │ columns: (column8, a, b)
     │ ordering: +a
-    │ render column6: a
+    │ render column8: a
     │ render a: a
     │ render b: b
     │
     └── • sort
         │ columns: (a, b)
-        │ ordering: +a
         │ estimated row count: 1,000 (missing stats)
         │ order: +a
         │
@@ -880,15 +871,14 @@ vectorized: true
 │ columns: (b, a)
 │
 └── • render
-    │ columns: (column6, a, b)
+    │ columns: (column8, a, b)
     │ ordering: +b
-    │ render column6: b
+    │ render column8: b
     │ render a: a
     │ render b: b
     │
     └── • sort
         │ columns: (a, b)
-        │ ordering: +b
         │ estimated row count: 1,000 (missing stats)
         │ order: +b
         │
@@ -915,7 +905,6 @@ vectorized: true
 ·
 • sort
 │ columns: (x, y)
-│ ordering: +x,+y
 │ estimated row count: 1,000 (missing stats)
 │ order: +x,+y
 │
@@ -933,7 +922,6 @@ vectorized: true
 ·
 • sort
 │ columns: (x, y)
-│ ordering: +x,+y
 │ estimated row count: 1,000 (missing stats)
 │ order: +x,+y
 │
@@ -1010,7 +998,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (k, v)
-    │ ordering: +v,+k
     │ estimated row count: 1,000 (missing stats)
     │ order: +v,+k
     │
@@ -1102,7 +1089,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (k, v)
-    │ ordering: -v,+k
     │ estimated row count: 2 (missing stats)
     │ order: -v,+k
     │
@@ -1201,7 +1187,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b)
-│ ordering: +b
 │ estimated row count: 1,000 (missing stats)
 │ order: +b
 │
@@ -1222,7 +1207,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, a, b)
-    │ ordering: +nulls_ordering_b,+b
     │ estimated row count: 1,000 (missing stats)
     │ order: +nulls_ordering_b,+b
     │
@@ -1249,7 +1233,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, a, b)
-    │ ordering: -nulls_ordering_b,-b
     │ estimated row count: 1,000 (missing stats)
     │ order: -nulls_ordering_b,-b
     │
@@ -1273,7 +1256,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b)
-│ ordering: -b
 │ estimated row count: 1,000 (missing stats)
 │ order: -b
 │
@@ -1294,7 +1276,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, nulls_ordering_c, a, b, c)
-    │ ordering: -nulls_ordering_b,-b,+nulls_ordering_c,+c
     │ estimated row count: 1,000 (missing stats)
     │ order: -nulls_ordering_b,-b,+nulls_ordering_c,+c
     │
@@ -1329,7 +1310,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, a, b)
-    │ ordering: +nulls_ordering_b,+b
     │ estimated row count: 1,000 (missing stats)
     │ order: +nulls_ordering_b,+b
     │

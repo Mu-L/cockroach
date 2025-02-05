@@ -1,27 +1,25 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { SessionsPageProps } from "./sessionsPage";
-import { createMemoryHistory } from "history";
-import { SessionInfo } from "./sessionsTable";
-import Long from "long";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-const Phase = cockroach.server.serverpb.ActiveQuery.Phase;
+import { createMemoryHistory } from "history";
+import Long from "long";
 import { util } from "protobufjs";
-import { defaultFilters, Filters } from "../queryFilter";
+
 import {
   CancelQueryRequestMessage,
   CancelSessionRequestMessage,
 } from "src/api/terminateQueryApi";
 
+import { defaultFilters, Filters } from "../queryFilter";
+
+import { SessionsPageProps } from "./sessionsPage";
+import { SessionInfo } from "./sessionsTable";
+
 const Status = cockroach.server.serverpb.Session.Status;
+const Phase = cockroach.server.serverpb.ActiveQuery.Phase;
 
 const history = createMemoryHistory({ initialEntries: ["/sessions"] });
 
@@ -50,6 +48,9 @@ export const idleSession: SessionInfo = {
     num_txns_executed: 1,
     txn_fingerprint_ids: [],
     status: Status.IDLE,
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
   },
 };
 
@@ -89,6 +90,9 @@ export const idleTransactionSession: SessionInfo = {
     num_txns_executed: 1,
     txn_fingerprint_ids: [],
     status: Status.IDLE,
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
   },
 };
 
@@ -142,6 +146,9 @@ export const activeSession: SessionInfo = {
     status: Status.ACTIVE,
     num_txns_executed: 1,
     txn_fingerprint_ids: [],
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
   },
 };
 
@@ -168,6 +175,9 @@ export const closedSession: SessionInfo = {
     status: Status.CLOSED,
     num_txns_executed: 1,
     txn_fingerprint_ids: [],
+    pg_backend_pid: 123,
+    trace_id: Long.fromNumber(123),
+    goroutine_id: Long.fromNumber(456),
   },
 };
 

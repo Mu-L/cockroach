@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 
 package model
@@ -123,11 +118,16 @@ func (b *Builder) resolveMetric(value *benchfmt.Value, units benchfmt.UnitMetada
 	if metricName == "" {
 		metricName = unit
 	}
+	better := units.GetBetter(unit)
+	// If the unit is not known, assume that lower values are better (-1).
+	if better == 0 {
+		better = -1
+	}
 	metric := &Metric{
 		Name:             metricName,
 		Unit:             unit,
 		Assumption:       units.GetAssumption(unit),
-		Better:           units.GetBetter(unit),
+		Better:           better,
 		BenchmarkEntries: make(map[string]*BenchmarkEntry),
 	}
 	b.metricMap[unit] = metric

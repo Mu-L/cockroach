@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.sql.contentionpb;
@@ -147,6 +142,12 @@ message ResolvedTxnID {
 }
 
 
+enum ContentionType {
+  LOCK_WAIT = 0;
+  SERIALIZATION_CONFLICT = 1;
+}
+
+
 message ExtendedContentionEvent {
   cockroach.roachpb.ContentionEvent blocking_event = 1 [
     (gogoproto.nullable) = false
@@ -179,4 +180,6 @@ message ExtendedContentionEvent {
   bytes waiting_stmt_id = 7 [(gogoproto.customname) = "WaitingStmtID",
     (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/sql/clusterunique.ID",
     (gogoproto.nullable) = false];
+
+  ContentionType contention_type = 8;
 }

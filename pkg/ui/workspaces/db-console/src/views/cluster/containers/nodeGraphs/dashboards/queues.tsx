@@ -1,18 +1,13 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
 import React from "react";
 
 import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
-import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 import { GraphDashboardProps, nodeDisplayName } from "./dashboardUtils";
 
@@ -30,6 +25,7 @@ export default function (props: GraphDashboardProps) {
       title="Queue Processing Failures"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="failures">
         <Metric
@@ -45,6 +41,11 @@ export default function (props: GraphDashboardProps) {
         <Metric
           name="cr.store.queue.replicate.process.failure"
           title="Replication"
+          nonNegativeRate
+        />
+        <Metric
+          name="cr.store.queue.lease.process.failure"
+          title="Lease"
           nonNegativeRate
         />
         <Metric
@@ -84,6 +85,7 @@ export default function (props: GraphDashboardProps) {
       title="Queue Processing Times"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="processing time">
         <Metric
@@ -99,6 +101,11 @@ export default function (props: GraphDashboardProps) {
         <Metric
           name="cr.store.queue.replicate.processingnanos"
           title="Replication"
+          nonNegativeRate
+        />
+        <Metric
+          name="cr.store.queue.lease.processingnanos"
+          title="Lease"
           nonNegativeRate
         />
         <Metric
@@ -141,6 +148,7 @@ export default function (props: GraphDashboardProps) {
       title="Replica GC Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -165,6 +173,7 @@ export default function (props: GraphDashboardProps) {
       title="Replication Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -215,9 +224,35 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
+      title="Lease Queue"
+      sources={storeSources}
+      tenantSource={tenantSource}
+      showMetricsInTooltip={true}
+    >
+      <Axis units={AxisUnits.Count} label="actions">
+        <Metric
+          name="cr.store.queue.lease.process.success"
+          title="Successful Actions / sec"
+          nonNegativeRate
+        />
+        <Metric
+          name="cr.store.queue.lease.pending"
+          title="Pending Actions"
+          downsampleMax
+        />
+        <Metric
+          name="cr.store.queue.lease.purgatory"
+          title="Replicas in  Purgatory"
+          downsampleMax
+        />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
       title="Split Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -237,6 +272,7 @@ export default function (props: GraphDashboardProps) {
       title="Merge Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -256,6 +292,7 @@ export default function (props: GraphDashboardProps) {
       title="Raft Log Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -275,6 +312,7 @@ export default function (props: GraphDashboardProps) {
       title="Raft Snapshot Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -294,6 +332,11 @@ export default function (props: GraphDashboardProps) {
       title="Consistency Checker Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
+      tooltip={`The Consistency Checker Queue periodically checks 
+      that all replicas in a given range are consistent. For large 
+      clusters, the queue is always expected to have a pending 
+      backlog.`}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -313,6 +356,7 @@ export default function (props: GraphDashboardProps) {
       title="Time Series Maintenance Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -332,6 +376,7 @@ export default function (props: GraphDashboardProps) {
       title="MVCC GC Queue"
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -351,7 +396,9 @@ export default function (props: GraphDashboardProps) {
       title="Protected Timestamp Records"
       sources={nodeSources}
       tenantSource={tenantSource}
-      tooltip={`Number of protected timestamp records (used by backups, changefeeds, etc. to prevent MVCC GC)`}
+      tooltip={`Number of protected timestamp records (used by backups, changefeeds,
+          etc. to prevent MVCC GC)`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="Records">
         {nodeIDs.map(nid => (

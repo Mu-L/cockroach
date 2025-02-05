@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package settings
 
@@ -41,6 +36,15 @@ func (s *ProtobufSetting) String(sv *Values) string {
 	json, err := s.MarshalToJSON(p)
 	if err != nil {
 		panic(errors.Wrapf(err, "marshaling %s: %+v", proto.MessageName(p), p))
+	}
+	return json
+}
+
+// DefaultString returns the default value for the setting as a string.
+func (s *ProtobufSetting) DefaultString() string {
+	json, err := s.MarshalToJSON(s.defaultValue)
+	if err != nil {
+		panic(errors.Wrapf(err, "marshaling %s: %+v", proto.MessageName(s.defaultValue), s.defaultValue))
 	}
 	return json
 }
@@ -107,7 +111,28 @@ func (s *ProtobufSetting) Validate(sv *Values, p protoutil.Message) error {
 
 // Override sets the setting to the given value, assuming it passes validation.
 func (s *ProtobufSetting) Override(ctx context.Context, sv *Values, p protoutil.Message) {
+	sv.setValueOrigin(ctx, s.slot, OriginOverride)
 	_ = s.set(ctx, sv, p)
+	sv.setDefaultOverride(s.slot, p)
+}
+
+func (s *ProtobufSetting) decodeAndSet(ctx context.Context, sv *Values, encoded string) error {
+	p, err := s.DecodeValue(encoded)
+	if err != nil {
+		return err
+	}
+	return s.set(ctx, sv, p)
+}
+
+func (s *ProtobufSetting) decodeAndSetDefaultOverride(
+	ctx context.Context, sv *Values, encoded string,
+) error {
+	p, err := s.DecodeValue(encoded)
+	if err != nil {
+		return err
+	}
+	sv.setDefaultOverride(s.slot, p)
+	return nil
 }
 
 func (s *ProtobufSetting) set(ctx context.Context, sv *Values, p protoutil.Message) error {
@@ -121,6 +146,13 @@ func (s *ProtobufSetting) set(ctx context.Context, sv *Values, p protoutil.Messa
 }
 
 func (s *ProtobufSetting) setToDefault(ctx context.Context, sv *Values) {
+	// See if the default value was overridden.
+	if val := sv.getDefaultOverride(s.slot); val != nil {
+		// As per the semantics of override, these values don't go through
+		// validation.
+		_ = s.set(ctx, sv, val.(protoutil.Message))
+		return
+	}
 	if err := s.set(ctx, sv, s.defaultValue); err != nil {
 		panic(err)
 	}

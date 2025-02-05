@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -24,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // Expr represents an expression.
@@ -427,7 +423,7 @@ func NewTypedCollateExpr(expr TypedExpr, locale string) *CollateExpr {
 		Expr:   expr,
 		Locale: locale,
 	}
-	node.typ = types.MakeCollatedString(types.String, locale)
+	node.typ = types.MakeCollatedType(expr.ResolvedType(), locale)
 	return node
 }
 
@@ -488,8 +484,10 @@ func MemoizeComparisonExprOp(node *ComparisonExpr) {
 
 	fn, ok := CmpOps[fOp.Symbol].LookupImpl(leftRet, rightRet)
 	if !ok {
-		panic(errors.AssertionFailedf("lookup for ComparisonExpr %s's CmpOp failed",
-			AsStringWithFlags(node, FmtShowTypes)))
+		panic(errors.AssertionFailedf("lookup for ComparisonExpr %s's CmpOp failed (%s(%s,%s))",
+			AsStringWithFlags(node, FmtShowTypes), redact.Safe(fOp.String()),
+			leftRet.SQLStringForError(), rightRet.SQLStringForError(),
+		))
 	}
 	node.Op = fn
 }
@@ -800,19 +798,11 @@ func NewPlaceholder(name string) (*Placeholder, error) {
 
 // Format implements the NodeFormatter interface.
 func (node *Placeholder) Format(ctx *FmtCtx) {
-	if ctx.HasFlags(FmtHideConstants) {
-		if ctx.placeholderFormat != nil {
-			ctx.placeholderFormat(ctx, node)
-			return
-		}
-		ctx.Printf("$%d", node.Idx+1)
-	} else {
-		if ctx.placeholderFormat != nil {
-			ctx.placeholderFormat(ctx, node)
-			return
-		}
-		ctx.Printf("$%d", node.Idx+1)
+	if ctx.placeholderFormat != nil {
+		ctx.placeholderFormat(ctx, node)
+		return
 	}
+	ctx.Printf("$%d", node.Idx+1)
 }
 
 // ResolvedType implements the TypedExpr interface.
@@ -1055,6 +1045,7 @@ var binaryOpPrio = [...]int{
 	treebin.Bitxor: 6,
 	treebin.Bitor:  7,
 	treebin.Concat: 8, treebin.JSONFetchVal: 8, treebin.JSONFetchText: 8, treebin.JSONFetchValPath: 8, treebin.JSONFetchTextPath: 8,
+	treebin.Distance: 8, treebin.CosDistance: 8, treebin.NegInnerProduct: 8,
 }
 
 // binaryOpFullyAssoc indicates whether an operator is fully associative.
@@ -1068,6 +1059,7 @@ var binaryOpFullyAssoc = [...]bool{
 	treebin.Bitxor: true,
 	treebin.Bitor:  true,
 	treebin.Concat: true, treebin.JSONFetchVal: false, treebin.JSONFetchText: false, treebin.JSONFetchValPath: false, treebin.JSONFetchTextPath: false,
+	treebin.Distance: false, treebin.CosDistance: false, treebin.NegInnerProduct: false,
 }
 
 // BinaryExpr represents a binary value expression.
@@ -1111,8 +1103,10 @@ func (node *BinaryExpr) memoizeOp() {
 	leftRet, rightRet := node.Left.(TypedExpr).ResolvedType(), node.Right.(TypedExpr).ResolvedType()
 	fn, ok := BinOps[node.Operator.Symbol].LookupImpl(leftRet, rightRet)
 	if !ok {
-		panic(errors.AssertionFailedf("lookup for BinaryExpr %s's BinOp failed",
-			AsStringWithFlags(node, FmtShowTypes)))
+		panic(errors.AssertionFailedf("lookup for BinaryExpr %s's BinOp failed (%s(%s,%s))",
+			AsStringWithFlags(node, FmtShowTypes), redact.Safe(node.Operator.String()),
+			leftRet.SQLStringForError(), rightRet.SQLStringForError(),
+		))
 	}
 	node.Op = fn
 }
@@ -1275,6 +1269,9 @@ type FuncExpr struct {
 	// is used for any type of aggregation.
 	OrderBy OrderBy
 
+	// InCall is true when the FuncExpr is part of a CALL statement.
+	InCall bool
+
 	typeAnnotation
 	fnProps *FunctionProperties
 	fn      *Overload
@@ -1374,11 +1371,17 @@ func (node *FuncExpr) Format(ctx *FmtCtx) {
 		typ = funcTypeName[node.Type] + " "
 	}
 
-	// We need to remove name anonymization/redaction for the function name in
-	// particular. Do this by overriding the flags.
-	// TODO(thomas): when function names are correctly typed as FunctionDefinition
-	// remove FmtMarkRedactionNode from being overridden.
-	ctx.WithFlags(ctx.flags&^FmtAnonymize&^FmtMarkRedactionNode|FmtBareIdentifiers, func() {
+	// We let anonymization and redaction flags pass through, which will cause
+	// built-in functions to be redacted if we have not resolved them. This is
+	// because we cannot distinguish between built-in functions and UDFs before
+	// they are resolved. We conservatively redact function names if requested.
+	// TODO(111385): Investigate ways to identify built-in functions before
+	// type-checking.
+	//
+	// Instruct the pretty-printer not to wrap reserved keywords in quotes. Only
+	// builtin functions can have reserved keywords as names, and it is not
+	// necessary (or desirable) to quote them.
+	ctx.WithFlags(ctx.flags|FmtBareReservedKeywords, func() {
 		ctx.FormatNode(&node.Func)
 	})
 
@@ -1769,6 +1772,7 @@ func (node *NumVal) String() string           { return AsString(node) }
 func (node *OrExpr) String() string           { return AsString(node) }
 func (node *ParenExpr) String() string        { return AsString(node) }
 func (node *RangeCond) String() string        { return AsString(node) }
+func (node *TxnControlExpr) String() string   { return AsString(node) }
 func (node *StrVal) String() string           { return AsString(node) }
 func (node *Subquery) String() string         { return AsString(node) }
 func (node *RoutineExpr) String() string      { return AsString(node) }

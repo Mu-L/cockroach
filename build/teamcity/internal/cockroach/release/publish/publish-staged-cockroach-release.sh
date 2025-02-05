@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2023 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -euxo pipefail
 
 dir="$(dirname $(dirname $(dirname $(dirname $(dirname $(dirname "${0}"))))))"
@@ -22,6 +28,11 @@ if ! echo "${version}" | grep -E -o '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9
   # https://github.com/cockroachdb/cockroach/blob/4c6864b44b9044874488cfedee3a31e6b23a6790/pkg/util/version/version.go#L75
   echo "Invalid version \"${version}\". Must be of the format \"vMAJOR.MINOR.PATCH(-PRERELEASE)?\"."
   exit 1
+fi
+
+PUBLISH_LATEST=
+if is_latest "$version"; then
+  PUBLISH_LATEST=true
 fi
 
 release_branch=$(echo "${version}" | grep -E -o '^v[0-9]+\.[0-9]+')
@@ -56,6 +67,12 @@ fi
 
 tc_end_block "Variable Setup"
 
+tc_start_block "Verify binaries SHA"
+# Make sure that the linux/amd64 source docker image is built using the same version and SHA. 
+# This is a quick check and it assumes that the docker image was built correctly and based on the tarball binaries.
+docker_login_gcr "$gcr_staged_repository" "$gcr_staged_credentials"
+verify_docker_image "${gcr_staged_repository}:${version}" "linux/amd64" "$BUILD_VCS_NUMBER" "$version" false
+tc_end_block "Verify binaries SHA"
 
 tc_start_block "Check remote tag and tag"
 if [[ -z "${DRY_RUN}" ]]; then
@@ -76,7 +93,6 @@ tc_start_block "Setup dockerhub credentials"
 configure_docker_creds
 docker_login
 tc_end_block "Setup dockerhub credentials"
-
 
 tc_start_block "Copy binaries"
 export google_credentials="$gcs_credentials"

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachpb
 
@@ -31,20 +26,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keysbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/raft/v3/raftpb"
 )
 
 const (
@@ -221,6 +219,26 @@ func (k Key) Compare(b Key) int {
 	return bytes.Compare(k, b)
 }
 
+// Less says whether key k is less than key b.
+func (k Key) Less(b Key) bool {
+	return k.Compare(b) < 0
+}
+
+// Clamp fixes the key to something within the range a < k < b.
+func (k Key) Clamp(min, max Key) (Key, error) {
+	if max.Less(min) {
+		return nil, errors.Newf("cannot clamp when min '%s' is larger than max '%s'", min, max)
+	}
+	result := k
+	if k.Less(min) {
+		result = min
+	}
+	if max.Less(k) {
+		result = max
+	}
+	return result, nil
+}
+
 // SafeFormat implements the redact.SafeFormatter interface.
 func (k Key) SafeFormat(w redact.SafePrinter, _ rune) {
 	SafeFormatKey(w, nil /* valDirs */, k)
@@ -266,13 +284,33 @@ const (
 	checksumSize          = 4
 	tagPos                = checksumSize
 	headerSize            = tagPos + 1
+
+	extendedMVCCValLenSize = 4
+	extendedPreludeSize    = extendedMVCCValLenSize + 1
 )
+
+var _ redact.SafeFormatter = ValueType(0)
+
+// Safeformat implements the redact.SafeFormatter interface.
+func (t ValueType) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.SafeString(redact.SafeString(t.String()))
+}
 
 func (v Value) checksum() uint32 {
 	if len(v.RawBytes) < checksumSize {
 		return 0
 	}
-	_, u, err := encoding.DecodeUint32Ascending(v.RawBytes[:checksumSize])
+
+	checksumStart := 0
+	if v.usesExtendedEncoding() {
+		extendedHeaderSize := int(extendedMVCCValLenSize + binary.BigEndian.Uint32(v.RawBytes))
+		if len(v.RawBytes) < extendedHeaderSize+headerSize {
+			return 0
+		}
+		checksumStart = extendedHeaderSize + 1
+	}
+
+	_, u, err := encoding.DecodeUint32Ascending(v.RawBytes[checksumStart : checksumStart+checksumSize])
 	if err != nil {
 		panic(err)
 	}
@@ -283,6 +321,10 @@ func (v *Value) setChecksum(cksum uint32) {
 	if len(v.RawBytes) >= checksumSize {
 		encoding.EncodeUint32Ascending(v.RawBytes[:0], cksum)
 	}
+}
+
+func (v *Value) usesExtendedEncoding() bool {
+	return len(v.RawBytes) > headerSize && v.RawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL)
 }
 
 // InitChecksum initializes a checksum based on the provided key and
@@ -297,7 +339,7 @@ func (v *Value) InitChecksum(key []byte) {
 	}
 	// Should be uninitialized.
 	if v.checksum() != checksumUninitialized {
-		panic(fmt.Sprintf("initialized checksum = %x", v.checksum()))
+		panic(errors.Errorf("initialized checksum = %x", v.checksum()))
 	}
 	v.setChecksum(v.computeChecksum(key))
 }
@@ -316,7 +358,7 @@ func (v Value) Verify(key []byte) error {
 	}
 	if sum := v.checksum(); sum != 0 {
 		if computedSum := v.computeChecksum(key); computedSum != sum {
-			return fmt.Errorf("%s: invalid checksum (%x) value [% x]",
+			return errors.Errorf("%s: invalid checksum (%x) value [% x]",
 				Key(key), computedSum, v.RawBytes)
 		}
 	}
@@ -342,7 +384,20 @@ func (v *Value) ShallowClone() *Value {
 
 // IsPresent returns true if the value is present (existent and not a tombstone).
 func (v *Value) IsPresent() bool {
-	return v != nil && len(v.RawBytes) != 0
+	if v == nil || len(v.RawBytes) == 0 {
+		return false
+	}
+	// TODO(ssd): This is a bit awkward because this is the right thing to
+	// do for production callers trying to determine if this value is a
+	// tombstone. But, many tests shove random strings into RawBytes, and in
+	// then case we'll hit this case if the 5th character of that string
+	// happens to be `e` (ascii 101). There aren't _that_ many callers to
+	// IsPresent(). We may just need to audit them all.
+	if v.usesExtendedEncoding() {
+		extendedHeaderSize := extendedPreludeSize + binary.BigEndian.Uint32(v.RawBytes)
+		return len(v.RawBytes) > int(extendedHeaderSize)
+	}
+	return true
 }
 
 // MakeValueFromString returns a value with bytes and tag set.
@@ -372,20 +427,64 @@ func (v Value) GetTag() ValueType {
 	if len(v.RawBytes) <= tagPos {
 		return ValueType_UNKNOWN
 	}
+	if v.RawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL) {
+		simpleTagPos := v.extendedSimpleTagPos()
+		if len(v.RawBytes) <= simpleTagPos {
+			return ValueType_UNKNOWN
+		}
+		return ValueType(v.RawBytes[simpleTagPos])
+	}
 	return ValueType(v.RawBytes[tagPos])
+}
+
+// GetMVCCValueHeader returns the MVCCValueHeader if one exists.
+func (v Value) GetMVCCValueHeader() (enginepb.MVCCValueHeader, error) {
+	if len(v.RawBytes) <= tagPos {
+		return enginepb.MVCCValueHeader{}, nil
+	}
+	if v.RawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL) {
+		extendedHeaderSize := extendedPreludeSize + binary.BigEndian.Uint32(v.RawBytes)
+		if len(v.RawBytes) < int(extendedHeaderSize) {
+			return enginepb.MVCCValueHeader{}, nil
+		}
+
+		parseBytes := v.RawBytes[extendedPreludeSize:extendedHeaderSize]
+		var vh enginepb.MVCCValueHeader
+		// NOTE: we don't use protoutil to avoid passing header through an interface,
+		// which would cause a heap allocation and incur the cost of dynamic dispatch.
+		if err := vh.Unmarshal(parseBytes); err != nil {
+			return enginepb.MVCCValueHeader{}, errors.Wrapf(err, "unmarshaling MVCCValueHeader")
+		}
+		return vh, nil
+	}
+	return enginepb.MVCCValueHeader{}, nil
 }
 
 func (v *Value) setTag(t ValueType) {
 	v.RawBytes[tagPos] = byte(t)
 }
 
+// extendedSimpleTagPos returns the position of the value tag assuming
+// that the value contains an enginepb.MVCCValueHeader.
+func (v Value) extendedSimpleTagPos() int {
+	return int(extendedMVCCValLenSize + binary.BigEndian.Uint32(v.RawBytes) + headerSize)
+}
+
 func (v Value) dataBytes() []byte {
+	if v.usesExtendedEncoding() {
+		simpleTagPos := v.extendedSimpleTagPos()
+		return v.RawBytes[simpleTagPos+1:]
+	}
 	return v.RawBytes[headerSize:]
 }
 
 // TagAndDataBytes returns the value's tag and data (no checksum, no timestamp).
 // This is suitable to be used as the expected value in a CPut.
 func (v Value) TagAndDataBytes() []byte {
+	if v.usesExtendedEncoding() {
+		simpleTagPos := v.extendedSimpleTagPos()
+		return v.RawBytes[simpleTagPos:]
+	}
 	return v.RawBytes[tagPos:]
 }
 
@@ -570,7 +669,7 @@ func (v *Value) SetTuple(data []byte) {
 // BYTES an error will be returned.
 func (v Value) GetBytes() ([]byte, error) {
 	if tag := v.GetTag(); tag != ValueType_BYTES {
-		return nil, fmt.Errorf("value type is not %s: %s", ValueType_BYTES, tag)
+		return nil, errors.Errorf("value type is not %s: %s", ValueType_BYTES, tag)
 	}
 	return v.dataBytes(), nil
 }
@@ -580,11 +679,11 @@ func (v Value) GetBytes() ([]byte, error) {
 // will be returned.
 func (v Value) GetFloat() (float64, error) {
 	if tag := v.GetTag(); tag != ValueType_FLOAT {
-		return 0, fmt.Errorf("value type is not %s: %s", ValueType_FLOAT, tag)
+		return 0, errors.Errorf("value type is not %s: %s", ValueType_FLOAT, tag)
 	}
 	dataBytes := v.dataBytes()
 	if len(dataBytes) != 8 {
-		return 0, fmt.Errorf("float64 value should be exactly 8 bytes: %d", len(dataBytes))
+		return 0, errors.Errorf("float64 value should be exactly 8 bytes: %d", len(dataBytes))
 	}
 	_, u, err := encoding.DecodeUint64Ascending(dataBytes)
 	if err != nil {
@@ -597,7 +696,7 @@ func (v Value) GetFloat() (float64, error) {
 // tag is not GEO an error will be returned.
 func (v Value) GetGeo() (geopb.SpatialObject, error) {
 	if tag := v.GetTag(); tag != ValueType_GEO {
-		return geopb.SpatialObject{}, fmt.Errorf("value type is not %s: %s", ValueType_GEO, tag)
+		return geopb.SpatialObject{}, errors.Errorf("value type is not %s: %s", ValueType_GEO, tag)
 	}
 	var ret geopb.SpatialObject
 	err := protoutil.Unmarshal(v.dataBytes(), &ret)
@@ -609,11 +708,11 @@ func (v Value) GetGeo() (geopb.SpatialObject, error) {
 func (v Value) GetBox2D() (geopb.BoundingBox, error) {
 	box := geopb.BoundingBox{}
 	if tag := v.GetTag(); tag != ValueType_BOX2D {
-		return box, fmt.Errorf("value type is not %s: %s", ValueType_BOX2D, tag)
+		return box, errors.Errorf("value type is not %s: %s", ValueType_BOX2D, tag)
 	}
 	dataBytes := v.dataBytes()
 	if len(dataBytes) != 32 {
-		return box, fmt.Errorf("float64 value should be exactly 32 bytes: %d", len(dataBytes))
+		return box, errors.Errorf("float64 value should be exactly 32 bytes: %d", len(dataBytes))
 	}
 	var err error
 	var val uint64
@@ -646,14 +745,14 @@ func (v Value) GetBox2D() (geopb.BoundingBox, error) {
 // an error will be returned.
 func (v Value) GetBool() (bool, error) {
 	if tag := v.GetTag(); tag != ValueType_INT {
-		return false, fmt.Errorf("value type is not %s: %s", ValueType_INT, tag)
+		return false, errors.Errorf("value type is not %s: %s", ValueType_INT, tag)
 	}
 	i, n := binary.Varint(v.dataBytes())
 	if n <= 0 {
-		return false, fmt.Errorf("int64 varint decoding failed: %d", n)
+		return false, errors.Errorf("int64 varint decoding failed: %d", n)
 	}
 	if i > 1 || i < 0 {
-		return false, fmt.Errorf("invalid bool: %d", i)
+		return false, errors.Errorf("invalid bool: %d", i)
 	}
 	return i != 0, nil
 }
@@ -662,11 +761,11 @@ func (v Value) GetBool() (bool, error) {
 // tag is not INT or the value cannot be decoded an error will be returned.
 func (v Value) GetInt() (int64, error) {
 	if tag := v.GetTag(); tag != ValueType_INT {
-		return 0, fmt.Errorf("value type is not %s: %s", ValueType_INT, tag)
+		return 0, errors.Errorf("value type is not %s: %s", ValueType_INT, tag)
 	}
 	i, n := binary.Varint(v.dataBytes())
 	if n <= 0 {
-		return 0, fmt.Errorf("int64 varint decoding failed: %d", n)
+		return 0, errors.Errorf("int64 varint decoding failed: %d", n)
 	}
 	return i, nil
 }
@@ -683,7 +782,7 @@ func (v Value) GetProto(msg protoutil.Message) error {
 	}
 
 	if tag := v.GetTag(); tag != expectedTag {
-		return fmt.Errorf("value type is not %s: %s", expectedTag, tag)
+		return errors.Errorf("value type is not %s: %s", expectedTag, tag)
 	}
 	return protoutil.Unmarshal(v.dataBytes(), msg)
 }
@@ -692,7 +791,7 @@ func (v Value) GetProto(msg protoutil.Message) error {
 // tag is not TIME an error will be returned.
 func (v Value) GetTime() (time.Time, error) {
 	if tag := v.GetTag(); tag != ValueType_TIME {
-		return time.Time{}, fmt.Errorf("value type is not %s: %s", ValueType_TIME, tag)
+		return time.Time{}, errors.Errorf("value type is not %s: %s", ValueType_TIME, tag)
 	}
 	_, t, err := encoding.DecodeTimeAscending(v.dataBytes())
 	return t, err
@@ -702,7 +801,7 @@ func (v Value) GetTime() (time.Time, error) {
 // tag is not TIMETZ an error will be returned.
 func (v Value) GetTimeTZ() (timetz.TimeTZ, error) {
 	if tag := v.GetTag(); tag != ValueType_TIMETZ {
-		return timetz.TimeTZ{}, fmt.Errorf("value type is not %s: %s", ValueType_TIMETZ, tag)
+		return timetz.TimeTZ{}, errors.Errorf("value type is not %s: %s", ValueType_TIMETZ, tag)
 	}
 	_, t, err := encoding.DecodeTimeTZAscending(v.dataBytes())
 	return t, err
@@ -712,7 +811,7 @@ func (v Value) GetTimeTZ() (timetz.TimeTZ, error) {
 // the tag is not DURATION an error will be returned.
 func (v Value) GetDuration() (duration.Duration, error) {
 	if tag := v.GetTag(); tag != ValueType_DURATION {
-		return duration.Duration{}, fmt.Errorf("value type is not %s: %s", ValueType_DURATION, tag)
+		return duration.Duration{}, errors.Errorf("value type is not %s: %s", ValueType_DURATION, tag)
 	}
 	_, t, err := encoding.DecodeDurationAscending(v.dataBytes())
 	return t, err
@@ -722,7 +821,7 @@ func (v Value) GetDuration() (duration.Duration, error) {
 // the tag is not BITARRAY an error will be returned.
 func (v Value) GetBitArray() (bitarray.BitArray, error) {
 	if tag := v.GetTag(); tag != ValueType_BITARRAY {
-		return bitarray.BitArray{}, fmt.Errorf("value type is not %s: %s", ValueType_BITARRAY, tag)
+		return bitarray.BitArray{}, errors.Errorf("value type is not %s: %s", ValueType_BITARRAY, tag)
 	}
 	_, t, err := encoding.DecodeUntaggedBitArrayValue(v.dataBytes())
 	return t, err
@@ -732,7 +831,7 @@ func (v Value) GetBitArray() (bitarray.BitArray, error) {
 // tag is not DECIMAL an error will be returned.
 func (v Value) GetDecimal() (apd.Decimal, error) {
 	if tag := v.GetTag(); tag != ValueType_DECIMAL {
-		return apd.Decimal{}, fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
+		return apd.Decimal{}, errors.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
 	}
 	return encoding.DecodeNonsortingDecimal(v.dataBytes(), nil)
 }
@@ -742,7 +841,7 @@ func (v Value) GetDecimal() (apd.Decimal, error) {
 // tag is not DECIMAL an error will be returned.
 func (v Value) GetDecimalInto(d *apd.Decimal) error {
 	if tag := v.GetTag(); tag != ValueType_DECIMAL {
-		return fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
+		return errors.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
 	}
 	return encoding.DecodeIntoNonsortingDecimal(d, v.dataBytes(), nil)
 }
@@ -764,7 +863,7 @@ func (v Value) GetTimeseries() (InternalTimeSeriesData, error) {
 // error will be returned.
 func (v Value) GetTuple() ([]byte, error) {
 	if tag := v.GetTag(); tag != ValueType_TUPLE {
-		return nil, fmt.Errorf("value type is not %s: %s", ValueType_TUPLE, tag)
+		return nil, errors.Errorf("value type is not %s: %s", ValueType_TUPLE, tag)
 	}
 	return v.dataBytes(), nil
 }
@@ -779,6 +878,15 @@ func computeChecksum(key, rawBytes []byte, crc hash.Hash32) uint32 {
 	if len(rawBytes) < headerSize {
 		return 0
 	}
+
+	if rawBytes[tagPos] == byte(ValueType_MVCC_EXTENDED_ENCODING_SENTINEL) {
+		simpleValueStart := extendedMVCCValLenSize + binary.BigEndian.Uint32(rawBytes) + 1
+		rawBytes = rawBytes[simpleValueStart:]
+		if len(rawBytes) < headerSize {
+			return 0
+		}
+	}
+
 	if _, err := crc.Write(key); err != nil {
 		panic(err)
 	}
@@ -893,6 +1001,29 @@ func (v Value) PrettyPrint() (ret string) {
 	return buf.String()
 }
 
+// SafeFormat implements the redact.SafeFormatter interface.
+func (sp StoreProperties) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.SafeString(redact.SafeString(sp.Dir))
+	w.SafeString(":")
+	if sp.ReadOnly {
+		w.SafeString(" ro")
+	} else {
+		w.SafeString(" rw")
+	}
+	w.Printf(" encrypted=%t", sp.Encrypted)
+	if sp.WalFailoverPath != nil {
+		w.Printf(" wal_failover_path=%s", redact.SafeString(*sp.WalFailoverPath))
+	}
+	if sp.FileStoreProperties != nil {
+		w.SafeString(" fs:{")
+		w.Printf("bdev=%s", redact.SafeString(sp.FileStoreProperties.BlockDevice))
+		w.Printf(" fstype=%s", redact.SafeString(sp.FileStoreProperties.FsType))
+		w.Printf(" mountpoint=%s", redact.SafeString(sp.FileStoreProperties.MountPoint))
+		w.Printf(" mountopts=%s", redact.SafeString(sp.FileStoreProperties.MountOptions))
+		w.SafeString("}")
+	}
+}
+
 // Kind returns the kind of commit trigger as a string.
 func (ct InternalCommitTrigger) Kind() redact.SafeString {
 	switch {
@@ -941,6 +1072,10 @@ func (TransactionStatus) SafeValue() {}
 //
 // baseKey can be nil, in which case it will be set when sending the first
 // write.
+//
+// omitInRangefeeds controls whether the transaction's writes are exposed via
+// rangefeeds. When set to true, all the transaction's writes will be
+// filtered out by rangefeeds, and will not be available in changefeeds.
 func MakeTransaction(
 	name string,
 	baseKey Key,
@@ -949,11 +1084,10 @@ func MakeTransaction(
 	now hlc.Timestamp,
 	maxOffsetNs int64,
 	coordinatorNodeID int32,
+	admissionPriority admissionpb.WorkPriority,
+	omitInRangefeeds bool,
 ) Transaction {
-	u := uuid.FastMakeV4()
-	// TODO(nvanbenschoten): technically, gul should be a synthetic timestamp.
-	// Make this change in v21.2 when all nodes in a cluster are guaranteed to
-	// be aware of synthetic timestamps by addressing the TODO in Timestamp.Add.
+	u := uuid.MakeV4()
 	gul := now.Add(maxOffsetNs, 0)
 
 	return Transaction{
@@ -971,17 +1105,21 @@ func MakeTransaction(
 		LastHeartbeat:          now,
 		ReadTimestamp:          now,
 		GlobalUncertaintyLimit: gul,
+		AdmissionPriority:      int32(admissionPriority),
+		// When set to true OmitInRangefeeds indicates that none of the
+		// transaction's writes will appear in rangefeeds. Should be set to false
+		// for all transactions that write to internal system tables and most other
+		// transactions unless specifically stated otherwise (e.g. by the
+		// disable_changefeed_replication session variable).
+		OmitInRangefeeds: omitInRangefeeds,
 	}
 }
 
 // LastActive returns the last timestamp at which client activity definitely
-// occurred, i.e. the maximum of ReadTimestamp and LastHeartbeat.
+// occurred, i.e. the maximum of MinTimestamp and LastHeartbeat.
 func (t Transaction) LastActive() hlc.Timestamp {
-	ts := t.LastHeartbeat
-	// TODO(nvanbenschoten): remove this when we remove synthetic timestamps.
-	if !t.ReadTimestamp.Synthetic {
-		ts.Forward(t.ReadTimestamp)
-	}
+	ts := t.MinTimestamp
+	ts.Forward(t.LastHeartbeat)
 	return ts
 }
 
@@ -1216,15 +1354,16 @@ func (t *Transaction) BumpReadTimestamp(timestamp hlc.Timestamp) {
 // others) for the transaction. If t.ID is empty, then the transaction is
 // copied from o.
 func (t *Transaction) Update(o *Transaction) {
+	ctx := context.TODO()
 	if o == nil {
 		return
 	}
-	o.AssertInitialized(context.TODO())
+	o.AssertInitialized(ctx)
 	if t.ID == (uuid.UUID{}) {
 		*t = *o
 		return
 	} else if t.ID != o.ID {
-		log.Fatalf(context.Background(), "updating txn %s with different txn %s", t.String(), o.String())
+		log.Fatalf(ctx, "updating txn %s with different txn %s", t.String(), o.String())
 		return
 	}
 	if len(t.Key) == 0 {
@@ -1234,9 +1373,15 @@ func (t *Transaction) Update(o *Transaction) {
 
 	// Update epoch-scoped state, depending on the two transactions' epochs.
 	if t.Epoch < o.Epoch {
+		// Ensure that the transaction status makes sense. If the transaction
+		// has already been finalized, then it should remain finalized.
+		if !t.Status.IsFinalized() {
+			t.Status = o.Status
+		} else if t.Status == COMMITTED {
+			log.Warningf(ctx, "updating COMMITTED txn %s with txn at later epoch %s", t.String(), o.String())
+		}
 		// Replace all epoch-scoped state.
 		t.Epoch = o.Epoch
-		t.Status = o.Status
 		t.WriteTooOld = o.WriteTooOld
 		t.ReadTimestampFixed = o.ReadTimestampFixed
 		t.Sequence = o.Sequence
@@ -1248,16 +1393,22 @@ func (t *Transaction) Update(o *Transaction) {
 		switch t.Status {
 		case PENDING:
 			t.Status = o.Status
+		case PREPARED:
+			if o.Status != PENDING {
+				t.Status = o.Status
+			}
 		case STAGING:
 			if o.Status != PENDING {
 				t.Status = o.Status
 			}
 		case ABORTED:
 			if o.Status == COMMITTED {
-				log.Warningf(context.Background(), "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
+				log.Warningf(ctx, "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
 			}
 		case COMMITTED:
 			// Nothing to do.
+		default:
+			log.Fatalf(ctx, "unexpected txn status: %s", t.Status)
 		}
 
 		if t.ReadTimestamp == o.ReadTimestamp {
@@ -1298,8 +1449,8 @@ func (t *Transaction) Update(o *Transaction) {
 			// have incremented the txn's epoch without realizing that it was
 			// aborted.
 			t.Status = ABORTED
-		case COMMITTED:
-			log.Warningf(context.Background(), "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
+		case PREPARED, COMMITTED:
+			log.Warningf(ctx, "updating txn %s with %s txn at earlier epoch %s", t.String(), o.Status, o.String())
 		}
 	}
 
@@ -1325,6 +1476,24 @@ func (t *Transaction) Update(o *Transaction) {
 
 	// Ratchet the transaction priority.
 	t.UpgradePriority(o.Priority)
+
+	// The following fields are not present in TransactionRecord, so we need to be
+	// careful when updating them since Transaction o might be coming from a
+	// TransactionRecord. If the fields were previously set, do not overwrite them
+	// with the default values. Conversely, if the fields were previously unset,
+	// allow updating them to handle the case when a Transaction proto updates a
+	// TransactionRecord proto.
+
+	// AdmissionPriority doesn't change after the transaction is created, so we
+	// don't ever expect to change it from a non-zero value to 0.
+	if o.AdmissionPriority != 0 {
+		t.AdmissionPriority = o.AdmissionPriority
+	}
+	// OmitInRangefeeds doesn't change after the transaction is created, so we
+	// don't ever expect to change it from true to false.
+	if o.OmitInRangefeeds {
+		t.OmitInRangefeeds = o.OmitInRangefeeds
+	}
 }
 
 // UpgradePriority sets transaction priority to the maximum of current
@@ -1547,16 +1716,10 @@ func confChangeImpl(
 	for _, rDesc := range removed {
 		sl = append(sl, raftpb.ConfChangeSingle{
 			Type:   raftpb.ConfChangeRemoveNode,
-			NodeID: uint64(rDesc.ReplicaID),
+			NodeID: raftpb.PeerID(rDesc.ReplicaID),
 		})
 
 		switch rDesc.Type {
-		case VOTER_OUTGOING:
-			// If a voter is removed through joint consensus, it will
-			// be turned into an outgoing voter first.
-			if err := checkExists(rDesc); err != nil {
-				return nil, err
-			}
 		case VOTER_DEMOTING_LEARNER, VOTER_DEMOTING_NON_VOTER:
 			// If a voter is demoted through joint consensus, it will
 			// be turned into a demoting voter first.
@@ -1566,7 +1729,7 @@ func confChangeImpl(
 			// It's being re-added as a learner, not only removed.
 			sl = append(sl, raftpb.ConfChangeSingle{
 				Type:   raftpb.ConfChangeAddLearnerNode,
-				NodeID: uint64(rDesc.ReplicaID),
+				NodeID: raftpb.PeerID(rDesc.ReplicaID),
 			})
 		case LEARNER:
 			// A learner could in theory show up in the descriptor if the removal was
@@ -1584,13 +1747,8 @@ func confChangeImpl(
 			if err := checkNotExists(rDesc); err != nil {
 				return nil, err
 			}
-		case VOTER_FULL:
-			// A voter can't be in the descriptor if it's being removed.
-			if err := checkNotExists(rDesc); err != nil {
-				return nil, err
-			}
 		default:
-			return nil, errors.Errorf("can't remove replica in state %v", rDesc.Type)
+			return nil, errors.Errorf("removal of %v unsafe, demote to LEARNER first", rDesc.Type)
 		}
 	}
 
@@ -1626,7 +1784,7 @@ func confChangeImpl(
 		}
 		sl = append(sl, raftpb.ConfChangeSingle{
 			Type:   changeType,
-			NodeID: uint64(rDesc.ReplicaID),
+			NodeID: raftpb.PeerID(rDesc.ReplicaID),
 		})
 	}
 
@@ -1776,6 +1934,9 @@ type LeaseSequence uint64
 // SafeValue implements the redact.SafeValue interface.
 func (s LeaseSequence) SafeValue() {}
 
+// SafeValue implements the redact.SafeValue interface.
+func (LeaseAcquisitionType) SafeValue() {}
+
 var _ fmt.Stringer = &Lease{}
 
 func (l Lease) String() string {
@@ -1788,14 +1949,18 @@ func (l Lease) SafeFormat(w redact.SafePrinter, _ rune) {
 		w.SafeString("<empty>")
 		return
 	}
-	if l.Type() == LeaseExpiration {
-		w.Printf("repl=%s seq=%d start=%s exp=%s", l.Replica, l.Sequence, l.Start, l.Expiration)
-	} else {
-		w.Printf("repl=%s seq=%d start=%s epo=%d", l.Replica, l.Sequence, l.Start, l.Epoch)
+	w.Printf("repl=%s seq=%d start=%s", l.Replica, l.Sequence, l.Start)
+	switch l.Type() {
+	case LeaseExpiration:
+		w.Printf(" exp=%s", l.Expiration)
+	case LeaseEpoch:
+		w.Printf(" epo=%d min-exp=%s", l.Epoch, l.MinExpiration)
+	case LeaseLeader:
+		w.Printf(" term=%d min-exp=%s", l.Term, l.MinExpiration)
+	default:
+		panic("unexpected lease type")
 	}
-	if l.ProposedTS != nil {
-		w.Printf(" pro=%s", l.ProposedTS)
-	}
+	w.Printf(" pro=%s acq=%s", l.ProposedTS, l.AcquisitionType)
 }
 
 // Empty returns true for the Lease zero-value.
@@ -1809,7 +1974,9 @@ func (l Lease) OwnedBy(storeID StoreID) bool {
 }
 
 // LeaseType describes the type of lease.
-type LeaseType int
+//
+//go:generate stringer -type=LeaseType
+type LeaseType int32
 
 const (
 	// LeaseNone specifies no lease, to be used as a default value.
@@ -1820,14 +1987,63 @@ const (
 	// LeaseEpoch allows range operations while the node liveness epoch
 	// is equal to the lease epoch.
 	LeaseEpoch
+	// LeaseLeader allows range operations while the replica is guaranteed
+	// to be the range's raft leader.
+	LeaseLeader
 )
+
+// TestingAllLeaseTypes returns a list of all lease types to test against.
+func TestingAllLeaseTypes() []LeaseType {
+	if syncutil.DeadlockEnabled {
+		// Skip expiration-based leases under deadlock since it could overload the
+		// testing cluster.
+		return []LeaseType{LeaseEpoch, LeaseLeader}
+	}
+	return []LeaseType{LeaseExpiration, LeaseEpoch, LeaseLeader}
+}
+
+// EpochAndLeaderLeaseType returns a list of {epcoh, leader} lease types.
+func EpochAndLeaderLeaseType() []LeaseType {
+	return []LeaseType{LeaseEpoch, LeaseLeader}
+}
+
+// ExpirationAndLeaderLeaseType returns a list of {expiration, leader} lease
+// types.
+func ExpirationAndLeaderLeaseType() []LeaseType {
+	return []LeaseType{LeaseExpiration, LeaseLeader}
+}
 
 // Type returns the lease type.
 func (l Lease) Type() LeaseType {
-	if l.Epoch == 0 {
-		return LeaseExpiration
+	if l.Epoch != 0 && l.Term != 0 {
+		panic("lease cannot have both epoch and term")
 	}
-	return LeaseEpoch
+	if l.Epoch != 0 {
+		return LeaseEpoch
+	}
+	if l.Term != 0 {
+		return LeaseLeader
+	}
+	return LeaseExpiration
+}
+
+// SupportsQuiescence returns whether the lease supports quiescence or not.
+func (l Lease) SupportsQuiescence() bool {
+	switch l.Type() {
+	case LeaseExpiration, LeaseLeader:
+		// Expiration based leases do not support quiescence because they'll likely
+		// be renewed soon, so there's not much point to it.
+		//
+		// Leader leases do not support quiescence because a fortified raft leader
+		// will not send raft heartbeats, so quiescence is not needed. All liveness
+		// decisions are based on store liveness communication, which is cheap
+		// enough to not need a notion of quiescence.
+		return false
+	case LeaseEpoch:
+		return true
+	default:
+		panic("unexpected lease type")
+	}
 }
 
 // Speculative returns true if this lease instance doesn't correspond to a
@@ -1839,22 +2055,55 @@ func (l Lease) Speculative() bool {
 	return l.Sequence == 0
 }
 
-// Equivalent determines whether ol is considered the same lease
-// for the purposes of matching leases when executing a command.
+// Equivalent determines whether the old lease (l) is considered the same as
+// the new lease (newL) for the purposes of matching leases when executing a
+// command.
+//
 // For expiration-based leases, extensions are allowed.
 // Ignore proposed timestamps for lease verification; for epoch-
 // based leases, the start time of the lease is sufficient to
 // avoid using an older lease with same epoch.
 //
+// expToEpochEquiv indicates whether an expiration-based lease
+// can be considered equivalent to an epoch-based lease during
+// a promotion from expiration-based to epoch-based. It is used
+// for mixed-version compatibility. No such flag is needed for
+// expiration-based to leader lease promotion, because there is
+// no need for mixed-version compatibility.
+//
 // NB: Lease.Equivalent is NOT symmetric. For expiration-based
 // leases, a lease is equivalent to another with an equal or
-// later expiration, but not an earlier expiration.
-func (l Lease) Equivalent(newL Lease) bool {
+// later expiration, but not an earlier expiration. Similarly,
+// an expiration-based lease is equivalent to an epoch-based
+// lease with the same replica and start time (representing a
+// promotion from expiration-based to epoch-based), but the
+// reverse is not true.
+//
+// One of the uses of Equivalent is in deciding what Sequence to assign to
+// newL, so this method must not use the value of Sequence for equivalency.
+//
+// The Start time of the two leases is compared, and a necessary condition
+// for equivalency is that they must be equal. So in the case where the
+// caller is someone who is constructing a new lease proposal, it is the
+// caller's responsibility to realize that the two leases *could* be
+// equivalent, and adjust the start time to be the same. Even if the start
+// times are the same, the leases could turn out to be non-equivalent -- in
+// that case they will share a start time but not the sequence.
+//
+// NB: we do not allow transitions from epoch-based or leader leases to
+// expiration-based leases to be equivalent. This was because both of the
+// former lease types don't have an expiration in the lease, while the
+// latter does. We can introduce safety violations by shortening the lease
+// expiration if we allow this transition, since the new lease may not apply
+// at the leaseholder until much after it applies at some other replica, so
+// the leaseholder may continue acting as one based on an old lease, while
+// the other replica has stepped up as leaseholder.
+func (l Lease) Equivalent(newL Lease, expToEpochEquiv bool) bool {
 	// Ignore proposed timestamp & deprecated start stasis.
-	l.ProposedTS, newL.ProposedTS = nil, nil
+	l.ProposedTS, newL.ProposedTS = hlc.ClockTimestamp{}, hlc.ClockTimestamp{}
 	l.DeprecatedStartStasis, newL.DeprecatedStartStasis = nil, nil
-	// Ignore sequence numbers, they are simply a reflection of
-	// the equivalency of other fields.
+	// Ignore sequence numbers, they are simply a reflection of the equivalency of
+	// other fields. Also, newL may not have an initialized sequence number.
 	l.Sequence, newL.Sequence = 0, 0
 	// Ignore the acquisition type, as leases will always be extended via
 	// RequestLease requests regardless of how a leaseholder first acquired its
@@ -1877,17 +2126,84 @@ func (l Lease) Equivalent(newL Lease) bool {
 		if l.Epoch == newL.Epoch {
 			l.Epoch, newL.Epoch = 0, 0
 		}
-	case LeaseExpiration:
-		// See the comment above, though this field's nullability wasn't
-		// changed. We nil it out for completeness only.
-		l.Epoch, newL.Epoch = 0, 0
 
-		// For expiration-based leases, extensions are considered equivalent.
-		// This is the one case where Equivalent is not commutative and, as
-		// such, requires special handling beneath Raft (see checkForcedErr).
-		if l.GetExpiration().LessEq(newL.GetExpiration()) {
-			l.Expiration, newL.Expiration = nil, nil
+		// For epoch-based leases, extensions to the minimum expiration are
+		// considered equivalent.
+		if l.MinExpiration.LessEq(newL.MinExpiration) {
+			l.MinExpiration, newL.MinExpiration = hlc.Timestamp{}, hlc.Timestamp{}
 		}
+
+	case LeaseLeader:
+		if l.Term == newL.Term {
+			l.Term, newL.Term = 0, 0
+		}
+		// For leader leases, extensions to the minimum expiration are considered
+		// equivalent.
+		if l.MinExpiration.LessEq(newL.MinExpiration) {
+			l.MinExpiration, newL.MinExpiration = hlc.Timestamp{}, hlc.Timestamp{}
+		}
+
+	case LeaseExpiration:
+		switch newL.Type() {
+		case LeaseEpoch:
+			// An expiration-based lease being promoted to an epoch-based lease. This
+			// transition occurs after a successful lease transfer if the setting
+			// kv.transfer_expiration_leases_first.enabled is enabled.
+			//
+			// Expiration-based leases carry a local expiration timestamp. Epoch-based
+			// leases store their expiration indirectly in NodeLiveness. We assume that
+			// this promotion is only proposed if the liveness expiration is later than
+			// previous expiration carried by the expiration-based lease. This is a
+			// case where Equivalent is not commutative, as the reverse transition
+			// (from epoch-based to expiration-based) requires a sequence increment.
+			//
+			// Ignore expiration, epoch, and min expiration. The remaining fields
+			// which are compared are Replica and Start.
+			if expToEpochEquiv {
+				l.Expiration = nil
+				newL.Epoch = 0
+				newL.MinExpiration = hlc.Timestamp{}
+			}
+
+		case LeaseLeader:
+			// An expiration-based lease being promoted to a leader lease. This
+			// transition occurs after a successful lease transfer if the setting
+			// kv.transfer_expiration_leases_first.enabled is enabled and leader
+			// leases are in use.
+			//
+			// Expiration-based leases carry a local expiration timestamp. Leader
+			// leases extend their expiration indirectly through the leadership
+			// fortification protocol and associated Store Liveness heartbeats. We
+			// assume that this promotion is only proposed if the leader support
+			// expiration (and associated min expiration) is equal to or later than
+			// previous expiration carried by the expiration-based lease. This is a
+			// case where Equivalent is not commutative, as the reverse transition
+			// (from leader lease to expiration-based) requires a sequence increment.
+			//
+			// Ignore expiration, term, and min expiration. The remaining fields
+			// which are compared are Replica and Start.
+			l.Expiration = nil
+			newL.Term = 0
+			newL.MinExpiration = hlc.Timestamp{}
+
+		case LeaseExpiration:
+			// See the comment above, though this field's nullability wasn't
+			// changed. We nil it out for completeness only.
+			l.Epoch, newL.Epoch = 0, 0
+
+			// For expiration-based leases, extensions are considered equivalent.
+			// This is one case where Equivalent is not commutative and, as such,
+			// requires special handling beneath Raft (see checkForcedErr).
+			if l.GetExpiration().LessEq(newL.GetExpiration()) {
+				l.Expiration, newL.Expiration = nil, nil
+			}
+
+		default:
+			panic("unexpected lease type")
+		}
+
+	default:
+		panic("unexpected lease type")
 	}
 	return l == newL
 }
@@ -1921,8 +2237,8 @@ func equivalentTimestamps(a, b *hlc.Timestamp) bool {
 
 // Equal implements the gogoproto Equal interface. This implementation is
 // forked from the gogoproto generated code to allow l.Expiration == nil and
-// l.Expiration == &hlc.Timestamp{} to compare equal. Ditto for
-// DeprecatedStartStasis.
+// l.Expiration == &hlc.Timestamp{} to compare equal. It also ignores
+// DeprecatedStartStasis entirely to allow for its removal in a later release.
 func (l *Lease) Equal(that interface{}) bool {
 	if that == nil {
 		return l == nil
@@ -1952,9 +2268,6 @@ func (l *Lease) Equal(that interface{}) bool {
 	if !l.Replica.Equal(&that1.Replica) {
 		return false
 	}
-	if !equivalentTimestamps(l.DeprecatedStartStasis, that1.DeprecatedStartStasis) {
-		return false
-	}
 	if !l.ProposedTS.Equal(that1.ProposedTS) {
 		return false
 	}
@@ -1964,11 +2277,21 @@ func (l *Lease) Equal(that interface{}) bool {
 	if l.Sequence != that1.Sequence {
 		return false
 	}
+	if l.AcquisitionType != that1.AcquisitionType {
+		return false
+	}
+	if !l.MinExpiration.Equal(&that1.MinExpiration) {
+		return false
+	}
+	if l.Term != that1.Term {
+		return false
+	}
 	return true
 }
 
 // MakeLock makes a lock with the given txn, key, and strength.
-// This is suitable for use when constructing LockConflictError.
+// This is suitable for use when constructing a LockConflictError or
+// WriteIntentError.
 func MakeLock(txn *enginepb.TxnMeta, key Key, str lock.Strength) Lock {
 	var l Lock
 	l.Txn = *txn
@@ -2014,15 +2337,24 @@ func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 // MakeLockAcquisition makes a lock acquisition message from the given
 // txn, key, durability level, and lock strength.
 func MakeLockAcquisition(
-	txn *Transaction, key Key, dur lock.Durability, str lock.Strength,
+	txn enginepb.TxnMeta,
+	key Key,
+	dur lock.Durability,
+	str lock.Strength,
+	ignoredSeqNums []enginepb.IgnoredSeqNumRange,
 ) LockAcquisition {
 	return LockAcquisition{
 		Span:           Span{Key: key},
-		Txn:            txn.TxnMeta,
+		Txn:            txn,
 		Durability:     dur,
 		Strength:       str,
-		IgnoredSeqNums: txn.IgnoredSeqNums,
+		IgnoredSeqNums: ignoredSeqNums,
 	}
+}
+
+// Empty returns true if the lock acquisition is empty.
+func (m *LockAcquisition) Empty() bool {
+	return m.Span.Equal(Span{})
 }
 
 // MakeLockUpdate makes a lock update from the given txn and span.
@@ -2088,6 +2420,27 @@ func (s Span) EqualValue(o Span) bool {
 // Equal compares two spans.
 func (s Span) Equal(o Span) bool {
 	return s.Key.Equal(o.Key) && s.EndKey.Equal(o.EndKey)
+}
+
+// ZeroLength returns true if the distance between the start and end key is 0.
+func (s Span) ZeroLength() bool {
+	return s.Key.Equal(s.EndKey)
+}
+
+// Clamp clamps span s's keys within the span defined in bounds.
+func (s Span) Clamp(bounds Span) (Span, error) {
+	start, err := s.Key.Clamp(bounds.Key, bounds.EndKey)
+	if err != nil {
+		return Span{}, err
+	}
+	end, err := s.EndKey.Clamp(bounds.Key, bounds.EndKey)
+	if err != nil {
+		return Span{}, err
+	}
+	return Span{
+		Key:    start,
+		EndKey: end,
+	}, nil
 }
 
 // Overlaps returns true WLOG for span A and B iff:
@@ -2298,15 +2651,24 @@ func (a Spans) ContainsKey(key Key) bool {
 // SpansOverhead is the overhead of Spans in bytes.
 const SpansOverhead = int64(unsafe.Sizeof(Spans{}))
 
-// MemUsage returns the size of the Spans in bytes for memory accounting
-// purposes.
-func (a Spans) MemUsage() int64 {
-	// Slice the full capacity of a so we can account for the memory
-	// used by spans past the length of a.
-	aCap := a[:cap(a)]
-	size := SpansOverhead
-	for i := range aCap {
-		size += aCap[i].MemUsage()
+// MemUsageUpToLen returns the size of the Spans in bytes for memory accounting
+// purposes. The method assumes that all spans in [len(a), cap(a)] range are
+// empty and will panic in test builds when not.
+func (a Spans) MemUsageUpToLen() int64 {
+	if buildutil.CrdbTestBuild {
+		l := len(a)
+		aCap := a[:cap(a)]
+		for _, s := range aCap[l:] {
+			if len(s.Key) > 0 || len(s.EndKey) > 0 {
+				panic(errors.AssertionFailedf(
+					"spans are not empty past length: %v (len=%d, cap=%d)", aCap, l, cap(a)),
+				)
+			}
+		}
+	}
+	size := SpansOverhead + int64(cap(a)-len(a))*SpanOverhead
+	for i := range a {
+		size += a[i].MemUsage()
 	}
 	return size
 }
@@ -2318,6 +2680,43 @@ func (a Spans) String() string {
 			buf.WriteString(", ")
 		}
 		buf.WriteString(span.String())
+	}
+	return buf.String()
+}
+
+// BoundedString returns a stringified representation of Spans while adhering to
+// the provided hint on the length (although not religiously). The following
+// heuristics are used:
+// - if there are no more than 6 spans, then all are printed,
+// - otherwise, at least 3 "head" and at least 3 "tail" spans are always printed
+//   - the bytes "budget" is consumed from the "head".
+func (a Spans) BoundedString(bytesHint int) string {
+	if len(a) <= 6 {
+		return a.String()
+	}
+	var buf bytes.Buffer
+	var i int
+	headEndIdx, tailStartIdx := 2, len(a)-3
+	for i = range a {
+		if i != 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(a[i].String())
+		if buf.Len() >= bytesHint && i >= headEndIdx && i+1 < tailStartIdx {
+			// If the bytes budget has been consumed, and we've included at
+			// least 3 spans from the "head", and we have more than 3 spans left
+			// total, we stop iteration from the front.
+			break
+		}
+	}
+	if i+1 < len(a) {
+		buf.WriteString(" ... ")
+		for i = tailStartIdx; i < len(a); i++ {
+			if i != tailStartIdx {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(a[i].String())
+		}
 	}
 	return buf.String()
 }

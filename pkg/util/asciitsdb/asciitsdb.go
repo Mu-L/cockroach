@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package asciitsdb
 
@@ -15,11 +10,13 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/guptarohit/asciigraph"
 	"github.com/stretchr/testify/require"
 )
@@ -106,9 +103,17 @@ func (t *TSDB) Scrape(ctx context.Context) {
 			if _, ok := t.mu.points[name]; !ok {
 				return
 			}
-			count, _ := mtr.Total()
+			// Use cumulative stats here. Count must be calculated against the cumulative histogram.
+			cumulative, ok := mtr.(metric.CumulativeHistogram)
+			if !ok {
+				panic(errors.AssertionFailedf(`extractValue called on histogram metric %q that does not implement the
+				CumulativeHistogram interface. All histogram metrics are expected to implement this interface`, name))
+			}
+			count, _ := cumulative.CumulativeSnapshot().Total()
 			t.mu.points[name+"-count"] = append(t.mu.points[name+"-count"], float64(count))
-			avg := mtr.MeanWindowed()
+			// Use windowed stats for avg and quantiles
+			windowedSnapshot := mtr.WindowedSnapshot()
+			avg := windowedSnapshot.Mean()
 			if math.IsNaN(avg) || math.IsInf(avg, +1) || math.IsInf(avg, -1) {
 				avg = 0
 			}
@@ -120,7 +125,7 @@ func (t *TSDB) Scrape(ctx context.Context) {
 				{"-p75", 75},
 				{"-p50", 50},
 			} {
-				t.mu.points[name+pt.suffix] = append(t.mu.points[name+pt.suffix], mtr.ValueAtQuantileWindowed(pt.quantile))
+				t.mu.points[name+pt.suffix] = append(t.mu.points[name+pt.suffix], windowedSnapshot.ValueAtQuantile(pt.quantile))
 			}
 		case metric.PrometheusExportable:
 			// NB: this branch is intentionally at the bottom since all metrics
@@ -176,6 +181,23 @@ func (t *TSDB) read(metric string) ([]float64, bool) {
 
 	points, ok := t.mu.points[metric]
 	return points, ok
+}
+
+// RegisteredMetricNames returns a list of all metric names that have been
+// registerd with TSDB via Register(..).
+func (t *TSDB) RegisteredMetricNames() []string {
+	var names []string
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for metric := range t.mu.points {
+		names = append(names, metric)
+	}
+
+	// For deterministic output.
+	sort.Strings(names)
+
+	return names
 }
 
 func (t *TSDB) registerMetricValue(val reflect.Value, name string, skipNil bool) {
@@ -301,11 +323,4 @@ func divide(input []float64, divisor float64) []float64 {
 type quantile struct {
 	suffix   string
 	quantile float64
-}
-
-func min(i, j int64) int64 {
-	if i < j {
-		return i
-	}
-	return j
 }

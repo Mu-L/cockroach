@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -20,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -29,6 +23,7 @@ import (
 )
 
 type renameDatabaseNode struct {
+	zeroInputPlanNode
 	n       *tree.RenameDatabase
 	dbDesc  *dbdesc.Mutable
 	newName string
@@ -48,7 +43,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 	}
 
 	if n.Name == "" || n.NewName == "" {
-		return nil, errEmptyDatabaseName
+		return nil, sqlerrors.ErrEmptyDatabaseName
 	}
 
 	if string(n.Name) == p.SessionData().Database && p.SessionData().SafeUpdates {
@@ -81,7 +76,7 @@ func (p *planner) RenameDatabase(ctx context.Context, n *tree.RenameDatabase) (p
 			return nil, pgerror.Newf(
 				pgcode.InsufficientPrivilege, "must be owner of database %s", n.Name)
 		}
-		hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
+		hasCreateDB, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.CREATEDB)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +206,7 @@ func maybeFailOnDependentDescInRename(
 	if withLeased {
 		b = p.Descriptors().ByIDWithLeased(p.txn)
 	} else {
-		b = p.Descriptors().ByID(p.txn)
+		b = p.Descriptors().ByIDWithoutLeased(p.txn)
 	}
 	descs, err := b.WithoutNonPublic().Get().Descs(ctx, ids)
 	if err != nil {
@@ -247,16 +242,13 @@ func maybeFailOnDependentDescInRename(
 			if err != nil {
 				return err
 			}
-			depErr := sqlerrors.NewDependentObjectErrorf(
+			// Otherwise, we default to the view error message.
+			return errors.WithHintf(sqlerrors.NewDependentObjectErrorf(
 				"cannot rename %s because relation %q depends on relation %q",
 				renameDescType,
 				dependentDescQualifiedString,
 				tbTableName.String(),
-			)
-
-			// Otherwise, we default to the view error message.
-			return errors.WithHintf(depErr,
-				"you can drop %q instead", dependentDescQualifiedString)
+			), "consider dropping %q first", dependentDescQualifiedString)
 		}); err != nil {
 			return err
 		}

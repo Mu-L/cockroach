@@ -1,18 +1,14 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package kvpb contains basic utilities for the kv layer.
 package kvpb
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
@@ -69,6 +65,8 @@ func PrepareTransactionForRetry(
 			now.ToTimestamp(),
 			clock.MaxOffset().Nanoseconds(),
 			txn.CoordinatorNodeID,
+			admissionpb.WorkPriority(txn.AdmissionPriority),
+			txn.OmitInRangefeeds,
 		)
 		// Use the priority communicated back by the server.
 		txn.Priority = errTxnPri

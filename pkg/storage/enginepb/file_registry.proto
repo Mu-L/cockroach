@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.storage.enginepb;
@@ -29,8 +24,8 @@ enum RegistryVersion {
 // EnvType determines which rocksdb::Env is used and for what purpose.
 enum EnvType {
   // The default Env when no encryption is used.
-  // File using Plaintext are not recorded in the file registry.
-  Plaintext = 0;
+  // File using Plain are not recorded in the file registry.
+  Plain = 0;
   // The Env using store-level keys.
   // Used only to read/write the data key registry.
   Store = 1;

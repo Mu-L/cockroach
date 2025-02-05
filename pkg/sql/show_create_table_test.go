@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -20,8 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
@@ -31,13 +26,12 @@ func TestShowCreateTableWithConstraintInvalidated(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
 
-	s0 := tc.Server(0)
+	s0 := s.ApplicationLayer()
 
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(conn)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
@@ -69,7 +63,7 @@ func TestShowCreateTableWithConstraintInvalidated(t *testing.T) {
 					`\n\tx INT8 NULL,`+
 					`\n\ty INT8 NULL,`+
 					`\n\tcrdb_internal_y_shard_16 INT8 NOT VISIBLE NOT NULL AS (`+
-					`mod(fnv32(crdb_internal.datums_to_bytes(y)), 16:::INT8)) VIRTUAL,`+
+					`mod(fnv32(md5(crdb_internal.datums_to_bytes(y))), 16:::INT8)) VIRTUAL,`+
 					`\n\trowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),`+
 					`\n\tCONSTRAINT table_pkey PRIMARY KEY (rowid ASC),`+
 					`\n\tINDEX table_y_idx (y ASC) USING HASH WITH (bucket_count=16)`+
@@ -104,7 +98,7 @@ func TestShowCreateTableWithConstraintInvalidated(t *testing.T) {
 				`e'CREATE TABLE schema."table" (`+
 					`\n\tx INT8 NULL,`+
 					`\n\ty INT8 NULL,`+
-					`\n\tcrdb_internal_y_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(y)), 16:::INT8)) VIRTUAL,`+
+					`\n\tcrdb_internal_y_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(y))), 16:::INT8)) VIRTUAL,`+
 					`\n\trowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),`+
 					`\n\tCONSTRAINT table_pkey PRIMARY KEY (rowid ASC),`+
 					`\n\tINDEX table_y_idx (y ASC) USING HASH WITH (bucket_count=16),`+

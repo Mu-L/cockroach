@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package descs provides abstractions for dealing with sets of descriptors.
 // It is utilized during schema changes and by catalog.Accessor implementations.
@@ -33,6 +28,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -124,6 +121,10 @@ type Collection struct {
 	// repairs.
 	skipValidationOnWrite bool
 
+	// readerCatalogSetup indicates that replicated descriptors can be modified
+	// by this collection.
+	readerCatalogSetup bool
+
 	// deletedDescs that will not need to wait for new lease versions.
 	deletedDescs catalog.DescriptorIDSet
 
@@ -137,6 +138,11 @@ type Collection struct {
 	// It must be set in the multi-tenant environment for ephemeral
 	// SQL pods. It should not be set otherwise.
 	sqlLivenessSession sqlliveness.Session
+
+	// LeaseGeneration is the first generation value observed by this
+	// txn. This guarantees the generation for long-running transactions
+	// this value stays the same for the life of the transaction.
+	leaseGeneration int64
 }
 
 // FromTxn is a convenience function to extract a descs.Collection which is
@@ -181,6 +187,12 @@ func (tc *Collection) SkipValidationOnWrite() {
 	tc.skipValidationOnWrite = true
 }
 
+// SetReaderCatalogSetup indicates this collection is being used to
+// modify reader catalogs.
+func (tc *Collection) SetReaderCatalogSetup() {
+	tc.readerCatalogSetup = true
+}
+
 // ReleaseSpecifiedLeases releases the leases for the descriptors with ids in
 // the passed slice. Errors are logged but ignored.
 func (tc *Collection) ReleaseSpecifiedLeases(ctx context.Context, descs []lease.IDVersion) {
@@ -192,6 +204,7 @@ func (tc *Collection) ReleaseLeases(ctx context.Context) {
 	tc.leased.releaseAll(ctx)
 	// Clear the associated sqlliveness.session
 	tc.sqlLivenessSession = nil
+	tc.leaseGeneration = 0
 }
 
 // ReleaseAll releases all state currently held by the Collection.
@@ -201,6 +214,29 @@ func (tc *Collection) ReleaseAll(ctx context.Context) {
 	tc.ResetUncommitted(ctx)
 	tc.cr.Reset(ctx)
 	tc.skipValidationOnWrite = false
+}
+
+// ResetLeaseGeneration selects an initial value at the beginning of a txn
+// for lease generation.
+func (tc *Collection) ResetLeaseGeneration() {
+	// Note: If a collection doesn't have a lease manager assigned, then
+	// no generation will be selected. This can only happen with either
+	// bare-bones collections or test cases.
+	if tc.leased.lm != nil {
+		tc.leaseGeneration = tc.leased.lm.GetLeaseGeneration()
+	}
+}
+
+// GetLeaseGeneration provides an integer which will change whenever new
+// descriptor versions are available. This can be used for fast comparisons
+// to make sure previously looked up information is still valid.
+func (tc *Collection) GetLeaseGeneration() int64 {
+	// Sanity: Pick a lease generation if one hasn't been set.
+	if tc.leaseGeneration == 0 {
+		tc.ResetLeaseGeneration()
+	}
+	// Return the cached lease generation, one should have been set earlier.
+	return tc.leaseGeneration
 }
 
 // HasUncommittedTables returns true if the Collection contains uncommitted
@@ -219,6 +255,23 @@ func (tc *Collection) HasUncommittedTables() (has bool) {
 // uncommitted descriptors.
 func (tc *Collection) HasUncommittedDescriptors() bool {
 	return tc.uncommitted.uncommitted.Len() > 0
+}
+
+// HasUncommittedNewOrDroppedDescriptors returns true if the collection contains
+// any uncommitted descriptors that are newly created or dropped.
+func (tc *Collection) HasUncommittedNewOrDroppedDescriptors() bool {
+	isNewDescriptor := false
+	err := tc.uncommitted.iterateUncommittedByID(func(desc catalog.Descriptor) error {
+		if desc.GetVersion() == 1 || desc.Dropped() {
+			isNewDescriptor = true
+			return iterutil.StopIteration()
+		}
+		return nil
+	})
+	if err != nil {
+		return false
+	}
+	return isNewDescriptor
 }
 
 // HasUncommittedTypes returns true if the Collection contains uncommitted
@@ -254,10 +307,7 @@ func (tc *Collection) AddUncommittedDescriptor(
 		return nil
 	}
 	defer func() {
-		if err != nil {
-			err = errors.NewAssertionErrorWithWrappedErrf(err, "adding uncommitted %s %q (%d) version %d",
-				desc.DescriptorType(), desc.GetName(), desc.GetID(), desc.GetVersion())
-		}
+		err = DecorateDescriptorError(desc, err)
 	}()
 	if tc.synthetic.getSyntheticByID(desc.GetID()) != nil {
 		return errors.AssertionFailedf(
@@ -282,6 +332,15 @@ func (tc *Collection) WriteDescToBatch(
 		return errors.AssertionFailedf("cannot write descriptor with an empty ID: %v", desc)
 	}
 	desc.MaybeIncrementVersion()
+	// Replicated PCR descriptors cannot be modified unless the collection
+	// is setup for updating them.
+	if !tc.readerCatalogSetup && desc.GetReplicatedPCRVersion() != 0 {
+		return pgerror.Newf(pgcode.ReadOnlySQLTransaction,
+			"replicated %s %s (%d) cannot be mutated",
+			desc.GetObjectTypeString(),
+			desc.GetName(),
+			desc.GetID())
+	}
 	if !tc.skipValidationOnWrite && tc.validationModeProvider.ValidateDescriptorsOnWrite() {
 		if err := validate.Self(tc.version, desc); err != nil {
 			return err
@@ -334,7 +393,7 @@ func (tc *Collection) DeleteDescToBatch(
 func (tc *Collection) InsertNamespaceEntryToBatch(
 	ctx context.Context, kvTrace bool, e catalog.NameEntry, b *kv.Batch,
 ) error {
-	if ns := tc.cr.Cache().LookupNamespaceEntry(e); ns != nil {
+	if ns := tc.cr.Cache().LookupNamespaceEntry(catalog.MakeNameInfo(e)); ns != nil {
 		tc.markAsShadowedName(ns.GetID())
 	}
 	tc.markAsShadowedName(e.GetID())
@@ -357,7 +416,7 @@ func (tc *Collection) InsertNamespaceEntryToBatch(
 func (tc *Collection) UpsertNamespaceEntryToBatch(
 	ctx context.Context, kvTrace bool, e catalog.NameEntry, b *kv.Batch,
 ) error {
-	if ns := tc.cr.Cache().LookupNamespaceEntry(e); ns != nil {
+	if ns := tc.cr.Cache().LookupNamespaceEntry(catalog.MakeNameInfo(e)); ns != nil {
 		tc.markAsShadowedName(ns.GetID())
 	}
 	tc.markAsShadowedName(e.GetID())
@@ -380,7 +439,7 @@ func (tc *Collection) UpsertNamespaceEntryToBatch(
 func (tc *Collection) DeleteNamespaceEntryToBatch(
 	ctx context.Context, kvTrace bool, k catalog.NameKey, b *kv.Batch,
 ) error {
-	if ns := tc.cr.Cache().LookupNamespaceEntry(k); ns != nil {
+	if ns := tc.cr.Cache().LookupNamespaceEntry(catalog.MakeNameInfo(k)); ns != nil {
 		tc.markAsShadowedName(ns.GetID())
 	}
 	nameKey := catalogkeys.EncodeNameKey(tc.codec(), k)
@@ -406,21 +465,8 @@ func (tc *Collection) markAsShadowedName(id descpb.ID) {
 	}] = struct{}{}
 }
 
-func (tc *Collection) isShadowedName(nameKey catalog.NameKey) bool {
-	var k descpb.NameInfo
-	switch t := nameKey.(type) {
-	case descpb.NameInfo:
-		k = t
-	case *descpb.NameInfo:
-		k = *t
-	default:
-		k = descpb.NameInfo{
-			ParentID:       nameKey.GetParentID(),
-			ParentSchemaID: nameKey.GetParentSchemaID(),
-			Name:           nameKey.GetName(),
-		}
-	}
-	_, ok := tc.shadowedNames[k]
+func (tc *Collection) isShadowedName(nameKey descpb.NameInfo) bool {
+	_, ok := tc.shadowedNames[nameKey]
 	return ok
 }
 
@@ -535,10 +581,7 @@ func (tc *Collection) WriteZoneConfigToBatch(
 		return err
 	}
 
-	if descID != keys.RootNamespaceID && !keys.IsPseudoTableID(uint32(descID)) {
-		return tc.AddUncommittedZoneConfig(descID, zc.ZoneConfigProto())
-	}
-	return nil
+	return tc.AddUncommittedZoneConfig(descID, zc.ZoneConfigProto())
 }
 
 // DeleteZoneConfigInBatch deletes zone config of the table.
@@ -555,9 +598,7 @@ func (tc *Collection) DeleteZoneConfigInBatch(
 		return err
 	}
 
-	if descID != keys.RootNamespaceID && !keys.IsPseudoTableID(uint32(descID)) {
-		tc.MarkUncommittedZoneConfigDeleted(descID)
-	}
+	tc.MarkUncommittedZoneConfigDeleted(descID)
 	return nil
 }
 
@@ -648,7 +689,7 @@ func (tc *Collection) lookupDescriptorID(
 	if err != nil {
 		return descpb.InvalidID, err
 	}
-	if e := read.LookupNamespaceEntry(&key); e != nil {
+	if e := read.LookupNamespaceEntry(key); e != nil {
 		return e.GetID(), nil
 	}
 	return descpb.InvalidID, nil
@@ -732,13 +773,21 @@ func (tc *Collection) GetAll(ctx context.Context, txn *kv.Txn) (nstree.Catalog, 
 	return ret.Catalog, nil
 }
 
-// GetAllComments gets all comments for all descriptors. This method never
-// returns the underlying catalog, since it will be incomplete and only
+// GetDescriptorsInSpans returns all descriptors within a given span.
+func (tc *Collection) GetDescriptorsInSpans(
+	ctx context.Context, txn *kv.Txn, spans []roachpb.Span,
+) (nstree.Catalog, error) {
+	return tc.cr.ScanDescriptorsInSpans(ctx, txn, spans)
+}
+
+// GetAllComments gets all comments for all descriptors in the given database.
+// This method never returns the underlying catalog, since it will be incomplete and only
 // contain comments.
+// If the dbContext is nil, we return the database-level comments.
 func (tc *Collection) GetAllComments(
-	ctx context.Context, txn *kv.Txn,
+	ctx context.Context, txn *kv.Txn, db catalog.DatabaseDescriptor,
 ) (nstree.CommentCatalog, error) {
-	kvComments, err := tc.cr.ScanAllComments(ctx, txn)
+	kvComments, err := tc.cr.ScanAllComments(ctx, txn, db)
 	if err != nil {
 		return nil, err
 	}
@@ -957,7 +1006,7 @@ func (tc *Collection) aggregateAllLayers(
 	})
 	// Add stored namespace entries which are not shadowed.
 	_ = stored.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
-		if tc.isShadowedName(e) {
+		if tc.isShadowedName(catalog.MakeNameInfo(e)) {
 			return nil
 		}
 		// Temporary schemas don't have descriptors and are persisted only
@@ -1113,6 +1162,25 @@ func (tc *Collection) GetAllDatabaseDescriptors(
 	return ret, nil
 }
 
+// GetAllDatabaseDescriptorsMap returns the results of
+// GetAllDatabaseDescriptors but as a map with the database ID as the
+// key.
+func (tc *Collection) GetAllDatabaseDescriptorsMap(
+	ctx context.Context, txn *kv.Txn,
+) (map[descpb.ID]catalog.DatabaseDescriptor, error) {
+	descriptors, err := tc.GetAllDatabaseDescriptors(ctx, txn)
+	result := map[descpb.ID]catalog.DatabaseDescriptor{}
+	if err != nil {
+		return nil, err
+	}
+
+	for _, descriptor := range descriptors {
+		result[descriptor.GetID()] = descriptor
+	}
+
+	return result, nil
+}
+
 // GetSchemasForDatabase returns the schemas for a given database
 // visible by the transaction.
 // Deprecated: prefer GetAllSchemasInDatabase.
@@ -1214,6 +1282,11 @@ func (tc *Collection) GetTableComment(tableID descpb.ID) (comment string, ok boo
 	return tc.GetComment(catalogkeys.MakeCommentKey(uint32(tableID), 0, catalogkeys.TableCommentType))
 }
 
+// GetTypeComment implements the scdecomp.CommentGetter interface.
+func (tc *Collection) GetTypeComment(typeID descpb.ID) (comment string, ok bool) {
+	return tc.GetComment(catalogkeys.MakeCommentKey(uint32(typeID), 0, catalogkeys.TypeCommentType))
+}
+
 // GetColumnComment implements the scdecomp.CommentGetter interface.
 func (tc *Collection) GetColumnComment(
 	tableID descpb.ID, pgAttrNum catid.PGAttributeNum,
@@ -1226,6 +1299,22 @@ func (tc *Collection) GetIndexComment(
 	tableID descpb.ID, indexID catid.IndexID,
 ) (comment string, ok bool) {
 	return tc.GetComment(catalogkeys.MakeCommentKey(uint32(tableID), uint32(indexID), catalogkeys.IndexCommentType))
+}
+
+// MaybeSetReplicationSafeTS modifies a txn to apply the replication safe timestamp,
+// if we are executing against a PCR reader catalog.
+func (tc *Collection) MaybeSetReplicationSafeTS(ctx context.Context, txn *kv.Txn) error {
+	now := txn.DB().Clock().Now()
+	desc, err := tc.leased.lm.Acquire(ctx, now, keys.SystemDatabaseID)
+	if err != nil {
+		return err
+	}
+	defer desc.Release(ctx)
+
+	if desc.Underlying().(catalog.DatabaseDescriptor).GetReplicatedPCRVersion() == 0 {
+		return nil
+	}
+	return txn.SetFixedTimestamp(ctx, tc.leased.lm.GetSafeReplicationTS())
 }
 
 // GetConstraintComment implements the scdecomp.CommentGetter interface.
@@ -1291,4 +1380,20 @@ func NewHistoricalInternalExecTxnRunner(
 		execHistoricalTxn: fn,
 		readAsOf:          readAsOf,
 	}
+}
+
+// DecorateDescriptorError will ensure that if we have an error we will wrap
+// additional context about the descriptor to aid in debugging.
+func DecorateDescriptorError(desc catalog.MutableDescriptor, err error) error {
+	if err != nil {
+		err = errors.Wrapf(err, "adding uncommitted %s %q (%d) version %d",
+			desc.DescriptorType(), desc.GetName(), desc.GetID(), desc.GetVersion())
+		// If this error doesn't have a pgerror code attached to it, lets ensure
+		// that it's marked as an assertion error. This ensures it gets flagged for
+		// things like sentry reports.
+		if pgerror.GetPGCode(err) == pgcode.Uncategorized {
+			err = errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error occurred")
+		}
+	}
+	return err
 }

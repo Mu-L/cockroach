@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlexec_test
 
@@ -63,6 +58,7 @@ thenshort`,
 	// not much" int, "very very long
 	// thenshort" int, "κόσμε" int, "a|b" int, ܈85 int)
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// sql -e insert into t.u values (0, 0, 0, 0, 0, 0, 0, 0)
 	// INSERT 0 1
@@ -171,6 +167,13 @@ thenshort`,
 	// <tr><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
 	// </tbody>
 	// </table>
+	// sql --format=unnumbered-html -e select * from t.u
+	// <table>
+	// <thead><tr><th>f&#34;oo</th><th>f&#39;oo</th><th>f\oo</th><th>short<br/>very very long<br/>not much</th><th>very very long<br/>thenshort</th><th>κόσμε</th><th>a|b</th><th>܈85</th></tr></thead>
+	// <tbody>
+	// <tr><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+	// </tbody>
+	// </table>
 	// sql --format=raw -e select * from t.u
 	// # 8 columns
 	// # row 1
@@ -210,8 +213,11 @@ func Example_sql_empty_table() {
 	// Output:
 	// sql -e create database t;create table t.norows(x int);create table t.nocolsnorows();create table t.nocols(); insert into t.nocols(rowid) values (1),(2),(3);
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// INSERT 0 3
 	// sql --format=tsv -e select * from t.norows
@@ -240,6 +246,11 @@ func Example_sql_empty_table() {
 	// </tbody>
 	// <tfoot><tr><td colspan=2>0 rows</td></tr></tfoot></table>
 	// sql --format=rawhtml -e select * from t.norows
+	// <table>
+	// <thead><tr><th>x</th></tr></thead>
+	// </tbody>
+	// </table>
+	// sql --format=unnumbered-html -e select * from t.norows
 	// <table>
 	// <thead><tr><th>x</th></tr></thead>
 	// </tbody>
@@ -298,6 +309,15 @@ func Example_sql_empty_table() {
 	// <tr></tr>
 	// </tbody>
 	// </table>
+	// sql --format=unnumbered-html -e select * from t.nocols
+	// <table>
+	// <thead><tr></tr></thead>
+	// <tbody>
+	// <tr></tr>
+	// <tr></tr>
+	// <tr></tr>
+	// </tbody>
+	// </table>
 	// sql --format=raw -e select * from t.nocols
 	// # 0 columns
 	// # row 1
@@ -329,6 +349,11 @@ func Example_sql_empty_table() {
 	// </tbody>
 	// <tfoot><tr><td colspan=1>0 rows</td></tr></tfoot></table>
 	// sql --format=rawhtml -e select * from t.nocolsnorows
+	// <table>
+	// <thead><tr></tr></thead>
+	// </tbody>
+	// </table>
+	// sql --format=unnumbered-html -e select * from t.nocolsnorows
 	// <table>
 	// <thead><tr></tr></thead>
 	// </tbody>
@@ -524,6 +549,7 @@ func Example_sql_table() {
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// sql -e insert into t.t values (e'foo', 'printable ASCII')
 	// INSERT 0 1
@@ -693,6 +719,21 @@ func Example_sql_table() {
 	// <tbody>
 	// <tr><td>foo</td><td>printable ASCII</td></tr>
 	// <tr><td>"foo</td><td>printable ASCII with quotes</td></tr>
+	// <tr><td>\foo</td><td>printable ASCII with backslash</td></tr>
+	// <tr><td>foo<br/>bar</td><td>non-printable ASCII</td></tr>
+	// <tr><td>κόσμε</td><td>printable UTF8</td></tr>
+	// <tr><td>ñ</td><td>printable UTF8 using escapes</td></tr>
+	// <tr><td>\x01</td><td>non-printable UTF8 string</td></tr>
+	// <tr><td>܈85</td><td>UTF8 string with RTL char</td></tr>
+	// <tr><td>a	b	c<br/>12	123123213	12313</td><td>tabs</td></tr>
+	// </tbody>
+	// </table>
+	// sql --format=unnumbered-html -e select * from t.t
+	// <table>
+	// <thead><tr><th>s</th><th>d</th></tr></thead>
+	// <tbody>
+	// <tr><td>foo</td><td>printable ASCII</td></tr>
+	// <tr><td>&#34;foo</td><td>printable ASCII with quotes</td></tr>
 	// <tr><td>\foo</td><td>printable ASCII with backslash</td></tr>
 	// <tr><td>foo<br/>bar</td><td>non-printable ASCII</td></tr>
 	// <tr><td>κόσμε</td><td>printable UTF8</td></tr>

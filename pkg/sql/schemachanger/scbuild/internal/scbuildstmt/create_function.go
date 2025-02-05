@@ -1,16 +1,13 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scbuildstmt
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcinfo"
@@ -21,7 +18,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
@@ -39,10 +38,8 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 	n.Name.SchemaName = tree.Name(scName.Name)
 	n.Name.CatalogName = tree.Name(dbname.Name)
 
-	validateParameters(n)
-
-	existingFn := b.ResolveUDF(
-		&tree.FuncObj{
+	existingFn := b.ResolveRoutine(
+		&tree.RoutineObj{
 			FuncName: n.Name,
 			Params:   n.Params,
 		},
@@ -50,6 +47,7 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 			IsExistenceOptional: true,
 			RequireOwnership:    true,
 		},
+		tree.UDFRoutine|tree.ProcedureRoutine,
 	)
 	if existingFn != nil {
 		panic(pgerror.Newf(
@@ -59,19 +57,48 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 		))
 	}
 
+	typ := tree.ResolvableTypeReference(types.Void)
+	setof := false
+	if n.IsProcedure {
+		if n.ReturnType != nil {
+			returnType := b.ResolveTypeRef(n.ReturnType.Type)
+			if returnType.Type.Family() != types.VoidFamily && returnType.Type.Oid() != oid.T_record {
+				panic(errors.AssertionFailedf(
+					"CreateRoutine.ReturnType is expected to be empty, VOID, or RECORD for procedures",
+				))
+			}
+		}
+		// For procedures, if specified, output parameters form the return type.
+		outParamTypes, outParamNames := getOutputParameters(b, n.Params)
+		if len(outParamTypes) > 0 {
+			typ = types.MakeLabeledTuple(outParamTypes, outParamNames)
+		}
+	} else if n.ReturnType != nil {
+		typ = n.ReturnType.Type
+		if returnType := b.ResolveTypeRef(typ); returnType.Type.Oid() == oid.T_record {
+			// If the function returns a RECORD type, then we need to check
+			// whether its OUT parameters specify labels for the return type.
+			outParamTypes, outParamNames := getOutputParameters(b, n.Params)
+			if len(outParamTypes) == 1 {
+				panic(errors.AssertionFailedf(
+					"we shouldn't get the RECORD return type with a single OUT parameter, expected %s",
+					outParamTypes[0].SQLStringForError(),
+				))
+			} else if len(outParamTypes) > 1 {
+				typ = types.MakeLabeledTuple(outParamTypes, outParamNames)
+			}
+		}
+		setof = n.ReturnType.SetOf
+	}
 	fnID := b.GenerateUniqueDescID()
 	fn := scpb.Function{
-		FunctionID: fnID,
-		ReturnSet:  n.ReturnType.IsSet,
-		ReturnType: b.ResolveTypeRef(n.ReturnType.Type),
+		FunctionID:  fnID,
+		ReturnSet:   setof,
+		ReturnType:  b.ResolveTypeRef(typ),
+		IsProcedure: n.IsProcedure,
 	}
 	fn.Params = make([]scpb.Function_Parameter, len(n.Params))
 	for i, param := range n.Params {
-		// TODO(chengxiong): create `FunctionParamDefaultExpression` element when
-		// default parameter default expression is enabled.
-		if param.DefaultVal != nil {
-			panic(unimplemented.NewWithIssue(100962, "default value"))
-		}
 		paramCls, err := funcinfo.ParamClassToProto(param.Class)
 		if err != nil {
 			panic(err)
@@ -80,6 +107,16 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 			Name:  string(param.Name),
 			Class: catpb.FunctionParamClass{Class: paramCls},
 			Type:  b.ResolveTypeRef(param.Type),
+		}
+		if param.DefaultVal != nil {
+			// Type-check the expression so that we get the right type
+			// annotation when serializing it below.
+			texpr, err := tree.TypeCheck(b, param.DefaultVal, b.SemaCtx(), fn.Params[i].Type.Type)
+			if err != nil {
+				panic(err)
+			}
+			fn.Params[i].DefaultExpr = tree.Serialize(texpr)
+			n.Params[i].DefaultVal = texpr
 		}
 	}
 
@@ -130,13 +167,22 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 			lang = v
 		case tree.RoutineBodyStr:
 			fnBodyStr = string(t)
+		case tree.RoutineSecurity:
+			s, err := funcinfo.SecurityToProto(t)
+			if err != nil {
+				panic(err)
+			}
+			b.Add(&scpb.FunctionSecurity{
+				FunctionID: fnID,
+				Security:   catpb.FunctionSecurity{Security: s},
+			})
 		}
 	}
 	owner, ups := b.BuildUserPrivilegesFromDefaultPrivileges(
 		db,
 		sc,
 		fnID,
-		privilege.Functions,
+		privilege.Routines,
 		b.CurrentUser(),
 	)
 	b.Add(owner)
@@ -146,23 +192,28 @@ func CreateFunction(b BuildCtx, n *tree.CreateRoutine) {
 	refProvider := b.BuildReferenceProvider(n)
 	validateTypeReferences(b, refProvider, db.DatabaseID)
 	validateFunctionRelationReferences(b, refProvider, db.DatabaseID)
-	b.Add(b.WrapFunctionBody(fnID, fnBodyStr, lang, refProvider))
+	validateFunctionToFunctionReferences(b, refProvider, db.DatabaseID)
+	b.Add(b.WrapFunctionBody(fnID, fnBodyStr, lang, typ, refProvider))
 	b.LogEventForExistingTarget(&fn)
 }
 
-func validateParameters(n *tree.CreateRoutine) {
-	seen := make(map[tree.Name]struct{})
-	for _, param := range n.Params {
-		if param.Name != "" {
-			if _, ok := seen[param.Name]; ok {
-				// Argument names cannot be used more than once.
-				panic(pgerror.Newf(
-					pgcode.InvalidFunctionDefinition, "parameter name %q used more than once", param.Name,
-				))
+func getOutputParameters(
+	b BuildCtx, params tree.RoutineParams,
+) (outParamTypes []*types.T, outParamNames []string) {
+	// Note that this logic effectively copies what the optimizer does in
+	// optbuilder.Builder.buildCreateFunction.
+	for _, param := range params {
+		if param.IsOutParam() {
+			paramType := b.ResolveTypeRef(param.Type)
+			outParamTypes = append(outParamTypes, paramType.Type)
+			paramName := string(param.Name)
+			if paramName == "" {
+				paramName = fmt.Sprintf("column%d", len(outParamTypes))
 			}
-			seen[param.Name] = struct{}{}
+			outParamNames = append(outParamNames, paramName)
 		}
 	}
+	return outParamTypes, outParamNames
 }
 
 func validateTypeReferences(b BuildCtx, refProvider ReferenceProvider, parentDBID descpb.ID) {
@@ -177,12 +228,34 @@ func validateFunctionRelationReferences(
 	for _, id := range refProvider.ReferencedRelationIDs().Ordered() {
 		_, _, namespace := scpb.FindNamespace(b.QueryByID(id))
 		if namespace.DatabaseID != parentDBID {
-			name := tree.MakeTypeNameWithPrefix(b.NamePrefix(namespace), namespace.Name)
 			panic(pgerror.Newf(
 				pgcode.FeatureNotSupported,
-				"the function cannot refer to other databases",
-				name.String()))
+				"dependent relation %s cannot be from another database",
+				namespace.Name))
 		}
+	}
+}
+
+// validateFunctionToFunctionReferences validates no function references are
+// cross database.
+func validateFunctionToFunctionReferences(
+	b BuildCtx, refProvider ReferenceProvider, parentDBID descpb.ID,
+) {
+	err := refProvider.ForEachFunctionReference(func(id descpb.ID) error {
+		funcElts := b.QueryByID(id)
+		funcName := funcElts.FilterFunctionName().MustGetOneElement()
+		schemaParent := funcElts.FilterSchemaChild().MustGetOneElement()
+		schemaNamespace := b.QueryByID(schemaParent.SchemaID).FilterNamespace().MustGetOneElement()
+		if schemaNamespace.DatabaseID != parentDBID {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"dependent function %s cannot be from another database",
+				funcName.Name)
+		}
+		return nil
+	})
+	if err != nil {
+		panic(err)
 	}
 }
 

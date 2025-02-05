@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
@@ -162,7 +157,7 @@ type Flow interface {
 	// GetOnCleanupFns returns a couple of functions that should be called at
 	// the very beginning and the very end of Cleanup, respectively. Both will
 	// be non-nil.
-	GetOnCleanupFns() (startCleanup, endCleanup func())
+	GetOnCleanupFns() (startCleanup func(), endCleanup func(context.Context))
 
 	// Cleanup must be called whenever the flow is done (meaning it either
 	// completes gracefully after all processors and mailboxes exited or an
@@ -214,6 +209,10 @@ type FlowBase struct {
 	// goroutines.
 	startedGoroutines bool
 
+	// headProcStarted tracks whether Start was called on the "head" processor
+	// in Run.
+	headProcStarted bool
+
 	// inboundStreams are streams that receive data from other hosts; this map
 	// is to be passed to FlowRegistry.RegisterFlow. This map is populated in
 	// Flow.Setup(), so it is safe to lookup into concurrently later.
@@ -228,7 +227,7 @@ type FlowBase struct {
 	// onCleanupStart and onCleanupEnd will be called in the very beginning and
 	// the very end of Cleanup(), respectively.
 	onCleanupStart func()
-	onCleanupEnd   func()
+	onCleanupEnd   func(context.Context)
 
 	statementSQL string
 
@@ -324,7 +323,7 @@ func NewFlowBase(
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localProcessors []execinfra.LocalProcessor,
 	localVectorSources map[int32]any,
-	onFlowCleanupEnd func(),
+	onFlowCleanupEnd func(context.Context),
 	statementSQL string,
 ) *FlowBase {
 	// We are either in a single tenant cluster, or a SQL node in a multi-tenant
@@ -571,6 +570,7 @@ func (f *FlowBase) Run(ctx context.Context, noWait bool) {
 	}
 	f.resumeCtx = ctx
 	log.VEventf(ctx, 1, "running %T in the flow's goroutine", headProc)
+	f.headProcStarted = true
 	headProc.Run(ctx, headOutput)
 }
 
@@ -642,15 +642,16 @@ func (f *FlowBase) AddOnCleanupStart(fn func()) {
 }
 
 var noopFn = func() {}
+var noopCtxFn = func(context.Context) {}
 
 // GetOnCleanupFns is part of the Flow interface.
-func (f *FlowBase) GetOnCleanupFns() (startCleanup, endCleanup func()) {
+func (f *FlowBase) GetOnCleanupFns() (startCleanup func(), endCleanup func(context.Context)) {
 	onCleanupStart, onCleanupEnd := f.onCleanupStart, f.onCleanupEnd
 	if onCleanupStart == nil {
 		onCleanupStart = noopFn
 	}
 	if onCleanupEnd == nil {
-		onCleanupEnd = noopFn
+		onCleanupEnd = noopCtxFn
 	}
 	return onCleanupStart, onCleanupEnd
 }
@@ -663,6 +664,18 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 		if f.getStatus() == flowFinished {
 			panic("flow cleanup called twice")
 		}
+	}
+
+	// Ensure that all processors are closed. Usually this is done automatically
+	// (when a processor is exhausted or at the end of execinfra.Run loop), but
+	// in edge cases we need to do it here. Close can be called multiple times.
+	//
+	// Note that Close is not thread-safe, but at this point if the processor
+	// wasn't fused and ran in its own goroutine, that goroutine must have
+	// exited since Cleanup is called after having waited for all started
+	// goroutines to exit.
+	for _, proc := range f.processors {
+		proc.Close(ctx)
 	}
 
 	// Release any descriptors accessed by this flow.
@@ -687,8 +700,7 @@ func (f *FlowBase) Cleanup(ctx context.Context) {
 		}
 	}
 
-	// This closes the disk monitor opened in newFlowContext as well as the
-	// memory monitor opened in ServerImpl.setupFlow.
+	// This closes the monitors opened in ServerImpl.setupFlow.
 	if r := recover(); r != nil {
 		f.DiskMonitor.EmergencyStop(ctx)
 		f.Mon.EmergencyStop(ctx)

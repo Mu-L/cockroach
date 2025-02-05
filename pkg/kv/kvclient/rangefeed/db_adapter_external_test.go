@@ -1,33 +1,31 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rangefeed_test
 
 import (
 	"context"
+	"slices"
 	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
@@ -35,11 +33,12 @@ import (
 )
 
 func startMonitorWithBudget(budget int64) *mon.BytesMonitor {
-	mm := mon.NewMonitorWithLimit(
-		"test-mm", mon.MemoryResource, budget,
-		nil, nil,
-		128 /* small allocation increment */, 100,
-		cluster.MakeTestingClusterSettings())
+	mm := mon.NewMonitor(mon.Options{
+		Name:      mon.MakeMonitorName("test-mm"),
+		Limit:     budget,
+		Increment: 128, /* small allocation increment */
+		Settings:  cluster.MakeTestingClusterSettings(),
+	})
 	mm.Start(context.Background(), nil, mon.NewStandaloneBudget(budget))
 	return mm
 }
@@ -49,14 +48,19 @@ func startMonitorWithBudget(budget int64) *mon.BytesMonitor {
 // testing directly.
 func TestDBClientScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	ts := srv.ApplicationLayer()
 
-	db := tc.Server(0).DB()
 	beforeAny := db.Clock().Now()
-	scratchKey := tc.ScratchRange(t)
+
+	scratchKey := slices.Clip(append(ts.Codec().TenantPrefix(), keys.ScratchRangeMin...))
+	_, _, err := srv.StorageLayer().SplitRange(scratchKey)
+	require.NoError(t, err)
+
 	mkKey := func(k string) roachpb.Key {
 		return encoding.EncodeStringAscending(scratchKey, k)
 	}
@@ -65,7 +69,7 @@ func TestDBClientScan(t *testing.T) {
 	afterB := db.Clock().Now()
 	require.NoError(t, db.Put(ctx, mkKey("c"), 3))
 
-	dba, err := rangefeed.NewDBAdapter(db, tc.Server(0).ClusterSettings())
+	dba, err := rangefeed.NewDBAdapter(db, ts.ClusterSettings())
 	require.NoError(t, err)
 	sp := roachpb.Span{
 		Key:    scratchKey,
@@ -124,7 +128,7 @@ func TestDBClientScan(t *testing.T) {
 
 	// Verify parallel scan operations.
 	t.Run("parallel scan requests", func(t *testing.T) {
-		sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+		sqlDB := sqlutils.MakeSQLRunner(sqlDB)
 		sqlDB.Exec(t, `CREATE TABLE foo (key INT PRIMARY KEY)`)
 		defer func() {
 			sqlDB.Exec(t, `DROP TABLE foo`)
@@ -134,10 +138,39 @@ func TestDBClientScan(t *testing.T) {
 		sqlDB.Exec(t, "ALTER TABLE foo SPLIT AT VALUES (250), (500), (750)")
 
 		fooDesc := desctestutils.TestingGetPublicTableDescriptor(
-			db, keys.SystemSQLCodec, "defaultdb", "foo")
-		fooSpan := fooDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
+			db, ts.Codec(), "defaultdb", "foo")
+		fooSpan := fooDesc.PrimaryIndexSpan(ts.Codec())
 
-		// We expect 4 splits -- we'll start the scan with parallelism set to 3.
+		// Ensure the splits make it into the meta ranges and range cache. Simply
+		// running a DistSender scan does not appear sufficient in rare cases.
+		//
+		// ScanWithOptions will split the scan requests itself based on the range
+		// cache and assert on that split, before sending them to the DistSender.
+		ds := ts.DistSenderI().(*kvcoord.DistSender)
+		testutils.SucceedsSoon(t, func() error {
+			// Flush the cache, and repopulate it via a scan. This looks at the
+			// canonical range descriptors rather than the possibly stale meta ranges.
+			ds.RangeDescriptorCache().Clear()
+			_, err := db.Scan(ctx, fooSpan.Key, fooSpan.EndKey, 0)
+			require.NoError(t, err)
+
+			var descs []roachpb.RangeDescriptor
+			iter := kvcoord.MakeRangeIterator(ds)
+			for iter.Seek(ctx, roachpb.RKey(fooSpan.Key), kvcoord.Ascending); iter.Valid(); iter.Next(ctx) {
+				desc := iter.Desc()
+				if !fooSpan.Overlaps(desc.KeySpan().AsRawSpanWithNoLocals()) {
+					break
+				}
+				descs = append(descs, *desc)
+			}
+			if len(descs) == 4 {
+				t.Logf("range cache has 4 ranges: %v", descs)
+				return nil
+			}
+			return errors.Errorf("range cache has %d ranges: %v", len(descs), descs)
+		})
+
+		// We have 4 ranges -- we'll start the scan with parallelism set to 3.
 		// We will block these scans from completion until we know that we have 3
 		// concurrently running scan requests.
 		var parallelism = 3
@@ -150,6 +183,7 @@ func TestDBClientScan(t *testing.T) {
 				func(value roachpb.KeyValue) {},
 				rangefeed.WithInitialScanParallelismFn(func() int { return parallelism }),
 				rangefeed.WithOnScanCompleted(func(ctx context.Context, sp roachpb.Span) error {
+					t.Logf("completed scan for %s", sp)
 					atomic.AddInt32(&barrier, 1)
 					<-proceed
 					return nil
@@ -158,10 +192,10 @@ func TestDBClientScan(t *testing.T) {
 		})
 
 		testutils.SucceedsSoon(t, func() error {
-			if atomic.LoadInt32(&barrier) == int32(parallelism) {
-				return nil
+			if b := atomic.LoadInt32(&barrier); b != int32(parallelism) {
+				return errors.Errorf("still waiting for barrier (%d/%d)", b, parallelism)
 			}
-			return errors.New("still  waiting for barrier")
+			return nil
 		})
 		close(proceed)
 		require.NoError(t, g.Wait())
@@ -169,7 +203,7 @@ func TestDBClientScan(t *testing.T) {
 
 	// Verify when errors occur during scan, only the failed spans are retried.
 	t.Run("scan retries failed spans", func(t *testing.T) {
-		sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+		sqlDB := sqlutils.MakeSQLRunner(sqlDB)
 		sqlDB.Exec(t, `CREATE TABLE foo (key INT PRIMARY KEY)`)
 		defer func() {
 			sqlDB.Exec(t, `DROP TABLE foo`)
@@ -179,8 +213,8 @@ func TestDBClientScan(t *testing.T) {
 		sqlDB.Exec(t, "ALTER TABLE foo SPLIT AT (SELECT * FROM generate_series(100, 900, 100))")
 
 		fooDesc := desctestutils.TestingGetPublicTableDescriptor(
-			db, keys.SystemSQLCodec, "defaultdb", "foo")
-		fooSpan := fooDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
+			db, ts.Codec(), "defaultdb", "foo")
+		fooSpan := fooDesc.PrimaryIndexSpan(ts.Codec())
 
 		scanData := struct {
 			syncutil.Mutex
@@ -192,7 +226,7 @@ func TestDBClientScan(t *testing.T) {
 		// We expect 11 splits.
 		// One span will fail.  Verify we retry only the spans that we have not attempted before.
 		var parallelism = 6
-		f := rangefeed.NewFactoryWithDB(tc.Server(0).Stopper(), dba, nil /* knobs */)
+		f := rangefeed.NewFactoryWithDB(ts.AppStopper(), dba, nil /* knobs */)
 		scanComplete := make(chan struct{})
 		scanErr := make(chan error, 1)
 		retryScanErr := errors.New("retry scan")
@@ -200,7 +234,6 @@ func TestDBClientScan(t *testing.T) {
 		feed, err := f.RangeFeed(ctx, "foo-feed", []roachpb.Span{fooSpan}, db.Clock().Now(),
 			func(ctx context.Context, value *kvpb.RangeFeedValue) {},
 
-			rangefeed.WithScanRetryBehavior(rangefeed.ScanRetryRemaining),
 			rangefeed.WithInitialScanParallelismFn(func() int { return parallelism }),
 
 			rangefeed.WithInitialScan(func(ctx context.Context) {

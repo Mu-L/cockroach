@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // Package sqlstats is a subsystem that is responsible for tracking the
 // statistics of statements and transactions.
@@ -37,6 +32,7 @@ import (
 func TestPersistedSQLStatsReadMemory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	skip.UnderStress(t, "the test is too slow to run under stress")
 
 	testCluster, ctx := createCluster(t)
@@ -50,13 +46,14 @@ func TestPersistedSQLStatsReadMemory(t *testing.T) {
 func TestPersistedSQLStatsReadDisk(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	skip.UnderStress(t, "the test is too slow to run under stress")
 
 	testCluster, ctx := createCluster(t)
 	defer testCluster.Stopper().Stop(ctx)
 	sqlConn, sqlStats, expectedStmtsNoConst := insertData(t, testCluster)
 
-	sqlStats.Flush(ctx)
+	sqlStats.MaybeFlush(ctx, testCluster.ApplicationLayer(0).AppStopper())
 	verifyDiskStmtFingerprints(t, sqlConn, expectedStmtsNoConst)
 	verifyStoredStmtFingerprints(t, expectedStmtsNoConst, sqlStats)
 }
@@ -64,13 +61,14 @@ func TestPersistedSQLStatsReadDisk(t *testing.T) {
 func TestPersistedSQLStatsReadHybrid(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	skip.UnderStress(t, "the test is too slow to run under stress")
 
 	testCluster, ctx := createCluster(t)
 	defer testCluster.Stopper().Stop(ctx)
 
 	sqlConn, sqlStats, expectedStmtsNoConst := insertData(t, testCluster)
-	sqlStats.Flush(ctx)
+	sqlStats.MaybeFlush(ctx, testCluster.ApplicationLayer(0).AppStopper())
 	// We execute each test queries one more time without flushing the stats.
 	// This means that we should see the exact same result as previous subtest
 	// except the execution count field will be incremented. We should not
@@ -142,8 +140,8 @@ func insertData(
 	t *testing.T, testCluster serverutils.TestClusterInterface,
 ) (*sqlutils.SQLRunner, *persistedsqlstats.PersistedSQLStats, map[string]int64) {
 	server1 := testCluster.Server(0 /* idx */)
-	sqlConn := sqlutils.MakeSQLRunner(server1.SQLConn(t, ""))
-	sqlStats := server1.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
+	sqlConn := sqlutils.MakeSQLRunner(server1.SQLConn(t))
+	sqlStats := server1.SQLServer().(*sql.Server).GetSQLStatsProvider()
 
 	sqlConn.Exec(t, `SET application_name = 'TestPersistedSQLStatsRead'`)
 	expectedStmtsNoConst := make(map[string]int64)
@@ -182,7 +180,7 @@ func TestSQLStatsWithMultipleIdxRec(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStressRace(t, "expensive tests")
+	skip.UnderRace(t, "expensive tests")
 
 	fakeTime := stubTime{
 		aggInterval: time.Hour,
@@ -244,7 +242,7 @@ func verifyInMemoryStmtFingerprints(
 	foundTxns := make(map[string]struct{})
 	stmtFingerprintIDToQueries := make(map[appstatspb.StmtFingerprintID]string)
 	require.NoError(t,
-		sqlStats.GetApplicationStats(appName, false).IterateStatementStats(
+		sqlStats.GetApplicationStats(appName).IterateStatementStats(
 			context.Background(),
 			sqlstats.IteratorOptions{},
 			func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {

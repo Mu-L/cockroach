@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvpb
 
@@ -31,7 +26,7 @@ func testPrepareTransactionForRetry(t *testing.T, isoLevel isolation.Level) {
 	ts1 := hlc.Timestamp{WallTime: 1}
 	ts2 := hlc.Timestamp{WallTime: 2}
 	tsClock := hlc.Timestamp{WallTime: 3}
-	txn := roachpb.MakeTransaction("test", nil, isoLevel, -1, ts1, 0, 99)
+	txn := roachpb.MakeTransaction("test", nil, isoLevel, -1, ts1, 0, 99, 0, false /* omitInRangefeeds */)
 	txn2ID := uuid.MakeV4() // used if txn is aborted
 	tests := []struct {
 		name   string
@@ -167,7 +162,7 @@ func TestTransactionRefreshTimestamp(t *testing.T) {
 func testTransactionRefreshTimestamp(t *testing.T, isoLevel isolation.Level) {
 	ts1 := hlc.Timestamp{WallTime: 1}
 	ts2 := hlc.Timestamp{WallTime: 2}
-	txn := roachpb.MakeTransaction("test", nil, isoLevel, 1, ts1, 0, 99)
+	txn := roachpb.MakeTransaction("test", nil, isoLevel, 1, ts1, 0, 99, 0, false /* omitInRangefeeds */)
 	tests := []struct {
 		name  string
 		err   *Error

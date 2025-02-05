@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scmutationexec
 
@@ -16,11 +11,13 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/errors"
 )
 
@@ -64,11 +61,6 @@ func addNewIndexMutation(
 		tbl.NextConstraintID = opIndex.ConstraintID + 1
 	}
 
-	// Set up the index descriptor type.
-	indexType := descpb.IndexDescriptor_FORWARD
-	if opIndex.IsInverted {
-		indexType = descpb.IndexDescriptor_INVERTED
-	}
 	// Set up the encoding type.
 	encodingType := catenumpb.PrimaryIndexEncoding
 	indexVersion := descpb.LatestIndexDescriptorVersion
@@ -83,7 +75,7 @@ func addNewIndexMutation(
 		NotVisible:                  opIndex.IsNotVisible,
 		Invisibility:                opIndex.Invisibility,
 		Version:                     indexVersion,
-		Type:                        indexType,
+		Type:                        opIndex.Type,
 		CreatedExplicitly:           true,
 		EncodingType:                encodingType,
 		ConstraintID:                opIndex.ConstraintID,
@@ -411,6 +403,10 @@ func (i *immediateVisitor) AddColumnToIndex(ctx context.Context, op scop.AddColu
 			return colOrdMap.GetDefault(cids[i]) < colOrdMap.GetDefault(cids[j])
 		})
 	}
+	// If this is an inverted column, note that.
+	if indexDesc.Type == idxtype.INVERTED && op.ColumnID == indexDesc.InvertedColumnID() {
+		indexDesc.InvertedColumnKinds = []catpb.InvertedIndexColumnKind{op.InvertedKind}
+	}
 	return nil
 }
 
@@ -447,7 +443,7 @@ func (i *immediateVisitor) RemoveColumnFromIndex(
 			idx.KeyColumnNames = idx.KeyColumnNames[:i]
 			idx.KeyColumnIDs = idx.KeyColumnIDs[:i]
 			idx.KeyColumnDirections = idx.KeyColumnDirections[:i]
-			if idx.Type == descpb.IndexDescriptor_INVERTED && i == len(idx.KeyColumnIDs)-1 {
+			if idx.Type == idxtype.INVERTED && i == len(idx.KeyColumnIDs)-1 {
 				idx.InvertedColumnKinds = nil
 			}
 		}
@@ -491,5 +487,19 @@ func (m *deferredVisitor) MaybeAddSplitForIndex(
 	_ context.Context, op scop.MaybeAddSplitForIndex,
 ) error {
 	m.AddIndexForMaybeSplitAndScatter(op.TableID, op.IndexID)
+	return nil
+}
+
+func (i *immediateVisitor) AddIndexZoneConfig(_ context.Context, op scop.AddIndexZoneConfig) error {
+	i.ImmediateMutationStateUpdater.UpdateSubzoneConfig(
+		op.TableID, op.Subzone, op.SubzoneSpans, op.SubzoneIndexToDelete)
+	return nil
+}
+
+func (i *immediateVisitor) AddPartitionZoneConfig(
+	_ context.Context, op scop.AddPartitionZoneConfig,
+) error {
+	i.ImmediateMutationStateUpdater.UpdateSubzoneConfig(
+		op.TableID, op.Subzone, op.SubzoneSpans, op.SubzoneIndexToDelete)
 	return nil
 }

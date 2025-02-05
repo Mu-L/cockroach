@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package settings
 
@@ -33,7 +28,7 @@ type VersionSetting struct {
 	common
 }
 
-var _ Setting = &VersionSetting{}
+var _ internalSetting = &VersionSetting{}
 
 // VersionSettingImpl is the interface bridging pkg/settings and
 // pkg/clusterversion. See VersionSetting for additional commentary.
@@ -62,29 +57,21 @@ type VersionSettingImpl interface {
 	SettingsListDefault() string
 }
 
-// ClusterVersionImpl is used to stub out the dependency on the clusterVersion
+// ClusterVersionImpl is used to stub out the dependency on the ClusterVersion
 // type (in pkg/clusterversion). The VersionSetting below is used to set
-// clusterVersion values, but we can't import the type directly due to the
+// ClusterVersion values, but we can't import the type directly due to the
 // cyclical dependency structure.
 type ClusterVersionImpl interface {
-	ClusterVersionImpl()
-	// We embed fmt.Stringer so to be able to later satisfy the `Setting`
-	// interface (which requires us to return a string representation of the
-	// current value of the setting)
 	fmt.Stringer
+
+	// Encode encodes the ClusterVersion (using the protobuf encoding).
+	Encode() []byte
 }
 
 // MakeVersionSetting instantiates a version setting instance. See
 // VersionSetting for additional commentary.
 func MakeVersionSetting(impl VersionSettingImpl) VersionSetting {
 	return VersionSetting{impl: impl}
-}
-
-// Decode takes in an encoded cluster version and returns it as the native
-// type (the clusterVersion proto). Except it does it through the
-// ClusterVersionImpl to avoid circular dependencies.
-func (v *VersionSetting) Decode(val []byte) (ClusterVersionImpl, error) {
-	return v.impl.Decode(val)
 }
 
 // Validate checks whether an version update is permitted. It takes in the
@@ -112,20 +99,25 @@ const VersionSettingValueType = "m"
 
 // String is part of the Setting interface.
 func (v *VersionSetting) String(sv *Values) string {
-	encV := []byte(v.Get(sv))
-	if encV == nil {
+	cv := v.GetInternal(sv)
+	if cv == nil {
 		panic("unexpected nil value")
-	}
-	cv, err := v.impl.Decode(encV)
-	if err != nil {
-		panic(err)
 	}
 	return cv.String()
 }
 
+// DefaultString returns the default value for the setting as a string.
+func (v *VersionSetting) DefaultString() string {
+	return encodedDefaultVersion
+}
+
 // Encoded is part of the NonMaskedSetting interface.
 func (v *VersionSetting) Encoded(sv *Values) string {
-	return v.Get(sv)
+	cv := v.GetInternal(sv)
+	if cv == nil {
+		panic("unexpected nil value")
+	}
+	return string(cv.Encode())
 }
 
 // EncodedDefault is part of the NonMaskedSetting interface.
@@ -147,37 +139,46 @@ func (v *VersionSetting) DecodeToString(encoded string) (string, error) {
 	return cv.String(), nil
 }
 
-// Get retrieves the encoded value (in string form) in the setting. It panics if
-// set() has not been previously called.
-//
-// TODO(irfansharif): This (along with `set`) below should be folded into one of
-// the Setting interfaces, or be removed entirely. All readable settings
-// implement it.
-func (v *VersionSetting) Get(sv *Values) string {
-	encV := v.GetInternal(sv)
-	if encV == nil {
-		panic(fmt.Sprintf("missing value for version setting in slot %d", v.slot))
-	}
-	return string(encV.([]byte))
-}
-
 // GetInternal returns the setting's current value.
-func (v *VersionSetting) GetInternal(sv *Values) interface{} {
-	return sv.getGeneric(v.slot)
+func (v *VersionSetting) GetInternal(sv *Values) ClusterVersionImpl {
+	val := sv.getGeneric(v.slot)
+	if val == nil {
+		return nil
+	}
+	return val.(ClusterVersionImpl)
 }
 
 // SetInternal updates the setting's value in the provided Values container.
-func (v *VersionSetting) SetInternal(ctx context.Context, sv *Values, newVal interface{}) {
+func (v *VersionSetting) SetInternal(ctx context.Context, sv *Values, newVal ClusterVersionImpl) {
 	sv.setGeneric(ctx, v.slot, newVal)
 }
 
-// setToDefault is part of the extendingSetting interface. This is a no-op for
+// setToDefault is part of the internalSetting interface. This is a no-op for
 // VersionSetting. They don't have defaults that they can go back to at any
 // time.
-//
-// TODO(irfansharif): Is this true? Shouldn't the default here just the the
-// version we initialize with?
 func (v *VersionSetting) setToDefault(ctx context.Context, sv *Values) {}
+
+// decodeAndSet is part of the internalSetting interface. We intentionally avoid
+//
+// We intentionally avoid updating the setting through this code path. The
+// specific setting backed by VersionSetting is the cluster version setting,
+// changes to which are propagated through direct RPCs to each node in the
+// cluster instead of gossip. This is done using the BumpClusterVersion RPC.
+func (v *VersionSetting) decodeAndSet(ctx context.Context, sv *Values, encoded string) error {
+	return nil
+}
+
+// decodeAndSetDefaultOverride is part of the internalSetting interface.
+//
+// We intentionally avoid updating the setting through this code path. The
+// specific setting backed by VersionSetting is the cluster version setting,
+// changes to which are propagated through direct RPCs to each node in the
+// cluster instead of gossip. This is done using the BumpClusterVersion RPC.
+func (v *VersionSetting) decodeAndSetDefaultOverride(
+	ctx context.Context, sv *Values, encoded string,
+) error {
+	return nil
+}
 
 // RegisterVersionSetting adds the provided version setting to the global
 // registry.

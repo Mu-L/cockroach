@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package invertedidx
 
@@ -21,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -36,7 +30,7 @@ var _ invertedFilterPlanner = &trigramFilterPlanner{}
 // extractInvertedFilterConditionFromLeaf implements the invertedFilterPlanner
 // interface.
 func (t *trigramFilterPlanner) extractInvertedFilterConditionFromLeaf(
-	_ context.Context, _ *eval.Context, expr opt.ScalarExpr,
+	_ context.Context, evalCtx *eval.Context, expr opt.ScalarExpr,
 ) (
 	invertedExpr inverted.Expression,
 	remainingFilters opt.ScalarExpr,
@@ -73,6 +67,17 @@ func (t *trigramFilterPlanner) extractInvertedFilterConditionFromLeaf(
 		// Equality is commutative.
 		commutative = true
 	case *memo.ModExpr:
+		// Do not generate legacy inverted constraints for similarity filters
+		// if the text similarity optimization is enabled.
+		if evalCtx.SessionData().OptimizerUseTrigramSimilarityOptimization {
+			return inverted.NonInvertedColExpression{}, expr, nil
+		}
+
+		// Do not plan inverted index scans when the trigram similarity threshold is 0
+		// because all strings will be matched.
+		if evalCtx.SessionData().TrigramSimilarityThreshold == 0 {
+			return inverted.NonInvertedColExpression{}, expr, nil
+		}
 		// If we're doing a % expression (similarity threshold), we need to
 		// construct an OR out of the spans: we need to find results that match any
 		// of the trigrams in the constant datum, and we'll filter the results
@@ -95,13 +100,14 @@ func (t *trigramFilterPlanner) extractInvertedFilterConditionFromLeaf(
 		// Can only accelerate with a single constant value.
 		return inverted.NonInvertedColExpression{}, expr, nil
 	}
-	d := memo.ExtractConstDatum(constantVal)
-	if d.ResolvedType() != types.String {
+	d := tree.UnwrapDOidWrapper(memo.ExtractConstDatum(constantVal))
+	ds, ok := d.(*tree.DString)
+	if !ok {
 		panic(errors.AssertionFailedf(
-			"trying to apply inverted index to unsupported type %s", d.ResolvedType(),
+			"trying to apply inverted index to unsupported type %s", d.ResolvedType().SQLStringForError(),
 		))
 	}
-	s := string(*d.(*tree.DString))
+	s := string(*ds)
 	var err error
 	invertedExpr, err = rowenc.EncodeTrigramSpans(s, allMustMatch)
 	if err != nil {

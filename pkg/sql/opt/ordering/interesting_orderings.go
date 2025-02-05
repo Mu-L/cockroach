@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
@@ -15,6 +10,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 )
 
 // DeriveRestrictedInterestingOrderings calculates and returns the entry of the
@@ -110,7 +106,8 @@ func interestingOrderingsForScan(scan *memo.ScanExpr) props.OrderingSet {
 
 	addIndexOrdering := func(indexOrd cat.IndexOrdinal, fds *props.FuncDepSet, exactPrefix int) {
 		index := tab.Index(indexOrd)
-		if index.IsInverted() {
+		if index.Type() != idxtype.FORWARD {
+			// Do not consider inverted or vector indexes.
 			return
 		}
 		numIndexCols := index.KeyColumnCount()

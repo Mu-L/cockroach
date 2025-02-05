@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -17,10 +12,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
+	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"go.etcd.io/raft/v3"
 )
 
 const (
@@ -45,14 +41,18 @@ type CandidateReplica interface {
 	// GetFirstIndex returns the index of the first entry in the replica's Raft
 	// log.
 	GetFirstIndex() kvpb.RaftIndex
-	// DescAndSpanConfig returns the authoritative range descriptor as well
-	// as the span config for the replica.
-	DescAndSpanConfig() (*roachpb.RangeDescriptor, roachpb.SpanConfig)
+	// LoadSpanConfig returns the span config for the replica or an error if it can't
+	// be determined.
+	LoadSpanConfig(context.Context) (*roachpb.SpanConfig, error)
 	// Desc returns the authoritative range descriptor.
 	Desc() *roachpb.RangeDescriptor
 	// RangeUsageInfo returns usage information (sizes and traffic) needed by
 	// the allocator to make rebalancing decisions for a given range.
 	RangeUsageInfo() allocator.RangeUsageInfo
+	// BasicSendStreamStats populates the range's flow control send stream stats
+	// into the provided struct, iff the replica is the raft leader and RACv2 is
+	// enabled, otherwise nil.
+	SendStreamStats(stats *rac2.RangeSendStreamStats)
 	// AdminTransferLease transfers the LeaderLease to another replica.
 	AdminTransferLease(ctx context.Context, target roachpb.StoreID, bypassSafetyChecks bool) error
 	// Repl returns the underlying replica for this CandidateReplica. It is
@@ -77,7 +77,7 @@ func (cr candidateReplica) RangeUsageInfo() allocator.RangeUsageInfo {
 	return cr.usage
 }
 
-// Replica returns the underlying replica for this CandidateReplica. It is
+// Repl returns the underlying replica for this CandidateReplica. It is
 // only used for determining timeouts in production code and not the
 // simulator.
 func (cr candidateReplica) Repl() *Replica {

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package xform
 
@@ -76,7 +71,7 @@ func (c *CustomFuncs) MakeMinMaxScalarSubqueriesWithFilter(
 		if !ok {
 			panic(errors.AssertionFailedf("expected a variable as input to the aggregate, but found %T", aggs[i].Agg.Child(0)))
 		}
-		newVarExpr := c.remapScanColsInScalarExpr(variable, scanPrivate, newScanPrivate)
+		newVarExpr := c.RemapScanColsInScalarExpr(variable, scanPrivate, newScanPrivate)
 		var newAggrFunc opt.ScalarExpr
 		switch aggs[i].Agg.(type) {
 		case *memo.MaxExpr:
@@ -153,13 +148,17 @@ func (c *CustomFuncs) TwoOrMoreMinOrMax(aggs memo.AggregationsExpr) bool {
 // input expression is expected to return zero or one rows, and the aggregate
 // functions are expected to always pass through their values in that case.
 func (c *CustomFuncs) MakeProjectFromPassthroughAggs(
-	grp memo.RelExpr, required *physical.Required, input memo.RelExpr, aggs memo.AggregationsExpr,
+	grp memo.RelExpr,
+	required *physical.Required,
+	input memo.RelExpr,
+	aggs memo.AggregationsExpr,
+	groupingCols opt.ColSet,
 ) {
 	if !input.Relational().Cardinality.IsZeroOrOne() {
 		panic(errors.AssertionFailedf("input expression cannot have more than one row: %v", input))
 	}
 
-	var passthrough opt.ColSet
+	passthrough := groupingCols.Copy()
 	projections := make(memo.ProjectionsExpr, 0, len(aggs))
 	for i := range aggs {
 		// If aggregate remaps the column ID, need to synthesize projection item;
@@ -469,6 +468,24 @@ func (c *CustomFuncs) SplitGroupByScanIntoUnionScans(
 		return nil, false
 	}
 
+	md := c.e.mem.Metadata()
+	tableMeta := md.TableMeta(sp.Table)
+	index := tableMeta.Table.Index(sp.Index)
+	if keyPrefixLength >= index.KeyColumnCount() {
+		// There is no benefit to splitting into scans of a single row each.
+		return nil, false
+	}
+
+	// If the original scan cannot provide an ordering on at least one of the
+	// grouping columns, then GenerateStreamingGroupBy will not produce a
+	// streaming grouping operation, and therefore there is no benefit to
+	// splitting into scans.
+	if !indexHasOrderingSequenceOnOne(
+		md, scan, sp, private.GroupingCols, keyPrefixLength,
+	) {
+		return nil, false
+	}
+
 	// Create a UnionAll of scans that can provide the ordering of the
 	// GroupingPrivate (if no such UnionAll is possible this will return
 	// ok=false). We pass a limit of 0 since the scans are unlimited
@@ -523,12 +540,13 @@ func (c *CustomFuncs) GenerateLimitedGroupByScans(
 	if !requiredOrdering.Any() && !requiredOrdering.Group(0).Intersects(gp.GroupingCols) && !requiredOrdering.Optional.Intersects(gp.GroupingCols) {
 		return
 	}
-	// Iterate over all non-inverted and non-partial secondary indexes.
+	// Iterate over all non-inverted and non-vector secondary indexes.
 	var pkCols opt.ColSet
 	var iter scanIndexIter
 	var sb indexScanBuilder
 	sb.Init(c, sp.Table)
-	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, sp, nil /* filters */, rejectPrimaryIndex|rejectInvertedIndexes)
+	reject := rejectPrimaryIndex | rejectInvertedIndexes | rejectVectorIndexes
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, sp, nil /* filters */, reject)
 	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, indexCols opt.ColSet, isCovering bool, constProj memo.ProjectionsExpr) {
 		// The iterator only produces pseudo-partial indexes (the predicate is
 		// true) because no filters are passed to iter.Init to imply a partial

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -191,6 +186,10 @@ func parseAndSummarizeJavaORMTestsResults(
 	}
 	for i, file := range files {
 		t.L().Printf("Parsing %d of %d: %s\n", i+1, len(files), file)
+		// NB: It is necessary to escape `$` in case the name contains them so they
+		// aren't treated as environment variables. We avoid using single quotes
+		// because we still want `~` to be expanded to the home directory.
+		file = strings.ReplaceAll(file, "$", "\\$")
 		result, err := repeatRunWithDetailsSingleNode(
 			ctx,
 			c,

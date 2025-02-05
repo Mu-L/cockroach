@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scpb
 
@@ -146,6 +141,58 @@ func (e *ElementProto) Element() Element {
 	return e.GetElementOneOf().(ElementGetter).Element()
 }
 
+type ZoneConfigElement interface {
+	Element
+	GetSeqNum() uint32
+	GetTargetID() catid.DescID
+}
+
+var _ ZoneConfigElement = &NamedRangeZoneConfig{}
+var _ ZoneConfigElement = &DatabaseZoneConfig{}
+var _ ZoneConfigElement = &TableZoneConfig{}
+var _ ZoneConfigElement = &IndexZoneConfig{}
+var _ ZoneConfigElement = &PartitionZoneConfig{}
+
+func (e *NamedRangeZoneConfig) GetSeqNum() uint32 {
+	return e.SeqNum
+}
+
+func (e *NamedRangeZoneConfig) GetTargetID() catid.DescID {
+	return e.RangeID
+}
+
+func (e *DatabaseZoneConfig) GetSeqNum() uint32 {
+	return e.SeqNum
+}
+
+func (e *DatabaseZoneConfig) GetTargetID() catid.DescID {
+	return e.DatabaseID
+}
+
+func (e *TableZoneConfig) GetSeqNum() uint32 {
+	return e.SeqNum
+}
+
+func (e *TableZoneConfig) GetTargetID() catid.DescID {
+	return e.TableID
+}
+
+func (e *IndexZoneConfig) GetSeqNum() uint32 {
+	return e.SeqNum
+}
+
+func (e *IndexZoneConfig) GetTargetID() catid.DescID {
+	return e.TableID
+}
+
+func (e *PartitionZoneConfig) GetSeqNum() uint32 {
+	return e.SeqNum
+}
+
+func (e *PartitionZoneConfig) GetTargetID() catid.DescID {
+	return e.TableID
+}
+
 // IsLinkedToSchemaChange return if a Target is linked to a schema change.
 func (t *Target) IsLinkedToSchemaChange() bool {
 	return t.Metadata.IsLinkedToSchemaChange()
@@ -189,6 +236,7 @@ func MakeCurrentStateFromDescriptors(descriptorStates []*DescriptorState) (Curre
 	var s CurrentState
 	var targetRanks []uint32
 	var rollback, revertible bool
+	maxRank := 0
 	stmts := make(map[uint32]Statement)
 	for i, cs := range descriptorStates {
 		if i == 0 {
@@ -221,6 +269,9 @@ func MakeCurrentStateFromDescriptors(descriptorStates []*DescriptorState) (Curre
 					)
 				}
 			}
+			if int(stmt.StatementRank) > maxRank {
+				maxRank = int(stmt.StatementRank)
+			}
 			stmts[stmt.StatementRank] = stmt.Statement
 		}
 		s.Authorization = cs.Authorization
@@ -230,13 +281,15 @@ func MakeCurrentStateFromDescriptors(descriptorStates []*DescriptorState) (Curre
 	}
 	sort.Sort(NameMappings(s.NameMappings))
 	sort.Sort(&stateAndRanks{CurrentState: &s, ranks: targetRanks})
-	var sr stmtsAndRanks
+	// Statements will always be indexed by ranks, during
+	// restore cases this array could become sparse. But execution
+	// relies on it being indexable by rank.
+	// Note: In the sparse case some statements will be left empty,
+	// but these will never be accessed during execution.
+	s.Statements = make([]Statement, maxRank+1)
 	for rank, stmt := range stmts {
-		sr.stmts = append(sr.stmts, stmt)
-		sr.ranks = append(sr.ranks, rank)
+		s.Statements[rank] = stmt
 	}
-	sort.Sort(&sr)
-	s.Statements = sr.stmts
 	s.InRollback = rollback
 	s.Revertible = revertible
 	return s, nil
@@ -257,17 +310,3 @@ func (s *stateAndRanks) Swap(i, j int) {
 	s.Initial[i], s.Initial[j] = s.Initial[j], s.Initial[i]
 	s.Current[i], s.Current[j] = s.Current[j], s.Current[i]
 }
-
-type stmtsAndRanks struct {
-	stmts []Statement
-	ranks []uint32
-}
-
-func (s *stmtsAndRanks) Len() int           { return len(s.stmts) }
-func (s *stmtsAndRanks) Less(i, j int) bool { return s.ranks[i] < s.ranks[j] }
-func (s stmtsAndRanks) Swap(i, j int) {
-	s.ranks[i], s.ranks[j] = s.ranks[j], s.ranks[i]
-	s.stmts[i], s.stmts[j] = s.stmts[j], s.stmts[i]
-}
-
-var _ sort.Interface = (*stmtsAndRanks)(nil)

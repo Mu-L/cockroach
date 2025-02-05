@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -32,13 +27,14 @@ func registerPebbleWriteThroughput(r registry.Registry) {
 	// Register the Pebble write benchmark. We only run the 1024 variant for now.
 	size := 1024
 	r.Add(registry.TestSpec{
-		Name:      fmt.Sprintf("pebble/write/size=%d", size),
-		Owner:     registry.OwnerStorage,
-		Benchmark: true,
-		Timeout:   10 * time.Hour,
-		Cluster:   r.MakeClusterSpec(5, spec.CPU(16), spec.SSD(16), spec.RAID0(true)),
-		Leases:    registry.MetamorphicLeases,
-		Tags:      registry.Tags("pebble_nightly_write"),
+		Name:             fmt.Sprintf("pebble/write/size=%d", size),
+		Owner:            registry.OwnerStorage,
+		Benchmark:        true,
+		Timeout:          10 * time.Hour,
+		Cluster:          r.MakeClusterSpec(5, spec.CPU(16), spec.SSD(16), spec.RAID0(true)),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllClouds,
+		Suites:           registry.Suites(registry.PebbleNightlyWrite),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPebbleWriteBenchmark(ctx, t, c, size, pebble)
 		},

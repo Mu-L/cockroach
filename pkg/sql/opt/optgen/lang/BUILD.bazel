@@ -33,7 +33,6 @@ go_test(
         "parser_test.go",
         "scanner_test.go",
     ],
-    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":lang"],
     deps = [
@@ -51,7 +50,7 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/langgen) -out $@ exprs $(location lang.opt)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/langgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/langgen"],
     visibility = [
         ":__pkg__",
         "//pkg/gen:__pkg__",
@@ -65,7 +64,7 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/langgen) -out $@ ops $(location lang.opt)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/langgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/langgen"],
     visibility = [
         ":__pkg__",
         "//pkg/gen:__pkg__",

@@ -11,6 +11,7 @@ go_library(
         "//pkg/kv",
         "//pkg/scheduledjobs",
         "//pkg/security/username",
+        "//pkg/settings",
         "//pkg/sql",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catpb",
@@ -24,6 +25,7 @@ go_library(
         "//pkg/util/metric",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_gogo_protobuf//types",
     ],
 )

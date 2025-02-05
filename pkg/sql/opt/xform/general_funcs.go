@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package xform contains logic for transforming SQL queries.
 package xform
@@ -24,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/partialidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -47,7 +43,7 @@ func (c *CustomFuncs) Init(e *explorer) {
 		e: e,
 	}
 	c.CustomFuncs.Init(e.f)
-	c.im.Init(e.f, e.mem.Metadata(), e.evalCtx)
+	c.im.Init(e.ctx, e.f, e.mem.Metadata(), e.evalCtx)
 }
 
 // IsCanonicalScan returns true if the given ScanPrivate is an original
@@ -64,41 +60,11 @@ func (c *CustomFuncs) HasInvertedIndexes(scanPrivate *memo.ScanPrivate) bool {
 
 	// Skip the primary index because it cannot be inverted.
 	for i := 1; i < tab.IndexCount(); i++ {
-		if tab.Index(i).IsInverted() {
+		if tab.Index(i).Type() == idxtype.INVERTED {
 			return true
 		}
 	}
 	return false
-}
-
-// RemapScanColsInFilter returns a new FiltersExpr where columns in src's table
-// are replaced with columns of the same ordinal in dst's table. src and dst
-// must scan the same base table.
-func (c *CustomFuncs) RemapScanColsInFilter(
-	filters memo.FiltersExpr, src, dst *memo.ScanPrivate,
-) memo.FiltersExpr {
-	newFilters := c.remapScanColsInScalarExpr(&filters, src, dst).(*memo.FiltersExpr)
-	return *newFilters
-}
-
-func (c *CustomFuncs) remapScanColsInScalarExpr(
-	scalar opt.ScalarExpr, src, dst *memo.ScanPrivate,
-) opt.ScalarExpr {
-	md := c.e.mem.Metadata()
-	if md.Table(src.Table).ID() != md.Table(dst.Table).ID() {
-		panic(errors.AssertionFailedf("scans must have the same base table"))
-	}
-	if src.Cols.Len() != dst.Cols.Len() {
-		panic(errors.AssertionFailedf("scans must have the same number of columns"))
-	}
-	// Remap each column in src to a column in dst.
-	var colMap opt.ColMap
-	for srcCol, ok := src.Cols.Next(0); ok; srcCol, ok = src.Cols.Next(srcCol + 1) {
-		ord := src.Table.ColumnOrdinal(srcCol)
-		dstCol := dst.Table.ColumnID(ord)
-		colMap.Set(int(srcCol), int(dstCol))
-	}
-	return c.e.f.RemapCols(scalar, colMap)
 }
 
 // RemapJoinColsInFilter returns a new FiltersExpr where columns in leftSrc's
@@ -230,7 +196,7 @@ func (c *CustomFuncs) initIdxConstraintForIndex(
 
 	// Generate index constraints.
 	ic.Init(
-		requiredFilters, optionalFilters,
+		c.e.ctx, requiredFilters, optionalFilters,
 		columns, notNullCols, tabMeta.ComputedCols,
 		tabMeta.ColsInComputedColsExpressions,
 		true /* consolidate */, c.e.evalCtx, c.e.f, ps,
@@ -301,14 +267,6 @@ func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
 	// If OptSplitScanLimit is below maxScanCount, we will decrease maxScanCount
 	// to that value because a hard limit should never be lower than a soft limit.
 	hardMaxScanCount := int(c.e.evalCtx.SessionData().OptSplitScanLimit)
-	// Hack: If OptSplitScanLimit is set to 0, it may be because it is
-	// uninitialized for an internal SQL execution. Set it to the old maximum of
-	// 16 to ensure there are no regressions.
-	if hardMaxScanCount == 0 {
-		// TODO(msirek): Remove this code once the following PR ships:
-		//   https://github.com/cockroachdb/cockroach/pull/73267
-		hardMaxScanCount = 16
-	}
 	if hardMaxScanCount < maxScanCount {
 		maxScanCount = hardMaxScanCount
 	}
@@ -328,7 +286,7 @@ func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
 			}
 		}
 	}
-	keyCtx := constraint.MakeKeyContext(&cons.Columns, c.e.evalCtx)
+	keyCtx := constraint.MakeKeyContext(c.e.ctx, &cons.Columns, c.e.evalCtx)
 	spans := cons.Spans
 
 	// Get the total number of keys that can be extracted from the spans. Also
@@ -520,7 +478,7 @@ func (c *CustomFuncs) splitScanIntoUnionScansOrSelects(
 	// construct an unlimited Scan and add it to the UnionAll tree.
 	newScanPrivate := c.DuplicateScanPrivate(sp)
 	// Map from cons Columns to new columns.
-	newScanPrivate.SetConstraint(c.e.evalCtx, &constraint.Constraint{
+	newScanPrivate.SetConstraint(c.e.ctx, c.e.evalCtx, &constraint.Constraint{
 		Columns: cons.Columns.RemapColumns(sp.Table, newScanPrivate.Table),
 		Spans:   noLimitSpans,
 	})
@@ -578,7 +536,7 @@ func (c *CustomFuncs) numAllowedValues(
 			if constraint.IsContradiction() || constraint.IsUnconstrained() {
 				continue
 			}
-			if distinctVals, ok := constraint.CalculateMaxResults(c.e.evalCtx, cols, cols); ok {
+			if distinctVals, ok := constraint.CalculateMaxResults(c.e.ctx, c.e.evalCtx, cols, cols); ok {
 				if distinctVals > math.MaxInt32 {
 					return math.MaxInt32, true
 				}
@@ -587,6 +545,24 @@ func (c *CustomFuncs) numAllowedValues(
 		}
 	}
 	return 0, false
+}
+
+// indexHasOrderingSequenceOnOne returns whether the Scan can provide an
+// ordering on at least one of the columns in cols, in either the forward or
+// reverse direction, under the assumption that we are scanning a single-key
+// span with the given keyLength.
+func indexHasOrderingSequenceOnOne(
+	md *opt.Metadata, scan memo.RelExpr, sp *memo.ScanPrivate, cols opt.ColSet, keyLength int,
+) (hasSequence bool) {
+	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col) {
+		var ord props.OrderingChoice
+		ord.AppendCol(col, false)
+		if has, _ := indexHasOrderingSequence(md, scan, sp, ord, keyLength); has {
+			return true
+		}
+		col++
+	}
+	return false
 }
 
 // indexHasOrderingSequence returns whether the Scan can provide a given
@@ -674,7 +650,7 @@ func (c *CustomFuncs) makeNewScanPrivate(
 		Columns: columns.RemapColumns(sp.Table, newScanPrivate.Table),
 		Spans:   newSpans,
 	}
-	newScanPrivate.SetConstraint(c.e.evalCtx, newConstraint)
+	newScanPrivate.SetConstraint(c.e.ctx, c.e.evalCtx, newConstraint)
 
 	return newScanPrivate
 }
@@ -686,21 +662,22 @@ func (c *CustomFuncs) makeNewScanPrivate(
 // constraints. getKnownScanConstraint assumes that the scan is not inverted.
 func (c *CustomFuncs) getKnownScanConstraint(
 	sp *memo.ScanPrivate,
-) (cons *constraint.Constraint, found bool) {
+) (_ *constraint.Constraint, found bool) {
 	if sp.Constraint != nil {
 		// The ScanPrivate has a constraint, so return it.
-		cons = sp.Constraint
-	} else {
-		// Build a constraint set with the check constraints of the underlying
-		// table.
-		filters := c.checkConstraintFilters(sp.Table)
-		instance := c.initIdxConstraintForIndex(
-			nil, /* requiredFilters */
-			filters,
-			sp.Table,
-			sp.Index,
-		)
-		cons = instance.Constraint()
+		return sp.Constraint, !sp.Constraint.IsUnconstrained()
 	}
-	return cons, !cons.IsUnconstrained()
+
+	// Build a constraint set with the check constraints of the underlying
+	// table.
+	filters := c.checkConstraintFilters(sp.Table)
+	instance := c.initIdxConstraintForIndex(
+		nil, /* requiredFilters */
+		filters,
+		sp.Table,
+		sp.Index,
+	)
+	var cons constraint.Constraint
+	instance.Constraint(&cons)
+	return &cons, !cons.IsUnconstrained()
 }

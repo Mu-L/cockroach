@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutilsccl
 
@@ -17,10 +14,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/stretchr/testify/require"
 )
@@ -62,11 +62,20 @@ func AlterPrimaryKeyCorrectZoneConfigTest(
 		t.Run(tc.Desc, func(t *testing.T) {
 			var db *gosql.DB
 			var params base.TestServerArgs
+			params.Settings = cluster.MakeClusterSettings()
 			params.Locality.Tiers = []roachpb.Tier{
 				{Key: "region", Value: "ajstorm-1"},
 			}
 
 			runCheck := false
+
+			// This setting must be overridden so that secondary tenants can configure
+			// regions.
+			sql.SecondaryTenantsMultiRegionAbstractionsEnabled.Override(
+				ctx,
+				&params.Settings.SV,
+				true,
+			)
 			params.Knobs = base.TestingKnobs{
 				SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 					BackfillChunkSize: chunkSize,
@@ -97,11 +106,6 @@ func AlterPrimaryKeyCorrectZoneConfigTest(
 			db = sqlDB
 			defer s.Stopper().Stop(ctx)
 
-			st := s.ApplicationLayer().ClusterSettings()
-			// Ensure multi-region abstractions and zone configs are enabled in secondary tenants.
-			sql.SecondaryTenantZoneConfigsEnabled.Override(ctx, &st.SV, true)
-			sql.SecondaryTenantsMultiRegionAbstractionsEnabled.Override(ctx, &st.SV, true)
-
 			if _, err := sqlDB.Exec(fmt.Sprintf(`
 %s;
 USE t;
@@ -113,9 +117,18 @@ USE t;
 			// Insert some rows so we can interrupt inspect state during backfill.
 			require.NoError(t, sqltestutils.BulkInsertIntoTable(sqlDB, maxValue))
 
-			runCheck = true
-			_, err := sqlDB.Exec(tc.AlterQuery)
-			require.NoError(t, err)
+			testutils.RunTrueAndFalse(t, "uses-declarative-for-alter-table",
+				func(t *testing.T, useDeclarativeSchemaChangerForAlter bool) {
+					if useDeclarativeSchemaChangerForAlter {
+						skip.WithIssue(t, 136846)
+					} else {
+						_, err := sqlDB.Exec("SET CLUSTER SETTING sql.schema.force_declarative_statements = '!ALTER TABLE';")
+						require.NoError(t, err)
+					}
+					runCheck = true
+					_, err := sqlDB.Exec(tc.AlterQuery)
+					require.NoError(t, err)
+				})
 		})
 	}
 

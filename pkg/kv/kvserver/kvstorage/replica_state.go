@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvstorage
 
@@ -17,20 +12,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/raft/v3/raftpb"
 )
 
 // LoadedReplicaState represents the state of a Replica loaded from storage, and
 // is used to initialize the in-memory Replica instance.
 // TODO(pavelkalinnikov): integrate with kvstorage.Replica.
 type LoadedReplicaState struct {
-	ReplicaID roachpb.ReplicaID
-	LastIndex kvpb.RaftIndex
-	ReplState kvserverpb.ReplicaState
+	ReplicaID  roachpb.ReplicaID
+	LastIndex  kvpb.RaftIndex
+	ReplState  kvserverpb.ReplicaState
+	TruncState kvserverpb.RaftTruncatedState
 
 	hardState raftpb.HardState
 }
@@ -58,6 +54,9 @@ func LoadReplicaState(
 
 	ls := LoadedReplicaState{ReplicaID: replicaID}
 	if ls.hardState, err = sl.LoadHardState(ctx, eng); err != nil {
+		return LoadedReplicaState{}, err
+	}
+	if ls.TruncState, err = sl.LoadRaftTruncatedState(ctx, eng); err != nil {
 		return LoadedReplicaState{}, err
 	}
 	if ls.LastIndex, err = sl.LoadLastIndex(ctx, eng); err != nil {
@@ -137,20 +136,6 @@ func CreateUninitializedReplica(
 	//   the Term and Vote values for that older replica in the context of
 	//   this newer replica is harmless since it just limits the votes for
 	//   this replica.
-	//
-	// Compatibility:
-	// - v21.2 and v22.1: v22.1 unilaterally introduces RaftReplicaID (an
-	//   unreplicated range-id local key). If a v22.1 binary is rolled back at
-	//   a node, the fact that RaftReplicaID was written is harmless to a
-	//   v21.2 node since it does not read it. When a v21.2 drops an
-	//   initialized range, the RaftReplicaID will also be deleted because the
-	//   whole range-ID local key space is deleted.
-	// - v22.2: no changes: RaftReplicaID is written, but old Replicas may not
-	//   have it yet.
-	// - v23.1: at startup, we remove any uninitialized replicas that have a
-	//   HardState but no RaftReplicaID, see kvstorage.LoadAndReconcileReplicas.
-	//   So after first call to this method we have the invariant that all replicas
-	//   have a RaftReplicaID persisted.
 	sl := stateloader.Make(rangeID)
 	if err := sl.SetRaftReplicaID(ctx, eng, replicaID); err != nil {
 		return err

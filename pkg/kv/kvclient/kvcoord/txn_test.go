@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord_test
 
@@ -17,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
@@ -25,12 +21,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -421,7 +420,7 @@ func TestTxnReadCommittedPerStatementReadSnapshot(t *testing.T) {
 			incrementKey()
 
 			if step {
-				require.NoError(t, txn1.Step(ctx))
+				require.NoError(t, txn1.Step(ctx, true /* allowReadTimestampStep */))
 			}
 
 			// Read the key twice in the same batch, to demonstrate that regardless of
@@ -491,35 +490,41 @@ func TestTxnReadCommittedPerStatementReadSnapshot(t *testing.T) {
 func TestTxnWriteReadConflict(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	s := createTestDB(t)
+	defer s.Stop()
+	ctx := context.Background()
 
 	run := func(t *testing.T, writeIsoLevel, readIsoLevel isolation.Level) {
-		s := createTestDB(t)
-		defer s.Stop()
-		ctx := context.Background()
+		key := fmt.Sprintf("key-%s-%s", writeIsoLevel, readIsoLevel)
 
-		// Begin the test's writer and reader transactions.
+		// Begin the test's writer transaction.
 		writeTxn := s.DB.NewTxn(ctx, "writer")
 		require.NoError(t, writeTxn.SetIsoLevel(writeIsoLevel))
+
+		// Perform a write to key in the writer transaction.
+		require.NoError(t, writeTxn.Put(ctx, key, "value"))
+
+		// Begin the test's reader transaction.
+		// NOTE: we do this after the write because if the writer is Read Committed,
+		// it will select a new write timestamp on each batch. We want the reader's
+		// read timestamp to be above the writer's write timestamp.
 		readTxn := s.DB.NewTxn(ctx, "reader")
 		require.NoError(t, readTxn.SetIsoLevel(readIsoLevel))
 
-		// Perform a write to key "a" in the writer transaction.
-		require.NoError(t, writeTxn.Put(ctx, "a", "value"))
-
-		// Read from key "a" in the reader transaction.
+		// Read from key in the reader transaction.
 		expBlocking := writeIsoLevel == isolation.Serializable && readIsoLevel == isolation.Serializable
 		readCtx := ctx
 		if expBlocking {
 			var cancel func()
-			readCtx, cancel = context.WithTimeout(ctx, 500*time.Millisecond)
+			readCtx, cancel = context.WithTimeout(ctx, 50*time.Millisecond)
 			defer cancel()
 		}
-		res, err := readTxn.Get(readCtx, "a")
+		res, err := readTxn.Get(readCtx, key)
 
 		// Verify the expected blocking behavior.
 		if expBlocking {
 			require.Error(t, err)
-			require.ErrorIs(t, context.DeadlineExceeded, err)
+			require.ErrorIs(t, err, context.DeadlineExceeded)
 		} else {
 			require.NoError(t, err)
 			require.False(t, res.Exists())
@@ -1043,9 +1048,9 @@ func TestTxnContinueAfterCputError(t *testing.T) {
 }
 
 // Test that a transaction can be used after a locking request returns a
-// LockConflictError. This is not generally allowed for other errors, but
-// a LockConflictError is special.
-func TestTxnContinueAfterLockConflictError(t *testing.T) {
+// WriteIntentError. This is not generally allowed for other errors, but
+// a WriteIntentError is special.
+func TestTxnContinueAfterWriteIntentError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
@@ -1061,7 +1066,7 @@ func TestTxnContinueAfterLockConflictError(t *testing.T) {
 	b.Header.WaitPolicy = lock.WaitPolicy_Error
 	b.Put("a", "c")
 	err := txn.Run(ctx, b)
-	require.IsType(t, &kvpb.LockConflictError{}, err)
+	require.IsType(t, &kvpb.WriteIntentError{}, err)
 
 	require.NoError(t, txn.Put(ctx, "a'", "c"))
 	require.NoError(t, txn.Commit(ctx))
@@ -1118,13 +1123,17 @@ func TestTxnWaitPolicies(t *testing.T) {
 			errorC <- s.DB.Run(ctx, &b)
 		}()
 
-		// Should return error immediately, without blocking.
-		// Priority does not matter.
-		err := <-errorC
-		require.NotNil(t, err)
-		lcErr := new(kvpb.LockConflictError)
-		require.True(t, errors.As(err, &lcErr))
-		require.Equal(t, kvpb.LockConflictError_REASON_WAIT_POLICY, lcErr.Reason)
+		if highPriority {
+			// Should push txn and not block.
+			require.NoError(t, <-errorC)
+		} else {
+			// Should return error immediately, without blocking.
+			err := <-errorC
+			require.NotNil(t, err)
+			lcErr := new(kvpb.WriteIntentError)
+			require.True(t, errors.As(err, &lcErr))
+			require.Equal(t, kvpb.WriteIntentError_REASON_WAIT_POLICY, lcErr.Reason)
+		}
 
 		// SkipLocked wait policy.
 		type skipRes struct {
@@ -1174,9 +1183,9 @@ func TestTxnLockTimeout(t *testing.T) {
 	b.Get(key)
 	err := s.DB.Run(ctx, &b)
 	require.NotNil(t, err)
-	lcErr := new(kvpb.LockConflictError)
+	lcErr := new(kvpb.WriteIntentError)
 	require.True(t, errors.As(err, &lcErr))
-	require.Equal(t, kvpb.LockConflictError_REASON_LOCK_TIMEOUT, lcErr.Reason)
+	require.Equal(t, kvpb.WriteIntentError_REASON_LOCK_TIMEOUT, lcErr.Reason)
 }
 
 // TestTxnReturnsWriteTooOldErrorOnConflictingDeleteRange tests that if two
@@ -1330,5 +1339,190 @@ func TestTxnRetryWithLatchesDroppedEarly(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTxnUpdateFromTxnRecordDoesNotOverwriteFields tests that any field in
+// the Transaction proto, that is not present in TransactionRecord, is not
+// accidentally overwritten by Update().
+// OmitInRangefeeds and AdmissionPriority are two such fields.
+func TestTxnUpdateFromTxnRecordDoesNotOverwriteFields(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	keyA := roachpb.Key("a")
+	var storeKnobs kvserver.StoreTestingKnobs
+	storeKnobs.TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+		if args.Req.Txn != nil && args.Req.Txn.Name == "txn" {
+			// Ensure all requests by the transaction use the right admission
+			// priority.
+			require.Equal(t, int32(admissionpb.UserHighPri), args.Req.Txn.AdmissionPriority)
+		}
+		return nil
+	}
+
+	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{Store: &storeKnobs},
+	})
+	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+
+	// Start a transaction with high admission priority.
+	txn := kv.NewTxnWithAdmissionControl(
+		ctx, kvDB, 0, kvpb.AdmissionHeader_ROOT_KV, admissionpb.UserHighPri)
+	// Set OmitInRangefeeds to true.
+	txn.SetOmitInRangefeeds()
+	txn.SetDebugName("txn")
+	require.NoError(t, txn.Put(ctx, keyA, "a"))
+
+	hbRequest := &kvpb.HeartbeatTxnRequest{
+		RequestHeader: kvpb.RequestHeader{Key: keyA},
+		Now:           txn.ReadTimestamp(),
+	}
+
+	// The first txn heartbeat writes the TransactionRecord to disk.
+	// OmitInRangefeeds and AdmissionPriority are not present on the
+	// TransactionRecord proto, so they are not written to disk.
+	b := txn.NewBatch()
+	b.AddRawRequest(hbRequest)
+	require.NoError(t, txn.Run(ctx, b))
+
+	// The second txn heartbeat reads the TransactionRecord from disk, writes an
+	// updated one, and returns it.
+	// As part of command evaluation, the Transaction proto is updated with the
+	// new TransactionRecord. OmitInRangefeeds and AdmissionPriority are not
+	// dropped in the process because they can be updated only if they were not
+	// set previously.
+	b = txn.NewBatch()
+	b.AddRawRequest(hbRequest)
+	require.NoError(t, txn.Run(ctx, b))
+
+	require.NoError(t, txn.Commit(ctx))
+
+	// OmitInRangefeeds is still true.
+	require.True(t, txn.GetOmitInRangefeeds())
+}
+
+// TestTxnPrepare tests that a transaction can be prepared and committed or
+// rolled back.
+//
+// The test exercises both methods of finalizing a prepared transaction:
+// - using the DB methods CommitPrepared and RollbackPrepared
+// - using the Txn methods Commit and Rollback
+//
+// The test also exercises all combinations of isolation levels, read-only vs.
+// read-write, and commit vs. rollback.
+func TestTxnPrepare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	s := createTestDB(t)
+	defer s.Stop()
+
+	run := func(t *testing.T, isoLevel isolation.Level, readOnly, withProto, commit bool) {
+		key := fmt.Sprintf("key-%s-%t-%t-%t", isoLevel, readOnly, withProto, commit)
+		txn := s.DB.NewTxn(ctx, "test txn")
+		require.NoError(t, txn.SetIsoLevel(isoLevel))
+
+		var err error
+		if readOnly {
+			_, err = txn.Get(ctx, key)
+		} else {
+			err = txn.Put(ctx, key, "value")
+		}
+		require.NoError(t, err)
+
+		err = txn.Prepare(ctx)
+		require.NoError(t, err)
+		require.False(t, txn.IsOpen())
+		require.False(t, txn.IsCommitted())
+		require.False(t, txn.IsAborted())
+		require.True(t, txn.IsPrepared())
+
+		if withProto {
+			txnPrepared := txn.TestingCloneTxn()
+			require.Equal(t, roachpb.PREPARED, txnPrepared.Status)
+
+			if commit {
+				err = s.DB.CommitPrepared(ctx, txnPrepared)
+			} else {
+				err = s.DB.RollbackPrepared(ctx, txnPrepared)
+			}
+		} else {
+			if commit {
+				err = txn.Commit(ctx)
+			} else {
+				err = txn.Rollback(ctx)
+			}
+		}
+		require.NoError(t, err)
+
+		if !readOnly {
+			res, err := s.DB.Get(ctx, key)
+			require.NoError(t, err)
+			require.Equal(t, commit, res.Exists())
+		}
+	}
+
+	isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+		testutils.RunTrueAndFalse(t, "readOnly", func(t *testing.T, readOnly bool) {
+			testutils.RunTrueAndFalse(t, "withProto", func(t *testing.T, withProto bool) {
+				testutils.RunTrueAndFalse(t, "commit", func(t *testing.T, commit bool) {
+					run(t, isoLevel, readOnly, withProto, commit)
+				})
+			})
+		})
+	})
+}
+
+// TestTxnPreparedWriteReadConflict verifies that write-read conflicts with a
+// prepared writer are blocking to the reader until the writer is committed or
+// rolled back, regardless of isolation level.
+func TestTxnPreparedWriteReadConflict(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s := createTestDB(t)
+	defer s.Stop()
+	ctx := context.Background()
+
+	run := func(t *testing.T, writeIsoLevel, readIsoLevel isolation.Level) {
+		key := fmt.Sprintf("key-%s-%s", writeIsoLevel, readIsoLevel)
+
+		// Begin the test's writer transaction.
+		writeTxn := s.DB.NewTxn(ctx, "writer")
+		require.NoError(t, writeTxn.SetIsoLevel(writeIsoLevel))
+
+		// Perform a write to key in the writer transaction.
+		require.NoError(t, writeTxn.Put(ctx, key, "value"))
+
+		// Prepare the writer transaction.
+		err := writeTxn.Prepare(ctx)
+		require.NoError(t, err)
+
+		// Begin the test's reader transaction.
+		// NOTE: we do this after the write and prepare because if the writer is Read Committed,
+		// it will select a new write timestamp on each batch. We want the reader's
+		// read timestamp to be above the writer's write timestamp.
+		readTxn := s.DB.NewTxn(ctx, "reader")
+		require.NoError(t, readTxn.SetIsoLevel(readIsoLevel))
+
+		// Read from key in the reader transaction.
+		readCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		_, err = readTxn.Get(readCtx, key)
+
+		// Verify the expected blocking behavior.
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		require.NoError(t, writeTxn.Rollback(ctx))
+		require.NoError(t, readTxn.Rollback(ctx))
+	}
+
+	for _, writeIsoLevel := range isolation.Levels() {
+		for _, readIsoLevel := range isolation.Levels() {
+			name := fmt.Sprintf("writeIso=%s,readIso=%s", writeIsoLevel, readIsoLevel)
+			t.Run(name, func(t *testing.T) { run(t, writeIsoLevel, readIsoLevel) })
+		}
 	}
 }

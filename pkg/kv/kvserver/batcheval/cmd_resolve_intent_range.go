@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -33,8 +28,8 @@ func declareKeysResolveIntentRange(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
-	declareKeysResolveIntentCombined(rs, req, latchSpans)
+) error {
+	return declareKeysResolveIntentCombined(rs, req, latchSpans)
 }
 
 // ResolveIntentRange resolves write intents in the specified
@@ -55,8 +50,10 @@ func ResolveIntentRange(
 		// The observation was from the wrong node. Ignore.
 		update.ClockWhilePending = roachpb.ObservedTimestamp{}
 	}
-	numKeys, numBytes, resumeSpan, resumeReason, err := storage.MVCCResolveWriteIntentRange(ctx, readWriter, ms, update,
-		storage.MVCCResolveWriteIntentRangeOptions{MaxKeys: h.MaxSpanRequestKeys, TargetBytes: h.TargetBytes})
+	numKeys, numBytes, resumeSpan, resumeReason, replLocksReleased, err :=
+		storage.MVCCResolveWriteIntentRange(ctx, readWriter, ms, update,
+			storage.MVCCResolveWriteIntentRangeOptions{MaxKeys: h.MaxSpanRequestKeys, TargetBytes: h.TargetBytes},
+		)
 	if err != nil {
 		return result.Result{}, err
 	}
@@ -76,6 +73,22 @@ func ResolveIntentRange(
 	var res result.Result
 	res.Local.ResolvedLocks = []roachpb.LockUpdate{update}
 	res.Local.Metrics = resolveToMetricType(args.Status, args.Poison)
+
+	// Handle replicated lock releases.
+	if replLocksReleased && update.Status == roachpb.COMMITTED {
+		// A replicated {shared, exclusive} lock was released for a committed
+		// transaction. Now that the lock is no longer there, we still need to make
+		// sure other transactions can't write underneath the transaction's commit
+		// timestamp to the key. We return the transaction's commit timestamp on the
+		// response and update the timestamp cache a few layers above to ensure
+		// this.
+		//
+		// NB: Doing so will update the timestamp cache over the entire key span the
+		// request operated over -- we're losing fidelity about which key(s) had
+		// locks. We could do a better job tracking and plumbing this information
+		// up, but we choose not to.
+		reply.ReplicatedLocksReleasedCommitTimestamp = update.Txn.WriteTimestamp
+	}
 
 	if WriteAbortSpanOnResolve(args.Status, args.Poison, numKeys > 0) {
 		if err := UpdateAbortSpan(ctx, cArgs.EvalCtx, readWriter, ms, args.IntentTxn, args.Poison); err != nil {

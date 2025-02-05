@@ -1,19 +1,18 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
-import { stdDevLong, Duration, Bytes, longToInt } from "src/util";
 import classNames from "classnames/bind";
-import styles from "../barCharts/barCharts.module.scss";
+
 import { barChartFactory } from "src/barCharts/barChartFactory";
 import { bar, approximify } from "src/barCharts/utils";
+import { stdDevLong, Duration, Bytes, longToInt } from "src/util";
+
+import styles from "../barCharts/barCharts.module.scss";
+
+import { TransactionInfo } from "./transactionsTable";
 
 type Transaction =
   protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
@@ -32,19 +31,30 @@ const bytesReadBar = [
 const bytesReadStdDev = bar(cx("bytes-read-dev"), (d: Transaction) =>
   stdDevLong(d.stats_data.stats.bytes_read, d.stats_data.stats.count),
 );
-const latencyBar = [
+const serviceLatencyBar = [
   bar(
     "bar-chart__service-lat",
     (d: Transaction) => d.stats_data.stats.service_lat.mean,
   ),
 ];
-const latencyStdDev = bar(cx("bar-chart__overall-dev"), (d: Transaction) =>
-  stdDevLong(d.stats_data.stats.service_lat, d.stats_data.stats.count),
+const serviceLatencyStdDev = bar(
+  cx("bar-chart__overall-dev"),
+  (d: Transaction) =>
+    stdDevLong(d.stats_data.stats.service_lat, d.stats_data.stats.count),
+);
+const commitLatencyBar = [
+  bar(
+    "bar-chart__commit-lat",
+    (d: Transaction) => d.stats_data.stats.commit_lat.mean,
+  ),
+];
+const commitLatencyStdDev = bar("bar-chart__commit-dev", (d: Transaction) =>
+  stdDevLong(d.stats_data.stats.commit_lat, d.stats_data.stats.count),
 );
 const contentionBar = [
   bar(
     "contention",
-    (d: Transaction) => d.stats_data.stats.exec_stats.contention_time?.mean,
+    (d: TransactionInfo) => d.stats_data.stats.exec_stats.contention_time?.mean,
   ),
 ];
 const contentionStdDev = bar(cx("contention-dev"), (d: Transaction) =>
@@ -56,7 +66,7 @@ const contentionStdDev = bar(cx("contention-dev"), (d: Transaction) =>
 const cpuBar = [
   bar(
     "cpu",
-    (d: Transaction) => d.stats_data.stats.exec_stats.cpu_sql_nanos?.mean,
+    (d: TransactionInfo) => d.stats_data.stats.exec_stats.cpu_sql_nanos?.mean,
   ),
 ];
 const cpuStdDev = bar(cx("cpu-dev"), (d: Transaction) =>
@@ -66,7 +76,7 @@ const cpuStdDev = bar(cx("cpu-dev"), (d: Transaction) =>
   ),
 );
 const maxMemUsageBar = [
-  bar("max-mem-usage", (d: Transaction) =>
+  bar("max-mem-usage", (d: TransactionInfo) =>
     longToInt(d.stats_data.stats.exec_stats.max_mem_usage?.mean),
   ),
 ];
@@ -77,7 +87,7 @@ const maxMemUsageStdDev = bar(cx("max-mem-usage-dev"), (d: Transaction) =>
   ),
 );
 const networkBytesBar = [
-  bar("network-bytes", (d: Transaction) =>
+  bar("network-bytes", (d: TransactionInfo) =>
     longToInt(d.stats_data.stats.exec_stats.network_bytes?.mean),
   ),
 ];
@@ -104,11 +114,17 @@ export const transactionsBytesReadBarChart = barChartFactory(
   Bytes,
   bytesReadStdDev,
 );
-export const transactionsLatencyBarChart = barChartFactory(
+export const transactionsServiceLatencyBarChart = barChartFactory(
   "grey",
-  latencyBar,
+  serviceLatencyBar,
   v => Duration(v * 1e9),
-  latencyStdDev,
+  serviceLatencyStdDev,
+);
+export const transactionsCommitLatencyBarChart = barChartFactory(
+  "grey",
+  commitLatencyBar,
+  v => Duration(v * 1e9),
+  commitLatencyStdDev,
 );
 export const transactionsContentionBarChart = barChartFactory(
   "grey",

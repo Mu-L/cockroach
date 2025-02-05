@@ -1,17 +1,13 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package local
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,7 +40,7 @@ func (n *dnsProvider) Domain() string {
 }
 
 // CreateRecords is part of the vm.DNSProvider interface.
-func (n *dnsProvider) CreateRecords(records ...vm.DNSRecord) error {
+func (n *dnsProvider) CreateRecords(_ context.Context, records ...vm.DNSRecord) error {
 	unlock, err := lock.AcquireFilesystemLock(n.lockFilePath)
 	if err != nil {
 		return err
@@ -63,12 +59,11 @@ func (n *dnsProvider) CreateRecords(records ...vm.DNSRecord) error {
 }
 
 // LookupSRVRecords is part of the vm.DNSProvider interface.
-func (n *dnsProvider) LookupSRVRecords(service, proto, subdomain string) ([]vm.DNSRecord, error) {
+func (n *dnsProvider) LookupSRVRecords(_ context.Context, name string) ([]vm.DNSRecord, error) {
 	records, err := n.loadRecords()
 	if err != nil {
 		return nil, err
 	}
-	name := fmt.Sprintf("_%s._%s.%s.%s", service, proto, subdomain, n.Domain())
 	var matchingRecords []vm.DNSRecord
 	for _, record := range records {
 		if record.Name == name && record.Type == vm.SRV {
@@ -78,8 +73,35 @@ func (n *dnsProvider) LookupSRVRecords(service, proto, subdomain string) ([]vm.D
 	return matchingRecords, nil
 }
 
+// ListRecords is part of the vm.DNSProvider interface.
+func (n *dnsProvider) ListRecords(_ context.Context) ([]vm.DNSRecord, error) {
+	records, err := n.loadRecords()
+	if err != nil {
+		return nil, err
+	}
+	return maps.Values(records), nil
+}
+
+// DeleteRecordsByName is part of the vm.DNSProvider interface.
+func (n *dnsProvider) DeleteRecordsByName(_ context.Context, names ...string) error {
+	unlock, err := lock.AcquireFilesystemLock(n.lockFilePath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	entries, err := n.loadRecords()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		delete(entries, name)
+	}
+	return n.saveRecords(entries)
+}
+
 // DeleteRecordsBySubdomain is part of the vm.DNSProvider interface.
-func (n *dnsProvider) DeleteRecordsBySubdomain(subdomain string) error {
+func (n *dnsProvider) DeleteRecordsBySubdomain(_ context.Context, subdomain string) error {
 	unlock, err := lock.AcquireFilesystemLock(n.lockFilePath)
 	if err != nil {
 		return err

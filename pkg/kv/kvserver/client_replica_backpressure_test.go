@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -31,8 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,15 +68,15 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		var allowSplits atomic.Value
 		allowSplits.Store(true)
 		unblockCh := make(chan struct{}, 1)
-		var rangesBlocked sync.Map
+		var rangesBlocked syncutil.Set[roachpb.RangeID]
 		args = base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
 						TestingRequestFilter: func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 							if ba.Header.Txn != nil && ba.Header.Txn.Name == "split" && !allowSplits.Load().(bool) {
-								rangesBlocked.Store(ba.Header.RangeID, true)
-								defer rangesBlocked.Delete(ba.Header.RangeID)
+								rangesBlocked.Add(ba.Header.RangeID)
+								defer rangesBlocked.Remove(ba.Header.RangeID)
 								select {
 								case <-unblockCh:
 									return kvpb.NewError(errors.Errorf("splits disabled"))
@@ -99,6 +95,11 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 
 		// Create the table, split it off, and load it up with data.
 		tdb = sqlutils.MakeSQLRunner(tc.ServerConn(0))
+
+		// speeds up the test
+		//		tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
+		//		tdb.Exec(t, `SET CLUSTER SETTING kv.protectedts.poll_interval = '10ms'`)
+
 		tdb.Exec(t, "CREATE TABLE foo (k INT PRIMARY KEY, v BYTES NOT NULL)")
 
 		var tableID int
@@ -124,7 +125,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		}
 		waitForBlockedRange = func(id roachpb.RangeID) {
 			testutils.SucceedsSoon(t, func() error {
-				if _, ok := rangesBlocked.Load(id); !ok {
+				if !rangesBlocked.Contains(id) {
 					return errors.Errorf("waiting for %v to be blocked", id)
 				}
 				return nil
@@ -138,7 +139,10 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 			for i := 0; i < tc.NumServers(); i++ {
 				s := tc.Server(i)
 				_, r := getFirstStoreReplica(t, s, tablePrefix)
-				conf := r.SpanConfig()
+				conf, err := r.LoadSpanConfig(ctx)
+				if err != nil {
+					return err
+				}
 				if conf.RangeMaxBytes != exp {
 					return fmt.Errorf("expected %d, got %d", exp, conf.RangeMaxBytes)
 				}
@@ -277,7 +281,10 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		// Ensure that the new replica has applied the same config.
 		testutils.SucceedsSoon(t, func() error {
 			_, r := getFirstStoreReplica(t, tc.Server(1), tablePrefix)
-			conf := r.SpanConfig()
+			conf, err := r.LoadSpanConfig(ctx)
+			if err != nil {
+				return err
+			}
 			if conf.RangeMaxBytes != newMax {
 				return fmt.Errorf("expected %d, got %d", newMax, conf.RangeMaxBytes)
 			}
@@ -285,7 +292,7 @@ func TestBackpressureNotAppliedWhenReducingRangeSize(t *testing.T) {
 		})
 
 		s, repl := getFirstStoreReplica(t, tc.Server(1), tablePrefix)
-		s.SetReplicateQueueActive(false)
+		s.TestingSetReplicateQueueActive(false)
 		require.Len(t, repl.Desc().Replicas().Descriptors(), 1)
 		// We really need to make sure that the split queue has hit this range,
 		// otherwise we'll fail to backpressure.

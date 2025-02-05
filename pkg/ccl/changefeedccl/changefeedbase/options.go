@@ -1,19 +1,18 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedbase
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
@@ -73,33 +72,37 @@ const (
 
 // Constants for the options.
 const (
-	OptAvroSchemaPrefix        = `avro_schema_prefix`
-	OptConfluentSchemaRegistry = `confluent_schema_registry`
-	OptCursor                  = `cursor`
-	OptCustomKeyColumn         = `key_column`
-	OptEndTime                 = `end_time`
-	OptEnvelope                = `envelope`
-	OptFormat                  = `format`
-	OptFullTableName           = `full_table_name`
-	OptKeyInValue              = `key_in_value`
-	OptTopicInValue            = `topic_in_value`
-	OptResolvedTimestamps      = `resolved`
-	OptMinCheckpointFrequency  = `min_checkpoint_frequency`
-	OptUpdatedTimestamps       = `updated`
-	OptMVCCTimestamps          = `mvcc_timestamp`
-	OptDiff                    = `diff`
-	OptCompression             = `compression`
-	OptSchemaChangeEvents      = `schema_change_events`
-	OptSchemaChangePolicy      = `schema_change_policy`
-	OptSplitColumnFamilies     = `split_column_families`
-	OptExpirePTSAfter          = `gc_protect_expires_after`
-	OptWebhookAuthHeader       = `webhook_auth_header`
-	OptWebhookClientTimeout    = `webhook_client_timeout`
-	OptOnError                 = `on_error`
-	OptMetricsScope            = `metrics_label`
-	OptUnordered               = `unordered`
-	OptVirtualColumns          = `virtual_columns`
-	OptExecutionLocality       = `execution_locality`
+	OptAvroSchemaPrefix                   = `avro_schema_prefix`
+	OptConfluentSchemaRegistry            = `confluent_schema_registry`
+	OptCursor                             = `cursor`
+	OptCustomKeyColumn                    = `key_column`
+	OptEndTime                            = `end_time`
+	OptEnvelope                           = `envelope`
+	OptFormat                             = `format`
+	OptFullTableName                      = `full_table_name`
+	OptKeyInValue                         = `key_in_value`
+	OptTopicInValue                       = `topic_in_value`
+	OptResolvedTimestamps                 = `resolved`
+	OptMinCheckpointFrequency             = `min_checkpoint_frequency`
+	OptUpdatedTimestamps                  = `updated`
+	OptMVCCTimestamps                     = `mvcc_timestamp`
+	OptDiff                               = `diff`
+	OptCompression                        = `compression`
+	OptSchemaChangeEvents                 = `schema_change_events`
+	OptSchemaChangePolicy                 = `schema_change_policy`
+	OptSplitColumnFamilies                = `split_column_families`
+	OptExpirePTSAfter                     = `gc_protect_expires_after`
+	OptWebhookAuthHeader                  = `webhook_auth_header`
+	OptWebhookClientTimeout               = `webhook_client_timeout`
+	OptOnError                            = `on_error`
+	OptMetricsScope                       = `metrics_label`
+	OptUnordered                          = `unordered`
+	OptVirtualColumns                     = `virtual_columns`
+	OptExecutionLocality                  = `execution_locality`
+	OptLaggingRangesThreshold             = `lagging_ranges_threshold`
+	OptLaggingRangesPollingInterval       = `lagging_ranges_polling_interval`
+	OptIgnoreDisableChangefeedReplication = `ignore_disable_changefeed_replication`
+	OptEncodeJSONValueNullAsObject        = `encode_json_value_null_as_object`
 
 	OptVirtualColumnsOmitted VirtualColumnVisibility = `omitted`
 	OptVirtualColumnsNull    VirtualColumnVisibility = `null`
@@ -131,11 +134,12 @@ const (
 	// the creation of the changeffed. If used in conjunction with a cursor,
 	// an initial scan will be performed at the cursor timestamp.
 	OptInitialScan = `initial_scan`
-	// OptInitialScan enables an initial scan. This is the default when a
+	// OptNoInitialScan disables an initial scan. This is the default when a
 	// cursor is specified. This option is useful to create a changefeed which
 	// subscribes only to new messages.
 	OptNoInitialScan = `no_initial_scan`
-	// Sentinel value to indicate that all resolved timestamp events should be emitted.
+	// OptEmitAllResolvedTimestamps is a sentinel value to indicate that all
+	// resolved timestamp events should be emitted.
 	OptEmitAllResolvedTimestamps = ``
 
 	OptInitialScanOnly = `initial_scan_only`
@@ -145,6 +149,7 @@ const (
 	OptEnvelopeDeprecatedRow EnvelopeType = `deprecated_row`
 	OptEnvelopeWrapped       EnvelopeType = `wrapped`
 	OptEnvelopeBare          EnvelopeType = `bare`
+	OptEnvelopeEnriched      EnvelopeType = `enriched`
 
 	OptFormatJSON    FormatType = `json`
 	OptFormatAvro    FormatType = `avro`
@@ -200,6 +205,7 @@ const (
 	SinkSchemeNull                  = `null`
 	SinkSchemeWebhookHTTP           = `webhook-http`
 	SinkSchemeWebhookHTTPS          = `webhook-https`
+	SinkSchemePulsar                = `pulsar`
 	SinkSchemeExternalConnection    = `external`
 	SinkParamSASLEnabled            = `sasl_enabled`
 	SinkParamSASLHandshake          = `sasl_handshake`
@@ -211,6 +217,24 @@ const (
 	SinkParamSASLTokenURL           = `sasl_token_url`
 	SinkParamSASLScopes             = `sasl_scopes`
 	SinkParamSASLGrantType          = `sasl_grant_type`
+	SinkParamSASLAwsIAMRoleArn      = `sasl_aws_iam_role_arn`
+	SinkParamSASLAwsRegion          = `sasl_aws_region`
+	SinkParamSASLAwsIAMSessionName  = `sasl_aws_iam_session_name`
+	SinkParamTableNameAttribute     = `with_table_name_attribute`
+
+	// These are custom fields required for proprietary oauth. They should not
+	// be documented.
+	SinkParamSASLProprietaryResource            = `sasl_proprietary_resource`
+	SinkParamSASLProprietaryClientAssertionType = `sasl_proprietary_client_assertion_type`
+	SinkParamSASLProprietaryClientAssertion     = `sasl_proprietary_client_assertion`
+
+	SinkSchemeConfluentKafka    = `confluent-cloud`
+	SinkParamConfluentAPIKey    = `api_key`
+	SinkParamConfluentAPISecret = `api_secret`
+
+	SinkSchemeAzureKafka        = `azure-event-hub`
+	SinkParamAzureAccessKeyName = `shared_access_key_name`
+	SinkParamAzureAccessKey     = `shared_access_key`
 
 	RegistryParamCACert     = `ca_cert`
 	RegistryParamClientCert = `client_cert`
@@ -319,7 +343,7 @@ var ChangefeedOptionExpectValues = map[string]OptionPermittedValues{
 	OptCursor:                             timestampOption,
 	OptCustomKeyColumn:                    stringOption,
 	OptEndTime:                            timestampOption,
-	OptEnvelope:                           enum("row", "key_only", "wrapped", "deprecated_row", "bare"),
+	OptEnvelope:                           enum("row", "key_only", "wrapped", "deprecated_row", "bare", "enriched"),
 	OptFormat:                             enum("json", "avro", "csv", "experimental_avro", "parquet"),
 	OptFullTableName:                      flagOption,
 	OptKeyInValue:                         flagOption,
@@ -348,6 +372,10 @@ var ChangefeedOptionExpectValues = map[string]OptionPermittedValues{
 	OptUnordered:                          flagOption,
 	OptVirtualColumns:                     enum("omitted", "null"),
 	OptExecutionLocality:                  stringOption,
+	OptLaggingRangesThreshold:             durationOption,
+	OptLaggingRangesPollingInterval:       durationOption,
+	OptIgnoreDisableChangefeedReplication: flagOption,
+	OptEncodeJSONValueNullAsObject:        flagOption,
 }
 
 // CommonOptions is options common to all sinks
@@ -360,7 +388,8 @@ var CommonOptions = makeStringSet(OptCursor, OptEndTime, OptEnvelope,
 	OptOnError,
 	OptInitialScan, OptNoInitialScan, OptInitialScanOnly, OptUnordered, OptCustomKeyColumn,
 	OptMinCheckpointFrequency, OptMetricsScope, OptVirtualColumns, Topics, OptExpirePTSAfter,
-	OptExecutionLocality,
+	OptExecutionLocality, OptLaggingRangesThreshold, OptLaggingRangesPollingInterval,
+	OptIgnoreDisableChangefeedReplication, OptEncodeJSONValueNullAsObject,
 )
 
 // SQLValidOptions is options exclusive to SQL sink
@@ -617,6 +646,8 @@ func (s StatementOptions) getEnumValue(k string) (string, error) {
 	return rawVal, nil
 }
 
+// getDurationValue validates that the option `k` was supplied with a
+// valid duration.
 func (s StatementOptions) getDurationValue(k string) (*time.Duration, error) {
 	v, ok := s.m[k]
 	if !ok {
@@ -743,18 +774,19 @@ func (s StatementOptions) GetCanHandle() CanHandle {
 // EncodingOptions describe how events are encoded when
 // sent to the sink.
 type EncodingOptions struct {
-	Format            FormatType
-	VirtualColumns    VirtualColumnVisibility
-	Envelope          EnvelopeType
-	KeyInValue        bool
-	TopicInValue      bool
-	UpdatedTimestamps bool
-	MVCCTimestamps    bool
-	Diff              bool
-	AvroSchemaPrefix  string
-	SchemaRegistryURI string
-	Compression       string
-	CustomKeyColumn   string
+	Format                      FormatType
+	VirtualColumns              VirtualColumnVisibility
+	Envelope                    EnvelopeType
+	KeyInValue                  bool
+	TopicInValue                bool
+	UpdatedTimestamps           bool
+	MVCCTimestamps              bool
+	Diff                        bool
+	EncodeJSONValueNullAsObject bool
+	AvroSchemaPrefix            string
+	SchemaRegistryURI           string
+	Compression                 string
+	CustomKeyColumn             string
 }
 
 // GetEncodingOptions populates and validates an EncodingOptions.
@@ -796,6 +828,7 @@ func (s StatementOptions) GetEncodingOptions() (EncodingOptions, error) {
 	_, o.UpdatedTimestamps = s.m[OptUpdatedTimestamps]
 	_, o.MVCCTimestamps = s.m[OptMVCCTimestamps]
 	_, o.Diff = s.m[OptDiff]
+	_, o.EncodeJSONValueNullAsObject = s.m[OptEncodeJSONValueNullAsObject]
 
 	o.SchemaRegistryURI = s.m[OptConfluentSchemaRegistry]
 	o.AvroSchemaPrefix = s.m[OptAvroSchemaPrefix]
@@ -813,6 +846,13 @@ func (e EncodingOptions) Validate() error {
 			OptEnvelope, OptEnvelopeRow, OptFormat, OptFormatAvro,
 		)
 	}
+	if e.Format != OptFormatJSON && e.EncodeJSONValueNullAsObject {
+		return errors.Errorf(`%s is only usable with %s=%s`, OptEncodeJSONValueNullAsObject, OptFormat, OptFormatJSON)
+	}
+	if e.Envelope == OptEnvelopeEnriched && !(e.Format == OptFormatJSON || e.Format == OptFormatAvro) {
+		return errors.Errorf(`%s=%s is only usable with %s=%s/%s`, OptEnvelope, OptEnvelopeEnriched, OptFormat, OptFormatJSON, OptFormatAvro)
+	}
+
 	if e.Envelope != OptEnvelopeWrapped && e.Format != OptFormatJSON && e.Format != OptFormatParquet {
 		requiresWrap := []struct {
 			k string
@@ -871,14 +911,17 @@ func (s StatementOptions) GetSchemaChangeHandlingOptions() (SchemaChangeHandling
 // Filters are aspects of the feed that the backing
 // kvfeed or rangefeed want to know about.
 type Filters struct {
-	WithDiff bool
+	WithDiff      bool
+	WithFiltering bool
 }
 
 // GetFilters returns a populated Filters.
 func (s StatementOptions) GetFilters() Filters {
 	_, withDiff := s.m[OptDiff]
+	_, withIgnoreDisableChangefeedReplication := s.m[OptIgnoreDisableChangefeedReplication]
 	return Filters{
-		WithDiff: withDiff,
+		WithDiff:      withDiff,
+		WithFiltering: !withIgnoreDisableChangefeedReplication,
 	}
 }
 
@@ -933,6 +976,32 @@ func (s StatementOptions) GetResolvedTimestampInterval() (*time.Duration, bool, 
 func (s StatementOptions) GetMetricScope() (string, bool) {
 	v, ok := s.m[OptMetricsScope]
 	return v, ok
+}
+
+// GetLaggingRangesConfig returns the threshold and polling rate to use for
+// lagging ranges metrics.
+func (s StatementOptions) GetLaggingRangesConfig(
+	ctx context.Context, settings *cluster.Settings,
+) (threshold time.Duration, pollingInterval time.Duration, e error) {
+	threshold = DefaultLaggingRangesThreshold
+	pollingInterval = DefaultLaggingRangesPollingInterval
+	_, ok := s.m[OptLaggingRangesThreshold]
+	if ok {
+		t, err := s.getDurationValue(OptLaggingRangesThreshold)
+		if err != nil {
+			return threshold, pollingInterval, err
+		}
+		threshold = *t
+	}
+	_, ok = s.m[OptLaggingRangesPollingInterval]
+	if ok {
+		i, err := s.getDurationValue(OptLaggingRangesPollingInterval)
+		if err != nil {
+			return threshold, pollingInterval, err
+		}
+		pollingInterval = *i
+	}
+	return threshold, pollingInterval, nil
 }
 
 // IncludeVirtual returns true if we need to set placeholder nulls for virtual columns.

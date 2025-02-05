@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfig
 
@@ -97,11 +92,8 @@ func TestKeyspaceTargeted(t *testing.T) {
 			expSpan: keys.EverythingSpan,
 		},
 		{
-			target: MakeTargetFromSystemTarget(TestingMakeTenantKeyspaceTargetOrFatal(t, ten10, ten10)),
-			expSpan: roachpb.Span{
-				Key:    keys.MakeTenantPrefix(ten10),
-				EndKey: keys.MakeTenantPrefix(ten10).PrefixEnd(),
-			},
+			target:  MakeTargetFromSystemTarget(TestingMakeTenantKeyspaceTargetOrFatal(t, ten10, ten10)),
+			expSpan: keys.MakeTenantSpan(ten10),
 		},
 		{
 			target: MakeTargetFromSystemTarget(
@@ -116,10 +108,7 @@ func TestKeyspaceTargeted(t *testing.T) {
 			target: MakeTargetFromSystemTarget(
 				TestingMakeTenantKeyspaceTargetOrFatal(t, roachpb.SystemTenantID, ten10),
 			),
-			expSpan: roachpb.Span{
-				Key:    keys.MakeTenantPrefix(ten10),
-				EndKey: keys.MakeTenantPrefix(ten10).PrefixEnd(),
-			},
+			expSpan: keys.MakeTenantSpan(ten10),
 		},
 		{
 			target:  MakeTargetFromSpan(roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("b")}),

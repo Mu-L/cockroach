@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcostserver
 
@@ -33,7 +30,7 @@ type instance struct {
 //
 //	tenantcostclient.extendedReportingPeriodFactor.
 var instanceInactivity = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"tenant_usage_instance_inactivity",
 	"server instances that have not reported consumption for longer than this value are cleaned up; "+
 		"should be at least four times higher than the tenant_cost_control.token_request_period of any tenant",

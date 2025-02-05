@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package admission
 
@@ -46,6 +41,12 @@ func (b *builderWithMu) printf(format string, a ...interface{}) {
 		fmt.Fprintf(&b.buf, "\n")
 	}
 	fmt.Fprintf(&b.buf, format, a...)
+}
+
+func (b *builderWithMu) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func (b *builderWithMu) stringAndReset() string {
@@ -88,18 +89,6 @@ func (tg *testGranter) tookWithoutPermission(count int64) {
 
 func (tg *testGranter) continueGrantChain(grantChainID grantChainID) {
 	tg.buf.printf("continueGrantChain%s %d", tg.name, grantChainID)
-}
-
-func (tg *testGranter) grant(grantChainID grantChainID) {
-	rv := tg.r.granted(grantChainID)
-	if rv > 0 {
-		// Need deterministic output, and this is racing with the goroutine that
-		// was admitted. Sleep to let it get scheduled. We could do something more
-		// sophisticated like monitoring goroutine states like in
-		// concurrency_manager_test.go.
-		time.Sleep(50 * time.Millisecond)
-	}
-	tg.buf.printf("granted%s: returned %d", tg.name, rv)
 }
 
 func (tg *testGranter) storeWriteDone(
@@ -208,6 +197,7 @@ func TestWorkQueueBasic(t *testing.T) {
 				timeSource = timeutil.NewManualTime(initialTime)
 				opts.timeSource = timeSource
 				opts.disableEpochClosingGoroutine = true
+				opts.disableGCTenantsAndResetUsed = true
 				st = cluster.MakeTestingClusterSettings()
 				q = makeWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()),
 					KVWork, tg, st, metrics, opts).(*WorkQueue)
@@ -247,8 +237,8 @@ func TestWorkQueueBasic(t *testing.T) {
 					}
 				}(ctx, workInfo, id)
 				// Need deterministic output, and this is racing with the goroutine
-				// which is trying to get admitted. Sleep to let it get scheduled.
-				time.Sleep(50 * time.Millisecond)
+				// which is trying to get admitted. Retry to let it get scheduled.
+				maybeRetryWithWait(t, d.Expected, d.Rewrite, buf.String)
 				return buf.stringAndReset()
 
 			case "set-try-get-return-value":
@@ -260,7 +250,13 @@ func TestWorkQueueBasic(t *testing.T) {
 			case "granted":
 				var chainID int
 				d.ScanArgs(t, "chain-id", &chainID)
-				tg.grant(grantChainID(chainID))
+				rv := tg.r.granted(grantChainID(chainID))
+				if rv > 0 {
+					// Need deterministic output, and this is racing with the goroutine that was
+					// admitted. Retry a few times.
+					maybeRetryWithWait(t, d.Expected, d.Rewrite, buf.String)
+				}
+				tg.buf.printf("granted%s: returned %d", tg.name, rv)
 				return buf.stringAndReset()
 
 			case "cancel-work":
@@ -275,8 +271,8 @@ func TestWorkQueueBasic(t *testing.T) {
 				}
 				work.cancel()
 				// Need deterministic output, and this is racing with the goroutine
-				// whose work is canceled. Sleep to let it get scheduled.
-				time.Sleep(50 * time.Millisecond)
+				// whose work is canceled. Retry to let it get scheduled.
+				maybeRetryWithWait(t, d.Expected, d.Rewrite, buf.String)
 				return buf.stringAndReset()
 
 			case "work-done":
@@ -289,7 +285,11 @@ func TestWorkQueueBasic(t *testing.T) {
 				if !work.admitted {
 					return fmt.Sprintf("id not admitted: %d\n", id)
 				}
-				q.AdmittedWorkDone(work.tenantID)
+				cpuTime := int64(1)
+				if d.HasArg("cpu-time") {
+					d.ScanArgs(t, "cpu-time", &cpuTime)
+				}
+				q.AdmittedWorkDone(work.tenantID, time.Duration(cpuTime))
 				wrkMap.delete(id)
 				return buf.stringAndReset()
 
@@ -314,6 +314,11 @@ func TestWorkQueueBasic(t *testing.T) {
 				return q.String()
 
 			case "print":
+				// Need deterministic output, and this is racing with the goroutine
+				// whose work is canceled. Retry to let it get scheduled.
+				maybeRetryWithWait(t, d.Expected, d.Rewrite, func() string {
+					return q.String()
+				})
 				return q.String()
 
 			case "advance-time":
@@ -322,6 +327,10 @@ func TestWorkQueueBasic(t *testing.T) {
 				timeSource.Advance(time.Duration(millis) * time.Millisecond)
 				EpochLIFOEnabled.Override(context.Background(), &st.SV, true)
 				q.tryCloseEpoch(timeSource.Now())
+				return q.String()
+
+			case "gc-tenants-and-reset-used":
+				q.gcTenantsAndResetUsed()
 				return q.String()
 
 			default:
@@ -334,6 +343,26 @@ func scanTenantID(t *testing.T, d *datadriven.TestData) roachpb.TenantID {
 	var id int
 	d.ScanArgs(t, "tenant", &id)
 	return roachpb.MustMakeTenantID(uint64(id))
+}
+
+func maybeRetryWithWait(t *testing.T, expected string, rewrite bool, f func() string) {
+	t.Helper()
+	if rewrite {
+		time.Sleep(100 * time.Millisecond)
+		return
+	}
+	var str string
+	// Retry for at most 2s (20 iterations with 100ms delay).
+	for i := 0; i < 20; i++ {
+		str = f()
+		if strings.TrimSpace(str) == strings.TrimSpace(expected) {
+			if i > 0 {
+				t.Logf("retried test case %d times", i)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // TestWorkQueueTokenResetRace induces racing between tenantInfo.used
@@ -373,6 +402,7 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 						TenantID:   w.tenantID,
 						CreateTime: createTime,
 					})
+					buf.printf("admit")
 					require.Equal(t, true, enabled)
 					mu.Lock()
 					defer mu.Unlock()
@@ -383,7 +413,12 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 				}(ctx, work2, createTime)
 				createTime++
 				if work != nil {
-					tg.grant(1)
+					rv := tg.r.granted(1)
+					if rv > 0 {
+						// Need deterministic output, and this is racing with the goroutine that was
+						// admitted. Add a retry to let it get scheduled.
+						maybeRetryWithWait(t, "admit", false /* rewrite */, buf.String)
+					}
 					work.cancel()
 					buf.stringAndReset()
 				}
@@ -393,7 +428,13 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 			}
 			if work != nil {
 				work.cancel()
-				tg.grant(1)
+				rv := tg.r.granted(1)
+				if rv > 0 {
+					// Need deterministic output, and this is racing with the goroutine that was
+					// admitted. Add a retry to let it get scheduled.
+					maybeRetryWithWait(t, "admit", false /* rewrite */, buf.String)
+				}
+				buf.stringAndReset()
 			}
 		}
 	}()
@@ -406,7 +447,7 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 				// This hot loop with GC calls is able to trigger the previously buggy
 				// code by squeezing in multiple times between the token grant and
 				// cancellation.
-				q.gcTenantsAndResetTokens()
+				q.gcTenantsAndResetUsed()
 			}
 		}
 	}()
@@ -517,7 +558,9 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 	}
 
 	registry := metric.NewRegistry()
-	metrics := makeWorkQueueMetrics("", registry)
+	regMetrics := makeWorkQueueMetrics("regular", registry)
+	elasticMetrics := makeWorkQueueMetrics("elastic", registry)
+	workQueueMetrics := [admissionpb.NumWorkClasses]*WorkQueueMetrics{regMetrics, elasticMetrics}
 	datadriven.RunTest(t, datapathutils.TestDataPath(t, "store_work_queue"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
@@ -529,6 +572,7 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 				opts.usesTokens = true
 				opts.timeSource = timeutil.NewManualTime(timeutil.FromUnixMicros(0))
 				opts.disableEpochClosingGoroutine = true
+				opts.disableGCTenantsAndResetUsed = true
 				st = cluster.MakeTestingClusterSettings()
 				var mockCoordMu syncutil.Mutex
 				q = makeStoreWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()), roachpb.StoreID(1),
@@ -536,7 +580,7 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 						tg[admissionpb.RegularWorkClass],
 						tg[admissionpb.ElasticWorkClass],
 					},
-					st, metrics, opts, nil /* testing knobs */, &noopOnLogEntryAdmitted{}, &mockCoordMu).(*StoreWorkQueue)
+					st, workQueueMetrics, opts, nil /* testing knobs */, &noopOnLogEntryAdmitted{}, metric.NewCounter(metric.Metadata{}), &mockCoordMu).(*StoreWorkQueue)
 				tg[admissionpb.RegularWorkClass].r = q.getRequesters()[admissionpb.RegularWorkClass]
 				tg[admissionpb.ElasticWorkClass].r = q.getRequesters()[admissionpb.ElasticWorkClass]
 				wrkMap.resetMap()
@@ -575,8 +619,8 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 					}
 				}(ctx, workInfo, id)
 				// Need deterministic output, and this is racing with the goroutine
-				// which is trying to get admitted. Sleep to let it get scheduled.
-				time.Sleep(50 * time.Millisecond)
+				// which is trying to get admitted. Retry to let it get scheduled.
+				maybeRetryWithWait(t, d.Expected, d.Rewrite, buf.String)
 				return buf.stringAndReset()
 
 			case "set-try-get-return-value":
@@ -596,7 +640,13 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 
 			case "granted":
 				wc := tryScanWorkClass(t, d)
-				tg[wc].grant(0)
+				rv := tg[wc].r.granted(0)
+				if rv > 0 {
+					// Need deterministic output, and this is racing with the goroutine that was
+					// admitted. Retry a few times.
+					maybeRetryWithWait(t, d.Expected, d.Rewrite, buf.String)
+				}
+				buf.printf("granted%s: returned %d", tg[wc].name, rv)
 				return buf.stringAndReset()
 
 			case "cancel-work":
@@ -611,8 +661,8 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 				}
 				work.cancel()
 				// Need deterministic output, and this is racing with the goroutine
-				// whose work is canceled. Sleep to let it get scheduled.
-				time.Sleep(50 * time.Millisecond)
+				// whose work is canceled. Retry to let it get scheduled.
+				maybeRetryWithWait(t, d.Expected, d.Rewrite, buf.String)
 				return buf.stringAndReset()
 
 			case "work-done":
@@ -657,16 +707,22 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 				return buf.stringAndReset()
 
 			case "stats-to-ignore":
-				var ingestedBytes, ingestedIntoL0Bytes int
+				var ingestedBytes, ingestedIntoL0Bytes, writeBytes int
 				d.ScanArgs(t, "ingested-bytes", &ingestedBytes)
 				d.ScanArgs(t, "ingested-into-L0-bytes", &ingestedIntoL0Bytes)
+				d.ScanArgs(t, "write-bytes", &writeBytes)
 				q.StatsToIgnore(pebble.IngestOperationStats{
 					Bytes:                     uint64(ingestedBytes),
 					ApproxIngestedIntoL0Bytes: uint64(ingestedIntoL0Bytes),
-				})
+				}, uint64(writeBytes))
 				return printQueue()
 
 			case "print":
+				// Need deterministic output, and this is racing with the goroutine
+				// whose work is canceled. Retry to let it get scheduled.
+				maybeRetryWithWait(t, d.Expected, d.Rewrite, func() string {
+					return printQueue()
+				})
 				return printQueue()
 
 			default:

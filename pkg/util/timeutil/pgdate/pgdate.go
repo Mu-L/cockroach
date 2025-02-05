@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package pgdate contains parsing functions and types for dates and times
 // in a manner that is compatible with PostgreSQL.
@@ -176,6 +171,8 @@ func (d Date) Format(buf *bytes.Buffer) {
 		year, month, day := t.Date()
 		bc := year <= 0
 		if bc {
+			// For the ISO 8601 standard, the conversion from a negative year to BC changes the year value (ex. -2013 == 2014 BC).
+			// https://en.wikipedia.org/wiki/ISO_8601#Years
 			year = -year + 1
 		}
 		fmt.Fprintf(buf, "%04d-%02d-%02d", year, month, day)

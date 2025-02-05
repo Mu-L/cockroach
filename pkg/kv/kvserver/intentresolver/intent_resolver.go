@@ -1,31 +1,30 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package intentresolver
 
 import (
 	"bytes"
 	"context"
+	"math"
 	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client/requestbatcher"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -36,91 +35,116 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const (
-	// defaultTaskLimit is the maximum number of asynchronous tasks
-	// that may be started by intentResolver. When this limit is reached
-	// asynchronous tasks will start to block to apply backpressure.  This is a
-	// last line of defense against issues like #4925.
-	// TODO(bdarnell): how to determine best value?
-	defaultTaskLimit = 1000
-
-	// asyncIntentResolutionTimeout is the timeout when processing a group of
-	// intents asynchronously. The timeout prevents async intent resolution from
-	// getting stuck. Since processing intents is best effort, we'd rather give
-	// up than wait too long (this helps avoid deadlocks during test shutdown).
-	asyncIntentResolutionTimeout = 30 * time.Second
-
-	// gcBatchSize is the maximum number of transaction records that will be
-	// GCed in a single batch. Batches that span many ranges (which is possible
-	// for the transaction records that spans many ranges) will be split into
-	// many batches by the DistSender.
-	gcBatchSize = 1024
-
-	// intentResolverBatchSize is the maximum number of single-intent resolution
-	// requests that will be sent in a single batch. Batches that span many
-	// ranges (which is possible for the commit of a transaction that spans many
-	// ranges) will be split into many batches by the DistSender.
-	// TODO(ajwerner): justify this value
-	intentResolverBatchSize = 100
-
-	// intentResolverRangeBatchSize is the maximum number of ranged intent
-	// resolutions requests that will be sent in a single batch.  It is set
-	// lower that intentResolverBatchSize since each request can fan out to a
-	// large number of intents.
-	intentResolverRangeBatchSize = 10
-
-	// intentResolverRangeRequestSize is the maximum number of intents a single
-	// range request can resolve. When exceeded, the response will include a
-	// ResumeSpan and the batcher will send a new range request.
-	intentResolverRangeRequestSize = 200
-
-	// intentResolverRequestTargetBytes is the target number of bytes of the
-	// write batch resulting from an intent resolution request. When exceeded,
-	// the response will include a ResumeSpan and the batcher will send a new
-	// intent resolution request.
-	intentResolverRequestTargetBytes = 4 << 20 // 4 MB.
-
-	// intentResolverSendBatchTimeout is the maximum amount of time an intent
-	// resolution batch request can run for before timeout.
-	intentResolverSendBatchTimeout = 1 * time.Minute
-
-	// MaxTxnsPerIntentCleanupBatch is the number of transactions whose
-	// corresponding intents will be resolved at a time. Intents are batched
-	// by transaction to avoid timeouts while resolving intents and ensure that
-	// progress is made.
-	MaxTxnsPerIntentCleanupBatch = 100
-
-	// defaultGCBatchIdle is the default duration which the gc request batcher
-	// will wait between requests for a range before sending it.
-	defaultGCBatchIdle = -1 // disabled
-
-	// defaultGCBatchWait is the default duration which the gc request batcher
-	// will wait between requests for a range before sending it.
-	defaultGCBatchWait = time.Second
-
-	// intentResolutionBatchWait is used to configure the RequestBatcher which
-	// batches intent resolution requests across transactions. Intent resolution
-	// needs to occur in a relatively short period of time after the completion
-	// of a transaction in order to minimize the contention footprint of the write
-	// for other contending reads or writes. The chosen value was selected based
-	// on some light experimentation to ensure that performance does not degrade
-	// in the face of highly contended workloads.
-	defaultIntentResolutionBatchWait = 10 * time.Millisecond
-
-	// intentResolutionBatchIdle is similar to the above setting but is used when
-	// when no additional traffic hits the batch.
-	defaultIntentResolutionBatchIdle = 5 * time.Millisecond
-
-	// gcTxnRecordTimeout is the timeout for asynchronous txn record removal
-	// during cleanupFinishedTxnIntents.
-	gcTxnRecordTimeout = 20 * time.Second
+// defaultTaskLimit is the maximum number of asynchronous tasks that may be
+// started by intentResolver. When this limit is reached asynchronous tasks will
+// start to block to apply backpressure.  This is a last line of defense against
+// issues like #4925.
+//
+// TODO(bdarnell): how to determine best value?
+var defaultTaskLimit = envutil.EnvOrDefaultInt(
+	"COCKROACH_ASYNC_INTENT_RESOLVER_TASK_LIMIT", 1000,
 )
+
+// asyncIntentResolutionTimeout is the timeout when processing a group of
+// intents asynchronously. The timeout prevents async intent resolution from
+// getting stuck. Since processing intents is best effort, we'd rather give
+// up than wait too long (this helps avoid deadlocks during test shutdown).
+var asyncIntentResolutionTimeout = envutil.EnvOrDefaultDuration(
+	"COCKROACH_ASYNC_INTENT_RESOLUTION_TIMEOUT", 30*time.Second,
+)
+
+// gcBatchSize is the maximum number of transaction records that will be GCed
+// in a single batch. Batches that span many ranges (which is possible for the
+// transaction records that spans many ranges) will be split into many batches
+// by the DistSender.
+var gcBatchSize = envutil.EnvOrDefaultInt(
+	"COCKROACH_TXN_RECORD_GC_BATCH_SIZE", 1024,
+)
+
+// intentResolverBatchSize is the maximum number of single-intent resolution
+// requests that will be sent in a single batch. Batches that span many
+// ranges (which is possible for the commit of a transaction that spans many
+// ranges) will be split into many batches by the DistSender.
+//
+// TODO(ajwerner): justify this value
+var intentResolverBatchSize = envutil.EnvOrDefaultInt(
+	"COCKROACH_INTENT_RESOLVER_BATCH_SIZE", 100,
+)
+
+// intentResolverRangeBatchSize is the maximum number of ranged intent
+// resolutions requests that will be sent in a single batch.  It is set
+// lower that intentResolverBatchSize since each request can fan out to a
+// large number of intents.
+var intentResolverRangeBatchSize = envutil.EnvOrDefaultInt(
+	"COCKROACH_RANGED_INTENT_RESOLVER_BATCH_SIZE", 10,
+)
+
+// intentResolverRangeRequestSize is the maximum number of intents a single
+// range request can resolve. When exceeded, the response will include a
+// ResumeSpan and the batcher will send a new range request.
+var intentResolverRangeRequestSize = envutil.EnvOrDefaultInt(
+	"COCKROACH_RANGED_INTENT_RESOLVER_REQUEST_SIZE", 200,
+)
+
+// intentResolverRequestTargetBytes is the target number of bytes of the
+// write batch resulting from an intent resolution request. When exceeded,
+// the response will include a ResumeSpan and the batcher will send a new
+// intent resolution request.
+var intentResolverRequestTargetBytes = envutil.EnvOrDefaultBytes(
+	"COCKROACH_INTENT_RESOLVER_REQUEST_TARGET_BYTES", 4<<20, // 4 MB
+)
+
+// intentResolverSendBatchTimeout is the maximum amount of time an intent
+// resolution batch request can run for before timeout.
+var intentResolverSendBatchTimeout = envutil.EnvOrDefaultDuration(
+	"COCKROACH_INTENT_RESOLVER_SEND_BATCH_TIMEOUT", 1*time.Minute,
+)
+
+// MaxTxnsPerIntentCleanupBatch is the number of transactions whose
+// corresponding intents will be resolved at a time. Intents are batched
+// by transaction to avoid timeouts while resolving intents and ensure that
+// progress is made.
+var MaxTxnsPerIntentCleanupBatch = envutil.EnvOrDefaultInt64(
+	"COCKROACH_MAX_TXNS_PER_INTENT_CLEANUP_BATCH", 100,
+)
+
+// defaultGCBatchIdle is the default duration which the gc request batcher
+// will wait between requests for a range before sending it.
+var defaultGCBatchIdle = envutil.EnvOrDefaultDuration(
+	"COCKROACH_GC_BATCH_IDLE", -1, // disabled
+)
+
+// defaultGCBatchWait is the default duration which the gc request batcher
+// will wait between requests for a range before sending it.
+var defaultGCBatchWait = envutil.EnvOrDefaultDuration("COCKROACH_GC_BATCH_WAIT_TIME", time.Second)
+
+// intentResolutionBatchWait is used to configure the RequestBatcher which
+// batches intent resolution requests across transactions. Intent resolution
+// needs to occur in a relatively short period of time after the completion
+// of a transaction in order to minimize the contention footprint of the write
+// for other contending reads or writes. The chosen value was selected based
+// on some light experimentation to ensure that performance does not degrade
+// in the face of highly contended workloads.
+var defaultIntentResolutionBatchWait = envutil.EnvOrDefaultDuration(
+	"COCKROACH_INTENT_RESOLVER_BATCH_WAIT", 10*time.Millisecond,
+)
+
+// intentResolutionBatchIdle is similar to the above setting but is used when
+// when no additional traffic hits the batch.
+var defaultIntentResolutionBatchIdle = envutil.EnvOrDefaultDuration(
+	"COCKROACH_INTENT_RESOLVER_BATCH_IDLE", 5*time.Millisecond,
+)
+
+// gcTxnRecordTimeout is the timeout for asynchronous txn record removal
+// during cleanupFinishedTxnIntents.
+var gcTxnRecordTimeout = envutil.EnvOrDefaultDuration("COCKROACH_GC_TXN_RECORD_TIMEOUT", 20*time.Second)
 
 // Config contains the dependencies to construct an IntentResolver.
 type Config struct {
 	Clock                *hlc.Clock
 	DB                   *kv.DB
 	Stopper              *stop.Stopper
+	Settings             *cluster.Settings
 	AmbientCtx           log.AmbientContext
 	TestingKnobs         kvserverbase.IntentResolverTestingKnobs
 	RangeDescriptorCache RangeCache
@@ -134,8 +158,8 @@ type Config struct {
 
 // RangeCache is a simplified interface to the rngcache.RangeCache.
 type RangeCache interface {
-	// Lookup looks up range information for the range containing key.
-	Lookup(ctx context.Context, key roachpb.RKey) (rangecache.CacheEntry, error)
+	// LookupRangeID looks up range ID for the range containing key.
+	LookupRangeID(ctx context.Context, key roachpb.RKey) (roachpb.RangeID, error)
 }
 
 // IntentResolver manages the process of pushing transactions and
@@ -147,6 +171,7 @@ type IntentResolver struct {
 	db           *kv.DB
 	stopper      *stop.Stopper
 	testingKnobs kvserverbase.IntentResolverTestingKnobs
+	settings     *cluster.Settings
 	ambientCtx   log.AmbientContext
 	sem          *quotapool.IntPool // semaphore to limit async goroutines
 
@@ -166,7 +191,8 @@ type IntentResolver struct {
 		// called directly after EndTxn evaluation or during GC of txn spans.
 		inFlightTxnCleanups map[uuid.UUID]struct{}
 	}
-	every log.EveryN
+	every                       log.EveryN
+	everyAdmissionHeaderMissing log.EveryN
 }
 
 func setConfigDefaults(c *Config) {
@@ -195,24 +221,26 @@ func setConfigDefaults(c *Config) {
 
 type nopRangeDescriptorCache struct{}
 
-func (nrdc nopRangeDescriptorCache) Lookup(
+func (nrdc nopRangeDescriptorCache) LookupRangeID(
 	ctx context.Context, key roachpb.RKey,
-) (rangecache.CacheEntry, error) {
-	return rangecache.CacheEntry{}, nil
+) (roachpb.RangeID, error) {
+	return 0, nil
 }
 
 // New creates an new IntentResolver.
 func New(c Config) *IntentResolver {
 	setConfigDefaults(&c)
 	ir := &IntentResolver{
-		clock:        c.Clock,
-		db:           c.DB,
-		stopper:      c.Stopper,
-		sem:          quotapool.NewIntPool("intent resolver", uint64(c.TaskLimit)),
-		every:        log.Every(time.Minute),
-		Metrics:      makeMetrics(),
-		rdc:          c.RangeDescriptorCache,
-		testingKnobs: c.TestingKnobs,
+		clock:                       c.Clock,
+		db:                          c.DB,
+		stopper:                     c.Stopper,
+		sem:                         quotapool.NewIntPool("intent resolver", uint64(c.TaskLimit)),
+		every:                       log.Every(time.Minute),
+		Metrics:                     makeMetrics(),
+		rdc:                         c.RangeDescriptorCache,
+		testingKnobs:                c.TestingKnobs,
+		settings:                    c.Settings,
+		everyAdmissionHeaderMissing: log.Every(5 * time.Minute),
 	}
 	c.Stopper.AddCloser(ir.sem.Closer("stopper"))
 	ir.mu.inFlightPushes = map[uuid.UUID]int{}
@@ -221,22 +249,24 @@ func New(c Config) *IntentResolver {
 	if c.TestingKnobs.MaxIntentResolutionSendBatchTimeout != 0 {
 		intentResolutionSendBatchTimeout = c.TestingKnobs.MaxIntentResolutionSendBatchTimeout
 	}
-	inFlightBackpressureLimit := requestbatcher.DefaultInFlightBackpressureLimit
+	inFlightGCBackpressureLimit := requestbatcher.DefaultInFlightBackpressureLimit
 	if c.TestingKnobs.InFlightBackpressureLimit != 0 {
-		inFlightBackpressureLimit = c.TestingKnobs.InFlightBackpressureLimit
+		inFlightGCBackpressureLimit = c.TestingKnobs.InFlightBackpressureLimit
 	}
 	gcBatchSize := gcBatchSize
 	if c.TestingKnobs.MaxIntentResolutionBatchSize > 0 {
 		gcBatchSize = c.TestingKnobs.MaxGCBatchSize
 	}
 	ir.gcBatcher = requestbatcher.New(requestbatcher.Config{
-		AmbientCtx:                c.AmbientCtx,
-		Name:                      "intent_resolver_gc_batcher",
-		MaxMsgsPerBatch:           gcBatchSize,
-		MaxWait:                   c.MaxGCBatchWait,
-		MaxIdle:                   c.MaxGCBatchIdle,
-		MaxTimeout:                intentResolutionSendBatchTimeout,
-		InFlightBackpressureLimit: inFlightBackpressureLimit,
+		AmbientCtx:      c.AmbientCtx,
+		Name:            "intent_resolver_gc_batcher",
+		MaxMsgsPerBatch: gcBatchSize,
+		MaxWait:         c.MaxGCBatchWait,
+		MaxIdle:         c.MaxGCBatchIdle,
+		MaxTimeout:      intentResolutionSendBatchTimeout,
+		// NB: async GC work is not limited by ir.sem, so we do need an in-flight
+		// backpressure limit.
+		InFlightBackpressureLimit: func() int { return inFlightGCBackpressureLimit },
 		Stopper:                   c.Stopper,
 		Sender:                    c.DB.NonTransactionalSender(),
 	})
@@ -246,6 +276,10 @@ func New(c Config) *IntentResolver {
 		intentResolutionBatchSize = c.TestingKnobs.MaxIntentResolutionBatchSize
 		intentResolutionRangeBatchSize = c.TestingKnobs.MaxIntentResolutionBatchSize
 	}
+	inFlightLimit := inFlightLimitProvider{
+		settings:                         c.Settings,
+		testingInFlightBackpressureLimit: c.TestingKnobs.InFlightBackpressureLimit,
+	}
 	ir.irBatcher = requestbatcher.New(requestbatcher.Config{
 		AmbientCtx:                c.AmbientCtx,
 		Name:                      "intent_resolver_ir_batcher",
@@ -254,7 +288,7 @@ func New(c Config) *IntentResolver {
 		MaxWait:                   c.MaxIntentResolutionBatchWait,
 		MaxIdle:                   c.MaxIntentResolutionBatchIdle,
 		MaxTimeout:                intentResolutionSendBatchTimeout,
-		InFlightBackpressureLimit: inFlightBackpressureLimit,
+		InFlightBackpressureLimit: inFlightLimit.limit,
 		Stopper:                   c.Stopper,
 		Sender:                    c.DB.NonTransactionalSender(),
 	})
@@ -267,7 +301,7 @@ func New(c Config) *IntentResolver {
 		MaxWait:                   c.MaxIntentResolutionBatchWait,
 		MaxIdle:                   c.MaxIntentResolutionBatchIdle,
 		MaxTimeout:                intentResolutionSendBatchTimeout,
-		InFlightBackpressureLimit: inFlightBackpressureLimit,
+		InFlightBackpressureLimit: inFlightLimit.limit,
 		Stopper:                   c.Stopper,
 		Sender:                    c.DB.NonTransactionalSender(),
 	})
@@ -318,21 +352,26 @@ func updateIntentTxnStatus(
 
 // PushTransaction takes a transaction and pushes its record using the specified
 // push type and request header. It returns the transaction proto corresponding
-// to the pushed transaction.
+// to the pushed transaction, and in the case of an ABORTED transaction, a bool
+// indicating whether the abort was ambiguous (see
+// PushTxnResponse.AmbiguousAbort).
+//
+// NB: ambiguousAbort may be false with nodes <24.1.
 func (ir *IntentResolver) PushTransaction(
 	ctx context.Context, pushTxn *enginepb.TxnMeta, h kvpb.Header, pushType kvpb.PushTxnType,
-) (*roachpb.Transaction, *kvpb.Error) {
+) (_ *roachpb.Transaction, ambiguousAbort bool, _ *kvpb.Error) {
 	pushTxns := make(map[uuid.UUID]*enginepb.TxnMeta, 1)
 	pushTxns[pushTxn.ID] = pushTxn
-	pushedTxns, pErr := ir.MaybePushTransactions(ctx, pushTxns, h, pushType, false /* skipIfInFlight */)
+	pushedTxns, ambiguousAbort, pErr := ir.MaybePushTransactions(
+		ctx, pushTxns, h, pushType, false /* skipIfInFlight */)
 	if pErr != nil {
-		return nil, pErr
+		return nil, false, pErr
 	}
 	pushedTxn, ok := pushedTxns[pushTxn.ID]
 	if !ok {
 		log.Fatalf(ctx, "missing PushTxn responses for %s", pushTxn)
 	}
-	return pushedTxn, nil
+	return pushedTxn, ambiguousAbort, nil
 }
 
 // MaybePushTransactions tries to push the conflicting transaction(s):
@@ -340,8 +379,12 @@ func (ir *IntentResolver) PushTransaction(
 // it on a write/write conflict, or doing nothing if the transaction is no
 // longer pending.
 //
-// Returns a set of transaction protos who correspond to the pushed
-// transactions and whose intents can now be resolved, and an error.
+// Returns a set of transaction protos who correspond to the pushed transactions
+// and whose intents can now be resolved, along with a bool indicating whether
+// any of the responses were an ambiguous abort (see
+// PushTxnResponse.AmbiguousAbort), and an error.
+//
+// NB: anyAmbiguousAbort may be false with nodes <24.1.
 //
 // If skipIfInFlight is true, then no PushTxns will be sent and no intents
 // will be returned for any transaction for which there is another push in
@@ -366,7 +409,7 @@ func (ir *IntentResolver) MaybePushTransactions(
 	h kvpb.Header,
 	pushType kvpb.PushTxnType,
 	skipIfInFlight bool,
-) (map[uuid.UUID]*roachpb.Transaction, *kvpb.Error) {
+) (_ map[uuid.UUID]*roachpb.Transaction, anyAmbiguousAbort bool, _ *kvpb.Error) {
 	// Decide which transactions to push and which to ignore because
 	// of other in-flight requests. For those transactions that we
 	// will be pushing, increment their ref count in the in-flight
@@ -397,7 +440,7 @@ func (ir *IntentResolver) MaybePushTransactions(
 	}
 	ir.mu.Unlock()
 	if len(pushTxns) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	pusherTxn := getPusherTxn(h)
@@ -408,6 +451,7 @@ func (ir *IntentResolver) MaybePushTransactions(
 	b := &kv.Batch{}
 	b.Header.Timestamp = ir.clock.Now()
 	b.Header.Timestamp.Forward(pushTo)
+	b.Header.WaitPolicy = h.WaitPolicy
 	for _, pushTxn := range pushTxns {
 		b.AddRawRequest(&kvpb.PushTxnRequest{
 			RequestHeader: kvpb.RequestHeader{
@@ -422,24 +466,22 @@ func (ir *IntentResolver) MaybePushTransactions(
 	err := ir.db.Run(ctx, b)
 	cleanupInFlightPushes()
 	if err != nil {
-		return nil, b.MustPErr()
+		return nil, false, b.MustPErr()
 	}
-
-	// TODO(nvanbenschoten): if we succeed because the transaction has already
-	// been pushed _past_ where we were pushing, we need to set the synthetic
-	// bit. This is part of #36431.
 
 	br := b.RawResponse()
 	pushedTxns := make(map[uuid.UUID]*roachpb.Transaction, len(br.Responses))
 	for _, resp := range br.Responses {
-		txn := &resp.GetInner().(*kvpb.PushTxnResponse).PusheeTxn
+		resp := resp.GetInner().(*kvpb.PushTxnResponse)
+		txn := &resp.PusheeTxn
+		anyAmbiguousAbort = anyAmbiguousAbort || resp.AmbiguousAbort
 		if _, ok := pushedTxns[txn.ID]; ok {
 			log.Fatalf(ctx, "have two PushTxn responses for %s", txn.ID)
 		}
 		pushedTxns[txn.ID] = txn
 		log.Eventf(ctx, "%s is now %s", txn.ID, txn.Status)
 	}
-	return pushedTxns, nil
+	return pushedTxns, anyAmbiguousAbort, nil
 }
 
 // runAsyncTask semi-synchronously runs a generic task function. If
@@ -486,7 +528,10 @@ func (ir *IntentResolver) runAsyncTask(
 // expired yet (i.e. they are not at least 5s old)? Should we filter
 // those out? If we don't, will this be too expensive for SKIP LOCKED?
 func (ir *IntentResolver) CleanupIntentsAsync(
-	ctx context.Context, intents []roachpb.Intent, allowSyncProcessing bool,
+	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
+	intents []roachpb.Intent,
+	allowSyncProcessing bool,
 ) error {
 	if len(intents) == 0 {
 		return nil
@@ -495,7 +540,7 @@ func (ir *IntentResolver) CleanupIntentsAsync(
 	return ir.runAsyncTask(ctx, allowSyncProcessing, func(ctx context.Context) {
 		err := timeutil.RunWithTimeout(ctx, "async intent resolution",
 			asyncIntentResolutionTimeout, func(ctx context.Context) error {
-				_, err := ir.CleanupIntents(ctx, intents, now, kvpb.PUSH_TOUCH)
+				_, err := ir.CleanupIntents(ctx, admissionHeader, intents, now, kvpb.PUSH_TOUCH)
 				return err
 			})
 		if err != nil && ir.every.ShouldLog() {
@@ -511,7 +556,11 @@ func (ir *IntentResolver) CleanupIntentsAsync(
 // subset of the intents may have been resolved, but zero will be
 // returned.
 func (ir *IntentResolver) CleanupIntents(
-	ctx context.Context, intents []roachpb.Intent, now hlc.Timestamp, pushType kvpb.PushTxnType,
+	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
+	intents []roachpb.Intent,
+	now hlc.Timestamp,
+	pushType kvpb.PushTxnType,
 ) (int, error) {
 	h := kvpb.Header{Timestamp: now}
 
@@ -535,7 +584,7 @@ func (ir *IntentResolver) CleanupIntents(
 		var i int
 		for i = 0; i < len(unpushed); i++ {
 			if curTxn := &unpushed[i].Txn; curTxn.ID != prevTxnID {
-				if len(pushTxns) >= MaxTxnsPerIntentCleanupBatch {
+				if len(pushTxns) >= int(MaxTxnsPerIntentCleanupBatch) {
 					break
 				}
 				prevTxnID = curTxn.ID
@@ -543,7 +592,7 @@ func (ir *IntentResolver) CleanupIntents(
 			}
 		}
 
-		pushedTxns, pErr := ir.MaybePushTransactions(ctx, pushTxns, h, pushType, skipIfInFlight)
+		pushedTxns, _, pErr := ir.MaybePushTransactions(ctx, pushTxns, h, pushType, skipIfInFlight)
 		if pErr != nil {
 			return 0, errors.Wrapf(pErr.GoError(), "failed to push during intent resolution")
 		}
@@ -568,7 +617,7 @@ func (ir *IntentResolver) CleanupIntents(
 		//   same situation as above.
 		//
 		// Thus, we must poison.
-		opts := ResolveOptions{Poison: true}
+		opts := ResolveOptions{Poison: true, AdmissionHeader: admissionHeader}
 		if pErr := ir.ResolveIntents(ctx, resolveIntents, opts); pErr != nil {
 			return 0, errors.Wrapf(pErr.GoError(), "failed to resolve intents")
 		}
@@ -608,7 +657,9 @@ func (ir *IntentResolver) CleanupTxnIntentsAsync(
 			}
 			defer release()
 			if err := ir.cleanupFinishedTxnIntents(
-				ctx, rangeID, et.Txn, et.Poison, onComplete,
+				// The admission header is constructed using the completed
+				// transaction.
+				ctx, kv.AdmissionHeaderForLockUpdateForTxn(et.Txn), rangeID, et.Txn, et.Poison, onComplete,
 			); err != nil {
 				if ir.every.ShouldLog() {
 					log.Warningf(ctx, "failed to cleanup transaction intents: %v", err)
@@ -652,6 +703,7 @@ func (ir *IntentResolver) lockInFlightTxnCleanup(
 // It will not be called if an error is returned.
 func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
 	rangeID roachpb.RangeID,
 	txn *roachpb.Transaction,
 	now hlc.Timestamp,
@@ -723,7 +775,8 @@ func (ir *IntentResolver) CleanupTxnIntentsOnGCAsync(
 			// Set onComplete to nil to disable the deferred call as the call has now
 			// been delegated to the callback passed to cleanupFinishedTxnIntents.
 			onComplete = nil
-			err := ir.cleanupFinishedTxnIntents(ctx, rangeID, txn, false /* poison */, onCleanupComplete)
+			err := ir.cleanupFinishedTxnIntents(
+				ctx, admissionHeader, rangeID, txn, false /* poison */, onCleanupComplete)
 			if err != nil {
 				if ir.every.ShouldLog() {
 					log.Warningf(ctx, "failed to cleanup transaction intents: %+v", err)
@@ -787,6 +840,7 @@ func (ir *IntentResolver) gcTxnRecord(
 // which is likely to be after this call returns in the case of success.
 func (ir *IntentResolver) cleanupFinishedTxnIntents(
 	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
 	rangeID roachpb.RangeID,
 	txn *roachpb.Transaction,
 	poison bool,
@@ -800,7 +854,8 @@ func (ir *IntentResolver) cleanupFinishedTxnIntents(
 		}
 	}()
 	// Resolve intents.
-	opts := ResolveOptions{Poison: poison, MinTimestamp: txn.MinTimestamp}
+	opts := ResolveOptions{
+		Poison: poison, MinTimestamp: txn.MinTimestamp, AdmissionHeader: admissionHeader}
 	if pErr := ir.resolveIntents(ctx, (*txnLockUpdates)(txn), opts); pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "failed to resolve intents")
 	}
@@ -845,6 +900,8 @@ type ResolveOptions struct {
 	// The original transaction timestamp from the earliest txn epoch; if
 	// supplied, resolution of intent ranges can be optimized in some cases.
 	MinTimestamp hlc.Timestamp
+	// AdmissionHeader of the caller.
+	AdmissionHeader kvpb.AdmissionHeader
 	// If set, instructs the IntentResolver to send the intent resolution requests
 	// immediately, instead of adding them to a batch and waiting for that batch
 	// to fill up with other intent resolution requests. This can be used to avoid
@@ -874,14 +931,14 @@ func (ir *IntentResolver) lookupRangeID(ctx context.Context, key roachpb.Key) ro
 		}
 		return 0
 	}
-	rInfo, err := ir.rdc.Lookup(ctx, rKey)
+	rangeID, err := ir.rdc.LookupRangeID(ctx, rKey)
 	if err != nil {
 		if ir.every.ShouldLog() {
 			log.Warningf(ctx, "failed to look up range descriptor for key %q: %+v", key, err)
 		}
 		return 0
 	}
-	return rInfo.Desc().RangeID
+	return rangeID
 }
 
 // lockUpdates allows for eager or lazy translation of lock spans to lock updates.
@@ -993,11 +1050,26 @@ func (ir *IntentResolver) resolveIntents(
 	// Construct a slice of requests to send.
 	var singleReq [1]kvpb.Request //gcassert:noescape
 	reqs := resolveIntentReqs(intents, opts, singleReq[:])
-
+	h := opts.AdmissionHeader
+	// We skip the warning for release builds to avoid printing out verbose stack traces.
+	// NB: this was disabled in general since there's a large backlog of reported warnings
+	// that yet have to be resolved, and in the meantime it's not worth  more engineering
+	// time making additional reports.
+	// TODO(aaditya): reconsider this once #112680 is resolved.
+	// if !build.IsRelease() && h == (kvpb.AdmissionHeader{}) && ir.everyAdmissionHeaderMissing.ShouldLog() {
+	if false {
+		log.Warningf(ctx,
+			"test-only warning: if you see this, please report to https://github.com/cockroachdb/cockroach/issues/112680. empty admission header provided by %s", debugutil.Stack())
+	}
 	// Send the requests ...
 	if opts.sendImmediately {
+		bypassAdmission := sendImmediatelyBypassAdmissionControl.Get(&ir.settings.SV)
+		if bypassAdmission {
+			h = kv.AdmissionHeaderForBypass(h)
+		}
 		// ... using a single batch.
 		b := &kv.Batch{}
+		b.AdmissionHeader = h
 		b.AddRawRequest(reqs...)
 		if err := ir.db.Run(ctx, b); err != nil {
 			return b.MustPErr()
@@ -1006,6 +1078,10 @@ func (ir *IntentResolver) resolveIntents(
 	}
 	// ... using their corresponding request batcher.
 	respChan := make(chan requestbatcher.Response, len(reqs))
+	batcherBypassAdmission := batchBypassAdmissionControl.Get(&ir.settings.SV)
+	if batcherBypassAdmission {
+		h = kv.AdmissionHeaderForBypass(h)
+	}
 	for _, req := range reqs {
 		var batcher *requestbatcher.RequestBatcher
 		switch req.Method() {
@@ -1017,7 +1093,7 @@ func (ir *IntentResolver) resolveIntents(
 			panic("unexpected")
 		}
 		rangeID := ir.lookupRangeID(ctx, req.Header().Key)
-		if err := batcher.SendWithChan(ctx, respChan, rangeID, req); err != nil {
+		if err := batcher.SendWithChan(ctx, respChan, rangeID, req, h); err != nil {
 			return kvpb.NewError(err)
 		}
 	}
@@ -1090,4 +1166,40 @@ func (s intentsByTxn) Len() int      { return len(s) }
 func (s intentsByTxn) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s intentsByTxn) Less(i, j int) bool {
 	return bytes.Compare(s[i].Txn.ID[:], s[j].Txn.ID[:]) < 0
+}
+
+// inFlightBackpressureLimitEnabled controls whether the intent resolving
+// requestbatcher.RequestBatchers created by the IntentResolver use an
+// in-flight backpressure limit of DefaultInFlightBackpressureLimit. The
+// default is false, i.e., there is no limit on in-flight requests. A limit on
+// in-flight requests is considered superfluous since we have two limits on
+// the number of active goroutines waiting to get their intent resolution
+// requests processed: the async goroutines, limited to 1000
+// (defaultTaskLimit), and the workload goroutines. Each waiter produces work
+// for a single range, and that work can typically be batched into a single
+// RPC (since requestbatcher.Config.MaxMsgsPerBatch is quite generous). In
+// the rare case where a single waiter produces numerous concurrent RPCs,
+// because of a large number of kvpb.Requests (note that wide
+// ResolveIntentRange cause pagination, and not concurrent RPCs), we have
+// already paid the memory cost of buffering these numerous kvpb.Requests, so
+// we may as well send them out.
+var inFlightBackpressureLimitEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.intent_resolver.batcher.in_flight_backpressure_limit.enabled",
+	"set to true to enable the use of DefaultInFlightBackpressureLimit",
+	false)
+
+type inFlightLimitProvider struct {
+	settings                         *cluster.Settings
+	testingInFlightBackpressureLimit int
+}
+
+func (p inFlightLimitProvider) limit() int {
+	if p.testingInFlightBackpressureLimit != 0 {
+		return p.testingInFlightBackpressureLimit
+	}
+	if p.settings == nil || inFlightBackpressureLimitEnabled.Get(&p.settings.SV) {
+		return requestbatcher.DefaultInFlightBackpressureLimit
+	}
+	return math.MaxInt32
 }

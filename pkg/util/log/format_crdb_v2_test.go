@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -25,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/kr/pretty"
 )
@@ -66,21 +62,21 @@ func TestFormatCrdbV2(t *testing.T) {
 
 	sysCtx := context.Background()
 	sysIDPayload := testIDPayload{tenantID: "1"}
-	sysCtx = context.WithValue(sysCtx, serverident.ServerIdentificationContextKey{}, sysIDPayload)
+	sysCtx = serverident.ContextWithServerIdentification(sysCtx, sysIDPayload)
 	sysCtx = logtags.AddTag(sysCtx, "noval", nil)
 	sysCtx = logtags.AddTag(sysCtx, "s", "1")
 	sysCtx = logtags.AddTag(sysCtx, "long", "2")
 
 	tenantIDPayload := testIDPayload{tenantID: "2"}
 	tenantCtx := context.Background()
-	tenantCtx = context.WithValue(tenantCtx, serverident.ServerIdentificationContextKey{}, tenantIDPayload)
+	tenantCtx = serverident.ContextWithServerIdentification(tenantCtx, tenantIDPayload)
 	tenantCtx = logtags.AddTag(tenantCtx, "noval", nil)
 	tenantCtx = logtags.AddTag(tenantCtx, "p", "3")
 	tenantCtx = logtags.AddTag(tenantCtx, "longKey", "456")
 
 	namedTenantIDPayload := tenantIDPayload
 	namedTenantIDPayload.tenantName = "abc"
-	namedTenantCtx := context.WithValue(tenantCtx, serverident.ServerIdentificationContextKey{}, namedTenantIDPayload)
+	namedTenantCtx := serverident.ContextWithServerIdentification(tenantCtx, namedTenantIDPayload)
 
 	defer func(prev int) { crdbV2LongLineLen.set(prev) }(int(crdbV2LongLineLen))
 	crdbV2LongLineLen.set(1024)
@@ -265,6 +261,10 @@ func TestCrdbV2Decode(t *testing.T) {
 					if err := d.Decode(&e); err != nil {
 						if err == io.EOF {
 							break
+						}
+						if errors.Is(err, ErrMalformedLogEntry) {
+							fmt.Fprintf(&out, "malformed entry:%# v\n", pretty.Formatter(e))
+							continue
 						}
 						td.Fatalf(t, "error while decoding: %v", err)
 					}

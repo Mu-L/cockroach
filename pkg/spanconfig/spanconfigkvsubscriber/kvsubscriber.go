@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfigkvsubscriber
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -122,7 +118,7 @@ type KVSubscriber struct {
 	knobs    *spanconfig.TestingKnobs
 	settings *cluster.Settings
 
-	rfc *rangefeedcache.Watcher
+	rfc *rangefeedcache.Watcher[*BufferEvent]
 
 	mu struct { // serializes between Start and external threads
 		syncutil.RWMutex
@@ -222,6 +218,7 @@ func New(
 		int(bufferMemLimit/spanConfigurationsTableRowSize),
 		[]roachpb.Span{spanConfigTableSpan},
 		true, // withPrevValue
+		true, // withRowTSInInitialScan
 		NewSpanConfigDecoder().TranslateEvent,
 		s.handleUpdate,
 		rfCacheKnobs,
@@ -261,7 +258,7 @@ func (s *KVSubscriber) Start(ctx context.Context, stopper *stop.Stopper) error {
 					}
 				})
 
-			timer := timeutil.NewTimer()
+			var timer timeutil.Timer
 			defer timer.Stop()
 
 			for {
@@ -271,7 +268,6 @@ func (s *KVSubscriber) Start(ctx context.Context, stopper *stop.Stopper) error {
 				} else {
 					// Disable the mechanism.
 					timer.Stop()
-					timer = timeutil.NewTimer()
 				}
 				select {
 				case <-timer.C:
@@ -356,7 +352,7 @@ func (s *KVSubscriber) ComputeSplitKey(
 // GetSpanConfigForKey is part of the spanconfig.KVSubscriber interface.
 func (s *KVSubscriber) GetSpanConfigForKey(
 	ctx context.Context, key roachpb.RKey,
-) (roachpb.SpanConfig, error) {
+) (roachpb.SpanConfig, roachpb.Span, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -373,6 +369,15 @@ func (s *KVSubscriber) GetProtectionTimestamps(
 	if err := s.mu.internal.ForEachOverlappingSpanConfig(ctx, sp,
 		func(sp roachpb.Span, config roachpb.SpanConfig) error {
 			for _, protection := range config.GCPolicy.ProtectionPolicies {
+				// If the current span is a subset of the key space we exclude from full
+				// cluster backups, then we ignore it. This avoids placing a protected
+				// timestamp and hold up GC on spans not needed for backup (i.e.
+				// NodeLiveness, Timeseries). These spans tend to be high churn,
+				// accumulating high amounts of MVCC garbage. Placing a PTS on these
+				// spans can thus be detrimental.
+				if keys.ExcludeFromBackupSpan.Contains(sp) {
+					continue
+				}
 				// If the SpanConfig that applies to this span indicates that the span
 				// is going to be excluded from backup, and the protection policy was
 				// written by a backup, then ignore it. This prevents the
@@ -390,7 +395,7 @@ func (s *KVSubscriber) GetProtectionTimestamps(
 	return protectionTimestamps, s.mu.lastUpdated, nil
 }
 
-func (s *KVSubscriber) handleUpdate(ctx context.Context, u rangefeedcache.Update) {
+func (s *KVSubscriber) handleUpdate(ctx context.Context, u rangefeedcache.Update[*BufferEvent]) {
 	switch u.Type {
 	case rangefeedcache.CompleteUpdate:
 		s.handleCompleteUpdate(ctx, u.Timestamp, u.Events)
@@ -400,17 +405,20 @@ func (s *KVSubscriber) handleUpdate(ctx context.Context, u rangefeedcache.Update
 }
 
 func (s *KVSubscriber) handleCompleteUpdate(
-	ctx context.Context, ts hlc.Timestamp, events []rangefeedbuffer.Event,
+	ctx context.Context, ts hlc.Timestamp, events []*BufferEvent,
 ) {
 	freshStore := spanconfigstore.New(s.fallback, s.settings, s.boundsReader, s.knobs)
 	for _, ev := range events {
-		freshStore.Apply(ctx, false /* dryrun */, ev.(*BufferEvent).Update)
+		freshStore.Apply(ctx, ev.Update)
 	}
-	s.mu.Lock()
-	s.mu.internal = freshStore
-	s.setLastUpdatedLocked(ts)
-	handlers := s.mu.handlers
-	s.mu.Unlock()
+	handlers := func() []handler {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.mu.internal = freshStore
+		s.setLastUpdatedLocked(ts)
+		return s.mu.handlers
+	}()
+
 	for i := range handlers {
 		handler := &handlers[i] // mutated by invoke
 		handler.invoke(ctx, keys.EverythingSpan)
@@ -424,23 +432,47 @@ func (s *KVSubscriber) setLastUpdatedLocked(ts hlc.Timestamp) {
 }
 
 func (s *KVSubscriber) handlePartialUpdate(
-	ctx context.Context, ts hlc.Timestamp, events []rangefeedbuffer.Event,
+	ctx context.Context, ts hlc.Timestamp, events []*BufferEvent,
 ) {
-	s.mu.Lock()
-	for _, ev := range events {
-		// TODO(irfansharif): We can apply a batch of updates atomically
-		// now that the StoreWriter interface supports it; it'll let us
-		// avoid this mutex.
-		s.mu.internal.Apply(ctx, false /* dryrun */, ev.(*BufferEvent).Update)
-	}
-	s.setLastUpdatedLocked(ts)
-	handlers := s.mu.handlers
-	s.mu.Unlock()
+	// The events we've received from the rangefeed buffer are sorted in
+	// increasing timestamp order. However, any updates with the same timestamp
+	// may be ordered arbitrarily. That's okay if they don't overlap. However, if
+	// they do overlap, the assumption is that an overlapping delete should be
+	// ordered before an addition it overlaps with -- not doing would cause the
+	// addition to get clobbered by the deletion, which will result in the store
+	// having missing span configurations. As such, we re-sort the list of events
+	// before applying it to our store, using Deletion() as a tie-breaker when
+	// timestamps are equal.
+	sort.Slice(events, func(i, j int) bool {
+		switch events[i].Timestamp().Compare(events[j].Timestamp()) {
+		case -1: // ts(i) < ts(j)
+			return true
+		case 1: // ts(i) > ts(j)
+			return false
+		case 0: // ts(i) == ts(j); deletions sort before additions
+			return events[i].Deletion() // no need to worry about the sort being stable
+		default:
+			panic("unexpected")
+		}
+	})
+	handlers := func() []handler {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, ev := range events {
+			// NB: Even though the StoreWriter can apply a batch of updates
+			// atomically, the updates need to be non-overlapping. That's not the case
+			// here because we can have deletion events followed by additions for
+			// overlapping spans.
+			s.mu.internal.Apply(ctx, ev.Update)
+		}
+		s.setLastUpdatedLocked(ts)
+		return s.mu.handlers
+	}()
 
 	for i := range handlers {
 		handler := &handlers[i] // mutated by invoke
 		for _, ev := range events {
-			target := ev.(*BufferEvent).Update.GetTarget()
+			target := ev.Update.GetTarget()
 			handler.invoke(ctx, target.KeyspaceTargeted())
 		}
 	}

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -14,16 +9,21 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
 var hibernateReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedHibernateTag = "5.6.15"
+
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
+var supportedHibernateTag = "6.6.0"
 
 type hibernateOptions struct {
 	testName string
@@ -39,7 +39,7 @@ var (
 		testName: "hibernate",
 		testDir:  "hibernate-core",
 		buildCmd: `cd /mnt/data1/hibernate/hibernate-core/ && ./../gradlew test -Pdb=cockroachdb ` +
-			`--tests org.hibernate.jdbc.util.BasicFormatterTest.*`,
+			`--tests org.hibernate.orm.test.jdbc.util.BasicFormatterTest.*`,
 		testCmd: "cd /mnt/data1/hibernate/hibernate-core/ && ./../gradlew test -Pdb=cockroachdb",
 		listWithName: listWithName{
 			blocklistName:  "hibernateBlockList",
@@ -52,10 +52,10 @@ var (
 	hibernateSpatialOpts = hibernateOptions{
 		testName: "hibernate-spatial",
 		testDir:  "hibernate-spatial",
-		buildCmd: `cd /mnt/data1/hibernate/hibernate-spatial/ && ./../gradlew test -Pdb=cockroachdb_spatial ` +
+		buildCmd: `cd /mnt/data1/hibernate/hibernate-spatial/ && ./../gradlew test -Pdb=cockroachdb ` +
 			`--tests org.hibernate.spatial.dialect.postgis.*`,
 		testCmd: `cd /mnt/data1/hibernate/hibernate-spatial && ` +
-			`HIBERNATE_CONNECTION_LEAK_DETECTION=true ./../gradlew test -Pdb=cockroachdb_spatial`,
+			`HIBERNATE_CONNECTION_LEAK_DETECTION=true ./../gradlew test -Pdb=cockroachdb`,
 		listWithName: listWithName{
 			blocklistName:  "hibernateSpatialBlockList",
 			blocklist:      hibernateSpatialBlockList,
@@ -89,8 +89,10 @@ func registerHibernate(r registry.Registry, opt hibernateOptions) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+		startOpts := option.NewStartOpts(sqlClientsInMemoryDB)
+		startOpts.RoachprodOpts.SQLPort = config.DefaultSQLPort
+		// Hibernate uses a hardcoded connection string with ssl disabled.
+		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(install.SecureOption(false)), c.All())
 
 		if opt.dbSetupFunc != nil {
 			opt.dbSetupFunc(ctx, t, c)
@@ -121,14 +123,13 @@ func registerHibernate(r registry.Registry, opt hibernateOptions) {
 			t.Fatal(err)
 		}
 
-		// TODO(rafi): use openjdk-11-jdk-headless once we are off of Ubuntu 16.
 		if err := repeatRunE(
 			ctx,
 			t,
 			c,
 			node,
 			"install dependencies",
-			`sudo apt-get -qq install default-jre openjdk-8-jdk-headless gradle`,
+			`sudo apt-get -qq install openjdk-11-jre-headless openjdk-11-jdk-headless`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -188,7 +189,7 @@ func registerHibernate(r registry.Registry, opt hibernateOptions) {
 		// Note that this will take upwards of 3 hours.
 		// Also note that this is expected to return an error, since the test suite
 		// will fail. And it is safe to swallow it here.
-		_ = c.RunE(ctx, node, opt.testCmd)
+		_ = c.RunE(ctx, option.WithNodes(node), opt.testCmd)
 
 		t.Status("collecting the test results")
 		// Copy all of the test results to the cockroach logs directory to be
@@ -243,12 +244,14 @@ func registerHibernate(r registry.Registry, opt hibernateOptions) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:       opt.testName,
-		Owner:      registry.OwnerSQLFoundations,
-		Cluster:    r.MakeClusterSpec(1),
-		Leases:     registry.MetamorphicLeases,
-		NativeLibs: registry.LibGEOS,
-		Tags:       registry.Tags(`default`, `orm`),
+		Name:             opt.testName,
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		NativeLibs:       registry.LibGEOS,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.ORM),
+		Timeout:          4 * time.Hour,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runHibernate(ctx, t, c)
 		},

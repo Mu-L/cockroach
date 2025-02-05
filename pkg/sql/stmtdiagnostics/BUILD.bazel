@@ -6,7 +6,6 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/clusterversion",
         "//pkg/multitenant",
         "//pkg/settings",
         "//pkg/settings/cluster",
@@ -31,7 +30,6 @@ go_test(
         "statement_diagnostics_helpers_test.go",
         "statement_diagnostics_test.go",
     ],
-    args = ["-test.timeout=295s"],
     embed = [":stmtdiagnostics"],
     tags = ["no-remote-exec"],
     deps = [
@@ -49,6 +47,7 @@ go_test(
         "//pkg/sql/sqlerrors",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",

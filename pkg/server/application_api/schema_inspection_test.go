@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package application_api_test
 
@@ -22,7 +17,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
@@ -44,9 +38,6 @@ import (
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -192,9 +183,6 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
-
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.ApplicationLayer()
@@ -208,9 +196,6 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
 
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -227,9 +212,6 @@ func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 func TestAdminAPITableDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
 
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -253,9 +235,6 @@ func TestAdminAPITableSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
-
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.ApplicationLayer()
@@ -271,9 +250,6 @@ func TestAdminAPITableSQLInjection(t *testing.T) {
 func TestAdminAPITableDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
 
 	const schemaName = "testschema"
 
@@ -313,7 +289,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, tblName),
 				fmt.Sprintf("CREATE STATISTICS test_stats FROM %s.%s", escDBName, tblName),
 			}
-			db := ts.SQLConn(t, tc.dbName)
+			db := ts.SQLConn(t, serverutils.DBName(tc.dbName))
 			for _, q := range setupQueries {
 				t.Logf("executing: %v", q)
 				if _, err := db.Exec(q); err != nil {
@@ -414,7 +390,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 			// Verify statistics last updated.
 			{
 
-				showStatisticsForTableQuery := fmt.Sprintf("SELECT max(created) AS created FROM [SHOW STATISTICS FOR TABLE %s.%s]", escDBName, tblName)
+				showStatisticsForTableQuery := fmt.Sprintf("SELECT max(created) AS stats_last_created_at FROM [SHOW STATISTICS FOR TABLE %s.%s]", escDBName, tblName)
 
 				row := db.QueryRow(showStatisticsForTableQuery)
 				var createdTs time.Time
@@ -443,14 +419,11 @@ func TestAdminAPIDatabaseDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
-
 	const numServers = 3
 	tc := testcluster.StartTestCluster(t, numServers, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(context.Background())
 
-	db := tc.ApplicationLayer(0).SQLConn(t, "")
+	db := tc.ApplicationLayer(0).SQLConn(t)
 
 	_, err := db.Exec("CREATE DATABASE test")
 	require.NoError(t, err)
@@ -505,24 +478,16 @@ func TestAdminAPITableStats(t *testing.T) {
 	skip.UnderStress(t, "flaky under stress #107156")
 	skip.UnderRace(t, "flaky under race #107156")
 
-	// Until this can be put in main_test.go.
-	defer ccl.TestingEnableEnterprise()()
-
 	const nodeCount = 3
 	tc := testcluster.StartTestCluster(t, nodeCount, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationAuto,
-		ServerArgs: base.TestServerArgs{
-			ScanInterval:    time.Millisecond,
-			ScanMinIdleTime: time.Millisecond,
-			ScanMaxIdleTime: time.Millisecond,
-		},
 	})
 	defer tc.Stopper().Stop(context.Background())
 
 	server0 := tc.Server(0).ApplicationLayer()
 
 	// Create clients (SQL, HTTP) connected to server 0.
-	db := server0.SQLConn(t, "")
+	db := server0.SQLConn(t)
 
 	client, err := server0.GetAdminHTTPClient()
 	if err != nil {
@@ -555,7 +520,7 @@ func TestAdminAPITableStats(t *testing.T) {
 		}
 	}
 
-	url := server0.AdminURL().String() + "/_admin/v1/databases/test test/tables/foo foo/stats"
+	url := server0.AdminURL().WithPath("/_admin/v1/databases/test test/tables/foo foo/stats").String()
 	var tsResponse serverpb.TableStatsResponse
 
 	// The new SQL table may not yet have split into its own range. Wait for

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storeliveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -49,6 +45,7 @@ type StoreTestingKnobs struct {
 	AllocatorKnobs          *allocator.TestingKnobs
 	GossipTestingKnobs      StoreGossipTestingKnobs
 	ReplicaPlannerKnobs     plan.ReplicaPlannerTestingKnobs
+	StoreLivenessKnobs      *storeliveness.TestingKnobs
 
 	// TestingRequestFilter is called before evaluating each request on a
 	// replica. The filter is run before the request acquires latches, so
@@ -66,7 +63,26 @@ type StoreTestingKnobs struct {
 	// drop Raft proposals before they are handed to etcd/raft to begin the
 	// process of replication. Dropped proposals are still eligible to be
 	// reproposed due to ticks.
-	TestingProposalSubmitFilter func(*ProposalData) (drop bool, err error)
+	TestingProposalSubmitFilter func(kvserverbase.ProposalFilterArgs) (drop bool, err error)
+
+	// TestingAfterRaftLogSync is invoked after completion of a synced write to
+	// Raft log for the given replica, before the corresponding message is sent
+	// back to Raft and these entries can next be applied to the state machine.
+	//
+	// If async log writes are enabled, this callback blocks async log write
+	// responses flow for the entire store, until it returns. This effectively
+	// blocks (most of) the command application flow. Some sync log writes may
+	// fall through because they use a different flow. Note that this callback
+	// does not block the entire raft flow, commands are still being committed.
+	//
+	// If async log writes are disabled, blocks this replica's entire raft
+	// processing while also holding raftMu for the replica. May block raft
+	// processing for other replicas in the same raft scheduler shard, so must be
+	// used with caution.
+	//
+	// TODO(pavelkalinnikov): have a more stable and less nuanced way of blocking
+	// the commands application flow for the entire store.
+	TestingAfterRaftLogSync func(storage.FullReplicaID)
 
 	// TestingApplyCalledTwiceFilter is called before applying the results of a command on
 	// each replica assuming the command was cleared for application (i.e. no
@@ -79,7 +95,8 @@ type StoreTestingKnobs struct {
 	// Users have to expect the filter to be invoked twice for each command, once
 	// from ephemerealReplicaAppBatch.Stage, and once from replicaAppBatch.Stage;
 	// this has to do with wanting to early-ack successful proposals. The second
-	// call is conditional on the first call succeeding.
+	// call is conditional on the first call succeeding. The field
+	// ApplyFilterArgs.Ephemeral will be true for the initial call.
 	//
 	// Consider using a TestPostApplyFilter instead, and use a
 	// TestingApplyCalledTwiceFilter only to inject forced errors.
@@ -99,6 +116,13 @@ type StoreTestingKnobs struct {
 	// with a forced error. That is, the "command" will apply as a
 	// no-op write, and the ForcedError field will be set.
 	TestingPostApplyFilter kvserverbase.ReplicaApplyFilter
+
+	// TestingPostApplySideEffectsFilter is called after a command is applied to
+	// state machine, and its side effects are applied to memory. Called on each
+	// replica that applies the command.
+	//
+	// NB: not all fields are passed in to this callback, see the implementation.
+	TestingPostApplySideEffectsFilter kvserverbase.ReplicaApplyFilter
 
 	// TestingResponseErrorEvent is called when an error is returned applying
 	// a command.
@@ -144,6 +168,8 @@ type StoreTestingKnobs struct {
 	LeaseTransferBlockedOnExtensionEvent func(nextLeader roachpb.ReplicaDescriptor)
 	// DisableGCQueue disables the GC queue.
 	DisableGCQueue bool
+	// DisableLeaseQueue disables the lease queue.
+	DisableLeaseQueue bool
 	// DisableMergeQueue disables the merge queue.
 	DisableMergeQueue bool
 	// DisableReplicateQueue disables the raft log queue.
@@ -152,6 +178,9 @@ type StoreTestingKnobs struct {
 	DisableReplicaGCQueue bool
 	// DisableReplicateQueue disables the replication queue.
 	DisableReplicateQueue bool
+	// DisableStoreRebalancer turns off the store rebalancer which moves replicas
+	// and leases.
+	DisableStoreRebalancer bool
 	// DisableLoadBasedSplitting turns off LBS so no splits happen because of load.
 	DisableLoadBasedSplitting bool
 	// LoadBasedSplittingOverrideKey returns a key which should be used for load
@@ -181,7 +210,7 @@ type StoreTestingKnobs struct {
 	// constructed and received, the follower will silently drop the snapshot
 	// without signaling an error to the sender, i.e. the leader. (To work around
 	// that, once could adjust the term for the message in that case in
-	// `(*Replica).stepRaftGroup` to prevent the message from getting dropped).
+	// `(*Replica).stepRaftGroupRaftMuLocked` to prevent the message from getting dropped).
 	//
 	// Another problem is that the snapshot may apply but fail to inform the
 	// leader of this fact. Once a Raft leader has determined that a follower
@@ -252,15 +281,11 @@ type StoreTestingKnobs struct {
 	// RefreshReasonTicksPeriod overrides the default period over which
 	// pending commands are refreshed. The period is specified as a multiple
 	// of Raft group ticks.
-	RefreshReasonTicksPeriod int
+	RefreshReasonTicksPeriod int64
 	// DisableProcessRaft disables the process raft loop.
 	DisableProcessRaft func(roachpb.StoreID) bool
 	// DisableLastProcessedCheck disables checking on replica queue last processed times.
 	DisableLastProcessedCheck bool
-	// ReplicateQueueAcceptsUnsplit allows the replication queue to
-	// process ranges that need to be split, for use in tests that use
-	// the replication queue but disable the split queue.
-	ReplicateQueueAcceptsUnsplit bool
 	// SplitQueuePurgatoryChan allows a test to control the channel used to
 	// trigger split queue purgatory processing.
 	SplitQueuePurgatoryChan <-chan time.Time
@@ -291,6 +316,11 @@ type StoreTestingKnobs struct {
 	// EnableUnconditionalRefreshesInRaftReady will always set the refresh reason
 	// in handleRaftReady to refreshReasonNewLeaderOrConfigChange.
 	EnableUnconditionalRefreshesInRaftReady bool
+	// DisableSyncLogWriteToss forces raft log appends to always be asynchronous
+	// when possible, if configured so by the cluster settings. If false, some
+	// asynchronous log writes can be randomly made synchronous in tests. Should
+	// be set to true by tests that require or test asynchronous log writes.
+	DisableSyncLogWriteToss bool
 
 	// SendSnapshot is run after receiving a DelegateRaftSnapshot request but
 	// before any throttling or sending logic.
@@ -341,7 +371,10 @@ type StoreTestingKnobs struct {
 	BeforeRemovingDemotedLearner func()
 	// BeforeSnapshotSSTIngestion is run just before the SSTs are ingested when
 	// applying a snapshot.
-	BeforeSnapshotSSTIngestion func(IncomingSnapshot, kvserverpb.SnapshotRequest_Type, []string) error
+	BeforeSnapshotSSTIngestion func(IncomingSnapshot, []string) error
+	// AfterSnapshotApplication is run after a snapshot is applied, before
+	// releasing the replica mutex.
+	AfterSnapshotApplication func(roachpb.ReplicaDescriptor, kvserverpb.ReplicaState, IncomingSnapshot)
 	// OnRelocatedOne intercepts the return values of s.relocateOne after they
 	// have successfully been put into effect.
 	OnRelocatedOne func(_ []kvpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget)
@@ -353,8 +386,7 @@ type StoreTestingKnobs struct {
 	// This can be useful for testing conditions which require commands to be
 	// applied in separate batches.
 	MaxApplicationBatchSize int
-	// RangeFeedPushTxnsInterval overrides the default value for
-	// rangefeed.Config.PushTxnsInterval.
+	// RangeFeedPushTxnsInterval overrides the default rangefeed txn push interval.
 	RangeFeedPushTxnsInterval time.Duration
 	// RangeFeedPushTxnsAge overrides the default value for
 	// rangefeed.Config.PushTxnsAge.
@@ -457,8 +489,8 @@ type StoreTestingKnobs struct {
 	GlobalMVCCRangeTombstone bool
 
 	// LeaseUpgradeInterceptor intercepts leases that get upgraded to
-	// epoch-based ones.
-	LeaseUpgradeInterceptor func(*roachpb.Lease)
+	// leader leases or epoch-based leases.
+	LeaseUpgradeInterceptor func(roachpb.RangeID, *roachpb.Lease)
 
 	// MVCCGCQueueLeaseCheckInterceptor intercepts calls to Replica.LeaseStatusAt when
 	// making high priority replica scans.
@@ -493,7 +525,11 @@ type StoreTestingKnobs struct {
 	// required.
 	BaseQueueInterceptor func(ctx context.Context, bq *baseQueue)
 
-	// InjectReproposalError injects an error in tryReproposeWithNewLeaseIndex.
+	// BaseQueueDisabledBypassFilter checks whether the replica for the given
+	// rangeID should ignore the queue being disabled, and be processed anyway.
+	BaseQueueDisabledBypassFilter func(rangeID roachpb.RangeID) bool
+
+	// InjectReproposalError injects an error in tryReproposeWithNewLeaseIndexRaftMuLocked.
 	// If nil is returned, reproposal will be attempted.
 	InjectReproposalError func(p *ProposalData) error
 
@@ -504,6 +540,21 @@ type StoreTestingKnobs struct {
 	// FlowControlTestingKnobs provide fine-grained control over the various
 	// kvflowcontrol components for testing.
 	FlowControlTestingKnobs *kvflowcontrol.TestingKnobs
+
+	// RaftReportUnreachableBypass is called when a replica reports that another
+	// replica is unreachable. If the bypass function is non-nil and returns
+	// true, the report is ignored and ReportUnreachable is not called on the
+	// raft group for that replica.
+	RaftReportUnreachableBypass func(roachpb.ReplicaID) bool
+
+	// DisableUpdateLastUpdateTimesMapOnRaftGroupStep, if set, is invoked with the
+	// replica whose raft group is being stepped. It returns whether the
+	// lastUpdateTimes map should be not be updated upon stepping the raft group.
+	//
+	// This testing knob is used to simulate the leader not sending or receiving
+	// messages because it has no updates and heartbeats are turned off. This
+	// simulation is only meaningful for ranges that use leader leases.
+	DisableUpdateLastUpdateTimesMapOnRaftGroupStep func(r *Replica) bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

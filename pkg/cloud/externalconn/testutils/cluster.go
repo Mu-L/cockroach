@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/stretchr/testify/require"
@@ -58,7 +54,7 @@ func (h *Handle) SetSQLDBForUser(tenantID roachpb.TenantID, user string) func() 
 		return resetToRootUser
 	}
 
-	userSQLDB := h.tc.Server(0).SQLConnForUser(h.t, user, "")
+	userSQLDB := tenantState.ApplicationLayerInterface.SQLConn(h.t, serverutils.User(user))
 	tenantState.curDB = sqlutils.MakeSQLRunner(userSQLDB)
 	tenantState.userToDB[user] = tenantState.curDB
 
@@ -71,8 +67,8 @@ func (h *Handle) InitializeTenant(ctx context.Context, tenID roachpb.TenantID) {
 	testServer := h.tc.Server(0)
 	tenantState := &Tenant{t: h.t, userToDB: make(map[string]*sqlutils.SQLRunner)}
 	if tenID == roachpb.SystemTenantID {
-		tenantState.ApplicationLayerInterface = testServer
-		userSQLDB := tenantState.ApplicationLayerInterface.SQLConn(h.t, "")
+		tenantState.ApplicationLayerInterface = testServer.SystemLayer()
+		userSQLDB := tenantState.ApplicationLayerInterface.SQLConn(h.t)
 		tenantState.curDB = sqlutils.MakeSQLRunner(userSQLDB)
 		tenantState.userToDB[username.RootUserName().Normalized()] = tenantState.curDB
 	} else {
@@ -80,10 +76,10 @@ func (h *Handle) InitializeTenant(ctx context.Context, tenID roachpb.TenantID) {
 			TenantID: tenID,
 		}
 		var err error
-		tenantState.ApplicationLayerInterface, err = testServer.StartTenant(ctx, tenantArgs)
+		tenantState.ApplicationLayerInterface, err = testServer.TenantController().StartTenant(ctx, tenantArgs)
 		require.NoError(h.t, err)
 
-		tenantSQLDB := tenantState.ApplicationLayerInterface.SQLConn(h.t, "")
+		tenantSQLDB := tenantState.ApplicationLayerInterface.SQLConn(h.t)
 		tenantState.curDB = sqlutils.MakeSQLRunner(tenantSQLDB)
 		tenantState.userToDB[username.RootUserName().Normalized()] = tenantState.curDB
 	}

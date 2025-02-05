@@ -1,16 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ssmemstorage
 
 import (
+	"slices"
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
@@ -71,7 +67,6 @@ func (s *StmtStatsIterator) Next() bool {
 
 	stmtKey := s.stmtKeys[s.idx]
 
-	stmtFingerprintID := constructStatementFingerprintIDFromStmtKey(stmtKey)
 	statementStats, _, _ :=
 		s.container.getStatsForStmtWithKey(stmtKey, invalidStmtFingerprintID, false /* createIfNonexistent */)
 
@@ -83,7 +78,7 @@ func (s *StmtStatsIterator) Next() bool {
 	}
 
 	statementStats.mu.Lock()
-	data := statementStats.mu.data
+	data := copyDataLocked(statementStats)
 	distSQLUsed := statementStats.mu.distSQLUsed
 	vectorized := statementStats.mu.vectorized
 	fullScan := statementStats.mu.fullScan
@@ -99,17 +94,30 @@ func (s *StmtStatsIterator) Next() bool {
 			Vec:                      vectorized,
 			ImplicitTxn:              stmtKey.implicitTxn,
 			FullScan:                 fullScan,
-			Failed:                   stmtKey.failed,
 			App:                      s.container.appName,
 			Database:                 database,
 			PlanHash:                 stmtKey.planHash,
 			TransactionFingerprintID: stmtKey.transactionFingerprintID,
 		},
-		ID:    stmtFingerprintID,
+		ID:    statementStats.ID,
 		Stats: data,
 	}
 
 	return true
+}
+
+// copyDataLocked Copies the statement stat's data object under the mutex.
+// This function requires that there is a lock on the stats object.
+func copyDataLocked(stats *stmtStats) appstatspb.StatementStatistics {
+	stats.mu.AssertHeld()
+	data := stats.mu.data
+	data.Nodes = slices.Clone(data.Nodes)
+	data.KVNodeIDs = slices.Clone(data.KVNodeIDs)
+	data.Regions = slices.Clone(data.Regions)
+	data.PlanGists = slices.Clone(data.PlanGists)
+	data.IndexRecommendations = slices.Clone(data.IndexRecommendations)
+	data.Indexes = slices.Clone(data.Indexes)
+	return data
 }
 
 // Cur returns the appstatspb.CollectedStatementStatistics at the current internal

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -16,9 +11,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -149,97 +142,6 @@ SELECT nextval(105:::REGCLASS);`,
 	require.NoError(t, err)
 }
 
-func TestVersionGatingUDFInCheckConstraints(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
-		params, _ := createTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1),
-		}
-
-		s, sqlDB, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.Background())
-
-		_, err := sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`CREATE TABLE t(a INT CHECK (f() > 0));`)
-		require.NoError(t, err)
-	})
-
-	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
-		params, _ := createTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1 - 1),
-		}
-
-		s, sqlDB, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.Background())
-
-		// Need to turn new schema changer off, because function related rules are
-		// only valid in 23.1.
-		_, err := sqlDB.Exec(`SET use_declarative_schema_changer = 'off'`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`CREATE TABLE t(a INT CHECK (f() > 0));`)
-		require.Equal(t, "pq: unimplemented: usage of user-defined function from relations not supported", err.Error())
-	})
-}
-
-func TestVersionGatingUDFInColumnDefault(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
-		params, _ := createTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1),
-		}
-
-		s, sqlDB, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.Background())
-
-		_, err := sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`CREATE TABLE t(a INT DEFAULT f());`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`ALTER TABLE t ALTER COLUMN a SET DEFAULT (f() + 1)`)
-		require.NoError(t, err)
-	})
-
-	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
-		params, _ := createTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V23_1 - 1),
-		}
-
-		s, sqlDB, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.Background())
-
-		// Need to turn new schema changer off, because function related rules are
-		// only valid in 23.1.
-		_, err := sqlDB.Exec(`SET use_declarative_schema_changer = 'off'`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`CREATE TABLE t(a INT DEFAULT f());`)
-		require.Equal(t, "pq: unimplemented: usage of user-defined function from relations not supported", err.Error())
-		_, err = sqlDB.Exec(`CREATE TABLE t(a INT);`)
-		require.NoError(t, err)
-		_, err = sqlDB.Exec(`ALTER TABLE t ALTER COLUMN a SET DEFAULT (f() + 1)`)
-		require.Equal(t, "pq: unimplemented: usage of user-defined function from relations not supported", err.Error())
-	})
-}
-
 func TestCreateOrReplaceFunctionUpdateReferences(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -354,7 +256,7 @@ $$;
 `)
 
 	err = sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-		funcDesc, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Function(ctx, 112)
+		funcDesc, err := col.ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Function(ctx, 112)
 		require.NoError(t, err)
 		require.Equal(t, funcDesc.GetName(), "f")
 
@@ -409,6 +311,7 @@ func TestCreateFunctionVisibilityInExplicitTransaction(t *testing.T) {
 	// Make sure that everything is rolled back if post commit job fails.
 	_, err := sqlDB.Exec(`
 BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE UNIQUE INDEX idx ON t(b);
 COMMIT;
@@ -417,7 +320,7 @@ COMMIT;
 	require.Contains(t, err.Error(), "transaction committed but schema change aborted")
 	_, err = sqlDB.Exec(`SELECT f()`)
 	require.Error(t, err, "")
-	require.Contains(t, err.Error(), "unknown function: f(): function undefined")
+	require.Contains(t, err.Error(), "unknown function: f()")
 
 	// Make data valid for the unique index so that the job won't fail.
 	tDB.Exec(t, `DELETE FROM t WHERE a = 2`)
@@ -433,6 +336,7 @@ COMMIT;
 	//tDB.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints='newschemachanger.before.exec'`)
 	_, err = sqlDB.Exec(`
 BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
 CREATE UNIQUE INDEX idx ON t(b);
 COMMIT;

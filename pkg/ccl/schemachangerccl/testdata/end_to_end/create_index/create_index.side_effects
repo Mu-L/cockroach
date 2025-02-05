@@ -19,8 +19,7 @@ write *eventpb.CreateIndex to event log:
   mutationId: 1
   sql:
     descriptorId: 104
-    statement: CREATE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹id›, ‹name›) STORING
-      (‹money›) PARTITION BY LIST (‹id›) (PARTITION ‹p1› VALUES IN (‹1›))
+    statement: CREATE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹id›, ‹name›) STORING (‹money›) PARTITION BY LIST (‹id›) (PARTITION ‹p1› VALUES IN (‹1›))
     tag: CREATE INDEX
     user: root
   tableName: defaultdb.public.t
@@ -60,6 +59,7 @@ upsert descriptor #104
   +      - 3
   +      storeColumnNames:
   +      - money
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: BACKFILLING
@@ -94,6 +94,7 @@ upsert descriptor #104
   +      storeColumnNames:
   +      - money
   +      useDeletePreservingEncoding: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: DELETE_ONLY
@@ -130,6 +131,8 @@ upsert descriptor #104
   +        "1": id
   +        "2": name
   +        "3": money
+  +        "4294967292": crdb_internal_origin_timestamp
+  +        "4294967293": crdb_internal_origin_id
   +        "4294967294": tableoid
   +        "4294967295": crdb_internal_mvcc_timestamp
   +      families:
@@ -141,10 +144,8 @@ upsert descriptor #104
   +      name: t
   +    relevantStatements:
   +    - statement:
-  +        redactedStatement: CREATE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹id›, ‹name›)
-  +          STORING (‹money›) PARTITION BY LIST (‹id›) (PARTITION ‹p1› VALUES IN (‹1›))
-  +        statement: CREATE INDEX idx ON defaultdb.t (id, name) STORING (money) PARTITION
-  +          BY LIST (id) (PARTITION p1 VALUES IN (1))
+  +        redactedStatement: CREATE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹id›, ‹name›) STORING (‹money›) PARTITION BY LIST (‹id›) (PARTITION ‹p1› VALUES IN (‹1›))
+  +        statement: CREATE INDEX idx ON defaultdb.t (id, name) STORING (money) PARTITION BY LIST (id) (PARTITION p1 VALUES IN (1))
   +        statementTag: CREATE INDEX
   +    revertible: true
   +    targetRanks: <redacted>
@@ -185,6 +186,7 @@ upsert descriptor #104
   +      - 3
   +      storeColumnNames:
   +      - money
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: BACKFILLING
@@ -219,6 +221,7 @@ upsert descriptor #104
   +      storeColumnNames:
   +      - money
   +      useDeletePreservingEncoding: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: DELETE_ONLY
@@ -353,6 +356,8 @@ upsert descriptor #104
   -        "1": id
   -        "2": name
   -        "3": money
+  -        "4294967292": crdb_internal_origin_timestamp
+  -        "4294967293": crdb_internal_origin_id
   -        "4294967294": tableoid
   -        "4294967295": crdb_internal_mvcc_timestamp
   -      families:
@@ -364,10 +369,8 @@ upsert descriptor #104
   -      name: t
   -    relevantStatements:
   -    - statement:
-  -        redactedStatement: CREATE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹id›, ‹name›)
-  -          STORING (‹money›) PARTITION BY LIST (‹id›) (PARTITION ‹p1› VALUES IN (‹1›))
-  -        statement: CREATE INDEX idx ON defaultdb.t (id, name) STORING (money) PARTITION
-  -          BY LIST (id) (PARTITION p1 VALUES IN (1))
+  -        redactedStatement: CREATE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹id›, ‹name›) STORING (‹money›) PARTITION BY LIST (‹id›) (PARTITION ‹p1› VALUES IN (‹1›))
+  -        statement: CREATE INDEX idx ON defaultdb.t (id, name) STORING (money) PARTITION BY LIST (id) (PARTITION p1 VALUES IN (1))
   -        statementTag: CREATE INDEX
   -    revertible: true
   -    targetRanks: <redacted>
@@ -406,6 +409,7 @@ upsert descriptor #104
   +    - 3
   +    storeColumnNames:
   +    - money
+  +    vecConfig: {}
   +    version: 4
      modificationTime: {}
   -  mutations:
@@ -439,6 +443,7 @@ upsert descriptor #104
   -      - 3
   -      storeColumnNames:
   -      - money
+  -      vecConfig: {}
   -      version: 4
   -    mutationId: 1
   -    state: WRITE_ONLY
@@ -473,6 +478,7 @@ upsert descriptor #104
   -      storeColumnNames:
   -      - money
   -      useDeletePreservingEncoding: true
+  -      vecConfig: {}
   -      version: 4
   -    mutationId: 1
   -    state: DELETE_ONLY

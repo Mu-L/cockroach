@@ -1,17 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gcjob_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"strconv"
 	"sync/atomic"
@@ -19,7 +15,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -29,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
@@ -40,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -76,10 +69,12 @@ func TestSchemaChangeGCJob(t *testing.T) {
 
 	for _, dropItem := range []DropItem{INDEX, TABLE, DATABASE} {
 		for _, ttlTime := range []TTLTime{PAST, SOON, FUTURE} {
-			// NB: The inner body of this loop has been extracted into a function to
-			// ensure defer statements (namely testserver.Stop) is executed at the
-			// end of each loop rather than the end of each test.
-			doTestSchemaChangeGCJob(t, dropItem, ttlTime)
+			t.Run(fmt.Sprintf("dropItem=%d/ttlTime=%d", dropItem, ttlTime), func(t *testing.T) {
+				// NB: The inner body of this loop has been extracted into a function to
+				// ensure defer statements (namely testserver.Stop) is executed at the
+				// end of each loop rather than the end of each test.
+				doTestSchemaChangeGCJob(t, dropItem, ttlTime)
+			})
 		}
 	}
 }
@@ -98,6 +93,10 @@ func doTestSchemaChangeGCJob(t *testing.T, dropItem DropItem, ttlTime TTLTime) {
 	s, db, kvDB := serverutils.StartServer(t, params)
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
+	// The deferred call to unblock the GC job needs to run before the deferred
+	// call to stop the TestServer. Otherwise, the quiesce step of shutting down
+	// can hang forever waiting for the GC job.
+	defer close(blockGC)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
@@ -123,12 +122,12 @@ func doTestSchemaChangeGCJob(t *testing.T, dropItem DropItem, ttlTime TTLTime) {
 	var myTableDesc *tabledesc.Mutable
 	var myOtherTableDesc *tabledesc.Mutable
 	if err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-		myImm, err := col.ByID(txn.KV()).Get().Table(ctx, myTableID)
+		myImm, err := col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, myTableID)
 		if err != nil {
 			return err
 		}
 		myTableDesc = tabledesc.NewBuilder(myImm.TableDesc()).BuildExistingMutableTable()
-		myOtherImm, err := col.ByID(txn.KV()).Get().Table(ctx, myOtherTableID)
+		myOtherImm, err := col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, myOtherTableID)
 		if err != nil {
 			return err
 		}
@@ -229,9 +228,20 @@ func doTestSchemaChangeGCJob(t *testing.T, dropItem DropItem, ttlTime TTLTime) {
 
 	// Check that the job started.
 	jobIDStr := strconv.Itoa(int(job.ID()))
-	if err := jobutils.VerifyRunningSystemJob(t, sqlDB, 0, jobspb.TypeSchemaChangeGC, sql.RunningStatusWaitingGC, lookupJR); err != nil {
-		t.Fatal(err)
-	}
+	testutils.SucceedsSoon(t, func() error {
+		if err := jobutils.VerifyRunningSystemJob(
+			t, sqlDB, 0, jobspb.TypeSchemaChangeGC, sql.RunningStatusWaitingGC, lookupJR,
+		); err != nil {
+			// Since the intervals are set very low, the GC TTL job may have already
+			// started. If so, the status will be "deleting data" since "waiting for
+			// GC TTL" will have completed already.
+			if testutils.IsError(err, "expected running status waiting for GC TTL, got deleting data") {
+				return nil
+			}
+			return err
+		}
+		return nil
+	})
 
 	if ttlTime != FUTURE {
 		// Check that the job eventually blocks right before performing GC, due to the testing knob.
@@ -252,7 +262,7 @@ func doTestSchemaChangeGCJob(t *testing.T, dropItem DropItem, ttlTime TTLTime) {
 	}
 
 	if err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-		myImm, err := col.ByID(txn.KV()).Get().Table(ctx, myTableID)
+		myImm, err := col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, myTableID)
 		if err != nil {
 			if ttlTime != FUTURE && (dropItem == TABLE || dropItem == DATABASE) {
 				// We dropped the table, so expect it to not be found.
@@ -262,7 +272,7 @@ func doTestSchemaChangeGCJob(t *testing.T, dropItem DropItem, ttlTime TTLTime) {
 			return err
 		}
 		myTableDesc = tabledesc.NewBuilder(myImm.TableDesc()).BuildExistingMutableTable()
-		myOtherImm, err := col.ByID(txn.KV()).Get().Table(ctx, myOtherTableID)
+		myOtherImm, err := col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, myOtherTableID)
 		if err != nil {
 			if ttlTime != FUTURE && dropItem == DATABASE {
 				// We dropped the entire database, so expect none of the tables to be found.
@@ -286,7 +296,6 @@ func TestGCJobRetry(t *testing.T) {
 	failed.Store(false)
 	cs := cluster.MakeTestingClusterSettings()
 	gcjob.EmptySpanPollInterval.Override(ctx, &cs.SV, 100*time.Millisecond)
-	storage.MVCCRangeTombstonesEnabledInMixedClusters.Override(ctx, &cs.SV, true)
 	params := base.TestServerArgs{Settings: cs}
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	params.Knobs.Store = &kvserver.StoreTestingKnobs{
@@ -317,10 +326,29 @@ SELECT job_id
   FROM [SHOW JOBS]
  WHERE job_type = 'SCHEMA CHANGE GC' AND description LIKE '%foo%';`,
 	).Scan(&jobID)
-	tdb.CheckQueryResultsRetry(t,
-		"SELECT running_status FROM crdb_internal.jobs WHERE job_id = "+jobID,
-		[][]string{{string(sql.RunningStatusWaitingForMVCCGC)}},
-	)
+
+	const expectedRunningStatus = string(sql.RunningStatusWaitingForMVCCGC)
+	testutils.SucceedsSoon(t, func() error {
+		var status, runningStatus, jobErr gosql.NullString
+		tdb.QueryRow(t, fmt.Sprintf(`
+SELECT status, running_status, error
+FROM crdb_internal.jobs
+WHERE job_id = %s`, jobID)).Scan(&status, &runningStatus, &jobErr)
+
+		t.Logf(`details about SCHEMA CHANGE GC job: {status: %#v, running_status: %#v, error: %#v}`,
+			status, runningStatus, jobErr)
+
+		if !runningStatus.Valid {
+			return errors.Newf(`running_status is NULL but expected %q`, expectedRunningStatus)
+		}
+
+		if actualRunningStatus := runningStatus.String; actualRunningStatus != expectedRunningStatus {
+			return errors.Newf(`running_status %q does not match expected status %q`,
+				actualRunningStatus, expectedRunningStatus)
+		}
+
+		return nil
+	})
 }
 
 // TestGCTenant is lightweight test that tests the branching logic in Resume
@@ -447,7 +475,7 @@ func TestGCTenant(t *testing.T) {
 		_, err := sql.CreateTenantRecord(
 			ctx, execCfg.Codec, execCfg.Settings,
 			txn,
-			execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn.KV()),
+			execCfg.SpanConfigKVAccessor.WithISQLTxn(ctx, txn),
 			&mtinfopb.TenantInfoWithUsage{
 				SQLInfo: mtinfopb.SQLInfo{ID: activeTenID},
 			},
@@ -462,7 +490,7 @@ func TestGCTenant(t *testing.T) {
 		_, err := sql.CreateTenantRecord(
 			ctx, execCfg.Codec, execCfg.Settings,
 			txn,
-			execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn.KV()),
+			execCfg.SpanConfigKVAccessor.WithISQLTxn(ctx, txn),
 			&mtinfopb.TenantInfoWithUsage{
 				SQLInfo: mtinfopb.SQLInfo{
 					ID:        dropTenID,
@@ -683,81 +711,5 @@ SELECT descriptor_id, index_id
 		testutils.RunTrueAndFalse(t, "drop index", func(t *testing.T, dropIndex bool) {
 			runTest(t, dropIndex, beforeDelRange)
 		})
-	})
-}
-
-func TestLegacyIndexGCSucceedsWithMissingDescriptor(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	var params base.TestServerArgs
-	// Override binary version to be older.
-	params.Knobs.Server = &server.TestingKnobs{
-		DisableAutomaticVersionUpgrade: make(chan struct{}),
-		// Need to disable MVCC since this test is testing the legacy GC path.
-		BinaryVersionOverride: clusterversion.ByKey(clusterversion.V23_1_MVCCRangeTombstonesUnconditionallyEnabled - 1),
-	}
-	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
-
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
-	tDB := sqlutils.MakeSQLRunner(sqlDB)
-
-	tDB.Exec(t, `SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = false`)
-	tDB.Exec(t, `CREATE TABLE t(a INT)`)
-	tDB.Exec(t, `INSERT INTO t VALUES (1), (2)`)
-	tDB.Exec(t, `TRUNCATE TABLE t`)
-
-	var truncateJobID string
-	testutils.SucceedsSoon(t, func() error {
-		rslt := tDB.QueryStr(t, `SELECT job_id, status, running_status FROM [SHOW JOBS] WHERE description = 'GC for TRUNCATE TABLE defaultdb.public.t'`)
-		if len(rslt) != 1 {
-			t.Fatalf("expect only 1 truncate job, found %d", len(rslt))
-		}
-		if rslt[0][1] != "running" {
-			return errors.New("job not running yet")
-		}
-		if rslt[0][2] != "waiting for GC TTL" {
-			return errors.New("not waiting for gc yet")
-		}
-		truncateJobID = rslt[0][0]
-		return nil
-	})
-
-	tDB.Exec(t, `PAUSE JOB `+truncateJobID)
-	testutils.SucceedsSoon(t, func() error {
-		rslt := tDB.QueryStr(t, `SELECT status FROM [SHOW JOBS] WHERE job_id = `+truncateJobID)
-		if len(rslt) != 1 {
-			t.Fatalf("expect only 1 truncate job, found %d", len(rslt))
-		}
-		if rslt[0][0] != "paused" {
-			return errors.New("job not paused yet")
-		}
-		return nil
-	})
-
-	tDB.Exec(t, `ALTER TABLE t CONFIGURE ZONE USING gc.ttlseconds = 1;`)
-	tDB.Exec(t, `DROP TABLE t`)
-	testutils.SucceedsSoon(t, func() error {
-		rslt := tDB.QueryStr(t, `SELECT status FROM [SHOW JOBS] WHERE description = 'GC for DROP TABLE defaultdb.public.t'`)
-		if len(rslt) != 1 {
-			t.Fatalf("expect only 1 truncate job, found %d", len(rslt))
-		}
-		if rslt[0][0] != "succeeded" {
-			return errors.New("job not running yet")
-		}
-		return nil
-	})
-
-	tDB.Exec(t, `RESUME JOB `+truncateJobID)
-	testutils.SucceedsSoon(t, func() error {
-		rslt := tDB.QueryStr(t, `SELECT status FROM [SHOW JOBS] WHERE job_id = `+truncateJobID)
-		if len(rslt) != 1 {
-			t.Fatalf("expect only 1 truncate job, found %d", len(rslt))
-		}
-		if rslt[0][0] != "succeeded" {
-			return errors.New("job not running")
-		}
-		return nil
 	})
 }

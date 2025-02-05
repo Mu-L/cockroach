@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -184,6 +179,12 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	// Find which table we're working on, check the permissions.
 	tab, depName, alias, refColumns := b.resolveTableForMutation(ins.Table, privilege.INSERT)
 
+	if tab.IsVirtualTable() {
+		panic(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"cannot insert into view \"%s\"", tab.Name(),
+		))
+	}
+
 	// It is possible to insert into specific columns using table reference
 	// syntax:
 	// INSERT INTO [<table_id>(<col1_id>,<col2_id>) AS <alias>] ...
@@ -293,15 +294,22 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	switch {
 	// Case 1: Simple INSERT statement.
 	case ins.OnConflict == nil:
+		// Project row-level BEFORE triggers for INSERT.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert, false /* cascade */)
+
 		// Build the final insert statement, including any returned expressions.
 		mb.buildInsert(returning)
 
 	// Case 2: INSERT..ON CONFLICT DO NOTHING.
 	case ins.OnConflict.DoNothing:
+
+		// Project row-level BEFORE triggers for INSERT.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert, false /* cascade */)
+
 		// Wrap the input in one ANTI JOIN per UNIQUE index, and filter out rows
 		// that have conflicts. See the buildInputForDoNothing comment for more
 		// details.
-		mb.buildInputForDoNothing(inScope, ins.OnConflict)
+		mb.buildInputForDoNothing(inScope, ins.Table, ins.OnConflict)
 
 		// Since buildInputForDoNothing filters out rows with conflicts, always
 		// insert rows that are not filtered.
@@ -318,11 +326,32 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		if mb.needExistingRows() {
 			// Left-join each input row to the target table, using conflict columns
 			// derived from the primary index as the join condition.
-			mb.buildInputForUpsert(inScope, nil /* onConflict */, nil /* whereClause */)
+			mb.buildInputForUpsert(inScope, ins.Table, nil /* onConflict */)
+
+			// Project row-level BEFORE triggers for INSERT.
+			//
+			// NOTE: we avoid building INSERT triggers until after buildInputForUpsert
+			// so that there are no buffering operators between INSERT and UPDATE
+			// triggers. This helps preserve Postgres compatibility
+			if mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert, false /* cascade */) {
+				// INSERT triggers are able to modify the row being inserted, so we need
+				// to recompute the upsert columns.
+				mb.setUpsertCols(nil /* insertCols */)
+			}
 
 			// Add additional columns for computed expressions that may depend on any
 			// updated columns, as well as mutation columns with default values.
 			mb.addSynthesizedColsForUpdate()
+
+			// Project row-level BEFORE triggers for UPDATE.
+			mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate, false /* cascade */)
+		} else {
+			// Project row-level BEFORE triggers for INSERT.
+			if mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert, false /* cascade */) {
+				// INSERT triggers are able to modify the row being inserted, so we need
+				// to recompute the upsert columns.
+				mb.setUpsertCols(nil /* insertCols */)
+			}
 		}
 
 		// Build the final upsert statement, including any returned expressions.
@@ -332,7 +361,17 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	default:
 		// Left-join each input row to the target table, using the conflict columns
 		// as the join condition.
-		mb.buildInputForUpsert(inScope, ins.OnConflict, ins.OnConflict.Where)
+		canaryCol := mb.buildInputForUpsert(inScope, ins.Table, ins.OnConflict)
+
+		// Project row-level BEFORE triggers for INSERT.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventInsert, false /* cascade */)
+
+		// Add a filter from the WHERE clause if one exists. This must happen after
+		// the INSERT triggers are added, since BEFORE INSERT triggers are called
+		// for every input row, even if it doesn't end up being inserted.
+		if ins.OnConflict.Where != nil {
+			mb.buildOnConflictWhereClause(ins.OnConflict.Where, canaryCol)
+		}
 
 		// Derive the columns that will be updated from the SET expressions.
 		mb.addTargetColsForUpdate(ins.OnConflict.Exprs)
@@ -340,8 +379,22 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		// Build each of the SET expressions.
 		mb.addUpdateCols(ins.OnConflict.Exprs)
 
+		// Project row-level BEFORE triggers for UPDATE.
+		mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate, false /* cascade */)
+
 		// Build the final upsert statement, including any returned expressions.
 		mb.buildUpsert(returning)
+	}
+
+	if b.trackSchemaDeps {
+		dep := opt.SchemaDep{DataSource: tab}
+		// Track dependencies on insert columns.
+		for i := range mb.insertColIDs {
+			if mb.insertColIDs[i] != 0 && !mb.implicitInsertCols.Contains(mb.insertColIDs[i]) {
+				dep.ColumnOrdinals.Add(i)
+			}
+		}
+		b.schemaDeps = append(b.schemaDeps, dep)
 	}
 
 	return mb.outScope
@@ -359,6 +412,7 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 //     values specified for them.
 //  4. Each update value is the same as the corresponding insert value.
 //  5. There are no inbound foreign keys containing non-key columns.
+//  6. There are no UPDATE triggers on the target table.
 //
 // TODO(andyk): The fast path is currently only enabled when the UPSERT alias
 // is explicitly selected by the user. It's possible to fast path some queries
@@ -408,6 +462,17 @@ func (mb *mutationBuilder) needExistingRows() bool {
 		for j, m := 0, mb.tab.InboundForeignKey(i).ColumnCount(); j < m; j++ {
 			ord := mb.tab.InboundForeignKey(i).ReferencedColumnOrdinal(mb.tab, j)
 			if !keyOrds.Contains(ord) {
+				return true
+			}
+		}
+	}
+
+	// If there are any UPDATE triggers on the target table, we must have access
+	// to both old and new values of conflicting rows.
+	for i, n := 0, mb.tab.TriggerCount(); i < n; i++ {
+		for j, m := 0, mb.tab.Trigger(i).EventCount(); j < m; j++ {
+			eventType := mb.tab.Trigger(i).Event(j).EventType
+			if eventType == tree.TriggerEventUpdate {
 				return true
 			}
 		}
@@ -566,10 +631,8 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 	// Handle DEFAULT VALUES case by creating a single empty row as input.
 	if inputRows == nil {
 		mb.outScope = inScope.push()
-		mb.outScope.expr = mb.b.factory.ConstructValues(memo.ScalarListWithEmptyTuple, &memo.ValuesPrivate{
-			Cols: opt.ColList{},
-			ID:   mb.md.NextUniqueID(),
-		})
+		mb.outScope.expr = mb.b.factory.ConstructNoColsRow()
+		mb.inputForInsertExpr = mb.outScope.expr
 		return
 	}
 
@@ -644,6 +707,7 @@ func (mb *mutationBuilder) buildInputForInsert(inScope *scope, inputRows *tree.S
 
 	// Add assignment casts for insert columns.
 	mb.addAssignmentCasts(mb.insertColIDs)
+	mb.inputForInsertExpr = mb.outScope.expr
 }
 
 // addSynthesizedColsForInsert wraps an Insert input expression with a Project
@@ -684,13 +748,18 @@ func (mb *mutationBuilder) buildInsert(returning *tree.ReturningExprs) {
 	// Project partial index PUT boolean columns.
 	mb.projectPartialIndexPutCols()
 
+	// Project vector index PUT columns.
+	mb.projectVectorIndexCols()
+
 	mb.buildUniqueChecksForInsert()
 
 	mb.buildFKChecksForInsert()
 
+	mb.buildRowLevelAfterTriggers(opt.InsertOp)
+
 	private := mb.makeMutationPrivate(returning != nil)
 	mb.outScope.expr = mb.b.factory.ConstructInsert(
-		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
+		mb.outScope.expr, mb.uniqueChecks, mb.fastPathUniqueChecks, mb.fkChecks, private,
 	)
 
 	mb.buildReturning(returning)
@@ -699,7 +768,9 @@ func (mb *mutationBuilder) buildInsert(returning *tree.ReturningExprs) {
 // buildInputForDoNothing wraps the input expression in ANTI JOIN expressions,
 // one for each arbiter on the target table. See the comment header for
 // Builder.buildInsert for an example.
-func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tree.OnConflict) {
+func (mb *mutationBuilder) buildInputForDoNothing(
+	inScope *scope, texpr tree.TableExpr, onConflict *tree.OnConflict,
+) {
 	// Determine the set of arbiter indexes and constraints to use to check for
 	// conflicts.
 	mb.arbiters = mb.findArbiters(onConflict)
@@ -711,14 +782,18 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 	mb.outScope.ordering = nil
 
 	// Create an anti-join for each arbiter.
-	mb.arbiters.ForEach(func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int) {
-		mb.buildAntiJoinForDoNothingArbiter(inScope, conflictOrds, pred)
+	mb.arbiters.ForEach(func(
+		name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int, uniqueWithoutIndex bool, uniqueOrd int,
+	) {
+		mb.buildAntiJoinForDoNothingArbiter(inScope, texpr, conflictOrds, pred, uniqueWithoutIndex, uniqueOrd)
 	})
 
 	// Create an UpsertDistinctOn for each arbiter. This must happen after all
 	// conflicting rows are removed with the anti-joins created above, to avoid
 	// removing valid rows (see #59125).
-	mb.arbiters.ForEach(func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int) {
+	mb.arbiters.ForEach(func(
+		name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int, uniqueWithoutIndex bool, uniqueOrd int,
+	) {
 		// If the arbiter has a partial predicate, project a new column that
 		// allows the UpsertDistinctOn to only de-duplicate insert rows that
 		// satisfy the predicate. See projectPartialArbiterDistinctColumn for
@@ -744,8 +819,8 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 // given insert row conflicts with an existing row in the table. If it is null,
 // then there is no conflict.
 func (mb *mutationBuilder) buildInputForUpsert(
-	inScope *scope, onConflict *tree.OnConflict, whereClause *tree.Where,
-) {
+	inScope *scope, texpr tree.TableExpr, onConflict *tree.OnConflict,
+) (canaryCol *scopeColumn) {
 	// Determine the set of arbiter indexes and constraints to use to check for
 	// conflicts.
 	mb.arbiters = mb.findArbiters(onConflict)
@@ -763,8 +838,9 @@ func (mb *mutationBuilder) buildInputForUpsert(
 	mb.outScope.ordering = nil
 
 	// Create an UpsertDistinctOn and a left-join for the single arbiter.
-	var canaryCol *scopeColumn
-	mb.arbiters.ForEach(func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int) {
+	mb.arbiters.ForEach(func(
+		name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int, uniqueWithoutIndex bool, uniqueOrd int,
+	) {
 		// If the arbiter has a partial predicate, project a new column that
 		// allows the UpsertDistinctOn to only de-duplicate insert rows that
 		// satisfy the predicate. See projectPartialArbiterDistinctColumn for
@@ -794,7 +870,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 
 		// Create a left-join for the arbiter.
 		mb.buildLeftJoinForUpsertArbiter(
-			inScope, conflictOrds, pred,
+			inScope, texpr, conflictOrds, pred, uniqueWithoutIndex, uniqueOrd,
 		)
 
 		// Record a not-null "canary" column. After the left-join, this will be
@@ -805,24 +881,9 @@ func (mb *mutationBuilder) buildInputForUpsert(
 		mb.canaryColID = canaryCol.id
 	})
 
-	// Add a filter from the WHERE clause if one exists.
-	if whereClause != nil {
-		where := &tree.Where{
-			Type: whereClause.Type,
-			Expr: &tree.OrExpr{
-				Left: &tree.ComparisonExpr{
-					Operator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
-					Left:     canaryCol,
-					Right:    tree.DNull,
-				},
-				Right: whereClause.Expr,
-			},
-		}
-		mb.b.buildWhere(where, mb.outScope)
-	}
-
 	mb.targetColList = make(opt.ColList, 0, mb.tab.ColumnCount())
 	mb.targetColSet = opt.ColSet{}
+	return canaryCol
 }
 
 // setUpsertCols sets the list of columns to be updated in case of conflict.
@@ -907,9 +968,14 @@ func (mb *mutationBuilder) buildUpsert(returning *tree.ReturningExprs) {
 		mb.projectPartialIndexPutCols()
 	}
 
+	// Project vector index PUT and DEL columns.
+	mb.projectVectorIndexCols()
+
 	mb.buildUniqueChecksForUpsert()
 
 	mb.buildFKChecksForUpsert()
+
+	mb.buildRowLevelAfterTriggers(opt.InsertOp)
 
 	private := mb.makeMutationPrivate(returning != nil)
 	mb.outScope.expr = mb.b.factory.ConstructUpsert(
@@ -1000,4 +1066,24 @@ func (mb *mutationBuilder) projectUpsertColumns() {
 
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 	mb.outScope = projectionsScope
+}
+
+// buildOnConflictWhereClause adds a filter from the ON CONFLICT WHERE clause.
+// The filter applies only to conflicting rows, as indicated by the canary
+// column.
+func (mb *mutationBuilder) buildOnConflictWhereClause(
+	whereClause *tree.Where, canaryCol tree.TypedExpr,
+) {
+	where := &tree.Where{
+		Type: whereClause.Type,
+		Expr: &tree.OrExpr{
+			Left: &tree.ComparisonExpr{
+				Operator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
+				Left:     canaryCol,
+				Right:    tree.DNull,
+			},
+			Right: whereClause.Expr,
+		},
+	}
+	mb.b.buildWhere(where, mb.outScope)
 }

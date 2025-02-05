@@ -1,19 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
 import (
 	"context"
 	gosql "database/sql"
-	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -51,7 +45,7 @@ func TestDropTenantSynchronous(t *testing.T) {
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
 						DisableAutomaticVersionUpgrade: make(chan struct{}),
-						BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V22_2),
+						ClusterVersionOverride:         clusterversion.MinSupported.Version(),
 					},
 				},
 			},
@@ -72,11 +66,9 @@ func testDestroyTenantSynchronous(ctx context.Context, t *testing.T, sqlDB *gosq
 	const tenantStateQuery = `
 SELECT id, active FROM system.tenants WHERE id = 10
 `
+	tenantSpan := codec.TenantSpan()
 	checkKVsExistForTenant := func(t *testing.T, shouldExist bool) {
-		rows, err := kvDB.Scan(
-			ctx, codec.TenantPrefix(), codec.TenantPrefix().PrefixEnd(),
-			1, /* maxRows */
-		)
+		rows, err := kvDB.Scan(ctx, tenantSpan.Key, tenantSpan.EndKey, 1 /* maxRows */)
 		require.NoError(t, err)
 		require.Equal(t, shouldExist, len(rows) > 0)
 	}
@@ -115,8 +107,8 @@ func TestGetTenantIds(t *testing.T) {
 	}))
 	expectedIds := []roachpb.TenantID{
 		roachpb.MustMakeTenantID(1),
-		roachpb.MustMakeTenantID(2),
 		roachpb.MustMakeTenantID(3),
+		roachpb.MustMakeTenantID(4),
 	}
 	require.Equal(t, expectedIds, ids)
 
@@ -129,30 +121,7 @@ func TestGetTenantIds(t *testing.T) {
 	}))
 	expectedIds = []roachpb.TenantID{
 		roachpb.MustMakeTenantID(1),
-		roachpb.MustMakeTenantID(3),
+		roachpb.MustMakeTenantID(4),
 	}
 	require.Equal(t, expectedIds, ids)
-}
-
-func TestAlterTenantCapabilityMixedVersion22_2_23_1(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: make(chan struct{}),
-					BinaryVersionOverride:          clusterversion.ByKey(clusterversion.V22_2),
-				},
-			},
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
-
-	systemTenant := sqlutils.MakeSQLRunner(tc.ServerConn(0))
-
-	const tenantID = 5
-	systemTenant.Exec(t, fmt.Sprintf("SELECT crdb_internal.create_tenant(%d)", tenantID))
-	systemTenant.ExpectErr(t, "cannot alter tenant capabilities until version is finalized", "ALTER TENANT $1 GRANT CAPABILITY can_admin_split", tenantID)
 }

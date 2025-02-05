@@ -10,10 +10,9 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/clusterversion",
         "//pkg/kv/kvpb",
+        "//pkg/multitenant/mtinfopb",
         "//pkg/multitenant/tenantcapabilities",
-        "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
@@ -27,7 +26,6 @@ go_library(
 go_test(
     name = "tenantcapabilitiesauthorizer_test",
     srcs = ["authorizer_test.go"],
-    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":tenantcapabilitiesauthorizer"],
     deps = [

@@ -1,27 +1,19 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parser_test
 
 import (
-	"bytes"
 	"fmt"
 	"go/constant"
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -37,78 +29,52 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var issueLinkRE = regexp.MustCompile("https://go.crdb.dev/issue-v/([0-9]+)/.*")
-
 // TestParseDataDriven verifies that we can parse the supplied SQL and regenerate the SQL
 // string from the syntax tree.
-func TestParseDatadriven(t *testing.T) {
+//
+// The follow commands are allowed:
+//
+//   - parse
+//
+//     Parses a statement and verifies that it round-trips. Various forms of the
+//     formatted AST are printed as test output.
+//
+//   - parse-no-verify
+//
+//     Parses a statement without verifying that it round-trips. It will fail if
+//     parsing errors. It does not print any test output.
+//
+//   - error
+//
+//     Parses a statement and expects an error. The error is printed as test
+//     output.
+func TestParseDataDriven(t *testing.T) {
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "parse":
-				// Check parse.
-				stmts, err := parser.Parse(d.Input)
-				if err != nil {
-					d.Fatalf(t, "unexpected parse error: %v", err)
-				}
-
-				// Check pretty-print roundtrip via the sqlfmt logic.
-				sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
-
-				ref := stmts.String()
-				note := ""
-				if ref != d.Input {
-					note = " -- normalized!"
-				}
-
-				// Check roundtrip and formatting with flags.
-				var buf bytes.Buffer
-				fmt.Fprintf(&buf, "%s%s\n", ref, note)
-				fmt.Fprintln(&buf, stmts.StringWithFlags(tree.FmtAlwaysGroupExprs), "-- fully parenthesized")
-				constantsHidden := stmts.StringWithFlags(tree.FmtHideConstants)
-				fmt.Fprintln(&buf, constantsHidden, "-- literals removed")
-
-				// As of this writing, the SQL statement stats proceed as follows:
-				// first the literals are removed from statement to form a stat key,
-				// then the stat key is re-parsed, to undergo the anonymization stage.
-				// We also want to check the re-parsing is fine.
-				reparsedStmts, err := parser.Parse(constantsHidden)
-				if err != nil {
-					d.Fatalf(t, "unexpected error when reparsing without literals: %+v", err)
-				} else {
-					reparsedStmtsS := reparsedStmts.String()
-					if reparsedStmtsS != constantsHidden {
-						d.Fatalf(t,
-							"mismatched AST when reparsing without literals:\noriginal: %s\nexpected: %s\nactual:   %s",
-							d.Input, constantsHidden, reparsedStmtsS,
-						)
+				const plpgsql = false
+				reparseWithoutLiterals := true
+				for _, arg := range d.CmdArgs {
+					if arg.Key == "no-parse-without-literals" {
+						reparseWithoutLiterals = false
 					}
 				}
-
-				fmt.Fprintln(&buf, stmts.StringWithFlags(tree.FmtAnonymize), "-- identifiers removed")
-				if strings.Contains(ref, tree.PasswordSubstitution) {
-					fmt.Fprintln(&buf, stmts.StringWithFlags(tree.FmtShowPasswords), "-- passwords exposed")
+				return sqlutils.VerifyParseFormat(t, d.Input, d.Pos, plpgsql, reparseWithoutLiterals)
+			case "parse-no-verify":
+				_, err := parser.Parse(d.Input)
+				if err != nil {
+					d.Fatalf(t, "%s\nunexpected error: %s", d.Pos, err)
 				}
-
-				return buf.String()
-
+				return ""
 			case "error":
 				_, err := parser.Parse(d.Input)
 				if err == nil {
-					return ""
+					d.Fatalf(t, "%s\nexpected error, found none", d.Pos)
 				}
-				pgerr := pgerror.Flatten(err)
-				msg := pgerr.Message
-				if pgerr.Detail != "" {
-					msg += "\nDETAIL: " + pgerr.Detail
-				}
-				if pgerr.Hint != "" {
-					msg += "\nHINT: " + pgerr.Hint
-				}
-				msg = issueLinkRE.ReplaceAllString(msg, "https://go.crdb.dev/issue-v/$1/")
-				return msg
+				return sqlutils.VerifyParseError(err)
 			}
-			d.Fatalf(t, "unsupported command: %s", d.Cmd)
+			d.Fatalf(t, "%s\nunsupported command: %s", d.Pos, d.Cmd)
 			return ""
 		})
 	})
@@ -410,21 +376,17 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`COPY t FROM STDIN OIDS`, 41608, `oids`, ``},
 		{`COPY t FROM STDIN FREEZE`, 41608, `freeze`, ``},
-		{`COPY t FROM STDIN ENCODING 'utf-8'`, 41608, `encoding`, ``},
 		{`COPY t FROM STDIN FORCE QUOTE *`, 41608, `quote`, ``},
 		{`COPY t FROM STDIN FORCE NULL *`, 41608, `force_null`, ``},
 		{`COPY t FROM STDIN FORCE NOT NULL *`, 41608, `force_not_null`, ``},
 		{`COPY t FROM STDIN WITH (OIDS)`, 41608, `oids`, ``},
 		{`COPY t FROM STDIN (FREEZE)`, 41608, `freeze`, ``},
-		{`COPY t FROM STDIN WITH (ESCAPE ',', ENCODING 'utf-8')`, 41608, `encoding`, ``},
 		{`COPY t FROM STDIN WITH (FORCE_QUOTE) *`, 41608, `quote`, ``},
 		{`COPY t FROM STDIN (FORCE_NULL) *`, 41608, `force_null`, ``},
 		{`COPY t FROM STDIN (HEADER, FORCE_NOT_NULL) *`, 41608, `force_not_null`, ``},
 		{`COPY x FROM STDIN WHERE a = b`, 54580, ``, ``},
 
 		{`ALTER AGGREGATE a`, 74775, `alter aggregate`, ``},
-
-		{`CALL foo`, 17511, `call procedure`, ``},
 
 		{`CREATE AGGREGATE a`, 74775, `create aggregate`, ``},
 		{`CREATE CAST a`, 0, `create cast`, ``},
@@ -443,7 +405,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE SUBSCRIPTION a`, 0, `create subscription`, ``},
 		{`CREATE TABLESPACE a`, 54113, `create tablespace`, ``},
 		{`CREATE TEXT SEARCH a`, 7821, `create text`, ``},
-		{`CREATE TRIGGER a`, 28296, `create`, ``},
 
 		{`DROP ACCESS METHOD a`, 0, `drop access method`, ``},
 		{`DROP AGGREGATE a`, 74775, `drop aggregate`, ``},
@@ -462,7 +423,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`DROP SERVER a`, 0, `drop server`, ``},
 		{`DROP SUBSCRIPTION a`, 0, `drop subscription`, ``},
 		{`DROP TEXT SEARCH a`, 7821, `drop text`, ``},
-		{`DROP TRIGGER a`, 28296, `drop`, ``},
 
 		{`DISCARD PLANS`, 0, `discard plans`, ``},
 
@@ -581,6 +541,9 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`UPSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``, ``},
 
 		{`SELECT 1 OPERATOR(public.+) 2`, 65017, ``, ``},
+
+		{`SELECT percentile_disc ( 0.50 ) WITHIN GROUP ( ORDER BY PRIMARY KEY tbl ) FROM tbl;`, 109847, `order by index`, ``},
+		{`SELECT percentile_disc ( 0.50 ) WITHIN GROUP ( ORDER BY INDEX_AFTER_ORDER_BY_BEFORE_AT INT . LIKE @ FAMILY );`, 109847, `order by index`, ``},
 	}
 	for _, d := range testData {
 		t.Run(d.sql, func(t *testing.T) {
@@ -735,7 +698,7 @@ func BenchmarkParse(b *testing.B) {
 		},
 		{
 			"tpcc-delivery",
-			`SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id ASC LIMIT 1`,
+			`SELECT no_o_id FROM new_order WHERE no_w_id = $1 AND no_d_id = $2 ORDER BY no_o_id ASC LIMIT 1 FOR UPDATE`,
 		},
 		{
 			"account",

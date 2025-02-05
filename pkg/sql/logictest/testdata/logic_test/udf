@@ -1,9 +1,3 @@
-# Set the distsql_workmem to the default production value because metamorphic
-# values may be too low for the legacy schema changer.
-onlyif config local-legacy-schema-changer
-statement ok
-SET distsql_workmem = '64MiB'
-
 statement ok
 CREATE TABLE ab (
   a INT PRIMARY KEY,
@@ -55,10 +49,6 @@ CREATE FUNCTION err(b BOOL) RETURNS INT LANGUAGE SQL AS 'SELECT b'
 statement error pgcode 42P13 return type mismatch in function declared to return bool\nDETAIL: Actual return type is int
 CREATE FUNCTION err(i INT, j INT) RETURNS BOOL LANGUAGE SQL AS 'SELECT i - j'
 
-# TODO(#100962): Add support for default parameters.
-statement error pgcode 0A000 unimplemented: default value
-CREATE FUNCTION err(i INT, j INT DEFAULT 2) RETURNS INT LANGUAGE SQL AS 'SELECT i - j'
-
 # Make sure using table name as tuple type name works properly.
 # It should pass the return type validation and stored as a tuple type.
 statement ok
@@ -74,12 +64,13 @@ CREATE FUNCTION f_no_ref(a int) RETURNS INT IMMUTABLE AS 'SELECT 1' LANGUAGE SQL
 query T
 SELECT create_statement FROM [SHOW CREATE FUNCTION f_no_ref];
 ----
-CREATE FUNCTION public.f_no_ref(IN a INT8)
+CREATE FUNCTION public.f_no_ref(a INT8)
   RETURNS INT8
   IMMUTABLE
   NOT LEAKPROOF
   CALLED ON NULL INPUT
   LANGUAGE SQL
+  SECURITY INVOKER
   AS $$
   SELECT 1;
 $$
@@ -107,12 +98,13 @@ $$
 query T
 SELECT create_statement FROM [SHOW CREATE FUNCTION f];
 ----
-CREATE FUNCTION public.f(IN a test.public.notmyworkday)
+CREATE FUNCTION public.f(a public.notmyworkday)
   RETURNS INT8
   VOLATILE
   NOT LEAKPROOF
   CALLED ON NULL INPUT
   LANGUAGE SQL
+  SECURITY INVOKER
   AS $$
   SELECT a FROM test.public.t;
   SELECT b FROM test.public.t@t_idx_b;
@@ -144,9 +136,9 @@ SELECT oid, proname, pronamespace, proowner, prolang, proleakproof, proisstrict,
 FROM pg_catalog.pg_proc WHERE proname IN ('proc_f', 'proc_f_2')
 ORDER BY 1
 ----
-100118  proc_f    105  1546506610  14  false  false  false  v  1  20  20     {i}    NULL    f  SELECT 1;
-100119  proc_f    105  1546506610  14  true   true   false  i  2  25  25 20  {i,i}  {"",b}  f  SELECT 'hello';
-100121  proc_f_2  120  1546506610  14  false  false  false  v  1  25  25     {i}    NULL    f  SELECT 'hello';
+100118  proc_f    105  1546506610  14  false  false  false  v  1  20  20     NULL  NULL    f  SELECT 1;
+100119  proc_f    105  1546506610  14  true   true   false  i  2  25  25 20  NULL  {"",b}  f  SELECT 'hello';
+100121  proc_f_2  120  1546506610  14  false  false  false  v  1  25  25     NULL  NULL    f  SELECT 'hello';
 
 # Ensure that the pg_proc virtual index works properly.
 
@@ -167,151 +159,6 @@ statement ok
 USE test;
 subtest end
 
-subtest create_function_statements
-
-query TITITIT
-SELECT create_statement, database_id, database_name, schema_id, schema_name, function_id, function_name
-FROM crdb_internal.create_function_statements
-WHERE function_name IN ('proc_f', 'proc_f_2')
-ORDER BY function_name;
-----
-CREATE FUNCTION public.proc_f(IN INT8)
-    RETURNS INT8
-    VOLATILE
-    NOT LEAKPROOF
-    CALLED ON NULL INPUT
-    LANGUAGE SQL
-    AS $$
-    SELECT 1;
-$$  104  test  105  public  118  proc_f
-CREATE FUNCTION public.proc_f(IN STRING, IN b INT8)
-    RETURNS STRING
-    IMMUTABLE
-    LEAKPROOF
-    STRICT
-    LANGUAGE SQL
-    AS $$
-    SELECT 'hello';
-$$  104  test  105  public  119  proc_f
-CREATE FUNCTION sc.proc_f_2(IN STRING)
-    RETURNS STRING
-    VOLATILE
-    NOT LEAKPROOF
-    CALLED ON NULL INPUT
-    LANGUAGE SQL
-    AS $$
-    SELECT 'hello';
-$$  104  test  120  sc  121  proc_f_2
-
-statement ok
-CREATE DATABASE test_cross_db;
-USE test_cross_db;
-CREATE FUNCTION f_cross_db() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
-USE test;
-
-query TITITIT
-SELECT create_statement, database_id, database_name, schema_id, schema_name, function_id, function_name
-FROM "".crdb_internal.create_function_statements
-WHERE function_name IN ('proc_f', 'proc_f_2', 'f_cross_db')
-ORDER BY database_id, function_name;
-----
-CREATE FUNCTION public.proc_f(IN INT8)
-    RETURNS INT8
-    VOLATILE
-    NOT LEAKPROOF
-    CALLED ON NULL INPUT
-    LANGUAGE SQL
-    AS $$
-    SELECT 1;
-$$  104  test  105  public  118  proc_f
-CREATE FUNCTION public.proc_f(IN STRING, IN b INT8)
-    RETURNS STRING
-    IMMUTABLE
-    LEAKPROOF
-    STRICT
-    LANGUAGE SQL
-    AS $$
-    SELECT 'hello';
-$$  104  test  105  public  119  proc_f
-CREATE FUNCTION sc.proc_f_2(IN STRING)
-    RETURNS STRING
-    VOLATILE
-    NOT LEAKPROOF
-    CALLED ON NULL INPUT
-    LANGUAGE SQL
-    AS $$
-    SELECT 'hello';
-$$  104  test  120  sc  121  proc_f_2
-CREATE FUNCTION public.f_cross_db()
-    RETURNS INT8
-    VOLATILE
-    NOT LEAKPROOF
-    CALLED ON NULL INPUT
-    LANGUAGE SQL
-    AS $$
-    SELECT 1;
-$$  122  test_cross_db  123  public  124  f_cross_db
-subtest end
-
-subtest show_create_function
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION proc_f] ORDER BY 1
-----
-CREATE FUNCTION public.proc_f(IN INT8)
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-CREATE FUNCTION public.proc_f(IN STRING, IN b INT8)
-  RETURNS STRING
-  IMMUTABLE
-  LEAKPROOF
-  STRICT
-  LANGUAGE SQL
-  AS $$
-  SELECT 'hello';
-$$
-
-statement error pgcode 42883 pq: unknown function: proc_f_2()
-SHOW CREATE FUNCTION proc_f_2;
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION sc.proc_f_2];
-----
-CREATE FUNCTION sc.proc_f_2(IN STRING)
-  RETURNS STRING
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 'hello';
-$$
-
-statement ok
-SET search_path = sc;
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION proc_f_2];
-----
-CREATE FUNCTION sc.proc_f_2(IN STRING)
-  RETURNS STRING
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 'hello';
-$$
-
-statement ok
-SET search_path = public;
-subtest end
 
 subtest udf_regproc
 
@@ -354,186 +201,6 @@ SELECT 999999::regproc;
 subtest end
 
 
-subtest drop_function
-
-statement ok
-CREATE FUNCTION f_test_drop() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
-
-statement ok
-CREATE FUNCTION f_test_drop(int) RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
-
-statement ok
-CREATE SCHEMA sc1
-
-statement ok
-CREATE FUNCTION sc1.f_test_drop(int) RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
-
-statement ok
-SET search_path = public,sc1
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop] ORDER BY 1
-----
-CREATE FUNCTION public.f_test_drop()
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-CREATE FUNCTION public.f_test_drop(IN INT8)
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
-----
-CREATE FUNCTION sc1.f_test_drop(IN INT8)
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-
-statement error pgcode 42725 pq: function name \"f_test_drop\" is not unique
-DROP FUNCTION f_test_drop;
-
-statement ok
-DROP FUNCTION IF EXISTS f_not_existing;
-
-statement error pgcode 42883 pq: unknown function: f_not_existing\(\): function undefined
-DROP FUNCTION f_not_existing;
-
-# drop a function twice should fail.
-statement error pgcode 42883 pq: function f_test_drop\(\) does not exist: function undefined
-BEGIN;
-DROP FUNCTION f_test_drop();
-DROP FUNCTION f_test_drop();
-COMMIT;
-
-statement ok
-ROLLBACK;
-
-statement ok
-DROP FUNCTION f_test_drop();
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
-----
-CREATE FUNCTION public.f_test_drop(IN INT8)
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
-----
-CREATE FUNCTION sc1.f_test_drop(IN INT8)
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-
-# Drop with two identical function signatures should be ok. And only first match
-# in path should be drop.
-statement ok
-DROP FUNCTION f_test_drop(INT), f_test_drop(INT);
-
-statement error pgcode 42883 pq: unknown function: public.f_test_drop\(\): function undefined
-SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
-----
-CREATE FUNCTION sc1.f_test_drop(IN INT8)
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-
-statement ok
-DROP FUNCTION f_test_drop(INT);
-
-statement error pgcode 42883 pq: unknown function: sc1.f_test_drop\(\): function undefined
-SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
-
-# If there are identical function signatures in different schemas, multiple drop
-# statements should drop them all. This matches postgres behavior.
-statement ok
-CREATE FUNCTION public.f_test_drop() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
-CREATE FUNCTION sc1.f_test_drop() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
-----
-CREATE FUNCTION public.f_test_drop()
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-
-query T
-SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
-----
-CREATE FUNCTION sc1.f_test_drop()
-  RETURNS INT8
-  VOLATILE
-  NOT LEAKPROOF
-  CALLED ON NULL INPUT
-  LANGUAGE SQL
-  AS $$
-  SELECT 1;
-$$
-
-statement ok;
-BEGIN;
-DROP FUNCTION f_test_drop();
-DROP FUNCTION f_test_drop();
-COMMIT;
-
-statement error pgcode 42883 pq: unknown function: public.f_test_drop\(\): function undefined
-SELECT create_statement FROM [SHOW CREATE FUNCTION public.f_test_drop];
-
-statement error pgcode 42883 pq: unknown function: sc1.f_test_drop\(\): function undefined
-SELECT create_statement FROM [SHOW CREATE FUNCTION sc1.f_test_drop];
-
-statement ok
-SET search_path = public
-
-statement ok
-DROP SCHEMA sc1;
-
-subtest end
-
-
 subtest execute_dropped_function
 
 statement ok
@@ -547,7 +214,7 @@ SELECT f_test_exec_dropped(123);
 statement ok
 DROP FUNCTION f_test_exec_dropped;
 
-statement error pgcode 42883 pq: unknown function: f_test_exec_dropped\(\): function undefined
+statement error pgcode 42883 pq: unknown function: f_test_exec_dropped\(\)
 SELECT f_test_exec_dropped(321);
 
 subtest end
@@ -555,14 +222,14 @@ subtest end
 
 subtest create_or_replace_function
 
-statement error pgcode 42P13 pq: parameter name "a" used more than once
-CREATE FUNCTION f_test_cor(a INT, a INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
-
 statement ok
 CREATE FUNCTION f_test_cor(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF STRICT LANGUAGE SQL AS $$ SELECT 1 $$;
 
 statement error pgcode 42723 pq: function "f_test_cor" already exists with same argument types
 CREATE FUNCTION f_test_cor(a INT, b INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
+
+statement error pgcode 42809 cannot change routine kind\nDETAIL: "f_test_cor" is a function
+CREATE OR REPLACE PROCEDURE f_test_cor(a INT, b INT) LANGUAGE SQL AS $$ SELECT 2 $$;
 
 statement ok
 CREATE OR REPLACE FUNCTION f_test_cor_not_exist(a INT, b INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS $$ SELECT 1 $$;
@@ -579,12 +246,13 @@ CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS INT LEAKPROOF LANGUA
 query T
 SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_cor];
 ----
-CREATE FUNCTION public.f_test_cor(IN a INT8, IN b INT8)
+CREATE FUNCTION public.f_test_cor(a INT8, b INT8)
   RETURNS INT8
   IMMUTABLE
   LEAKPROOF
   STRICT
   LANGUAGE SQL
+  SECURITY INVOKER
   AS $$
   SELECT 1;
 $$
@@ -597,12 +265,13 @@ CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS INT LANGUAGE SQL AS 
 query T
 SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_cor];
 ----
-CREATE FUNCTION public.f_test_cor(IN a INT8, IN b INT8)
+CREATE FUNCTION public.f_test_cor(a INT8, b INT8)
   RETURNS INT8
   VOLATILE
   NOT LEAKPROOF
   CALLED ON NULL INPUT
   LANGUAGE SQL
+  SECURITY INVOKER
   AS $$
   SELECT 2;
 $$
@@ -613,12 +282,13 @@ CREATE OR REPLACE FUNCTION f_test_cor(a INT, b INT) RETURNS INT IMMUTABLE LEAKPR
 query T
 SELECT create_statement FROM [SHOW CREATE FUNCTION f_test_cor];
 ----
-CREATE FUNCTION public.f_test_cor(IN a INT8, IN b INT8)
+CREATE FUNCTION public.f_test_cor(a INT8, b INT8)
   RETURNS INT8
   IMMUTABLE
   LEAKPROOF
   STRICT
   LANGUAGE SQL
+  SECURITY INVOKER
   AS $$
   SELECT 3;
 $$
@@ -999,12 +669,13 @@ $func$
 query T
 SELECT create_statement FROM [SHOW CREATE FUNCTION single_quote]
 ----
-CREATE FUNCTION public.single_quote(IN s STRING)
+CREATE FUNCTION public.single_quote(s STRING)
   RETURNS STRING
   VOLATILE
   NOT LEAKPROOF
   CALLED ON NULL INPUT
   LANGUAGE SQL
+  SECURITY INVOKER
   AS $$
   SELECT (e'\'' || s) || e'\'';
 $$
@@ -1049,7 +720,7 @@ subtest lowercase_hint_error_implicit_schema
 statement ok
 CREATE FUNCTION lowercase_hint_error_implicit_schema_fn() RETURNS INT AS 'SELECT 1' LANGUAGE SQL
 
-statement error function undefined\nHINT: lower-case alternative lowercase_hint_error_implicit_schema_fn exists
+statement error unknown function: LOWERCASE_HINT_ERROR_IMPLICIT_SCHEMA_FN\(\)\nHINT: lower-case alternative lowercase_hint_error_implicit_schema_fn exists
 SELECT "LOWERCASE_HINT_ERROR_IMPLICIT_SCHEMA_FN"();
 
 subtest end
@@ -1059,7 +730,252 @@ subtest lowercase_hint_error_explicit_schema
 statement ok
 CREATE FUNCTION public.lowercase_hint_error_explicit_schema_fn() RETURNS INT AS 'SELECT 1' LANGUAGE SQL
 
-statement error function undefined\nHINT: lower-case alternative public.lowercase_hint_error_explicit_schema_fn exists
+statement error unknown function: public.LOWERCASE_HINT_ERROR_EXPLICIT_SCHEMA_FN\(\)\nHINT: lower-case alternative public.lowercase_hint_error_explicit_schema_fn exists
 SELECT public."LOWERCASE_HINT_ERROR_EXPLICIT_SCHEMA_FN"();
+
+subtest end
+
+# Regression test for #102227 - it should be possible to use a UDF with a
+# composite type parameter after the type is updated.
+subtest udt_parameter
+
+statement ok
+CREATE TYPE amount AS ("value" INT, "currency" STRING, "minor_units" INT)
+
+statement ok
+CREATE TABLE "purchase" (
+    "id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    "amount" amount NOT NULL,
+    "timestamp" TIMESTAMP NOT NULL DEFAULT now()
+)
+
+statement ok
+INSERT INTO "purchase" (amount) VALUES
+    ((1000,  'GBP', 100)),
+    ((10,    'YEN', 1)),
+    ((10000, 'BHD', 1000))
+
+statement ok
+CREATE FUNCTION decimal_amount(a amount) RETURNS DECIMAL(10, 2) IMMUTABLE LANGUAGE SQL AS $$
+    SELECT (a)."value" / (a)."minor_units";
+$$
+
+query RT rowsort
+SELECT
+    decimal_amount(amount) AS amount,
+    (amount).currency
+FROM purchase
+----
+10.00  YEN
+10.00  BHD
+10.00  GBP
+
+statement ok
+UPDATE purchase
+SET amount = ((amount).value, (amount).currency, 10000)
+WHERE (amount).currency = 'BHD'
+
+query RT rowsort
+SELECT
+    decimal_amount(amount) AS amount,
+    (amount).currency
+FROM purchase
+----
+10.00  YEN
+1.00   BHD
+10.00  GBP
+
+subtest regression_113186
+
+statement ok
+CREATE FUNCTION f113186() RETURNS RECORD AS $$ SELECT 1.99; $$ LANGUAGE SQL;
+
+query I
+SELECT * FROM f113186() AS foo(x INT);
+----
+2
+
+# Test type-coercion rules for composite return types.
+subtest return_tuple
+
+statement ok
+CREATE TYPE one_typ AS (x INT);
+CREATE TYPE two_typ AS (x INT, y INT);
+
+# Test a function returning a composite type with one element.
+statement ok
+DROP FUNCTION f;
+CREATE FUNCTION f() RETURNS one_typ LANGUAGE SQL AS $$ SELECT 1; $$;
+
+query T
+SELECT f();
+----
+(1)
+
+query I
+SELECT * FROM f();
+----
+1
+
+statement ok
+DROP FUNCTION f;
+CREATE FUNCTION f() RETURNS one_typ LANGUAGE SQL AS $$ SELECT ROW(1); $$;
+
+query T
+SELECT f();
+----
+(1)
+
+query I
+SELECT * FROM f();
+----
+1
+
+statement ok
+DROP FUNCTION f;
+
+statement error pgcode 42P13 pq: return type mismatch in function declared to return one_typ
+CREATE FUNCTION f() RETURNS one_typ LANGUAGE SQL AS $$ SELECT ROW(ROW(1)); $$;
+
+# Test a function returning a composite type with two elements.
+statement ok
+CREATE FUNCTION f() RETURNS two_typ LANGUAGE SQL AS $$ SELECT 1, 2; $$;
+
+query T
+SELECT f();
+----
+(1,2)
+
+query II
+SELECT * FROM f();
+----
+1  2
+
+statement ok
+DROP FUNCTION f;
+
+statement ok
+CREATE FUNCTION f() RETURNS two_typ LANGUAGE SQL AS $$ SELECT ROW(1, 2); $$;
+
+query T
+SELECT f();
+----
+(1,2)
+
+query II
+SELECT * FROM f();
+----
+1  2
+
+statement ok
+DROP FUNCTION f;
+
+statement error pgcode 42P13 pq: return type mismatch in function declared to return two_typ
+CREATE FUNCTION f() RETURNS two_typ LANGUAGE SQL AS $$ SELECT ROW(ROW(1, 2)); $$;
+
+# Test a function with two OUT-parameters.
+statement ok
+CREATE FUNCTION f(OUT x INT, OUT y INT) LANGUAGE SQL AS $$ SELECT 1, 2; $$;
+
+query T
+SELECT f();
+----
+(1,2)
+
+query II
+SELECT * FROM f();
+----
+1  2
+
+statement ok
+DROP FUNCTION f;
+CREATE FUNCTION f(OUT x INT, OUT y INT) LANGUAGE SQL AS $$ SELECT ROW(1, 2); $$;
+
+query T
+SELECT f();
+----
+(1,2)
+
+query II
+SELECT * FROM f();
+----
+1  2
+
+statement ok
+DROP FUNCTION f;
+
+statement error pgcode 42P13 pq: return type mismatch in function declared to return record
+CREATE FUNCTION f(OUT x INT, OUT y INT) LANGUAGE SQL AS $$ SELECT ROW(ROW(1, 2)); $$;
+
+statement ok
+CREATE FUNCTION f(x ANYELEMENT) RETURNS INT LANGUAGE SQL AS $$ SELECT 1; $$;
+
+statement ok
+SELECT f(0);
+
+statement ok
+SELECT f(0);
+
+statement ok
+DROP FUNCTION f;
+CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE SQL AS $$ SELECT 1; $$;
+
+statement ok
+SELECT f('0');
+
+statement ok
+DROP FUNCTION f;
+CREATE FUNCTION f(x TEXT) RETURNS INT LANGUAGE SQL AS $$ SELECT 1; $$;
+
+statement ok
+SELECT f('0');
+
+statement ok
+DROP FUNCTION f;
+
+# Regression test for #117101 - update the resolved type of a VALUES row with a
+# UDF after the UDF is built.
+subtest regression_117101
+
+statement ok
+CREATE FUNCTION f117101() RETURNS RECORD CALLED ON NULL INPUT AS $funcbody$
+  SELECT ((42)::INT8, (43)::INT8)
+$funcbody$ LANGUAGE SQL;
+
+statement error pgcode 42804 pq: VALUES types tuple{int, int} and tuple{tuple{string, int}, unknown} cannot be matched
+SELECT
+  *
+FROM
+(
+  VALUES
+    (
+     (('aloha'::TEXT,
+     (44)::INT8), NULL)
+    ),
+    (COALESCE(f117101(), NULL))
+);
+
+subtest end
+
+# Regression test for #137968 - do not incorrectly modify the resolved type of
+# an expression that already found a non-wildcard type.
+subtest regression_137968
+
+statement ok
+SELECT
+	tab_18298.col_30903
+FROM
+	(
+		VALUES
+			(
+				('-26 years -422 days -21:13:57.660026':::INTERVAL::INTERVAL + now():::TIMESTAMP::TIMESTAMP::TIMESTAMP)::TIMESTAMP
+			),
+			(NULL)
+	)
+		AS tab_18298 (col_30903)
+ORDER BY
+	tab_18298.col_30903 ASC
+LIMIT
+	3:::INT8;
 
 subtest end

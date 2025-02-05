@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cloud
 
@@ -129,8 +124,20 @@ func TestResumingReader(t *testing.T) {
 					}
 
 					reader := NewResumingReader(ctx, rfWithErr.newReaderAt, nil, 0, 0, "", tc.retryOnErrFn, nil)
-					actualData, err := ioctx.ReadAll(ctx, reader)
-
+					var actualData []byte
+					buf := make([]byte, 8)
+					var err error
+					for {
+						var n int
+						n, err = reader.Read(ctx, buf)
+						if err != nil {
+							break
+						}
+						actualData = append(actualData, buf[:n]...)
+					}
+					if err == io.EOF {
+						err = nil
+					}
 					if retriable {
 						require.NoError(t, err)
 						require.Equal(t, "hello world", string(actualData))

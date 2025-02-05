@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -38,7 +33,7 @@ func declareKeysRecomputeStats(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
+) error {
 	// We don't declare any user key in the range. This is OK since all we're doing is computing a
 	// stats delta, and applying this delta commutes with other operations on the same key space.
 	//
@@ -58,7 +53,13 @@ func declareKeysRecomputeStats(
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(rdKey, uuid.Nil)})
 	// Disable the assertions which check that all reads were previously declared.
 	latchSpans.DisableUndeclaredAccessAssertions()
+	return nil
 }
+
+// RecomputeStatsMismatchError indicates that the start key provided in the
+// request arguments doesn't match the start key of the range descriptor. This
+// can happen when a concurrent merge subsumed this range into another one.
+var RecomputeStatsMismatchError = errors.New("descriptor mismatch; range likely merged")
 
 // RecomputeStats recomputes the MVCCStats stored for this range and adjust them accordingly,
 // returning the MVCCStats delta obtained in the process.
@@ -68,13 +69,13 @@ func RecomputeStats(
 	desc := cArgs.EvalCtx.Desc()
 	args := cArgs.Args.(*kvpb.RecomputeStatsRequest)
 	if !desc.StartKey.AsRawKey().Equal(args.Key) {
-		return result.Result{}, errors.New("descriptor mismatch; range likely merged")
+		return result.Result{}, RecomputeStatsMismatchError
 	}
 	dryRun := args.DryRun
 
 	args = nil // avoid accidental use below
 
-	actualMS, err := rditer.ComputeStatsForRange(desc, reader, cArgs.Header.Timestamp.WallTime)
+	actualMS, err := rditer.ComputeStatsForRange(ctx, desc, reader, cArgs.Header.Timestamp.WallTime)
 	if err != nil {
 		return result.Result{}, err
 	}

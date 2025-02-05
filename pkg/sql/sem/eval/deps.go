@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package eval
 
@@ -21,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -32,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
+	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 )
 
@@ -128,12 +123,14 @@ type CatalogBuiltins interface {
 	// puts it into a catalog.DescriptorBuilder,
 	// calls RunPostDeserializationChanges,
 	// calls StripDanglingBackReferences,
+	// calls StripNonExistentRoles,
 	// and re-encodes it.
 	RepairedDescriptor(
 		ctx context.Context,
 		encodedDescriptor []byte,
 		descIDMightExist func(id descpb.ID) bool,
 		nonTerminalJobIDMightExist func(id jobspb.JobID) bool,
+		roleExists func(username username.SQLUsername) bool,
 	) ([]byte, error)
 }
 
@@ -166,7 +163,7 @@ type HasPrivilegeSpecifier struct {
 	ColumnName   *tree.Name
 	ColumnAttNum *uint32
 
-	// Function privilege
+	// Routine privilege
 	// This needs to be a user-defined function OID. Builtin function OIDs won't
 	// work since they're not descriptors based.
 	FunctionOID *oid.Oid
@@ -216,7 +213,7 @@ type Planner interface {
 	// GetTypeFromValidSQLSyntax parses a column type when the input
 	// string uses the parseable SQL representation of a type name, e.g.
 	// `INT(13)`, `mytype`, `"mytype"`, `pg_catalog.int4` or `"public".mytype`.
-	GetTypeFromValidSQLSyntax(sql string) (*types.T, error)
+	GetTypeFromValidSQLSyntax(ctx context.Context, sql string) (*types.T, error)
 
 	// EvalSubquery returns the Datum for the given subquery node.
 	EvalSubquery(expr *tree.Subquery) (tree.Datum, error)
@@ -232,6 +229,13 @@ type Planner interface {
 	RoutineExprGenerator(
 		ctx context.Context, expr *tree.RoutineExpr, args tree.Datums,
 	) ValueGenerator
+
+	// EvalTxnControlExpr produces the side effects of a COMMIT or ROLLBACK
+	// statement within a PL/pgSQL stored procedure. See the sql.planner
+	// implementation for details.
+	EvalTxnControlExpr(
+		ctx context.Context, expr *tree.TxnControlExpr, args tree.Datums,
+	) (tree.Datum, error)
 
 	// GenerateTestObjects is used to generate a large number of
 	// objets quickly.
@@ -299,7 +303,7 @@ type Planner interface {
 	ExternalWriteFile(ctx context.Context, uri string, content []byte) error
 
 	// DecodeGist exposes gist functionality to the builtin functions.
-	DecodeGist(gist string, external bool) ([]string, error)
+	DecodeGist(ctx context.Context, gist string, external bool) ([]string, error)
 
 	// SerializeSessionState serializes the variables in the current session
 	// and returns a state, in bytes form.
@@ -348,17 +352,18 @@ type Planner interface {
 	// it is invalid.
 	RepairTTLScheduledJobForTable(ctx context.Context, tableID int64) error
 
+	// FingerprintSpan calculates a fingerprint for the given span. If a
+	// startTime is passed and allRevisions is true, then the fingerprint
+	// includes the MVCC history between startTime and the read timestamp of
+	// the transaction.
+	FingerprintSpan(ctx context.Context, span roachpb.Span, startTime hlc.Timestamp, allRevisions bool, stripped bool) (uint64, error)
+
 	// QueryRowEx executes the supplied SQL statement and returns a single row, or
 	// nil if no row is found, or an error if more that one row is returned.
 	//
 	// The fields set in session that are set override the respective fields if
 	// they have previously been set through SetSessionData().
-	QueryRowEx(
-		ctx context.Context,
-		opName string,
-		override sessiondata.InternalExecutorOverride,
-		stmt string,
-		qargs ...interface{}) (tree.Datums, error)
+	QueryRowEx(ctx context.Context, opName redact.RedactableString, override sessiondata.InternalExecutorOverride, stmt string, qargs ...interface{}) (tree.Datums, error)
 
 	// QueryIteratorEx executes the query, returning an iterator that can be used
 	// to get the results. If the call is successful, the returned iterator
@@ -366,7 +371,7 @@ type Planner interface {
 	//
 	// The fields set in session that are set override the respective fields if they
 	// have previously been set through SetSessionData().
-	QueryIteratorEx(ctx context.Context, opName string, override sessiondata.InternalExecutorOverride, stmt string, qargs ...interface{}) (InternalRows, error)
+	QueryIteratorEx(ctx context.Context, opName redact.RedactableString, override sessiondata.InternalExecutorOverride, stmt string, qargs ...interface{}) (InternalRows, error)
 
 	// IsActive returns if the version specified by key is active.
 	IsActive(ctx context.Context, key clusterversion.Key) bool
@@ -404,6 +409,45 @@ type Planner interface {
 
 	// Optimizer returns the optimizer associated with this Planner, if any.
 	Optimizer() interface{}
+
+	// GenUniqueCursorName returns a name that is guaranteed to be unique among
+	// the current list of cursors and portals. It is used to implement PLpgSQL
+	// OPEN statements when used with an unnamed cursor.
+	GenUniqueCursorName() tree.Name
+
+	// PLpgSQLCloseCursor closes the cursor with the given name, returning an
+	// error if the cursor doesn't exist. It is used to implement the PLpgSQL
+	// CLOSE statement.
+	PLpgSQLCloseCursor(cursorName tree.Name) error
+
+	// PLpgSQLFetchCursor returns the next row from the cursor with the given
+	// name, if any. It returns nil if no such row exists. Used to implement the
+	// PLpgSQL FETCH statement.
+	PLpgSQLFetchCursor(ctx context.Context, cursor *tree.CursorStmt) (res tree.Datums, err error)
+
+	// AutoCommit indicates whether the Planner has flagged the current statement
+	// as eligible for transaction auto-commit.
+	AutoCommit() bool
+
+	// StartHistoryRetentionJob creates a cluster-level protected timestamp
+	// and a job that owns it.
+	StartHistoryRetentionJob(ctx context.Context, desc string, protectTS hlc.Timestamp, expiration time.Duration) (jobspb.JobID, error)
+
+	// ExtendHistoryRetention extends the lifetime of a a cluster-level
+	// protected timestamp.
+	ExtendHistoryRetention(ctx context.Context, id jobspb.JobID) error
+
+	// InsertTemporarySchema inserts a temporary schema into the current session
+	// data.
+	InsertTemporarySchema(
+		tempSchemaName string, databaseID descpb.ID, schemaID descpb.ID,
+	)
+
+	// ClearQueryPlanCache removes all entries from the node's query plan cache.
+	ClearQueryPlanCache()
+
+	// ClearTableStatsCache removes all entries from the node's table stats cache.
+	ClearTableStatsCache()
 }
 
 // InternalRows is an iterator interface that's exposed by the internal
@@ -473,19 +517,16 @@ type SessionAccessor interface {
 	// GetSessionVar retrieves the current value of a session variable.
 	GetSessionVar(ctx context.Context, settingName string, missingOk bool) (bool, string, error)
 
-	// HasAdminRole returns true iff the current session user has the admin role.
-	HasAdminRole(ctx context.Context) (bool, error)
-
-	// HasRoleOption returns nil iff the current session user has the specified
-	// role option.
-	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
+	// HasGlobalPrivilegeOrRoleOption checks if the current user has the
+	// given global privilege, or the equivalent role option if one exists.
+	HasGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) (bool, error)
 
 	// CheckPrivilege verifies that the current user has `privilege` on `descriptor`.
 	CheckPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind) error
 
 	// HasViewActivityOrViewActivityRedactedRole returns true iff the current session user has the
 	// VIEWACTIVITY or VIEWACTIVITYREDACTED permission.
-	HasViewActivityOrViewActivityRedactedRole(ctx context.Context) (bool, error)
+	HasViewActivityOrViewActivityRedactedRole(ctx context.Context) (bool, bool, error)
 }
 
 // PreparedStatementState is a limited interface that exposes metadata about
@@ -519,9 +560,13 @@ type ClientNoticeSender interface {
 // for its own evaluation to a parent routine. This is used to defer execution
 // for tail-call optimization. It can only be used during local execution.
 type DeferredRoutineSender interface {
+	// CanOptimizeTailCall determines whether a nested routine in tail-call
+	// position can be executed in its parent's context.
+	CanOptimizeTailCall(nestedRoutine *tree.RoutineExpr) bool
+
 	// SendDeferredRoutine sends a local nested routine and its arguments to its
 	// parent routine.
-	SendDeferredRoutine(expr *tree.RoutineExpr, args tree.Datums)
+	SendDeferredRoutine(nestedRoutine *tree.RoutineExpr, args tree.Datums)
 }
 
 // PrivilegedAccessor gives access to certain queries that would otherwise
@@ -562,7 +607,7 @@ type RegionOperator interface {
 
 	// ResetMultiRegionZoneConfigsForTable resets the given table's zone
 	// configuration to its multi-region default.
-	ResetMultiRegionZoneConfigsForTable(ctx context.Context, id int64) error
+	ResetMultiRegionZoneConfigsForTable(ctx context.Context, id int64, forceZoneSurvival bool) error
 
 	// ResetMultiRegionZoneConfigsForDatabase resets the given database's zone
 	// configuration to its multi-region default.
@@ -609,7 +654,10 @@ type ChangefeedState interface {
 	SetHighwater(frontier hlc.Timestamp)
 
 	// SetCheckpoint sets the checkpoint for the changefeed.
-	SetCheckpoint(spans []roachpb.Span, timestamp hlc.Timestamp)
+	SetCheckpoint(
+		//lint:ignore SA1019 deprecated usage
+		checkpoint jobspb.ChangefeedProgress_Checkpoint,
+	)
 }
 
 // TenantOperator is capable of interacting with tenant state, allowing SQL
@@ -624,11 +672,6 @@ type TenantOperator interface {
 	// the gc job will not wait for a GC ttl.
 	DropTenantByID(ctx context.Context, tenantID uint64, synchronous, ignoreServiceMode bool) error
 
-	// GCTenant attempts to garbage collect a DROP tenant from the system. Upon
-	// success it also removes the tenant record.
-	// It returns an error if the tenant does not exist.
-	GCTenant(ctx context.Context, tenantID uint64) error
-
 	// LookupTenantID returns the ID for the given tenant name.o
 	LookupTenantID(ctx context.Context, tenantName roachpb.TenantName) (roachpb.TenantID, error)
 
@@ -637,11 +680,9 @@ type TenantOperator interface {
 	UpdateTenantResourceLimits(
 		ctx context.Context,
 		tenantID uint64,
-		availableRU float64,
+		availableTokens float64,
 		refillRate float64,
-		maxBurstRU float64,
-		asOf time.Time,
-		asOfConsumedRequestUnits float64,
+		maxBurstTokens float64,
 	) error
 }
 
@@ -670,6 +711,7 @@ type GossipOperator interface {
 type SQLStatsController interface {
 	ResetClusterSQLStats(ctx context.Context) error
 	ResetActivityTables(ctx context.Context) error
+	ResetInsightsTables(ctx context.Context) error
 	CreateSQLStatsCompactionSchedule(ctx context.Context) error
 }
 
@@ -698,6 +740,7 @@ type StmtDiagnosticsRequestInsertFunc func(
 	samplingProbability float64,
 	minExecutionLatency time.Duration,
 	expiresAfter time.Duration,
+	redacted bool,
 ) error
 
 // AsOfSystemTime represents the result from the evaluation of AS OF SYSTEM TIME

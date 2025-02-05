@@ -311,3 +311,76 @@ query T
 SELECT t FROM t89609@idx WHERE t::STRING % 'aab';
 ----
 aaaaaa
+
+subtest end
+
+# Regression test for issue #112713
+subtest 112713
+
+statement ok
+CREATE TABLE t_112713 (i INT PRIMARY KEY, t STRING, FAMILY (i, t));
+
+statement ok
+CREATE INVERTED INDEX ON t_112713 (t gin_trgm_ops);
+
+query T
+SELECT create_statement FROM [SHOW CREATE TABLE t_112713];
+----
+CREATE TABLE public.t_112713 (
+    i INT8 NOT NULL,
+    t STRING NULL,
+    CONSTRAINT t_112713_pkey PRIMARY KEY (i ASC),
+    INVERTED INDEX t_112713_t_idx (t gin_trgm_ops),
+    FAMILY fam_0_i_t (i, t)
+)
+
+subtest end
+
+# Regression test for hitting an internal error on string-like datums (e.g NAME).
+statement ok
+CREATE TABLE t117758 (
+  col1 VARCHAR NOT NULL,
+  col2 NAME NOT NULL,
+  INVERTED INDEX (col2 gin_trgm_ops)
+);
+SELECT
+    tab.col1_1
+FROM
+    t117758 AS tab2
+    JOIN (
+            SELECT
+                'foo'::NAME, 'bar'::NAME
+            FROM
+                t117758 AS tab3
+                JOIN t117758 AS tab4 ON
+                        (tab3.col2) = (tab4.col2)
+        )
+            AS tab (col1_1, col1_2) ON
+            (tab2.col1) = (tab.col1_1)
+            AND (tab2.col2) = (tab.col1_2);
+
+subtest trigram_similarity_zero_threshold_inverted_index
+
+statement ok
+SET pg_trgm.similarity_threshold =  0;
+
+statement ok
+CREATE TABLE trigram_similarity_zero_threshold_inverted_index_a (
+  a INT PRIMARY KEY,
+  b STRING,
+  INVERTED INDEX c (b gin_trgm_ops)
+);
+
+statement ok
+SET optimizer_use_trigram_similarity_optimization = false;
+
+statement error pq: index "c" is inverted and cannot be used for this query
+SELECT * FROM trigram_similarity_zero_threshold_inverted_index_a@c WHERE b % 'foo';
+
+statement ok
+SET optimizer_use_trigram_similarity_optimization = true;
+
+statement error pq: index "c" is inverted and cannot be used for this query
+SELECT * FROM trigram_similarity_zero_threshold_inverted_index_a@c WHERE b % 'foo';
+
+subtest end

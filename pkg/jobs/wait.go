@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -17,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -114,10 +110,17 @@ func (r *Registry) waitForJobsToBeTerminalOrPaused(
 			ctx,
 			"poll-show-jobs",
 			nil, /* txn */
-			sessiondata.RootUserSessionDataOverride,
+			sessiondata.NodeUserSessionDataOverride,
 			query,
 		)
 		if err != nil {
+			// While polling, we could encounter retryable errors, which may
+			// not get internally retried in the connection executor. So retry,
+			// here. When querying for jobs we will restart with a new transaction,
+			// which will hopefully not hit this retryable error.
+			if errors.HasInterface(err, (*pgerror.ClientVisibleRetryError)(nil)) {
+				continue
+			}
 			return errors.Wrap(err, "polling for queued jobs to complete")
 		}
 		if row == nil {

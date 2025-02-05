@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This file lives here instead of sql/distsql to avoid an import cycle.
 
@@ -22,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -116,6 +112,9 @@ type ServerConfig struct {
 	// used during restore.
 	RestoreMonitor *mon.BytesMonitor
 
+	// ChangefeedMonitor is the parent monitor for all CDC DistSQL flows.
+	ChangefeedMonitor *mon.BytesMonitor
+
 	// BulkSenderLimiter is the concurrency limiter that is shared across all of
 	// the processes in a given sql server when sending bulk ingest (AddSST) reqs.
 	BulkSenderLimiter limit.ConcurrentRequestLimiter
@@ -130,6 +129,7 @@ type ServerConfig struct {
 	Metrics            *DistSQLMetrics
 	RowMetrics         *rowinfra.Metrics
 	InternalRowMetrics *rowinfra.Metrics
+	KVStreamerMetrics  *kvstreamer.Metrics
 
 	// SQLLivenessReader provides access to reading the liveness of sessions.
 	SQLLivenessReader sqlliveness.Reader
@@ -145,8 +145,8 @@ type ServerConfig struct {
 	// draining state.
 	Gossip gossip.OptionalGossip
 
-	// Dialer for communication between SQL nodes/pods.
-	PodNodeDialer *nodedialer.Dialer
+	// Dialer for communication between SQL instances.
+	SQLInstanceDialer *nodedialer.Dialer
 
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
@@ -319,6 +319,11 @@ type TestingKnobs struct {
 	// run. The associated transaction ID of the statement performing the cascade
 	// or check query is passed in as an argument.
 	RunBeforeCascadesAndChecks func(txnID uuid.UUID)
+
+	// MinimumNumberOfGatewayPartitions is the minimum number of partitions that
+	// will be assigned to the gateway before we start assigning partitions to
+	// other nodes.
+	MinimumNumberOfGatewayPartitions int
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

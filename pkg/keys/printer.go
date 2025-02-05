@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keys
 
@@ -107,6 +102,10 @@ var (
 		psFunc func(rangeID roachpb.RangeID, input string) (string, roachpb.Key)
 	}{
 		{name: "AbortSpan", suffix: LocalAbortSpanSuffix, ppFunc: abortSpanKeyPrint, psFunc: abortSpanKeyParse},
+		{name: "ReplicatedSharedLocksTransactionLatch",
+			suffix: LocalReplicatedSharedLocksTransactionLatchingKeySuffix,
+			ppFunc: replicatedSharedLocksTransactionLatchingKeyPrint,
+		},
 		{name: "RangeTombstone", suffix: LocalRangeTombstoneSuffix},
 		{name: "RaftHardState", suffix: LocalRaftHardStateSuffix},
 		{name: "RangeAppliedState", suffix: LocalRangeAppliedStateSuffix},
@@ -518,7 +517,6 @@ func localRangeLockTablePrint(
 		buf.Printf("/\"%x\"", key)
 		return
 	}
-	buf.Print(redact.Safe("/Intent"))
 	key = key[len(LockTableSingleKeyInfix):]
 	b, lockedKey, err := encoding.DecodeBytesAscending(key, nil)
 	if err != nil || len(b) != 0 {
@@ -553,6 +551,22 @@ func abortSpanKeyParse(rangeID roachpb.RangeID, input string) (string, roachpb.K
 }
 
 func abortSpanKeyPrint(buf *redact.StringBuilder, key roachpb.Key) {
+	_, id, err := encoding.DecodeBytesAscending([]byte(key), nil)
+	if err != nil {
+		buf.Printf("/%q/err:%v", key, err)
+		return
+	}
+
+	txnID, err := uuid.FromBytes(id)
+	if err != nil {
+		buf.Printf("/%q/err:%v", key, err)
+		return
+	}
+
+	buf.Printf("/%q", txnID)
+}
+
+func replicatedSharedLocksTransactionLatchingKeyPrint(buf *redact.StringBuilder, key roachpb.Key) {
 	_, id, err := encoding.DecodeBytesAscending([]byte(key), nil)
 	if err != nil {
 		buf.Printf("/%q/err:%v", key, err)

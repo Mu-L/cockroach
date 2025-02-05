@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 package storage
 
 import (
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
@@ -48,17 +44,17 @@ func TestBallastSizeBytes(t *testing.T) {
 			want:       256 << 20, // 256 MiB
 		},
 		{
-			StoreSpec:  base.StoreSpec{BallastSize: &base.SizeSpec{InBytes: 1 << 30 /* 1 GiB */}},
+			StoreSpec:  base.StoreSpec{BallastSize: &storagepb.SizeSpec{Capacity: 1 << 30 /* 1 GiB */}},
 			totalBytes: 25 << 30, // 25 GiB
 			want:       1 << 30,  // 1 GiB
 		},
 		{
-			StoreSpec:  base.StoreSpec{BallastSize: &base.SizeSpec{Percent: 20}},
+			StoreSpec:  base.StoreSpec{BallastSize: &storagepb.SizeSpec{Percent: 20}},
 			totalBytes: 25 << 30, // 25 GiB
 			want:       5 << 30,  // 5 GiB
 		},
 		{
-			StoreSpec:  base.StoreSpec{BallastSize: &base.SizeSpec{Percent: 20}},
+			StoreSpec:  base.StoreSpec{BallastSize: &storagepb.SizeSpec{Percent: 20}},
 			totalBytes: 500 << 30, // 500 GiB
 			want:       100 << 30, // 100 GiB
 		},
@@ -129,7 +125,7 @@ func TestIsDiskFull(t *testing.T) {
 	})
 	t.Run("truncating ballast frees enough space", func(t *testing.T) {
 		spec := base.StoreSpec{
-			BallastSize: &base.SizeSpec{InBytes: 1024},
+			BallastSize: &storagepb.SizeSpec{Capacity: 1024},
 		}
 		// Provide two disk usages. The second one will be returned
 		// post-truncation.
@@ -148,7 +144,7 @@ func TestIsDiskFull(t *testing.T) {
 	})
 	t.Run("configured ballast, plenty of space", func(t *testing.T) {
 		spec := base.StoreSpec{
-			BallastSize: &base.SizeSpec{InBytes: 5 << 30 /* 5 GiB */},
+			BallastSize: &storagepb.SizeSpec{Capacity: 5 << 30 /* 5 GiB */},
 		}
 		fs, cleanup := setup(t, &spec, 0 /* ballastSize */, vfs.DiskUsage{
 			AvailBytes: 25 << 30,  // 25 GiB

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlshell
 
@@ -276,7 +271,7 @@ func (c *cliState) printCliHelp() {
 	fmt.Fprintf(c.iCtx.stdout, helpMessageFmt,
 		demoHelpStr,
 		docs.URL("sql-statements.html"),
-		docs.URL("use-the-built-in-sql-client.html"),
+		docs.URL("cockroach-sql.html"),
 	)
 	fmt.Fprintln(c.iCtx.stdout)
 }
@@ -945,24 +940,6 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 			dbName = c.refreshDatabaseName()
 		}
 
-		// Do we have a "cluster" option; either as an options= parameter
-		// or as a prefix to the database name?
-		opts := parsedURL.GetExtraOptions()
-		var logicalCluster string
-		if extOptsS := opts.Get("options"); extOptsS != "" {
-			extOpts, err := pgurl.ParseExtendedOptions(extOptsS)
-			if err == nil {
-				logicalCluster = extOpts.Get("cluster")
-			}
-		}
-		if urlDB := parsedURL.GetDatabase(); strings.HasPrefix(urlDB, "cluster:") {
-			parts := strings.SplitN(urlDB, "/", 2)
-			logicalCluster = parts[0][len("cluster:"):]
-		}
-		if logicalCluster != "" {
-			logicalCluster += "/"
-		}
-
 		c.fullPrompt = rePromptFmt.ReplaceAllStringFunc(c.iCtx.customPromptPattern, func(m string) string {
 			// See:
 			// https://www.postgresql.org/docs/15/app-psql.html#APP-PSQL-PROMPTING
@@ -1029,6 +1006,10 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 
 			case "%C":
 				// CockroachDB extension: the logical cluster name.
+				logicalCluster := c.conn.GetServerInfo().VirtualClusterName
+				if logicalCluster != "" {
+					logicalCluster += "/"
+				}
 				return logicalCluster
 
 			default:
@@ -1286,6 +1267,8 @@ func (c *cliState) doProcessFirstLine(startState, nextState cliStateEnum) cliSta
 		return startState
 
 	case "exit", "quit":
+		// When explicitly exiting, clear exitErr.
+		c.exitErr = nil
 		return cliStop
 	}
 
@@ -1406,6 +1389,10 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	// to handle it as a statement, so save the history.
 	c.addHistory(c.lastInputLine)
 
+	if c.sqlCtx.DemoCluster != nil {
+		c.lastInputLine = c.sqlCtx.DemoCluster.ExpandShortDemoURLs(c.lastInputLine)
+	}
+
 	// As a convenience to the user, we strip the final semicolon, if
 	// any, in all cases.
 	line := strings.TrimRight(c.lastInputLine, "; ")
@@ -1427,6 +1414,8 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 
 	switch cmd[0] {
 	case `\q`, `\quit`, `\exit`:
+		// When explicitly exiting, clear exitErr.
+		c.exitErr = nil
 		return cliStop
 
 	case `\`, `\?`, `\help`:
@@ -1992,6 +1981,10 @@ func (c *cliState) doPrepareStatementLine(
 	// Complete input. Remember it in the history.
 	if !c.inCopy() {
 		c.addHistory(c.concatLines)
+	}
+
+	if c.sqlCtx.DemoCluster != nil {
+		c.concatLines = c.sqlCtx.DemoCluster.ExpandShortDemoURLs(c.concatLines)
 	}
 
 	if !c.iCtx.checkSyntax {

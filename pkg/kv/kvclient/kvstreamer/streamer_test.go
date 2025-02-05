@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvstreamer_test
 
@@ -15,6 +10,9 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -27,8 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -39,24 +39,38 @@ import (
 )
 
 func getStreamer(
-	ctx context.Context, s serverutils.TestServerInterface, limitBytes int64, acc *mon.BoundAccount,
+	ctx context.Context,
+	s serverutils.ApplicationLayerInterface,
+	limitBytes int64,
+	acc *mon.BoundAccount,
 ) *kvstreamer.Streamer {
-	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
+	rootTxn := kv.NewTxn(ctx, s.DB(), s.DistSQLPlanningNodeID())
 	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
 	if err != nil {
 		panic(err)
 	}
+	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.DistSQLPlanningNodeID(), leafInputState)
+	metrics := kvstreamer.MakeMetrics()
 	return kvstreamer.NewStreamer(
 		s.DistSenderI().(*kvcoord.DistSender),
-		s.Stopper(),
-		kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState),
+		&metrics,
+		s.AppStopper(),
+		leafTxn,
+		func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
+			res, err := leafTxn.Send(ctx, ba)
+			if err != nil {
+				return nil, err.GoError()
+			}
+			return res, nil
+		},
 		cluster.MakeTestingClusterSettings(),
+		nil, /* sd */
 		lock.WaitPolicy(0),
 		limitBytes,
 		acc,
 		nil, /* kvPairsRead */
-		nil, /* batchRequestsIssued */
 		lock.None,
+		lock.Unreplicated,
 	)
 }
 
@@ -67,11 +81,13 @@ func TestStreamerLimitations(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
 
 	getStreamer := func() *kvstreamer.Streamer {
-		return getStreamer(ctx, s, math.MaxInt64, nil /* acc */)
+		return getStreamer(ctx, s, math.MaxInt64, mon.NewStandaloneUnlimitedAccount())
 	}
 
 	t.Run("non-unique requests unsupported", func(t *testing.T) {
@@ -85,7 +101,8 @@ func TestStreamerLimitations(t *testing.T) {
 		streamer := getStreamer()
 		defer streamer.Close(ctx)
 		streamer.Init(kvstreamer.OutOfOrder, kvstreamer.Hints{UniqueRequests: true}, 1 /* maxKeysPerRow */, nil /* diskBuffer */)
-		get := kvpb.NewGet(roachpb.Key("key"), false /* forUpdate */)
+		k := append(s.Codec().TenantPrefix(), roachpb.Key("key")...)
+		get := kvpb.NewGet(k)
 		reqs := []kvpb.RequestUnion{{
 			Value: &kvpb.RequestUnion_Get{
 				Get: get.(*kvpb.GetRequest),
@@ -98,18 +115,22 @@ func TestStreamerLimitations(t *testing.T) {
 	})
 
 	t.Run("unexpected RootTxn", func(t *testing.T) {
+		metrics := kvstreamer.MakeMetrics()
 		require.Panics(t, func() {
 			kvstreamer.NewStreamer(
 				s.DistSenderI().(*kvcoord.DistSender),
-				s.Stopper(),
-				kv.NewTxn(ctx, s.DB(), s.NodeID()),
+				&metrics,
+				s.AppStopper(),
+				kv.NewTxn(ctx, s.DB(), s.DistSQLPlanningNodeID()),
+				nil, /* sendFn */
 				cluster.MakeTestingClusterSettings(),
+				nil, /* sd */
 				lock.WaitPolicy(0),
 				math.MaxInt64, /* limitBytes */
 				nil,           /* acc */
 				nil,           /* kvPairsRead */
-				nil,           /* batchRequestsIssued */
 				lock.None,
+				lock.Unreplicated,
 			)
 		})
 	})
@@ -133,9 +154,12 @@ func TestStreamerBudgetErrorInEnqueue(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-	codec := s.ApplicationLayer().Codec()
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
+	codec := s.Codec()
 
 	// Create a dummy table for which we know the encoding of valid keys.
 	_, err := db.Exec("CREATE TABLE foo (pk_blob STRING PRIMARY KEY, attribute INT, blob TEXT, INDEX(attribute))")
@@ -168,15 +192,10 @@ func TestStreamerBudgetErrorInEnqueue(t *testing.T) {
 
 	// Imitate a root SQL memory monitor with 1MiB size.
 	const rootPoolSize = 1 << 20 /* 1MiB */
-	rootMemMonitor := mon.NewMonitor(
-		"root", /* name */
-		mon.MemoryResource,
-		nil,           /* curCount */
-		nil,           /* maxHist */
-		-1,            /* increment */
-		math.MaxInt64, /* noteworthy */
-		cluster.MakeTestingClusterSettings(),
-	)
+	rootMemMonitor := mon.NewMonitor(mon.Options{
+		Name:     mon.MakeMonitorName("root"),
+		Settings: cluster.MakeTestingClusterSettings(),
+	})
 	rootMemMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(rootPoolSize))
 	defer rootMemMonitor.Stop(ctx)
 
@@ -237,9 +256,7 @@ func TestStreamerCorrectlyDiscardsResponses(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		SQLMemoryPoolSize: 1 << 30, /* 1GiB */
 	})
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &s.ApplicationLayer().ClusterSettings().SV, true)
+	defer s.Stopper().Stop(context.Background())
 
 	// The initial estimate for TargetBytes argument for each asynchronous
 	// request by the Streamer will be numRowsPerRange x InitialAvgResponseSize,
@@ -302,9 +319,7 @@ func TestStreamerWideRows(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		SQLMemoryPoolSize: 1 << 30, /* 1GiB */
 	})
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &s.ApplicationLayer().ClusterSettings().SV, true)
+	defer s.Stopper().Stop(context.Background())
 
 	const blobSize = 10 * kvstreamer.InitialAvgResponseSize
 	const numRows = 2
@@ -400,15 +415,14 @@ func TestStreamerEmptyScans(t *testing.T) {
 	// Start a cluster with large --max-sql-memory parameter so that the
 	// Streamer isn't hitting the root budget exceeded error.
 	const rootPoolSize = 1 << 30 /* 1GiB */
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		SQLMemoryPoolSize: rootPoolSize,
 	})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
 
-	ts := s.ApplicationLayer()
+	ts := srv.ApplicationLayer()
 	codec := ts.Codec()
-	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &ts.ClusterSettings().SV, true)
 
 	// Create a dummy table for which we know the encoding of valid keys.
 	// Although not strictly necessary, we set up two column families since with
@@ -429,7 +443,7 @@ func TestStreamerEmptyScans(t *testing.T) {
 	require.NoError(t, err)
 
 	getStreamer := func() *kvstreamer.Streamer {
-		s := getStreamer(ctx, s, math.MaxInt64, nil /* acc */)
+		s := getStreamer(ctx, ts, math.MaxInt64, mon.NewStandaloneUnlimitedAccount())
 		// There are two column families in the table.
 		s.Init(kvstreamer.OutOfOrder, kvstreamer.Hints{UniqueRequests: true}, 2 /* maxKeysPerRow */, nil /* diskBuffer */)
 		return s
@@ -478,9 +492,7 @@ func TestStreamerMultiRangeScan(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
-	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &s.ApplicationLayer().ClusterSettings().SV, true)
+	defer s.Stopper().Stop(context.Background())
 
 	rng, _ := randutil.NewTestRand()
 	numRows := rng.Intn(100) + 2
@@ -538,4 +550,138 @@ func TestStreamerMultiRangeScan(t *testing.T) {
 	}
 	expected += "}"
 	require.Equal(t, expected, result)
+}
+
+// TestStreamerVaryingResponseSizes verifies that the Streamer handles the
+// responses of vastly variable sizes reasonably well. It is a regression test
+// for #113729.
+func TestStreamerVaryingResponseSizes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderDuress(t)
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLEvalContext: &eval.TestingKnobs{
+				// We disable the randomization of some batch sizes because with
+				// some low values the test takes much longer.
+				ForceProductionValues: true,
+			},
+		},
+		// Disable tenant randomization since this test is quite heavy and could
+		// result in a timeout under shared-process tenant.
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer s.Stopper().Stop(context.Background())
+
+	runner := sqlutils.MakeSQLRunner(db)
+	// Create a table with 10 ranges, with 3k rows in each. Within each range,
+	// first 1k rows are relatively small, then next 1k rows are medium, and
+	// the last 1k rows are large.
+	runner.Exec(t, `
+CREATE TABLE t (
+	k INT PRIMARY KEY,
+	v STRING,
+	blob STRING,
+	INDEX t_v_idx (v ASC)
+);
+
+INSERT INTO t SELECT 3000 * (i // 1000) + i % 1000, '1', repeat('a', 600 + i % 200) FROM generate_series(1, 10000) AS g(i);
+INSERT INTO t SELECT 3000 * (i // 1000) + i % 1000 + 1000, '1', repeat('a', 3000 + i % 1000) FROM generate_series(1, 10000) AS g(i);
+INSERT INTO t SELECT 3000 * (i // 1000) + i % 1000 + 2000, '1', repeat('a', 20000 + i) FROM generate_series(1, 10000) AS g(i);
+
+ALTER TABLE t SPLIT AT SELECT generate_series(1, 30000, 3000);
+`)
+
+	// The meat of the test - run the query that performs an index join to fetch
+	// all rows via the streamer, both in the OutOfOrder and InOrder modes. Each
+	// time assert that the number of BatchRequests issued is in double digits
+	// (if not, then the streamer was extremely suboptimal).
+	kvGRPCCallsRegex := regexp.MustCompile(`KV gRPC calls: ([\d,]+)`)
+	for inOrder := range []bool{false, true} {
+		runner.Exec(t, `SET streamer_always_maintain_ordering = $1;`, inOrder)
+		for i := 0; i < 2; i++ {
+			gRPCCalls := -1
+			var err error
+			rows := runner.QueryStr(t, `EXPLAIN ANALYZE SELECT length(blob) FROM t@t_v_idx WHERE v = '1';`)
+			for _, row := range rows {
+				if matches := kvGRPCCallsRegex.FindStringSubmatch(row[0]); len(matches) > 0 {
+					gRPCCalls, err = strconv.Atoi(strings.ReplaceAll(matches[1], ",", ""))
+					require.NoError(t, err)
+					break
+				}
+			}
+			require.Greater(t, gRPCCalls, 0, rows)
+			require.Greater(t, 100, gRPCCalls, rows)
+		}
+	}
+}
+
+// TestStreamerRandomAccess verifies that the Streamer handles the requests that
+// have random access pattern within ranges reasonably well. It is a regression
+// test for #133043.
+func TestStreamerRandomAccess(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderDuress(t)
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLEvalContext: &eval.TestingKnobs{
+				// We disable the randomization of some batch sizes because with
+				// some low values the test takes much longer.
+				ForceProductionValues: true,
+			},
+		},
+		// Disable tenant randomization since this test is quite heavy and could
+		// result in a timeout under shared-process tenant.
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer s.Stopper().Stop(context.Background())
+
+	rng, _ := randutil.NewTestRand()
+	runner := sqlutils.MakeSQLRunner(db)
+	// Create a table with 3 ranges, with 2k rows in each. Each row is about
+	// 2.7KiB in size and has a random value in column 'v'.
+	runner.Exec(t, `
+CREATE TABLE t (
+  k INT PRIMARY KEY,
+  v INT,
+  blob STRING,
+  INDEX v_idx (v)
+);
+
+INSERT INTO t (k, v, blob) SELECT i, (random()*6000)::INT, repeat('a', 2700) FROM generate_series(1, 6000) AS g(i);
+
+ALTER TABLE t SPLIT AT SELECT i*2000 FROM generate_series(0, 2) AS g(i);
+`)
+
+	// The meat of the test - run the query that performs an index join to fetch
+	// all rows via the streamer, both in the OutOfOrder and InOrder modes, and
+	// with different workmem limits. Each time assert that the number of
+	// BatchRequests issued is relatively small (if not, then the streamer was
+	// extremely suboptimal).
+	kvGRPCCallsRegex := regexp.MustCompile(`KV gRPC calls: ([\d,]+)`)
+	for i := 0; i < 10; i++ {
+		// Pick random workmem limit in [2MiB; 16MiB] range.
+		workmem := 2<<20 + rng.Intn(14<<20)
+		runner.Exec(t, fmt.Sprintf("SET distsql_workmem = '%dB'", workmem))
+		for inOrder := range []bool{false, true} {
+			runner.Exec(t, `SET streamer_always_maintain_ordering = $1;`, inOrder)
+			gRPCCalls := -1
+			var err error
+			rows := runner.QueryStr(t, `EXPLAIN ANALYZE SELECT * FROM t@v_idx WHERE v > 0`)
+			for _, row := range rows {
+				if matches := kvGRPCCallsRegex.FindStringSubmatch(row[0]); len(matches) > 0 {
+					gRPCCalls, err = strconv.Atoi(strings.ReplaceAll(matches[1], ",", ""))
+					require.NoError(t, err)
+					break
+				}
+			}
+			require.Greater(t, gRPCCalls, 0, rows)
+			require.Greater(t, 150, gRPCCalls, rows)
+		}
+	}
 }

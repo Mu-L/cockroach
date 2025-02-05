@@ -1,23 +1,22 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
 import classNames from "classnames/bind";
-import styles from "./sqlActivity.module.scss";
 import moment from "moment-timezone";
+import React from "react";
+
+import { isRequestError, RequestError } from "../util";
+
+import styles from "./sqlActivity.module.scss";
 
 const cx = classNames.bind(styles);
 
 interface SQLActivityErrorProps {
   statsType: string;
-  error: Error;
+  error: Error | RequestError;
+  sourceTables?: string[];
 }
 
 export function mergeErrors(errs: Error | Error[]): Error {
@@ -76,6 +75,17 @@ const LoadingError: React.FC<SQLActivityErrorProps> = props => {
     ? "a timeout"
     : "an unexpected error";
 
+  const tablesInfo =
+    props.sourceTables?.length === 1
+      ? `Source Table: ${props.sourceTables[0]}`
+      : props.sourceTables?.length > 1
+        ? `Source Tables: ${props.sourceTables.join(", ")}`
+        : "";
+
+  const respCode = isRequestError(props?.error)
+    ? props?.error?.status
+    : undefined;
+
   return (
     <div>
       <div className={cx("row")}>
@@ -92,11 +102,23 @@ const LoadingError: React.FC<SQLActivityErrorProps> = props => {
       </div>
       <div className={cx("row-small")}>
         <br />
-        <span>{`Debug information: ${moment
-          .utc()
-          .format("YYYY.MM.DD HH:mm:ss")} utc; Error message: ${
-          props?.error?.message
-        }; URL: ${url};`}</span>
+        <span>
+          {`Debug information: ${moment
+            .utc()
+            .format("YYYY.MM.DD HH:mm:ss")} utc;`}
+          <br />
+          {respCode && (
+            <>
+              {`Response code: ${respCode};`}
+              <br />
+            </>
+          )}
+          {`Error message: ${props?.error?.message};`}
+          <br />
+          {`URL: ${url};`}
+          <br />
+          {tablesInfo}
+        </span>
       </div>
     </div>
   );

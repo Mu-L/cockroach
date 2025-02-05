@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reducesql
 
@@ -52,6 +47,7 @@ var SQLPasses = []reduce.Pass{
 	removeIndexCols,
 	removeIndexPredicate,
 	removeIndexStoringCols,
+	removeIndexInvisibility,
 	removeIndexPartitionBy,
 	removeIndexPartitions,
 	removeIndexPartitionListValues,
@@ -427,6 +423,7 @@ func collectASTs(stmts statements.Statements) []tree.NodeFormatter {
 
 func joinASTs(stmts []tree.NodeFormatter) string {
 	var sb strings.Builder
+	var fmtCtx *tree.FmtCtx
 	for i, stmt := range stmts {
 		if i > 0 {
 			sb.WriteString("\n\n")
@@ -438,7 +435,16 @@ func joinASTs(stmts []tree.NodeFormatter) string {
 			UseTabs:   false,
 			Simplify:  true,
 		}
-		sb.WriteString(cfg.Pretty(stmt))
+		p, err := cfg.Pretty(stmt)
+		if err != nil {
+			// Use simple printing if pretty-printing fails.
+			if fmtCtx == nil {
+				fmtCtx = tree.NewFmtCtx(tree.FmtParsable)
+			}
+			stmt.Format(fmtCtx)
+			p = fmtCtx.CloseAndGetString()
+		}
+		sb.WriteString(p)
 		sb.WriteString(";")
 	}
 	return sb.String()
@@ -889,6 +895,19 @@ var (
 			return removeStoringCol(node)
 		case *tree.UniqueConstraintTableDef:
 			return removeStoringCol(&node.IndexTableDef)
+		}
+		return 0
+	})
+	removeIndexInvisibility = walkSQL("remove index Invisibility", func(xfi int, node interface{}) int {
+		xf := xfi == 0
+		switch node := node.(type) {
+		case *tree.IndexTableDef:
+			if node.Invisibility.Value != 0 {
+				if xf {
+					node.Invisibility = tree.IndexInvisibility{Value: 0.0}
+				}
+				return 1
+			}
 		}
 		return 0
 	})

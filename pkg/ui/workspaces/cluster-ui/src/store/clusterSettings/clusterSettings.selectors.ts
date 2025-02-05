@@ -1,15 +1,10 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { greaterOrEqualThanVersion, indexUnusedDuration } from "../../util";
 import { AppState } from "../reducers";
-import { greaterOrEqualThanVersion } from "../../util";
 
 export const selectAutomaticStatsCollectionEnabled = (
   state: AppState,
@@ -43,9 +38,10 @@ export const selectIndexUsageStatsEnabled = (state: AppState): boolean => {
 export const selectDropUnusedIndexDuration = (state: AppState): string => {
   const settings = state.adminUI?.clusterSettings.data?.key_values;
   if (!settings) {
-    return "168h";
+    return indexUnusedDuration;
   }
   return (
-    settings["sql.index_recommendation.drop_unused_duration"]?.value || "168h"
+    settings["sql.index_recommendation.drop_unused_duration"]?.value ||
+    indexUnusedDuration
   );
 };

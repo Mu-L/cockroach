@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -21,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -28,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
-	yaml "gopkg.in/yaml.v2"
 )
 
 func TestPlanToTreeAndPlanToString(t *testing.T) {
@@ -54,7 +49,7 @@ func TestPlanToTreeAndPlanToString(t *testing.T) {
 			r.Exec(t, d.Input)
 			return ""
 
-		case "plan-string", "plan-tree":
+		case "plan-string":
 			stmt, err := parser.ParseOne(d.Input)
 			if err != nil {
 				t.Fatal(err)
@@ -64,7 +59,7 @@ func TestPlanToTreeAndPlanToString(t *testing.T) {
 			internalPlanner, cleanup := NewInternalPlanner(
 				"test",
 				kv.NewTxn(ctx, db, s.NodeID()),
-				username.RootUserName(),
+				username.NodeUserName(),
 				&MemoryMetrics{},
 				&execCfg,
 				sd,
@@ -75,28 +70,21 @@ func TestPlanToTreeAndPlanToString(t *testing.T) {
 			ih := &p.instrumentation
 			ih.codec = execCfg.Codec
 			ih.collectBundle = true
-			ih.savePlanForStats = true
 
-			p.stmt = makeStatement(stmt, clusterunique.ID{})
+			p.stmt = makeStatement(stmt, clusterunique.ID{},
+				tree.FmtFlags(queryFormattingForFingerprintsMask.Get(&execCfg.Settings.SV)))
 			if err := p.makeOptimizerPlan(ctx); err != nil {
 				t.Fatal(err)
 			}
 			defer p.curPlan.close(ctx)
 			p.curPlan.savePlanInfo()
-			if d.Cmd == "plan-string" {
-				ob := ih.emitExplainAnalyzePlanToOutputBuilder(
-					explain.Flags{Verbose: true, ShowTypes: true},
-					sessionphase.NewTimes(),
-					&execstats.QueryLevelStats{},
-				)
-				return ob.BuildString()
-			}
-			treeYaml, err := yaml.Marshal(ih.PlanForStats(ctx))
-			if err != nil {
-				t.Fatal(err)
-			}
-			return string(treeYaml)
-
+			ob := ih.emitExplainAnalyzePlanToOutputBuilder(
+				ctx,
+				explain.Flags{Verbose: true, ShowTypes: true},
+				sessionphase.NewTimes(),
+				&execstats.QueryLevelStats{},
+			)
+			return ob.BuildString()
 		default:
 			t.Fatalf("unsupported command %s", d.Cmd)
 			return ""

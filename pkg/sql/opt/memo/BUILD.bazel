@@ -13,6 +13,7 @@ go_library(
         "extract.go",
         "filters_expr_mutate_checker.go",
         "group.go",
+        "insert_fastpath.go",
         "interner.go",
         "logical_props_builder.go",
         "memo.go",
@@ -29,6 +30,7 @@ go_library(
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/inverted",
+        "//pkg/sql/mutations",
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/constraint",
@@ -41,6 +43,7 @@ go_library(
         "//pkg/sql/sem/cast",
         "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
+        "//pkg/sql/sem/idxtype",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/sem/volatility",
@@ -73,7 +76,6 @@ go_test(
         "statistics_builder_test.go",
         "typing_test.go",
     ],
-    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]) + [
         "//c-deps:libgeos",
         "//pkg/sql/opt/testutils/opttester:testfixtures",
@@ -81,6 +83,7 @@ go_test(
     embed = [":memo"],
     deps = [
         "//pkg/kv/kvserver/concurrency/isolation",
+        "//pkg/security/username",
         "//pkg/settings/cluster",
         "//pkg/sql/inverted",
         "//pkg/sql/opt",
@@ -102,6 +105,7 @@ go_test(
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treewindow",
+        "//pkg/sql/sessiondata",
         "//pkg/sql/types",
         "//pkg/testutils",
         "//pkg/testutils/datapathutils",
@@ -123,7 +127,7 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ exprs $(locations //pkg/sql/opt:ops)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
     visibility = ["//visibility:public"],
 )
 

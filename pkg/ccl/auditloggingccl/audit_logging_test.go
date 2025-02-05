@@ -1,10 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package auditloggingccl
 
@@ -17,7 +14,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -29,83 +25,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
-
-func TestRoleBasedAuditEnterpriseGated(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	sc := log.ScopeWithoutShowLogs(t)
-	defer sc.Close(t)
-
-	cleanup := logtestutils.InstallLogFileSink(sc, t, logpb.Channel_SENSITIVE_ACCESS)
-	defer cleanup()
-
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	rootRunner := sqlutils.MakeSQLRunner(sqlDB)
-	defer s.Stopper().Stop(context.Background())
-
-	// Disable enterprise.
-	enableEnterprise := utilccl.TestingDisableEnterprise()
-
-	// Enable auditing.
-	rootRunner.Exec(t, `SET CLUSTER SETTING sql.log.user_audit = 'ALL ALL'`)
-
-	testutils.SucceedsSoon(t, func() error {
-		var currentVal string
-		rootRunner.QueryRow(t,
-			"SHOW CLUSTER SETTING sql.log.user_audit",
-		).Scan(&currentVal)
-		if currentVal == "" {
-			return errors.Newf("waiting for cluster setting to be set")
-		}
-		return nil
-	})
-
-	// Run a test query.
-	rootRunner.Exec(t, `SHOW CLUSTER SETTING sql.log.user_audit`)
-
-	log.Flush()
-
-	entries, err := log.FetchEntriesFromFiles(
-		0,
-		math.MaxInt64,
-		10000,
-		regexp.MustCompile(`"EventType":"role_based_audit_event"`),
-		log.WithMarkedSensitiveData,
-	)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Enterprise is disabled, expect the number of entries to be 0.
-	if len(entries) != 0 {
-		t.Fatal(errors.Newf("enterprise is disabled, found unexpected entries"))
-	}
-
-	// Enable enterprise
-	enableEnterprise()
-
-	// Run a test query.
-	rootRunner.Exec(t, `SHOW CLUSTER SETTING sql.log.user_audit`)
-
-	log.Flush()
-
-	entries, err = log.FetchEntriesFromFiles(
-		0,
-		math.MaxInt64,
-		10000,
-		regexp.MustCompile(`"Statement":"SHOW CLUSTER SETTING \\"sql.log.user_audit\\""`),
-		log.WithMarkedSensitiveData,
-	)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Enterprise is enabled, expect an audit log.
-	if len(entries) != 1 {
-		t.Fatal(errors.Newf("enterprise is enabled, expected 1 entry, got %d", len(entries)))
-	}
-}
 
 func TestSingleRoleAuditLogging(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -119,7 +38,7 @@ func TestSingleRoleAuditLogging(t *testing.T) {
 	rootRunner := sqlutils.MakeSQLRunner(sqlDB)
 	defer s.Stopper().Stop(context.Background())
 
-	testUserDb := s.ApplicationLayer().SQLConnForUser(t, username.TestUser, "")
+	testUserDb := s.ApplicationLayer().SQLConn(t, serverutils.User(username.TestUser))
 	testRunner := sqlutils.MakeSQLRunner(testUserDb)
 
 	// Dummy table/user used by tests.
@@ -214,7 +133,7 @@ func TestSingleRoleAuditLogging(t *testing.T) {
 		rootRunner.Exec(t, fmt.Sprintf("REVOKE %s from testuser", td.role))
 	}
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err := log.FetchEntriesFromFiles(
 		0,
@@ -261,7 +180,7 @@ func TestMultiRoleAuditLogging(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	rootRunner := sqlutils.MakeSQLRunner(sqlDB)
 
-	testUserDb := s.ApplicationLayer().SQLConnForUser(t, username.TestUser, "")
+	testUserDb := s.ApplicationLayer().SQLConn(t, serverutils.User(username.TestUser))
 	testRunner := sqlutils.MakeSQLRunner(testUserDb)
 
 	// Dummy table/user used by tests.
@@ -317,7 +236,7 @@ func TestMultiRoleAuditLogging(t *testing.T) {
 		testRunner.Exec(t, query)
 	}
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err := log.FetchEntriesFromFiles(
 		0,
@@ -376,7 +295,7 @@ func TestReducedAuditConfig(t *testing.T) {
 		return nil
 	})
 
-	testUserDb := s.ApplicationLayer().SQLConnForUser(t, username.TestUser, "")
+	testUserDb := s.ApplicationLayer().SQLConn(t, serverutils.User(username.TestUser))
 	testRunner := sqlutils.MakeSQLRunner(testUserDb)
 
 	// Set a cluster configuration.
@@ -412,7 +331,7 @@ func TestReducedAuditConfig(t *testing.T) {
 	// for the user at that time.
 	testRunner.Exec(t, testQuery)
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err := log.FetchEntriesFromFiles(
 		0,
@@ -426,36 +345,61 @@ func TestReducedAuditConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Expect the number of entries to be 0.
 	if len(entries) != 0 {
-		t.Fatal(errors.Newf("unexpected entries found"))
+		t.Fatal(errors.Newf("unexpected entries found; expected none found %d", len(entries)))
 	}
 
 	// Open 2nd connection for the test user.
-	testUserDb2 := s.ApplicationLayer().SQLConnForUser(t, username.TestUser, "")
+	testUserDb2 := s.ApplicationLayer().SQLConn(t, serverutils.User(username.TestUser))
 	testRunner2 := sqlutils.MakeSQLRunner(testUserDb2)
 
 	// Run a query on the new connection. The new connection will cause the reduced audit config to be re-computed.
 	// The user now has a corresponding audit setting. We use a new query here to differentiate.
-	testRunner2.Exec(t, `GRANT SELECT ON TABLE u TO root`)
+	testRunner2.Exec(t, `ALTER TABLE u ADD COLUMN y STRING DEFAULT 'foo'`)
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err = log.FetchEntriesFromFiles(
 		0,
 		math.MaxInt64,
 		10000,
-		regexp.MustCompile(`GRANT SELECT ON TABLE ‹u› TO root`),
+		regexp.MustCompile(`ALTER TABLE u ADD COLUMN y STRING DEFAULT ‹'foo'›`),
 		log.WithMarkedSensitiveData,
 	)
-
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Expect the number of entries to be 1.
 	if len(entries) != 1 {
-		t.Fatal(errors.Newf("unexpected number of entries found (not 1)"))
+		t.Fatal(errors.Newf("unexpected number of entries; expected: %d found: %d", 1, len(entries)))
+	}
+
+	// Open 3rd connection for the test user. Regression test for #123592.
+	testUserDb3 := s.ApplicationLayer().SQLConn(t, serverutils.User(username.TestUser))
+	testRunner3 := sqlutils.MakeSQLRunner(testUserDb3)
+
+	// Run an explicit transaction on the new connection.
+	explicitTxn := []string{`BEGIN`, `SHOW CLUSTER SETTING version`, `COMMIT`}
+	testRunner3.ExecMultiple(t, explicitTxn...)
+
+	log.FlushFiles()
+
+	// Ensure all parts of the explicit transaction appear in our logs without an error.
+	for _, stmt := range explicitTxn {
+		entries, err = log.FetchEntriesFromFiles(
+			0,
+			math.MaxInt64,
+			10000,
+			regexp.MustCompile(stmt),
+			log.WithMarkedSensitiveData,
+		)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(entries) != 1 {
+			t.Fatal(errors.Newf("unexpected number of entries for %s; expected: %d found: %d", stmt, 1, len(entries)))
+		}
 	}
 }
 

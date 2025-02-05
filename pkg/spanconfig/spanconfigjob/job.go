@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfigjob
 
@@ -20,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,8 +30,8 @@ type resumer struct {
 
 var _ jobs.Resumer = (*resumer)(nil)
 
-var reconciliationJobCheckpointInterval = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+var ReconciliationJobCheckpointInterval = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
 	"spanconfig.reconciliation_job.checkpoint_interval",
 	"the frequency at which the span config reconciliation job checkpoints itself",
 	5*time.Second,
@@ -76,21 +70,6 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 	// indicate through the job's idle status.
 	r.job.MarkIdle(true)
 
-	// If the Job's NumRuns is greater than 1, reset it to 0 so that future
-	// resumptions are not delayed by the job system.
-	//
-	// Note that we are doing this before the possible error return below. If
-	// there is a problem starting the reconciler this job will aggressively
-	// restart at the job system level with no backoff.
-	if err := r.job.NoTxn().Update(ctx, func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-		if md.RunStats != nil && md.RunStats.NumRuns > 1 {
-			ju.UpdateRunStats(1, md.RunStats.LastRun)
-		}
-		return nil
-	}); err != nil {
-		log.Warningf(ctx, "failed to reset reconciliation job run stats: %v", err)
-	}
-
 	// Start the protected timestamp reconciler. This will periodically poll the
 	// protected timestamp table to cleanup stale records. We take advantage of
 	// the fact that there can only be one instance of the spanconfig.Resumer
@@ -125,17 +104,17 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 		syncutil.Mutex
 		util.EveryN
 	}{}
-	persistCheckpointsMu.EveryN = util.Every(reconciliationJobCheckpointInterval.Get(settingValues))
+	persistCheckpointsMu.EveryN = util.Every(ReconciliationJobCheckpointInterval.Get(settingValues))
 
-	reconciliationJobCheckpointInterval.SetOnChange(settingValues, func(ctx context.Context) {
+	ReconciliationJobCheckpointInterval.SetOnChange(settingValues, func(ctx context.Context) {
 		persistCheckpointsMu.Lock()
 		defer persistCheckpointsMu.Unlock()
-		persistCheckpointsMu.EveryN = util.Every(reconciliationJobCheckpointInterval.Get(settingValues))
+		persistCheckpointsMu.EveryN = util.Every(ReconciliationJobCheckpointInterval.Get(settingValues))
 	})
 
 	checkpointingDisabled := false
 	shouldSkipRetry := false
-	var onCheckpointInterceptor func() error
+	var onCheckpointInterceptor func(lastCheckpoint hlc.Timestamp) error
 
 	retryOpts := retry.Options{
 		InitialBackoff: 5 * time.Second,
@@ -161,7 +140,7 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 		started := timeutil.Now()
 		if err := rc.Reconcile(ctx, lastCheckpoint, r.job.Session(), func() error {
 			if onCheckpointInterceptor != nil {
-				if err := onCheckpointInterceptor(); err != nil {
+				if err := onCheckpointInterceptor(lastCheckpoint); err != nil {
 					return err
 				}
 			}
@@ -170,9 +149,12 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 				return nil
 			}
 
-			persistCheckpointsMu.Lock()
-			shouldPersistCheckpoint := persistCheckpointsMu.ShouldProcess(timeutil.Now())
-			persistCheckpointsMu.Unlock()
+			shouldPersistCheckpoint := func() bool {
+				persistCheckpointsMu.Lock()
+				defer persistCheckpointsMu.Unlock()
+				return persistCheckpointsMu.ShouldProcess(timeutil.Now())
+			}()
+
 			if !shouldPersistCheckpoint {
 				return nil
 			}
@@ -219,6 +201,11 @@ func (r *resumer) OnFailOrCancel(ctx context.Context, _ interface{}, _ error) er
 	if jobs.HasErrJobCanceled(errors.DecodeError(ctx, *r.job.Payload().FinalResumeError)) {
 		return errors.AssertionFailedf("span config reconciliation job cannot be canceled")
 	}
+	return nil
+}
+
+// CollectProfile implements the jobs.Resumer interface.
+func (r *resumer) CollectProfile(_ context.Context, _ interface{}) error {
 	return nil
 }
 

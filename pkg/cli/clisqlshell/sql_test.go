@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlshell_test
 
@@ -60,12 +55,19 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(i-2) from generate_series(1,3) g(i)`})
 	c.RunWithArgs([]string{`sql`, `-e`, `SELECT '20:01:02+03:04:05'::timetz AS regression_65066`})
 
+	// Check that previous SQL error message is not displayed when the CLI is exited.
+	c.RunWithArgs([]string{`sql`, `-e`, `SELECT 1 FROM hoge`})
+	c.RunWithArgs([]string{`sql`, `-e`, `exit`})
+	c.RunWithArgs([]string{`sql`, `-e`, `SELECT 1 FROM hoge`})
+	c.RunWithArgs([]string{`sql`, `-e`, `\q`})
+
 	// Output:
 	// sql -e show application_name
 	// application_name
 	// $ cockroach sql
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// INSERT 0 1
 	// sql -e select 3 as "3" -e select * from t.f
@@ -101,11 +103,13 @@ func Example_sql() {
 	// sql -e create table t.g1 (x int)
 	// CREATE TABLE
 	// sql -e create table t.g2 as select * from generate_series(1,10)
+	// NOTICE: CREATE TABLE ... AS does not copy over indexes, default expressions, or constraints; the new table has a hidden rowid primary key column
 	// CREATE TABLE AS
 	// sql -d nonexistent -e select count(*) from "".information_schema.tables limit 0
 	// count
 	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// x
 	// sql -e copy t.f from stdin
@@ -118,6 +122,14 @@ func Example_sql() {
 	// sql -e SELECT '20:01:02+03:04:05'::timetz AS regression_65066
 	// regression_65066
 	// 20:01:02+03:04:05
+	// sql -e SELECT 1 FROM hoge
+	// ERROR: relation "hoge" does not exist
+	// SQLSTATE: 42P01
+	// sql -e exit
+	// sql -e SELECT 1 FROM hoge
+	// ERROR: relation "hoge" does not exist
+	// SQLSTATE: 42P01
+	// sql -e \q
 }
 
 func Example_sql_config() {
@@ -162,10 +174,10 @@ func Example_sql_config() {
 	// ERROR: -e: unknown variable name: "unknownoption"
 	// sql --set display_format=invalidvalue -e select 123 as "123"
 	// ERROR: -e: \set display_format=invalidvalue: invalid table display format: invalidvalue
-	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, raw.
+	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, unnumbered-html, raw.
 	// sql -e \set display_format=invalidvalue -e select 123 as "123"
 	// ERROR: -e: \set display_format=invalidvalue: invalid table display format: invalidvalue
-	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, raw.
+	// HINT: Possible values: tsv, csv, table, records, ndjson, json, sql, html, unnumbered-html, raw.
 }
 
 func Example_sql_watch() {
@@ -199,6 +211,7 @@ func Example_misc_table() {
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// sql --format=table -e select '  hai' as x
 	//     x
@@ -237,6 +250,7 @@ func Example_in_memory() {
 	// Output:
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// INSERT 0 1
 	// node ls
@@ -260,6 +274,7 @@ func Example_pretty_print_numerical_strings() {
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
 	// CREATE DATABASE
+	// NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
 	// CREATE TABLE
 	// sql -e insert into t.t values (e'0', 'positive numerical string')
 	// INSERT 0 1
@@ -335,14 +350,12 @@ func Example_includes() {
 	// SELECT -- incomplete statement, \i invalid
 	// \i testdata/i_twolevels2.sql
 	// ^
-	// HINT: try \h SELECT
 	// ERROR: at or near "\": syntax error
 	// SQLSTATE: 42601
 	// DETAIL: source SQL:
 	// SELECT -- incomplete statement, \i invalid
 	// \i testdata/i_twolevels2.sql
 	// ^
-	// HINT: try \h SELECT
 	// sql -f testdata/i_stopmiddle.sql
 	// ?column?
 	// 123

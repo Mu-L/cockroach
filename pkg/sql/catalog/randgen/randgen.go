@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package randgen
 
@@ -54,7 +49,7 @@ func NewTestSchemaGenerator(
 ) TestSchemaGenerator {
 	dbPrivs := catpb.NewBaseDatabasePrivilegeDescriptor(callingUser)
 	dbDefaultPrivs := catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_DATABASE)
-	publicSchemaPrivs := catpb.NewPublicSchemaPrivilegeDescriptor(true /*includeCreatePriv*/)
+	publicSchemaPrivs := catpb.NewPublicSchemaPrivilegeDescriptor(callingUser, true /*includeCreatePriv*/)
 	publicSchemaPrivs.SetOwner(callingUser)
 	g := &testSchemaGenerator{
 		rand: rand,
@@ -102,7 +97,7 @@ const genEnabledSettingName = "sql.schema.test_object_generator.enabled"
 // force disable the functionality from an unprivileged secondary
 // tenant.
 var genEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	genEnabledSettingName,
 	"enable the generate_test_objects function",
 	true,
@@ -111,7 +106,7 @@ var genEnabled = settings.RegisterBoolSetting(
 const genEnabledForNonAdminsSettingName = "sql.schema.test_object_generator.non_admin.enabled"
 
 var genEnabledForNonAdmins = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	genEnabledForNonAdminsSettingName,
 	"allow non-admin users to use the generate_test_objects function",
 	false,

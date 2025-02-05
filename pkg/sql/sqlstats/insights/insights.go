@@ -1,32 +1,23 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package insights
 
 import (
-	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
-	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	prometheus "github.com/prometheus/client_model/go"
 )
 
 // ExecutionInsightsCapacity limits the number of execution insights retained in memory.
 // As further insights are had, the oldest ones are evicted.
 var ExecutionInsightsCapacity = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.insights.execution_insights_capacity",
 	"the size of the per-node store of execution insights",
 	1000,
@@ -37,7 +28,7 @@ var ExecutionInsightsCapacity = settings.RegisterIntSetting(
 // considered slow. A LatencyThreshold of 0 (the default) disables this
 // detection.
 var LatencyThreshold = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.insights.latency_threshold",
 	"amount of time after which an executing statement is considered slow. Use 0 to disable.",
 	100*time.Millisecond,
@@ -48,7 +39,7 @@ var LatencyThreshold = settings.RegisterDurationSetting(
 // p99 latency while generally excluding uninteresting executions less than
 // 100ms.
 var AnomalyDetectionEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.insights.anomaly_detection.enabled",
 	"enable per-fingerprint latency recording and anomaly detection",
 	true,
@@ -61,7 +52,7 @@ var AnomalyDetectionEnabled = settings.RegisterBoolSetting(
 // and any potential slow execution must also cross this threshold to be
 // reported (this is a UX optimization, removing noise).
 var AnomalyDetectionLatencyThreshold = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.insights.anomaly_detection.latency_threshold",
 	"statements must surpass this threshold to trigger anomaly detection and identification",
 	50*time.Millisecond,
@@ -73,7 +64,7 @@ var AnomalyDetectionLatencyThreshold = settings.RegisterDurationSetting(
 // an eye on the metrics for memory usage and evictions to avoid introducing
 // churn.
 var AnomalyDetectionMemoryLimit = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.insights.anomaly_detection.memory_limit",
 	"the maximum amount of memory allowed for tracking statement latencies",
 	1024*1024,
@@ -82,7 +73,7 @@ var AnomalyDetectionMemoryLimit = settings.RegisterByteSizeSetting(
 // HighRetryCountThreshold sets the number of times a slow statement must have
 // been retried to be marked as having a high retry count.
 var HighRetryCountThreshold = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.insights.high_retry_count.threshold",
 	"the number of retries a slow statement must have undergone for its high retry count to be highlighted as a potential problem",
 	10,
@@ -135,66 +126,24 @@ func NewMetrics() Metrics {
 	}
 }
 
-// Writer observes statement and transaction executions.
-type Writer interface {
-	// ObserveStatement notifies the registry of a statement execution.
-	ObserveStatement(sessionID clusterunique.ID, statement *Statement)
-
-	// ObserveTransaction notifies the registry of the end of a transaction.
-	ObserveTransaction(sessionID clusterunique.ID, transaction *Transaction)
-}
-
-// WriterProvider offers a Writer.
-// Pass true for internal when called by the internal executor.
-type WriterProvider func(internal bool) Writer
-
-// Reader offers access to the currently retained set of insights.
-type Reader interface {
-	// IterateInsights calls visitor with each of the currently retained set of insights.
-	IterateInsights(context.Context, func(context.Context, *Insight))
-}
-
-type LatencyInformation interface {
-	GetPercentileValues(fingerprintID appstatspb.StmtFingerprintID, shouldFlush bool) PercentileValues
-}
-
 type PercentileValues struct {
 	P50 float64
 	P90 float64
 	P99 float64
 }
 
-// Provider offers access to the insights subsystem.
-type Provider interface {
-	// Start launches the background tasks necessary for processing insights.
-	Start(ctx context.Context, stopper *stop.Stopper)
-
-	// Writer returns an object that observes statement and transaction executions.
-	// Pass true for internal when called by the internal executor.
-	Writer(internal bool) Writer
-
-	// Reader returns an object that offers read access to any detected insights.
-	Reader() Reader
-
-	// LatencyInformation returns an object that offers read access to latency information,
-	// such as percentiles.
-	LatencyInformation() LatencyInformation
-}
-
 // New builds a new Provider.
-func New(st *cluster.Settings, metrics Metrics) Provider {
+func New(st *cluster.Settings, metrics Metrics, knobs *TestingKnobs) *Provider {
 	store := newStore(st)
 	anomalyDetector := newAnomalyDetector(st, metrics)
 
-	return &defaultProvider{
+	return &Provider{
 		store: store,
 		ingester: newConcurrentBufferIngester(
 			newRegistry(st, &compositeDetector{detectors: []detector{
 				&latencyThresholdDetector{st: st},
 				anomalyDetector,
-			}}, &compositeSink{sinks: []sink{
-				store,
-			}}),
+			}}, store, knobs),
 		),
 		anomalyDetector: anomalyDetector,
 	}

@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
@@ -29,9 +24,14 @@ func TestEnqueueRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
+
 		ReplicationMode: base.ReplicationManual,
 	})
 	defer testCluster.Stopper().Stop(context.Background())
+	s0 := testCluster.Server(0).SystemLayer()
 
 	// Up-replicate r1 to all 3 nodes. We use manual replication to avoid lease
 	// transfers causing temporary conditions in which no store is the
@@ -85,7 +85,7 @@ func TestEnqueueRange(t *testing.T) {
 				RangeID: tc.rangeID,
 			}
 			var resp serverpb.EnqueueRangeResponse
-			if err := srvtestutils.PostAdminJSONProto(testCluster.Server(0), "enqueue_range", req, &resp); err != nil {
+			if err := srvtestutils.PostAdminJSONProto(s0, "enqueue_range", req, &resp); err != nil {
 				t.Fatal(err)
 			}
 			if e, a := tc.expectedDetails, len(resp.Details); e != a {

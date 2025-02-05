@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
@@ -141,6 +136,7 @@ func processInboundStreamHelper(
 			if err != nil {
 				if err != io.EOF {
 					// Communication error.
+					log.VEventf(ctx, 2, "Inbox communication error: %v", err)
 					err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "inbox communication error")
 					sendErrToConsumer(err)
 					errChan <- err
@@ -152,6 +148,7 @@ func processInboundStreamHelper(
 				return
 			}
 
+			log.VEvent(ctx, 2, "Inbox received message")
 			if res := processProducerMessage(
 				ctx, f, stream, dst, &sd, &draining, msg,
 			); res.err != nil || res.consumerClosed {

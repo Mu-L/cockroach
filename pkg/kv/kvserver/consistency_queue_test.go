@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -34,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -248,7 +244,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	// Test uses sticky registry to have persistent pebble state that could
 	// be analyzed for existence of snapshots and to verify snapshot content
 	// after failures.
-	stickyVFSRegistry := server.NewStickyVFSRegistry()
+	stickyVFSRegistry := fs.NewStickyRegistry()
 
 	// The cluster has 3 nodes, one store per node. The test writes a few KVs to a
 	// range, which gets replicated to all 3 stores. Then it manually replaces an
@@ -337,11 +333,13 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 
 	// Write some arbitrary data only to store on n2. Inconsistent key "e"!
 	s2 := tc.GetFirstStoreFromServer(t, 1)
+	s2AuxDir := s2.TODOEngine().GetAuxiliaryDir()
 	var val roachpb.Value
 	val.SetInt(42)
 	// Put an inconsistent key "e" to s2, and have s1 and s3 still agree.
-	require.NoError(t, storage.MVCCPut(context.Background(), s2.TODOEngine(),
-		roachpb.Key("e"), tc.Server(0).Clock().Now(), val, storage.MVCCWriteOptions{}))
+	_, err := storage.MVCCPut(context.Background(), s2.TODOEngine(),
+		roachpb.Key("e"), tc.Server(0).Clock().Now(), val, storage.MVCCWriteOptions{})
+	require.NoError(t, err)
 
 	// Run consistency check again, this time it should find something.
 	resp = runConsistencyCheck()
@@ -385,9 +383,15 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 
 		// Create a new store on top of checkpoint location inside existing in-mem
 		// VFS to verify its contents.
-		fs := stickyVFSRegistry.Get(strconv.FormatInt(int64(i), 10))
-		cpEng := storage.InMemFromFS(context.Background(), fs, cps[0], cluster.MakeClusterSettings(),
-			storage.ForTesting, storage.MustExist, storage.ReadOnly, storage.CacheSize(1<<20))
+		ctx := context.Background()
+		memFS := stickyVFSRegistry.Get(strconv.FormatInt(int64(i), 10))
+		env, err := fs.InitEnv(ctx, memFS, cps[0], fs.EnvConfig{RW: fs.ReadOnly}, nil /* statsCollector */)
+		require.NoError(t, err)
+		cpEng, err := storage.Open(ctx, env, cluster.MakeClusterSettings(),
+			storage.ForTesting, storage.MustExist, storage.CacheSize(1<<20))
+		if err != nil {
+			require.NoError(t, err)
+		}
 		defer cpEng.Close()
 
 		// Find the problematic range in the storage.
@@ -403,7 +407,7 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 
 		// Compute a checksum over the content of the problematic range.
 		rd, err := kvserver.CalcReplicaDigest(context.Background(), *desc, cpEng,
-			kvpb.ChecksumMode_CHECK_FULL, quotapool.NewRateLimiter("test", quotapool.Inf(), 0))
+			kvpb.ChecksumMode_CHECK_FULL, quotapool.NewRateLimiter("test", quotapool.Inf(), 0), nil /* settings */)
 		require.NoError(t, err)
 		hashes[i] = rd.SHA512[:]
 	}
@@ -411,9 +415,10 @@ func TestCheckConsistencyInconsistent(t *testing.T) {
 	assert.Equal(t, hashes[0], hashes[2])    // s1 and s3 agree
 	assert.NotEqual(t, hashes[0], hashes[1]) // s2 diverged
 
-	// A death rattle should have been written on s2.
-	eng := s2.TODOEngine()
-	f, err := eng.Open(base.PreventedStartupFile(eng.GetAuxiliaryDir()))
+	// A death rattle should have been written on s2. Note that the VFSes are
+	// zero-indexed whereas store IDs are one-indexed.
+	fs := stickyVFSRegistry.Get("1")
+	f, err := fs.Open(base.PreventedStartupFile(s2AuxDir))
 	require.NoError(t, err)
 	b, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -524,7 +529,7 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 
 	func() {
 		eng, err := storage.Open(ctx,
-			storage.Filesystem(path),
+			fs.MustInitPhysicalTestingEnv(path),
 			cluster.MakeClusterSettings(),
 			storage.CacheSize(1<<20 /* 1 MiB */),
 			storage.MustExist)
@@ -601,18 +606,25 @@ func testConsistencyQueueRecomputeStatsImpl(t *testing.T, hadEstimates bool) {
 		t.Fatal(err)
 	}
 
-	// Force a run of the consistency queue, otherwise it might take a while.
-	store := tc.GetFirstStoreFromServer(t, 0)
-	require.NoError(t, store.ForceConsistencyQueueProcess())
+	// When running with leader leases, it might take an extra election interval
+	// for a lease to be established after adding the voters above because the
+	// leader needs to get store liveness support from the followers. The stats
+	// re-computation runs on the leaseholder and will fail if there isn't one.
+	testutils.SucceedsSoon(t, func() error {
+		// Force a run of the consistency queue, otherwise it might take a while.
+		store := tc.GetFirstStoreFromServer(t, 0)
+		require.NoError(t, store.ForceConsistencyQueueProcess())
 
-	// The stats should magically repair themselves. We'll first do a quick check
-	// and then a full recomputation.
-	repl, _, err := tc.Servers[0].GetStores().(*kvserver.Stores).GetReplicaForRangeID(ctx, rangeID)
-	require.NoError(t, err)
-	ms := repl.GetMVCCStats()
-	if ms.SysCount >= sysCountGarbage {
-		t.Fatalf("still have a SysCount of %d", ms.SysCount)
-	}
+		// The stats should magically repair themselves. We'll first do a quick check
+		// and then a full recomputation.
+		repl, _, err := tc.Servers[0].GetStores().(*kvserver.Stores).GetReplicaForRangeID(ctx, rangeID)
+		require.NoError(t, err)
+		ms := repl.GetMVCCStats()
+		if ms.SysCount >= sysCountGarbage {
+			return errors.Newf("still have a SysCount of %d", ms.SysCount)
+		}
+		return nil
+	})
 
 	if delta := computeDelta(db0); delta != (enginepb.MVCCStats{}) {
 		t.Fatalf("stats still in need of adjustment: %+v", delta)

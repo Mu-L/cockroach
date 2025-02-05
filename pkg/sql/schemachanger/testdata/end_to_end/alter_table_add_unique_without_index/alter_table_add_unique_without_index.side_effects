@@ -18,8 +18,7 @@ write *eventpb.AlterTable to event log:
   mutationId: 1
   sql:
     descriptorId: 104
-    statement: ALTER TABLE ‹defaultdb›.‹public›.‹t› ADD CONSTRAINT ‹unique_j› UNIQUE
-      WITHOUT INDEX (‹j›)
+    statement: ALTER TABLE ‹defaultdb›.‹public›.‹t› ADD CONSTRAINT ‹unique_j› UNIQUE WITHOUT INDEX (‹j›)
     tag: ALTER TABLE
     user: root
   tableName: defaultdb.public.t
@@ -74,6 +73,8 @@ upsert descriptor #104
   +      columns:
   +        "1": i
   +        "2": j
+  +        "4294967292": crdb_internal_origin_timestamp
+  +        "4294967293": crdb_internal_origin_id
   +        "4294967294": tableoid
   +        "4294967295": crdb_internal_mvcc_timestamp
   +      constraints:
@@ -86,8 +87,7 @@ upsert descriptor #104
   +      name: t
   +    relevantStatements:
   +    - statement:
-  +        redactedStatement: ALTER TABLE ‹defaultdb›.‹public›.‹t› ADD CONSTRAINT ‹unique_j›
-  +          UNIQUE WITHOUT INDEX (‹j›)
+  +        redactedStatement: ALTER TABLE ‹defaultdb›.‹public›.‹t› ADD CONSTRAINT ‹unique_j› UNIQUE WITHOUT INDEX (‹j›)
   +        statement: ALTER TABLE t ADD UNIQUE WITHOUT INDEX (j)
   +        statementTag: ALTER TABLE
   +    revertible: true
@@ -153,6 +153,8 @@ upsert descriptor #104
   -      columns:
   -        "1": i
   -        "2": j
+  -        "4294967292": crdb_internal_origin_timestamp
+  -        "4294967293": crdb_internal_origin_id
   -        "4294967294": tableoid
   -        "4294967295": crdb_internal_mvcc_timestamp
   -      constraints:
@@ -165,8 +167,7 @@ upsert descriptor #104
   -      name: t
   -    relevantStatements:
   -    - statement:
-  -        redactedStatement: ALTER TABLE ‹defaultdb›.‹public›.‹t› ADD CONSTRAINT ‹unique_j›
-  -          UNIQUE WITHOUT INDEX (‹j›)
+  -        redactedStatement: ALTER TABLE ‹defaultdb›.‹public›.‹t› ADD CONSTRAINT ‹unique_j› UNIQUE WITHOUT INDEX (‹j›)
   -        statement: ALTER TABLE t ADD UNIQUE WITHOUT INDEX (j)
   -        statementTag: ALTER TABLE
   -    revertible: true

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stmtdiagnostics_test
 
@@ -31,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -44,16 +40,20 @@ func TestDiagnosticsRequest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	skip.UnderShort(t)
+	skip.UnderDuress(t, "the test is too slow")
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	registry := s.ExecutorConfig().(sql.ExecutorConfig).StmtDiagnosticsRecorder
 	runner := sqlutils.MakeSQLRunner(db)
 	runner.Exec(t, "CREATE TABLE test (x int PRIMARY KEY)")
 
 	// Disable polling interval since we're inserting requests directly into the
 	// registry manually and want precise control of updating the registry.
-	runner.Exec(t, "SET CLUSTER SETTING sql.stmt_diagnostics.poll_interval = '0';")
+	stmtdiagnostics.PollingInterval.Override(ctx, &s.ClusterSettings().SV, 0)
 
 	var collectUntilExpirationEnabled bool
 	isCompleted := func(reqID int64) (completed bool, diagnosticsID gosql.NullInt64) {
@@ -140,7 +140,7 @@ func TestDiagnosticsRequest(t *testing.T) {
 	// Verify that EXECUTE triggers diagnostics collection (#66048).
 	t.Run("execute", func(t *testing.T) {
 		id, err := registry.InsertRequestInternal(
-			ctx, "SELECT x + $1 FROM test", anyPlan, noAntiMatch,
+			ctx, "SELECT x + _ FROM test", anyPlan, noAntiMatch,
 			sampleAll, noLatencyThreshold, noExpiration,
 		)
 		require.NoError(t, err)
@@ -158,15 +158,16 @@ func TestDiagnosticsRequest(t *testing.T) {
 		require.NoError(t, err)
 		checkNotCompleted(reqID)
 
-		// Set the statement timeout (as well as clean it up in a defer).
+		// Set the statement timeout.
 		runner.Exec(t, "SET statement_timeout = '100ms';")
-		defer func() {
-			runner.Exec(t, "RESET statement_timeout;")
-		}()
 
 		// Run the query that times out.
 		_, err = db.Exec("SELECT pg_sleep(999999)")
 		require.True(t, strings.Contains(err.Error(), sqlerrors.QueryTimeoutError.Error()))
+
+		// Reset the stmt timeout so that it doesn't affect the query in
+		// checkCompleted.
+		runner.Exec(t, "RESET statement_timeout;")
 		checkCompleted(reqID)
 	})
 
@@ -214,7 +215,7 @@ func TestDiagnosticsRequest(t *testing.T) {
 	t.Run("conditional with concurrency", func(t *testing.T) {
 		minExecutionLatency := 100 * time.Millisecond
 		reqID, err := registry.InsertRequestInternal(
-			ctx, "SELECT pg_sleep($1)", anyPlan, noAntiMatch,
+			ctx, "SELECT pg_sleep(_)", anyPlan, noAntiMatch,
 			sampleAll, minExecutionLatency, noExpiration,
 		)
 		require.NoError(t, err)
@@ -478,7 +479,7 @@ func TestDiagnosticsRequest(t *testing.T) {
 		runner.Exec(t, "ANALYZE small;")
 		runner.Exec(t, "CREATE TABLE large (v INT, INDEX (v));")
 		runner.Exec(t, "INSERT INTO large VALUES (1);")
-		runner.Exec(t, "INSERT INTO large SELECT 2 FROM generate_series(1, 10000);")
+		runner.Exec(t, "INSERT INTO large SELECT 2 FROM generate_series(1, 100);")
 		runner.Exec(t, "ANALYZE large;")
 
 		// query1 results in scan + lookup join whereas query2 does two scans +
@@ -541,13 +542,14 @@ func TestDiagnosticsRequestDifferentNode(t *testing.T) {
 	tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{})
 	ctx := context.Background()
 	defer tc.Stopper().Stop(ctx)
-	db0 := tc.ServerConn(0)
-	db1 := tc.ServerConn(1)
+	s0 := tc.ApplicationLayer(0)
+	db0 := s0.SQLConn(t)
+	db1 := tc.ApplicationLayer(1).SQLConn(t)
 	_, err := db0.Exec("CREATE TABLE test (x int PRIMARY KEY)")
 	require.NoError(t, err)
 
 	// Lower the polling interval to speed up the test.
-	_, err = db0.Exec("SET CLUSTER SETTING sql.stmt_diagnostics.poll_interval = '1ms'")
+	stmtdiagnostics.PollingInterval.Override(ctx, &s0.ClusterSettings().SV, time.Millisecond)
 	require.NoError(t, err)
 
 	var anyPlan string
@@ -556,7 +558,7 @@ func TestDiagnosticsRequestDifferentNode(t *testing.T) {
 	var noLatencyThreshold, noExpiration time.Duration
 
 	// Ask to trace a particular query using node 0.
-	registry := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).StmtDiagnosticsRecorder
+	registry := s0.ExecutorConfig().(sql.ExecutorConfig).StmtDiagnosticsRecorder
 	reqID, err := registry.InsertRequestInternal(
 		ctx, "INSERT INTO test VALUES (_)", anyPlan, noAntiMatch,
 		sampleAll, noLatencyThreshold, noExpiration,
@@ -624,6 +626,8 @@ func TestChangePollInterval(t *testing.T) {
 	ctx := context.Background()
 
 	// We'll inject a request filter to detect scans due to the polling.
+	// TODO(yuzefovich): it is suspicious that we're using the system codec, yet
+	// the test passes with the test tenant. Investigate this.
 	tableStart := keys.SystemSQLCodec.TablePrefix(uint32(systemschema.StatementDiagnosticsRequestsTable.GetID()))
 	tableSpan := roachpb.Span{
 		Key:    tableStart,
@@ -678,13 +682,12 @@ func TestChangePollInterval(t *testing.T) {
 			},
 		},
 	}
-	s, db, _ := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop(ctx)
+	srv := serverutils.StartServerOnly(t, args)
+	defer srv.Stopper().Stop(ctx)
 
 	require.Equal(t, 1, waitForScans(1))
 	time.Sleep(time.Millisecond) // ensure no unexpected scan occur
 	require.Equal(t, 1, waitForScans(1))
-	_, err := db.Exec("SET CLUSTER SETTING sql.stmt_diagnostics.poll_interval = '200us'")
-	require.NoError(t, err)
+	stmtdiagnostics.PollingInterval.Override(ctx, &settings.SV, 200*time.Microsecond)
 	waitForScans(10) // ensure several scans occur
 }

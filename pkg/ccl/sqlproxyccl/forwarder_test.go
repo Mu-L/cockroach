@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlproxyccl
 
@@ -20,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/interceptor"
+	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -32,6 +30,7 @@ import (
 
 func TestForward(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	bgCtx := context.Background()
 
@@ -111,24 +110,33 @@ func TestForward(t *testing.T) {
 		errChan := make(chan error, 1)
 		go func() {
 			<-sendEventCh
-			if _, err := client.Write((&pgproto3.Query{
+			if buf, err := (&pgproto3.Query{
 				String: "SELECT 1",
-			}).Encode(nil)); err != nil {
+			}).Encode(nil); err != nil {
+				errChan <- err
+				return
+			} else if _, err := client.Write(buf); err != nil {
 				errChan <- err
 				return
 			}
 			<-sendEventCh
-			if _, err := client.Write((&pgproto3.Execute{
+			if buf, err := (&pgproto3.Execute{
 				Portal:  "foobar",
 				MaxRows: 42,
-			}).Encode(nil)); err != nil {
+			}).Encode(nil); err != nil {
+				errChan <- err
+				return
+			} else if _, err := client.Write(buf); err != nil {
 				errChan <- err
 				return
 			}
 			<-sendEventCh
-			if _, err := client.Write((&pgproto3.Close{
+			if buf, err := (&pgproto3.Close{
 				ObjectType: 'P',
-			}).Encode(nil)); err != nil {
+			}).Encode(nil); err != nil {
+				errChan <- err
+				return
+			} else if _, err := client.Write(buf); err != nil {
 				errChan <- err
 				return
 			}
@@ -256,17 +264,23 @@ func TestForward(t *testing.T) {
 		errChan := make(chan error, 1)
 		go func() {
 			<-recvEventCh
-			if _, err := server.Write((&pgproto3.ErrorResponse{
+			if buf, err := (&pgproto3.ErrorResponse{
 				Code:    "100",
 				Message: "foobarbaz",
-			}).Encode(nil)); err != nil {
+			}).Encode(nil); err != nil {
+				errChan <- err
+				return
+			} else if _, err := server.Write(buf); err != nil {
 				errChan <- err
 				return
 			}
 			<-recvEventCh
-			if _, err := server.Write((&pgproto3.ReadyForQuery{
+			if buf, err := (&pgproto3.ReadyForQuery{
 				TxStatus: 'I',
-			}).Encode(nil)); err != nil {
+			}).Encode(nil); err != nil {
+				errChan <- err
+				return
+			} else if _, err := server.Write(buf); err != nil {
 				errChan <- err
 				return
 			}
@@ -328,6 +342,7 @@ func TestForward(t *testing.T) {
 
 func TestForwarder_Context(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	ctx := logtags.AddTag(context.Background(), "foo", "bar")
 	f := newForwarder(ctx, nil /* connector */, nil /* metrics */, nil /* timeSource */)
@@ -341,6 +356,7 @@ func TestForwarder_Context(t *testing.T) {
 
 func TestForwarder_Close(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	ctx := context.Background()
 	for _, withRun := range []bool{true, false} {
@@ -363,6 +379,7 @@ func TestForwarder_Close(t *testing.T) {
 
 func TestForwarder_tryReportError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	ctx := context.Background()
 	p1, p2 := net.Pipe()
@@ -398,6 +415,7 @@ func TestForwarder_tryReportError(t *testing.T) {
 
 func TestForwarder_replaceServerConn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	ctx := context.Background()
 	clientProxy, client := net.Pipe()
@@ -422,7 +440,8 @@ func TestForwarder_replaceServerConn(t *testing.T) {
 	require.NoError(t, f.resumeProcessors())
 
 	// Check that we can receive messages from newServer.
-	q := (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(nil)
+	q, err := (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(nil)
+	require.NoError(t, err)
 	go func() {
 		_, _ = newServer.Write(q)
 	}()
@@ -440,6 +459,7 @@ func TestForwarder_replaceServerConn(t *testing.T) {
 
 func TestWrapClientToServerError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	for _, tc := range []struct {
 		input  error
@@ -473,6 +493,7 @@ func TestWrapClientToServerError(t *testing.T) {
 
 func TestWrapServerToClientError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	for _, tc := range []struct {
 		input  error
@@ -506,6 +527,7 @@ func TestWrapServerToClientError(t *testing.T) {
 
 func TestMakeLogicalClockFn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	clockFn := makeLogicalClockFn()
 
@@ -532,6 +554,7 @@ func TestMakeLogicalClockFn(t *testing.T) {
 
 func TestSuspendResumeProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	t.Run("context_cancelled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -678,7 +701,8 @@ func TestSuspendResumeProcessor(t *testing.T) {
 
 		// Client writes messages to be forwarded.
 		buf := new(bytes.Buffer)
-		q := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+		q, err := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+		require.NoError(t, err)
 		for i := 0; i < queryCount; i++ {
 			// Alternate between SELECT 1 and 2 to ensure correctness.
 			if i%2 == 0 {
@@ -756,7 +780,7 @@ func TestSuspendResumeProcessor(t *testing.T) {
 		// have been forwarded.
 		go func(p *processor) { _ = p.resume(ctx) }(p)
 
-		err := p.waitResumed(ctx)
+		err = p.waitResumed(ctx)
 		require.NoError(t, err)
 
 		// Now read all the messages on the server for correctness.

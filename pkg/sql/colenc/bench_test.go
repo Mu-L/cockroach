@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colenc_test
 
@@ -20,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -32,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -91,8 +86,9 @@ func BenchmarkTCPHLineItem(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 
-	s, _, kvdb := serverutils.StartServer(b, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, _, kvdb := serverutils.StartServer(b, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	url, cleanup := sqlutils.PGUrl(b, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
 	defer cleanup()
@@ -127,25 +123,28 @@ func BenchmarkTCPHLineItem(b *testing.B) {
 		}
 	}
 	cb.SetLength(numRows)
-	desc := desctestutils.TestingGetTableDescriptor(kvdb, keys.SystemSQLCodec, "defaultdb", "public", "lineitem")
-	enc := colenc.MakeEncoder(keys.SystemSQLCodec, desc, &st.SV, cb, desc.PublicColumns(),
+	desc := desctestutils.TestingGetTableDescriptor(kvdb, s.Codec(), "defaultdb", "public", "lineitem")
+	enc := colenc.MakeEncoder(s.Codec(), desc, &st.SV, cb, desc.PublicColumns(),
 		nil /*metrics*/, nil /*partialIndexMap*/, func() error { return nil })
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		err = enc.PrepareBatch(ctx, &noopPutter{}, 0, cb.Length())
 	}
+	b.StopTimer()
 	require.NoError(b, err)
 }
 
 type noopPutter struct{}
 
-func (n *noopPutter) CPut(key, value interface{}, expValue []byte)              {}
+func (n *noopPutter) CPut(key, value interface{}, expValue []byte) {}
+func (n *noopPutter) CPutWithOriginTimestamp(
+	key, value interface{}, expValue []byte, ts hlc.Timestamp, shouldWinTie bool,
+) {
+}
 func (n *noopPutter) Put(key, value interface{})                                {}
-func (n *noopPutter) InitPut(key, value interface{}, failOnTombstones bool)     {}
 func (n *noopPutter) Del(key ...interface{})                                    {}
+func (n *noopPutter) CPutBytesEmpty(kys []roachpb.Key, values [][]byte)         {}
 func (n *noopPutter) CPutValuesEmpty(kys []roachpb.Key, values []roachpb.Value) {}
 func (n *noopPutter) CPutTuplesEmpty(kys []roachpb.Key, values [][]byte)        {}
 func (n *noopPutter) PutBytes(kys []roachpb.Key, values [][]byte)               {}
-func (n *noopPutter) InitPutBytes(kys []roachpb.Key, values [][]byte)           {}
 func (n *noopPutter) PutTuples(kys []roachpb.Key, values [][]byte)              {}
-func (n *noopPutter) InitPutTuples(kys []roachpb.Key, values [][]byte)          {}

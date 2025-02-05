@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colrpc
 
@@ -347,12 +342,14 @@ func (i *Inbox) Next() coldata.Batch {
 			// Regardless of the cause we want to propagate such an error as
 			// expected one in all cases so that the caller could decide on how
 			// to handle it.
+			log.VEventf(i.Ctx, 2, "Inbox communication error: %v", err)
 			err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "inbox communication error")
 			i.errCh <- err
 			ungracefulStreamTermination = true
 			colexecerror.ExpectedError(err)
 		}
 		if len(m.Data.Metadata) != 0 {
+			log.VEvent(i.Ctx, 2, "Inbox received metadata")
 			// If an error was encountered, it needs to be propagated
 			// immediately. All other metadata will simply be buffered and
 			// returned in DrainMeta.
@@ -376,7 +373,7 @@ func (i *Inbox) Next() coldata.Batch {
 					// to keep errors unchanged (e.g. kvpb.ErrPriority() will
 					// be called on each error in the DistSQLReceiver).
 					i.bufferedMeta = append(i.bufferedMeta, meta)
-					colexecutils.AccountForMetadata(i.allocator, i.bufferedMeta[len(i.bufferedMeta)-1:])
+					colexecutils.AccountForMetadata(i.Ctx, i.allocator.Acc(), i.bufferedMeta[len(i.bufferedMeta)-1:])
 				}
 			}
 			if receivedErr != nil {
@@ -385,6 +382,7 @@ func (i *Inbox) Next() coldata.Batch {
 			// Continue until we get the next batch or EOF.
 			continue
 		}
+		log.VEvent(i.Ctx, 2, "Inbox received batch")
 		if len(m.Data.RawBytes) == 0 {
 			// Protect against Deserialization panics by skipping empty messages.
 			continue
@@ -439,9 +437,7 @@ func (i *Inbox) GetNumMessages() int64 {
 func (i *Inbox) sendDrainSignal(ctx context.Context) error {
 	log.VEvent(ctx, 2, "Inbox sending drain signal to Outbox")
 	if err := i.stream.Send(&execinfrapb.ConsumerSignal{DrainRequest: &execinfrapb.DrainRequest{}}); err != nil {
-		if log.V(1) {
-			log.Warningf(ctx, "Inbox unable to send drain signal to Outbox: %+v", err)
-		}
+		log.VWarningf(ctx, 1, "Inbox unable to send drain signal to Outbox: %+v", err)
 		return err
 	}
 	return nil
@@ -477,11 +473,14 @@ func (i *Inbox) DrainMeta() []execinfrapb.ProducerMetadata {
 			if err == io.EOF {
 				break
 			}
-			if log.V(1) {
-				log.Warningf(i.Ctx, "Inbox Recv connection error while draining metadata: %+v", err)
-			}
+			log.VEventf(i.Ctx, 1, "Inbox communication error while draining metadata: %v", err)
 			return allMeta
 		}
+		if len(msg.Data.Metadata) == 0 {
+			log.VEvent(i.Ctx, 2, "Inbox received batch while draining metadata, ignoring")
+			continue
+		}
+		log.VEvent(i.Ctx, 2, "Inbox received metadata while draining metadata")
 		for _, remoteMeta := range msg.Data.Metadata {
 			meta, ok := execinfrapb.RemoteProducerMetaToLocalMeta(i.Ctx, remoteMeta)
 			if !ok {

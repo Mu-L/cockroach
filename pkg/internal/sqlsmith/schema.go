@@ -1,17 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
 import (
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -21,10 +18,12 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
 
@@ -51,6 +50,50 @@ type aliasedTableRef struct {
 
 type tableRefs []*tableRef
 
+func WithTableDescriptor(tn tree.TableName, desc descpb.TableDescriptor) SmitherOption {
+	return option{
+		name: fmt.Sprintf("inject table %s", tn.FQString()),
+		apply: func(s *Smither) {
+			s.lock.Lock()
+			defer s.lock.Unlock()
+			if tn.SchemaName != "" {
+				if !slices.ContainsFunc(s.schemas, func(ref *schemaRef) bool {
+					return ref.SchemaName == tn.SchemaName
+				}) {
+					s.schemas = append(s.schemas, &schemaRef{SchemaName: tn.SchemaName})
+				}
+			}
+
+			var cols []*tree.ColumnTableDef
+			for _, col := range desc.Columns {
+				column := tree.ColumnTableDef{
+					Name: tree.Name(col.Name),
+					Type: col.Type,
+				}
+				if col.Nullable {
+					column.Nullable.Nullability = tree.Null
+				}
+				if col.IsComputed() {
+					column.Computed.Computed = true
+				}
+				cols = append(cols, &column)
+			}
+
+			s.tables = append(s.tables, &tableRef{
+				TableName: &tn,
+				Columns:   cols,
+			})
+			if s.columns == nil {
+				s.columns = make(map[tree.TableName]map[tree.Name]*tree.ColumnTableDef)
+			}
+			s.columns[tn] = make(map[tree.Name]*tree.ColumnTableDef)
+			for _, col := range cols {
+				s.columns[tn][col.Name] = col
+			}
+		},
+	}
+}
+
 // ReloadSchemas loads tables from the database.
 func (s *Smither) ReloadSchemas() error {
 	if s.db == nil {
@@ -68,7 +111,15 @@ func (s *Smither) ReloadSchemas() error {
 	if err != nil {
 		return err
 	}
+	s.types.tableImplicitRecordTypes, s.types.tableImplicitRecordTypeNames, err = s.extractTableImplicitRecordTypes()
+	if err != nil {
+		return err
+	}
 	s.schemas, err = s.extractSchemas()
+	if err != nil {
+		return err
+	}
+	s.sequences, err = s.extractSequences()
 	if err != nil {
 		return err
 	}
@@ -83,6 +134,46 @@ func (s *Smither) ReloadSchemas() error {
 	return err
 }
 
+// indexesWithNames is a helper struct to sort CreateIndex nodes based on the
+// names.
+type indexesWithNames struct {
+	names []string
+	nodes []*tree.CreateIndex
+}
+
+func (t *indexesWithNames) Len() int {
+	return len(t.names)
+}
+
+func (t *indexesWithNames) Less(i, j int) bool {
+	return t.names[i] < t.names[j]
+}
+
+func (t *indexesWithNames) Swap(i, j int) {
+	t.names[i], t.names[j] = t.names[j], t.names[i]
+	t.nodes[i], t.nodes[j] = t.nodes[j], t.nodes[i]
+}
+
+var _ sort.Interface = &indexesWithNames{}
+
+// getAllIndexesForTableRLocked returns information about all indexes of the
+// given table in the deterministic order. s.lock is assumed to be read-locked.
+func (s *Smither) getAllIndexesForTableRLocked(tableName tree.TableName) []*tree.CreateIndex {
+	s.lock.AssertRHeld()
+	indexes, ok := s.indexes[tableName]
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(indexes))
+	nodes := make([]*tree.CreateIndex, 0, len(indexes))
+	for _, index := range indexes {
+		names = append(names, string(index.Name))
+		nodes = append(nodes, index)
+	}
+	sort.Sort(&indexesWithNames{names: names, nodes: nodes})
+	return nodes
+}
+
 func (s *Smither) getRandTable() (*aliasedTableRef, bool) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
@@ -90,22 +181,23 @@ func (s *Smither) getRandTable() (*aliasedTableRef, bool) {
 		return nil, false
 	}
 	table := s.tables[s.rnd.Intn(len(s.tables))]
-	indexes := s.indexes[*table.TableName]
-	var indexFlags tree.IndexFlags
+	aliased := &aliasedTableRef{
+		tableRef: table,
+	}
+
 	if !s.disableIndexHints && s.coin() {
+		indexes := s.getAllIndexesForTableRLocked(*table.TableName)
+		var indexFlags tree.IndexFlags
 		indexNames := make([]tree.Name, 0, len(indexes))
 		for _, index := range indexes {
-			if !index.Inverted {
+			if index.Type == idxtype.FORWARD {
 				indexNames = append(indexNames, index.Name)
 			}
 		}
 		if len(indexNames) > 0 {
 			indexFlags.Index = tree.UnrestrictedName(indexNames[s.rnd.Intn(len(indexNames))])
 		}
-	}
-	aliased := &aliasedTableRef{
-		tableRef:   table,
-		indexFlags: &indexFlags,
+		aliased.indexFlags = &indexFlags
 	}
 	return aliased, true
 }
@@ -113,17 +205,16 @@ func (s *Smither) getRandTable() (*aliasedTableRef, bool) {
 func (s *Smither) getRandTableIndex(
 	table, alias tree.TableName,
 ) (*tree.TableIndexName, *tree.CreateIndex, colRefs, bool) {
-	s.lock.RLock()
-	indexes := s.indexes[table]
-	s.lock.RUnlock()
+	var indexes []*tree.CreateIndex
+	func() {
+		s.lock.RLock()
+		defer s.lock.RUnlock()
+		indexes = s.getAllIndexesForTableRLocked(table)
+	}()
 	if len(indexes) == 0 {
 		return nil, nil, nil, false
 	}
-	names := make([]tree.Name, 0, len(indexes))
-	for n := range indexes {
-		names = append(names, n)
-	}
-	idx := indexes[names[s.rnd.Intn(len(names))]]
+	idx := indexes[s.rnd.Intn(len(indexes))]
 	var refs colRefs
 	s.lock.RLock()
 	defer s.lock.RUnlock()
@@ -155,13 +246,12 @@ func (s *Smither) getRandIndex() (*tree.TableIndexName, *tree.CreateIndex, colRe
 }
 
 func (s *Smither) getRandUserDefinedTypeLabel() (*tree.EnumValue, *tree.TypeName, bool) {
-	typName, ok := s.getRandUserDefinedType()
+	udt, typName, ok := s.getRandUserDefinedType()
 	if !ok {
 		return nil, nil, false
 	}
 	s.lock.RLock()
 	defer s.lock.RUnlock()
-	udt := s.types.udts[*typName]
 	logicalRepresentations := udt.TypeMeta.EnumData.LogicalRepresentations
 	// There are no values in this enum.
 	if len(logicalRepresentations) == 0 {
@@ -171,23 +261,17 @@ func (s *Smither) getRandUserDefinedTypeLabel() (*tree.EnumValue, *tree.TypeName
 	return &enumVal, typName, true
 }
 
-func (s *Smither) getRandUserDefinedType() (*tree.TypeName, bool) {
+func (s *Smither) getRandUserDefinedType() (*types.T, *tree.TypeName, bool) {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	if s.types == nil || len(s.types.udts) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	idx := s.rnd.Intn(len(s.types.udts))
-	count := 0
-	for typName := range s.types.udts {
-		if count == idx {
-			return &typName, true
-		}
-		count++
-	}
-	return nil, false
+	return s.types.udts[idx], &s.types.udtNames[idx], true
 }
 
+// extractTypes should be called before extractTables.
 func (s *Smither) extractTypes() (*typeInfo, error) {
 	rows, err := s.db.Query(`
 SELECT
@@ -201,7 +285,8 @@ FROM
 	defer rows.Close()
 
 	evalCtx := eval.Context{}
-	udtMapping := make(map[tree.TypeName]*types.T)
+	var udts []*types.T
+	var udtNames []tree.TypeName
 
 	for rows.Next() {
 		// For each row, collect columns.
@@ -239,21 +324,49 @@ FROM
 				IsMemberReadOnly:        make([]bool, len(members)),
 			},
 		}
-		key := tree.MakeSchemaQualifiedTypeName(scName, name)
-		udtMapping[key] = typ
-	}
-	var udts []*types.T
-	for _, t := range udtMapping {
-		udts = append(udts, t)
+		udts = append(udts, typ)
+		udtNames = append(udtNames, tree.MakeSchemaQualifiedTypeName(scName, name))
 	}
 	// Make sure that future appends to udts force a copy.
 	udts = udts[:len(udts):len(udts)]
 
 	return &typeInfo{
-		udts:        udtMapping,
+		udts:        udts,
+		udtNames:    udtNames,
 		scalarTypes: append(udts, types.Scalar...),
 		seedTypes:   append(udts, randgen.SeedTypes...),
 	}, nil
+}
+
+// extractTableImplicitRecordTypes should only be called after extractTables.
+func (s *Smither) extractTableImplicitRecordTypes() (
+	[]*types.T,
+	[]tree.ResolvableTypeReference,
+	error,
+) {
+	var tableImplicitRecordTypes []*types.T
+	var tableImplicitRecordTypeNames []tree.ResolvableTypeReference
+	for _, t := range s.tables {
+		contents := make([]*types.T, 0, len(t.Columns))
+		labels := make([]string, 0, len(t.Columns))
+		for _, col := range t.Columns {
+			if colinfo.IsSystemColumnName(string(col.Name)) {
+				// Ignore system columns since they are inaccessible.
+				continue
+			}
+			typ, ok := col.Type.(*types.T)
+			if !ok {
+				return nil, nil, errors.AssertionFailedf("unexpectedly column type is not *types.T: %T", col.Type)
+			}
+			contents = append(contents, typ)
+			labels = append(labels, string(col.Name))
+		}
+		typ := types.MakeLabeledTuple(contents, labels)
+		tableImplicitRecordTypes = append(tableImplicitRecordTypes, typ)
+		typeName := tree.MakeSchemaQualifiedTypeName(t.TableName.Schema(), t.TableName.Table())
+		tableImplicitRecordTypeNames = append(tableImplicitRecordTypeNames, &typeName)
+	}
+	return tableImplicitRecordTypes, tableImplicitRecordTypeNames, nil
 }
 
 type schemaRef struct {
@@ -321,8 +434,11 @@ ORDER BY
 		// All non virtual tables contain implicit system columns.
 		for i := range colinfo.AllSystemColumnDescs {
 			col := &colinfo.AllSystemColumnDescs[i]
-			if s.postgres && col.ID == colinfo.MVCCTimestampColumnID {
-				continue
+			if s.postgres {
+				switch col.ID {
+				case colinfo.MVCCTimestampColumnID, colinfo.OriginTimestampColumnID, colinfo.OriginIDColumnID:
+					continue
+				}
 			}
 			currentCols = append(currentCols, &tree.ColumnTableDef{
 				Name:   tree.Name(col.Name),
@@ -421,10 +537,14 @@ func (s *Smither) extractIndexes(
 				return nil, err
 			}
 			if _, ok := indexes[idx]; !ok {
+				indexType := idxtype.FORWARD
+				if inverted {
+					indexType = idxtype.INVERTED
+				}
 				indexes[idx] = &tree.CreateIndex{
-					Name:     idx,
-					Table:    *t.TableName,
-					Inverted: inverted,
+					Name:  idx,
+					Table: *t.TableName,
+					Type:  indexType,
 				}
 			}
 			create := indexes[idx]
@@ -450,6 +570,9 @@ func (s *Smither) extractIndexes(
 		// Remove indexes with empty Columns. This is the case for rowid indexes
 		// where the only index column, rowid, is ignored in the SQL statement
 		// above, but the stored columns are not.
+		//
+		// Note that here non-deterministic iteration order over 'indexes' map
+		// doesn't matter.
 		for name, idx := range indexes {
 			if len(idx.Columns) == 0 {
 				delete(indexes, name)
@@ -460,18 +583,49 @@ func (s *Smither) extractIndexes(
 	return ret, nil
 }
 
+type sequenceRef struct {
+	SequenceName tree.TableName
+}
+
+func (s *Smither) extractSequences() ([]*sequenceRef, error) {
+	rows, err := s.db.Query(`SELECT sequence_catalog, sequence_schema, sequence_name FROM information_schema.sequences`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ret []*sequenceRef
+	for rows.Next() {
+		var db, schema, name tree.Name
+		if err = rows.Scan(&db, &schema, &name); err != nil {
+			return nil, err
+		}
+		ret = append(ret, &sequenceRef{SequenceName: tree.MakeTableNameWithSchema(db, schema, name)})
+	}
+	return ret, nil
+}
+
 type operator struct {
 	*tree.BinOp
 	Operator treebin.BinaryOperator
 }
 
 var operators = func() map[oid.Oid][]operator {
+	// Ensure deterministic order of populating operators map.
+	binOps := make([]treebin.BinaryOperatorSymbol, 0, len(tree.BinOps))
+	for op := range tree.BinOps {
+		binOps = append(binOps, op)
+	}
+	sort.Slice(binOps, func(i, j int) bool {
+		return binOps[i] < binOps[j]
+	})
 	m := map[oid.Oid][]operator{}
-	for BinaryOperator, overload := range tree.BinOps {
+	for _, binOp := range binOps {
+		overload := tree.BinOps[binOp]
 		_ = overload.ForEachBinOp(func(bo *tree.BinOp) error {
 			m[bo.ReturnType.Oid()] = append(m[bo.ReturnType.Oid()], operator{
 				BinOp:    bo,
-				Operator: treebin.MakeBinaryOperator(BinaryOperator),
+				Operator: treebin.MakeBinaryOperator(binOp),
 			})
 			return nil
 		})
@@ -492,18 +646,15 @@ type functionsMu struct {
 }
 
 var functions = func() *functionsMu {
+	// Ensure deterministic order of populating functions map.
+	funcNames := make([]string, 0, len(tree.FunDefs))
+	for name := range tree.FunDefs {
+		funcNames = append(funcNames, name)
+	}
+	sort.Strings(funcNames)
 	m := map[tree.FunctionClass]map[oid.Oid][]function{}
-	for _, def := range tree.FunDefs {
-		switch def.Name {
-		case "pg_sleep":
-			continue
-		case "st_frechetdistance", "st_buffer":
-			// Some spatial functions can be very computationally expensive and
-			// run for a long time or never finish, so we avoid generating them.
-			// See #69213.
-			continue
-		}
-
+	for _, name := range funcNames {
+		def := tree.FunDefs[name]
 		if n := tree.Name(def.Name); n.String() != def.Name {
 			// sqlsmith doesn't know how to quote function names, e.g. for
 			// the numeric cast, we need to use `"numeric"(val)`, but sqlsmith
@@ -513,6 +664,12 @@ var functions = func() *functionsMu {
 
 		skip := false
 		for _, substr := range []string{
+			"pg_sleep",
+			// Some spatial functions can be very computationally expensive and
+			// run for a long time or never finish, so we avoid generating them.
+			// See #69213.
+			"st_frechetdistance",
+			"st_buffer",
 			"stream_ingestion",
 			"crdb_internal.force_",
 			"crdb_internal.unsafe_",
@@ -525,6 +682,7 @@ var functions = func() *functionsMu {
 			"crdb_internal.revalidate_unique_constraint",
 			"crdb_internal.request_statement_bundle",
 			"crdb_internal.set_compaction_concurrency",
+			"crdb_internal.reset_sql_stats",
 		} {
 			skip = skip || strings.Contains(def.Name, substr)
 		}

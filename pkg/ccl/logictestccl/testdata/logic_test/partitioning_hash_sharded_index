@@ -1,5 +1,8 @@
 # LogicTest: 5node
 
+# This test routinely times out under race without clear signs of problems.
+skip under race
+
 statement ok
 SET experimental_enable_implicit_column_partitioning = true;
 
@@ -126,7 +129,7 @@ CREATE TABLE public.t_to_be_hashed (
   a INT8 NOT NULL,
   b STRING NOT NULL,
   c INT8 NULL,
-  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(c)), 16:::INT8)) VIRTUAL,
+  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(c))), 16:::INT8)) VIRTUAL,
   CONSTRAINT t_to_be_hashed_pkey PRIMARY KEY (a ASC),
   INDEX t_to_be_hashed_c_idx (c ASC) USING HASH WITH (bucket_count=16),
   FAMILY fam_0_a_b_c (a, b, c)
@@ -135,6 +138,7 @@ CREATE TABLE public.t_to_be_hashed (
   PARTITION us_east VALUES IN (('new york'))
 )
 -- Warning: Partitioned table with no zone configurations.
+
 
 statement ok
 CREATE UNIQUE INDEX ON t_to_be_hashed (c) USING HASH;
@@ -146,7 +150,7 @@ CREATE TABLE public.t_to_be_hashed (
   a INT8 NOT NULL,
   b STRING NOT NULL,
   c INT8 NULL,
-  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(c)), 16:::INT8)) VIRTUAL,
+  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(c))), 16:::INT8)) VIRTUAL,
   CONSTRAINT t_to_be_hashed_pkey PRIMARY KEY (a ASC),
   INDEX t_to_be_hashed_c_idx (c ASC) USING HASH WITH (bucket_count=16),
   UNIQUE INDEX t_to_be_hashed_c_key (c ASC) USING HASH WITH (bucket_count=16),
@@ -156,6 +160,7 @@ CREATE TABLE public.t_to_be_hashed (
   PARTITION us_east VALUES IN (('new york'))
 )
 -- Warning: Partitioned table with no zone configurations.
+
 
 statement ok
 ALTER TABLE t_to_be_hashed ALTER PRIMARY KEY USING COLUMNS (a) USING HASH;
@@ -167,8 +172,8 @@ CREATE TABLE public.t_to_be_hashed (
   a INT8 NOT NULL,
   b STRING NOT NULL,
   c INT8 NULL,
-  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(c)), 16:::INT8)) VIRTUAL,
-  crdb_internal_a_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 16:::INT8)) VIRTUAL,
+  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(c))), 16:::INT8)) VIRTUAL,
+  crdb_internal_a_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(a))), 16:::INT8)) VIRTUAL,
   CONSTRAINT t_to_be_hashed_pkey PRIMARY KEY (a ASC) USING HASH WITH (bucket_count=16),
   INDEX t_to_be_hashed_c_idx (c ASC) USING HASH WITH (bucket_count=16),
   UNIQUE INDEX t_to_be_hashed_c_key (c ASC) USING HASH WITH (bucket_count=16),
@@ -178,6 +183,7 @@ CREATE TABLE public.t_to_be_hashed (
   PARTITION us_east VALUES IN (('new york'))
 )
 -- Warning: Partitioned table with no zone configurations.
+
 
 statement ok
 CREATE TABLE t_idx_pk_hashed_1 (
@@ -195,11 +201,11 @@ query T
 SELECT create_statement FROM [SHOW CREATE TABLE t_idx_pk_hashed_1];
 ----
 CREATE TABLE public.t_idx_pk_hashed_1 (
-  crdb_internal_a_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 16:::INT8)) VIRTUAL,
+  crdb_internal_a_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(a))), 16:::INT8)) VIRTUAL,
   a INT8 NOT NULL,
   b STRING NOT NULL,
   c INT8 NULL,
-  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(c)), 16:::INT8)) VIRTUAL,
+  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(c))), 16:::INT8)) VIRTUAL,
   CONSTRAINT t_idx_pk_hashed_1_pkey PRIMARY KEY (a ASC) USING HASH WITH (bucket_count=16),
   INDEX t_idx_pk_hashed_1_c_idx (c ASC) USING HASH WITH (bucket_count=16),
   FAMILY fam_0_a_b_c (a, b, c)
@@ -208,6 +214,7 @@ CREATE TABLE public.t_idx_pk_hashed_1 (
   PARTITION us_east VALUES IN (('new york'))
 )
 -- Warning: Partitioned table with no zone configurations.
+
 
 statement ok
 CREATE TABLE t_idx_pk_hashed_2 (
@@ -229,8 +236,8 @@ CREATE TABLE public.t_idx_pk_hashed_2 (
   a INT8 NOT NULL,
   b STRING NOT NULL,
   c INT8 NULL,
-  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(c)), 16:::INT8)) VIRTUAL,
-  crdb_internal_a_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(crdb_internal.datums_to_bytes(a)), 16:::INT8)) VIRTUAL,
+  crdb_internal_c_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(c))), 16:::INT8)) VIRTUAL,
+  crdb_internal_a_shard_16 INT8 NOT VISIBLE NOT NULL AS (mod(fnv32(md5(crdb_internal.datums_to_bytes(a))), 16:::INT8)) VIRTUAL,
   CONSTRAINT t_idx_pk_hashed_2_pkey PRIMARY KEY (a ASC) USING HASH WITH (bucket_count=16),
   INDEX t_idx_pk_hashed_2_c_idx (c ASC) USING HASH WITH (bucket_count=16),
   FAMILY fam_0_a_b_c (a, b, c)
@@ -239,6 +246,7 @@ CREATE TABLE public.t_idx_pk_hashed_2 (
   PARTITION us_east VALUES IN (('new york'))
 )
 -- Warning: Partitioned table with no zone configurations.
+
 
 subtest test_presplit_with_partitioning
 
@@ -280,4 +288,4 @@ t_presplit  112       t_presplit_idx_member_id  /Table/112/2/"seattle"/3    /Tab
 t_presplit  112       t_presplit_idx_member_id  /Table/112/2/"seattle"/4    /Table/112/2/"seattle"/5
 t_presplit  112       t_presplit_idx_member_id  /Table/112/2/"seattle"/5    /Table/112/2/"seattle"/6
 t_presplit  112       t_presplit_idx_member_id  /Table/112/2/"seattle"/6    /Table/112/2/"seattle"/7
-t_presplit  112       t_presplit_idx_member_id  /Table/112/2/"seattle"/7    /Table/112/3/"new york"/0
+t_presplit  112       t_presplit_idx_member_id  /Table/112/2/"seattle"/7    /Table/112/3

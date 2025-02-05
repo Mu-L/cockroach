@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package upgradejob contains the jobs.Resumer implementation
 // used for long-running upgrades.
@@ -29,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/migrationstable"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 func init() {
@@ -66,7 +62,7 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 	db := execCtx.ExecCfg().InternalDB
 	ex := db.Executor()
 	enterpriseEnabled := base.CCLDistributionAndEnterpriseEnabled(
-		execCtx.ExecCfg().Settings, execCtx.ExecCfg().NodeInfo.LogicalClusterID())
+		execCtx.ExecCfg().Settings)
 	alreadyCompleted, err := migrationstable.CheckIfMigrationCompleted(
 		ctx, v, nil /* txn */, ex,
 		enterpriseEnabled, migrationstable.ConsistentRead,
@@ -87,24 +83,24 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 		err = m.Run(ctx, v, mc.SystemDeps())
 	case *upgrade.TenantUpgrade:
 		tenantDeps := upgrade.TenantDeps{
-			Codec:            execCtx.ExecCfg().Codec,
-			Settings:         execCtx.ExecCfg().Settings,
-			DB:               execCtx.ExecCfg().InternalDB,
-			KVDB:             execCtx.ExecCfg().DB,
-			LeaseManager:     execCtx.ExecCfg().LeaseManager,
-			InternalExecutor: ex,
-			JobRegistry:      execCtx.ExecCfg().JobRegistry,
-			TestingKnobs:     execCtx.ExecCfg().UpgradeTestingKnobs,
-			SessionData:      execCtx.SessionData(),
+			Codec:              execCtx.ExecCfg().Codec,
+			Settings:           execCtx.ExecCfg().Settings,
+			DB:                 execCtx.ExecCfg().InternalDB,
+			KVDB:               execCtx.ExecCfg().DB,
+			LeaseManager:       execCtx.ExecCfg().LeaseManager,
+			LicenseEnforcer:    execCtx.ExecCfg().LicenseEnforcer,
+			InternalExecutor:   ex,
+			JobRegistry:        execCtx.ExecCfg().JobRegistry,
+			TestingKnobs:       execCtx.ExecCfg().UpgradeTestingKnobs,
+			SessionData:        execCtx.SessionData(),
+			ClusterID:          execCtx.ExtendedEvalContext().ClusterID,
+			TenantInfoAccessor: mc.SystemDeps().TenantInfoAccessor,
 		}
-		tenantDeps.SpanConfig.KVAccessor = execCtx.ExecCfg().SpanConfigKVAccessor
-		tenantDeps.SpanConfig.Splitter = execCtx.ExecCfg().SpanConfigSplitter
-		tenantDeps.SpanConfig.Default = execCtx.ExecCfg().DefaultZoneConfig.AsSpanConfig()
 
 		tenantDeps.SchemaResolverConstructor = func(
 			txn *kv.Txn, descriptors *descs.Collection, currDb string,
 		) (resolver.SchemaResolver, func(), error) {
-			opName := "internal-planner-for-upgrades"
+			opName := redact.SafeString("internal-planner-for-upgrades")
 			sd := execCtx.SessionData().Clone()
 			sd.Database = currDb
 			internalPlanner, cleanup := sql.NewInternalPlanner(
@@ -132,6 +128,14 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 		return errors.Wrapf(err, "running migration for %v", v)
 	}
 
+	// Bump the version of the system database schema whenever we run a
+	// non-permanent migration.
+	if !m.Permanent() {
+		if err := upgrade.BumpSystemDatabaseSchemaVersion(ctx, v, db); err != nil {
+			return err
+		}
+	}
+
 	// Mark the upgrade as having been completed so that subsequent iterations
 	// no-op and new jobs are not created.
 	if err := migrationstable.MarkMigrationCompleted(ctx, ex, v); err != nil {
@@ -142,5 +146,10 @@ func (r resumer) Resume(ctx context.Context, execCtxI interface{}) error {
 
 // The long-running upgrade resumer has no reverting logic.
 func (r resumer) OnFailOrCancel(ctx context.Context, execCtx interface{}, _ error) error {
+	return nil
+}
+
+// CollectProfile implements the jobs.Resumer interface.
+func (r resumer) CollectProfile(_ context.Context, _ interface{}) error {
 	return nil
 }

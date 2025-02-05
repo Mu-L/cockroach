@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package valueside
 
@@ -17,10 +12,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgrepl/lsn"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/tsearch"
+	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -122,6 +119,12 @@ func DecodeUntaggedDatum(
 			return nil, b, err
 		}
 		return a.NewDPGLSN(tree.DPGLSN{LSN: lsn.LSN(data)}), b, nil
+	case types.RefCursorFamily:
+		b, data, err := encoding.DecodeUntaggedBytesValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		return a.NewDRefCursor(tree.DString(data)), b, nil
 	case types.Box2DFamily:
 		b, data, err := encoding.DecodeUntaggedBox2DValue(buf)
 		if err != nil {
@@ -216,6 +219,16 @@ func DecodeUntaggedDatum(
 			return nil, b, err
 		}
 		return tree.NewDTSVector(v), b, nil
+	case types.PGVectorFamily:
+		b, data, err := encoding.DecodeUntaggedBytesValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		vec, err := vector.Decode(data)
+		if err != nil {
+			return nil, b, err
+		}
+		return tree.NewDPGVector(vec), b, nil
 	case types.OidFamily:
 		// TODO: This possibly should decode to uint32 (with corresponding changes
 		// to encoding) to ensure that the value fits in a DOid without any loss of
@@ -246,7 +259,10 @@ func DecodeUntaggedDatum(
 	case types.VoidFamily:
 		return a.NewDVoid(), buf, nil
 	default:
-		return nil, buf, errors.Errorf("couldn't decode type %s", t.SQLStringForError())
+		if buildutil.CrdbTestBuild {
+			return nil, buf, errors.AssertionFailedf("unable to decode table value %s", t.SQLStringForError())
+		}
+		return nil, buf, errors.Errorf("unable to decode table value %s", t.SQLStringForError())
 	}
 }
 
@@ -312,4 +328,42 @@ func (d *Decoder) Decode(a *tree.DatumAlloc, bytes []byte) (tree.Datums, error) 
 		}
 	}
 	return datums, nil
+}
+
+// encodingTypeToDatumType picks a datum type based on the encoding type. It is
+// a guess, so it could be incorrect (e.g. strings and enums use encoding.Bytes,
+// yet we'll unconditionally return types.Bytes).
+func encodingTypeToDatumType(t encoding.Type) (*types.T, error) {
+	switch t {
+	case encoding.Int:
+		return types.Int, nil
+	case encoding.Float:
+		return types.Float, nil
+	case encoding.Decimal:
+		return types.Decimal, nil
+	case encoding.Bytes, encoding.BytesDesc:
+		return types.Bytes, nil
+	case encoding.Time:
+		return types.TimestampTZ, nil
+	case encoding.Duration:
+		return types.Interval, nil
+	case encoding.True, encoding.False:
+		return types.Bool, nil
+	case encoding.UUID:
+		return types.Uuid, nil
+	case encoding.IPAddr:
+		return types.INet, nil
+	case encoding.JSON:
+		return types.Jsonb, nil
+	case encoding.BitArray, encoding.BitArrayDesc:
+		return types.VarBitArray, nil
+	case encoding.TimeTZ:
+		return types.TimeTZ, nil
+	case encoding.Geo, encoding.GeoDesc:
+		return types.Geometry, nil
+	case encoding.Box2D:
+		return types.Box2D, nil
+	default:
+		return nil, errors.Newf("no known datum type for encoding type %s", t)
+	}
 }

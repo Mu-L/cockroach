@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -22,7 +17,7 @@ import (
 // at the expense of possibly incomplete data, or raised for complete data, at the cost
 // of a possibly slower response.
 var HotRangesRequestNodeTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"server.hot_ranges_request.node.timeout",
 	"the duration allowed for a single node to return hot range data before the request is cancelled; if set to 0, there is no timeout",
 	time.Minute*5,

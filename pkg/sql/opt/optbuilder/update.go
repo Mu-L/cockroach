@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -70,12 +65,18 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 	}
 
 	// UX friendliness safeguard.
-	if upd.Where == nil && b.evalCtx.SessionData().SafeUpdates {
-		panic(pgerror.DangerousStatementf("UPDATE without WHERE clause"))
+	if upd.Where == nil && upd.Limit == nil && b.evalCtx.SessionData().SafeUpdates {
+		panic(pgerror.DangerousStatementf("UPDATE without WHERE or LIMIT clause"))
 	}
 
 	// Find which table we're working on, check the permissions.
 	tab, depName, alias, refColumns := b.resolveTableForMutation(upd.Table, privilege.UPDATE)
+
+	if tab.IsVirtualTable() {
+		panic(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"cannot update view \"%s\"", tab.Name(),
+		))
+	}
 
 	if refColumns != nil {
 		panic(pgerror.Newf(pgcode.Syntax,
@@ -105,6 +106,9 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 
 	// Build each of the SET expressions.
 	mb.addUpdateCols(upd.Exprs)
+
+	// Project row-level BEFORE triggers for UPDATE.
+	mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate, false /* cascade */)
 
 	// Build the final update statement, including any returned expressions.
 	if resultsNeeded(upd.Returning) {
@@ -142,7 +146,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				for i := range desiredTypes {
 					desiredTypes[i] = mb.md.ColumnMeta(mb.targetColList[targetIdx+i]).Type
 				}
-				outScope := mb.b.buildSelectStmt(t.Select, noRowLocking, desiredTypes, mb.outScope)
+				outScope := mb.b.buildSelectStmt(t.Select, noLocking, desiredTypes, mb.outScope)
 				mb.subqueries = append(mb.subqueries, outScope)
 				n = len(outScope.cols)
 
@@ -342,9 +346,14 @@ func (mb *mutationBuilder) buildUpdate(returning *tree.ReturningExprs) {
 	// Project partial index PUT and DEL boolean columns.
 	mb.projectPartialIndexPutAndDelCols()
 
+	// Project vector index PUT and DEL columns.
+	mb.projectVectorIndexCols()
+
 	mb.buildUniqueChecksForUpdate()
 
 	mb.buildFKChecksForUpdate()
+
+	mb.buildRowLevelAfterTriggers(opt.UpdateOp)
 
 	private := mb.makeMutationPrivate(returning != nil)
 	for _, col := range mb.extraAccessibleCols {

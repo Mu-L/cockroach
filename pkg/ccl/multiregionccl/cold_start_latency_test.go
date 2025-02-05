@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package multiregionccl
 
@@ -22,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -35,7 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -46,9 +44,7 @@ import (
 func TestColdStartLatency(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderRace(t, "too slow")
-	skip.UnderStress(t, "too slow")
-
+	skip.UnderDuress(t, "too slow")
 	// We'll need to make some per-node args to assign the different
 	// KV nodes to different regions and AZs. We'll want to do it to
 	// look somewhat like the real cluster topologies we have in mind.
@@ -71,8 +67,8 @@ func TestColdStartLatency(t *testing.T) {
 	}
 	pauseAfter := make(chan struct{})
 	signalAfter := make([]chan struct{}, numNodes)
-	var latencyEnabled syncutil.AtomicBool
-	var addrsToNodeIDs sync.Map
+	var latencyEnabled atomic.Bool
+	var addrsToNodeIDs syncutil.Map[string, int]
 
 	// Set up the host cluster.
 	perServerArgs := make(map[int]base.TestServerArgs, numNodes)
@@ -87,7 +83,7 @@ func TestColdStartLatency(t *testing.T) {
 			SignalAfterGettingRPCAddress: signalAfter[i],
 			ContextTestingKnobs: rpc.ContextTestingKnobs{
 				InjectedLatencyOracle:  regionlatency.MakeAddrMap(),
-				InjectedLatencyEnabled: latencyEnabled.Get,
+				InjectedLatencyEnabled: latencyEnabled.Load,
 				UnaryClientInterceptor: func(
 					target string, class rpc.ConnectionClass,
 				) grpc.UnaryClientInterceptor {
@@ -99,8 +95,10 @@ func TestColdStartLatency(t *testing.T) {
 						if !log.ExpensiveLogEnabled(ctx, 2) {
 							return invoker(ctx, method, req, reply, cc, opts...)
 						}
-						nodeIDi, _ := addrsToNodeIDs.Load(target)
-						nodeID, _ := nodeIDi.(int)
+						var nodeID int
+						if nodeIDPtr, ok := addrsToNodeIDs.Load(target); ok {
+							nodeID = *nodeIDPtr
+						}
 						start := timeutil.Now()
 						defer func() {
 							log.VEventf(ctx, 2, "%d->%d (%v->%v) %s %v %v took %v",
@@ -116,11 +114,13 @@ func TestColdStartLatency(t *testing.T) {
 		args.Knobs.Server = serverKnobs
 		perServerArgs[i] = args
 	}
+	cs := cluster.MakeTestingClusterSettings()
 	tc := testcluster.NewTestCluster(t, numNodes, base.TestClusterArgs{
 		ParallelStart:     true,
 		ServerArgsPerNode: perServerArgs,
 		ServerArgs: base.TestServerArgs{
 			DefaultTestTenant: base.TODOTestTenantDisabled,
+			Settings:          cs,
 		},
 	})
 	go func() {
@@ -134,14 +134,15 @@ func TestColdStartLatency(t *testing.T) {
 	ctx := context.Background()
 	defer tc.Stopper().Stop(ctx)
 	enableLatency := func() {
-		latencyEnabled.Set(true)
+		latencyEnabled.Store(true)
 		for i := 0; i < numNodes; i++ {
 			tc.Server(i).RPCContext().RemoteClocks.TestingResetLatencyInfos()
 		}
 	}
 
 	for i := 0; i < numNodes; i++ {
-		addrsToNodeIDs.Store(tc.Server(i).RPCAddr(), i)
+		nodeID := i
+		addrsToNodeIDs.Store(tc.Server(i).RPCAddr(), &nodeID)
 	}
 	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(1))
 
@@ -165,13 +166,12 @@ func TestColdStartLatency(t *testing.T) {
 		var stmts []string
 		if !isTenant {
 			stmts = []string{
-				"ALTER TENANT ALL SET CLUSTER SETTING sql.virtual_cluster.feature_access.zone_configs.enabled = true",
-				"ALTER TENANT ALL SET CLUSTER SETTING sql.virtual_cluster.feature_access.multiregion.enabled = true",
 				`alter range meta configure zone using constraints = '{"+region=us-east1": 1, "+region=us-west1": 1, "+region=europe-west1": 1}';`,
 			}
 		} else {
 			stmts = []string{`
 BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 ALTER DATABASE system PRIMARY REGION "us-east1";
 ALTER DATABASE system ADD REGION "us-west1";
 ALTER DATABASE system ADD REGION "europe-west1";
@@ -197,7 +197,7 @@ COMMIT;`}
 				InjectedLatencyOracle: tc.Server(i).TestingKnobs().
 					Server.(*server.TestingKnobs).ContextTestingKnobs.
 					InjectedLatencyOracle,
-				InjectedLatencyEnabled: latencyEnabled.Get,
+				InjectedLatencyEnabled: latencyEnabled.Load,
 				StreamClientInterceptor: func(
 					target string, class rpc.ConnectionClass,
 				) grpc.StreamClientInterceptor {
@@ -205,8 +205,10 @@ COMMIT;`}
 						ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn,
 						method string, streamer grpc.Streamer, opts ...grpc.CallOption,
 					) (grpc.ClientStream, error) {
-						nodeIDi, _ := addrsToNodeIDs.Load(target)
-						nodeID, _ := nodeIDi.(int)
+						var nodeID int
+						if nodeIDPtr, ok := addrsToNodeIDs.Load(target); ok {
+							nodeID = *nodeIDPtr
+						}
 						start := timeutil.Now()
 						maybeWait(ctx, i, nodeID)
 						defer func() {
@@ -229,8 +231,10 @@ COMMIT;`}
 					}
 				},
 				UnaryClientInterceptor: func(target string, class rpc.ConnectionClass) grpc.UnaryClientInterceptor {
-					nodeIDi, _ := addrsToNodeIDs.Load(target)
-					nodeID, _ := nodeIDi.(int)
+					var nodeID int
+					if nodeIDPtr, ok := addrsToNodeIDs.Load(target); ok {
+						nodeID = *nodeIDPtr
+					}
 					return func(
 						ctx context.Context, method string, req, reply interface{},
 						cc *grpc.ClientConn, invoker grpc.UnaryInvoker,
@@ -254,6 +258,7 @@ COMMIT;`}
 	const password = "asdf"
 	{
 		tenant, tenantDB := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
+			Settings: cs,
 			TenantID: serverutils.TestTenantID(),
 			TestingKnobs: base.TestingKnobs{
 				Server: tenantServerKnobs(0),
@@ -268,25 +273,8 @@ COMMIT;`}
 		// Wait for the span configs to propagate. After we know they have
 		// propagated, we'll shut down the tenant and wait for them to get
 		// applied.
-		tdb.Exec(t, "CREATE TABLE after AS SELECT now() AS after")
-		tdb.CheckQueryResultsRetry(t, `
-  WITH progress AS (
-                    SELECT crdb_internal.pb_to_json(
-                            'progress',
-                            progress
-                           )->'AutoSpanConfigReconciliation' AS p
-                      FROM crdb_internal.system_jobs
-                     WHERE status = 'running'
-                ),
-       checkpoint AS (
-                    SELECT (p->'checkpoint'->>'wallTime')::FLOAT8 / 1e9 AS checkpoint
-                      FROM progress
-                     WHERE p IS NOT NULL
-                  )
-SELECT checkpoint > extract(epoch from after)
-  FROM checkpoint, after`,
-			[][]string{{"true"}})
-		tenant.Stopper().Stop(ctx)
+		sqlutils.WaitForSpanConfigReconciliation(t, tdb)
+		tenant.AppStopper().Stop(ctx)
 	}
 
 	// Wait for the configs to be applied.
@@ -318,7 +306,8 @@ SELECT checkpoint > extract(epoch from after)
 		defer r.Release()
 		start := timeutil.Now()
 		sn := tenantServerKnobs(i)
-		tenant, err := tc.Server(i).StartTenant(ctx, base.TestTenantArgs{
+		tenant, err := tc.Server(i).TenantController().StartTenant(ctx, base.TestTenantArgs{
+			Settings:            cs,
 			TenantID:            serverutils.TestTenantID(),
 			DisableCreateTenant: true,
 			SkipTenantCheck:     true,
@@ -328,10 +317,10 @@ SELECT checkpoint > extract(epoch from after)
 			Locality: localities[i],
 		})
 		require.NoError(t, err)
-		defer tenant.Stopper().Stop(ctx)
+		defer tenant.AppStopper().Stop(ctx)
 		pgURL, cleanup, err := sqlutils.PGUrlWithOptionalClientCertsE(
 			tenant.AdvSQLAddr(), "tenantdata", url.UserPassword("foo", password),
-			false, // withClientCerts
+			false, "", // withClientCerts
 		)
 		if !assert.NoError(t, err) {
 			return

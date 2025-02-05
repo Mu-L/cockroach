@@ -24,7 +24,7 @@ write *eventpb.CreateIndex to event log:
     tag: CREATE INDEX
     user: root
   tableName: defaultdb.public.t
-## StatementPhase stage 1 of 1 with 9 MutationType ops
+## StatementPhase stage 1 of 1 with 10 MutationType ops
 upsert descriptor #104
   ...
      referencingDescriptorIds:
@@ -63,6 +63,7 @@ upsert descriptor #106
   +      predicate: v = b'@':::@100104
   +      sharded: {}
   +      storeColumnNames: []
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: BACKFILLING
@@ -84,9 +85,11 @@ upsert descriptor #106
   +      - 1
   +      name: crdb_internal_index_3_name_placeholder
   +      partitioning: {}
+  +      predicate: v = b'@':::@100104
   +      sharded: {}
   +      storeColumnNames: []
   +      useDeletePreservingEncoding: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: DELETE_ONLY
@@ -108,7 +111,7 @@ upsert descriptor #106
 ## PreCommitPhase stage 1 of 2 with 1 MutationType op
 undo all catalog changes within txn #1
 persist all catalog changes to storage
-## PreCommitPhase stage 2 of 2 with 15 MutationType ops
+## PreCommitPhase stage 2 of 2 with 16 MutationType ops
 upsert descriptor #104
    type:
      arrayTypeId: 105
@@ -159,6 +162,8 @@ upsert descriptor #106
   +      columns:
   +        "1": k
   +        "2": v
+  +        "4294967292": crdb_internal_origin_timestamp
+  +        "4294967293": crdb_internal_origin_id
   +        "4294967294": tableoid
   +        "4294967295": crdb_internal_mvcc_timestamp
   +      families:
@@ -170,8 +175,7 @@ upsert descriptor #106
   +      name: t
   +    relevantStatements:
   +    - statement:
-  +        redactedStatement: CREATE INDEX ‹idx1› ON ‹defaultdb›.‹public›.‹t› (‹v›) WHERE
-  +          (‹v› = ‹'a'›)
+  +        redactedStatement: CREATE INDEX ‹idx1› ON ‹defaultdb›.‹public›.‹t› (‹v›) WHERE (‹v› = ‹'a'›)
   +        statement: CREATE INDEX idx1 ON t (v) WHERE (v = 'a')
   +        statementTag: CREATE INDEX
   +    revertible: true
@@ -204,6 +208,7 @@ upsert descriptor #106
   +      predicate: v = b'@':::@100104
   +      sharded: {}
   +      storeColumnNames: []
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: BACKFILLING
@@ -225,9 +230,11 @@ upsert descriptor #106
   +      - 1
   +      name: crdb_internal_index_3_name_placeholder
   +      partitioning: {}
+  +      predicate: v = b'@':::@100104
   +      sharded: {}
   +      storeColumnNames: []
   +      useDeletePreservingEncoding: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: DELETE_ONLY
@@ -446,6 +453,8 @@ upsert descriptor #106
   -      columns:
   -        "1": k
   -        "2": v
+  -        "4294967292": crdb_internal_origin_timestamp
+  -        "4294967293": crdb_internal_origin_id
   -        "4294967294": tableoid
   -        "4294967295": crdb_internal_mvcc_timestamp
   -      families:
@@ -457,8 +466,7 @@ upsert descriptor #106
   -      name: t
   -    relevantStatements:
   -    - statement:
-  -        redactedStatement: CREATE INDEX ‹idx1› ON ‹defaultdb›.‹public›.‹t› (‹v›) WHERE
-  -          (‹v› = ‹'a'›)
+  -        redactedStatement: CREATE INDEX ‹idx1› ON ‹defaultdb›.‹public›.‹t› (‹v›) WHERE (‹v› = ‹'a'›)
   -        statement: CREATE INDEX idx1 ON t (v) WHERE (v = 'a')
   -        statementTag: CREATE INDEX
   -    revertible: true
@@ -489,6 +497,7 @@ upsert descriptor #106
   +    predicate: v = b'@':::@100104
   +    sharded: {}
   +    storeColumnNames: []
+  +    vecConfig: {}
   +    version: 4
      modificationTime: {}
   -  mutations:
@@ -513,6 +522,7 @@ upsert descriptor #106
   -      predicate: v = b'@':::@100104
   -      sharded: {}
   -      storeColumnNames: []
+  -      vecConfig: {}
   -      version: 4
   -    mutationId: 1
   -    state: WRITE_ONLY
@@ -534,9 +544,11 @@ upsert descriptor #106
   -      - 1
   -      name: crdb_internal_index_3_name_placeholder
   -      partitioning: {}
+  -      predicate: v = b'@':::@100104
   -      sharded: {}
   -      storeColumnNames: []
   -      useDeletePreservingEncoding: true
+  -      vecConfig: {}
   -      version: 4
   -    mutationId: 1
   -    state: DELETE_ONLY

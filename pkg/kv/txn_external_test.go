@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv_test
 
@@ -19,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
@@ -353,9 +349,19 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 	const testTime = 1 * time.Second
 	ctx := context.Background()
 
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationManual,
-	})
+	tc := testcluster.StartTestCluster(t, 3,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					// This test is setting specific routing policies and
+					// looking at the traces to determine what nodes were
+					// part of the routing.
+					KVClient: &kvcoord.ClientTestingKnobs{RouteToLeaseholderFirst: true},
+				},
+			},
+		},
+	)
 	defer tc.Stopper().Stop(ctx)
 
 	// Create a scratch range. Then add one voting follower and one non-voting
@@ -428,7 +434,7 @@ func testTxnNegotiateAndSendDoesNotBlock(t *testing.T, multiRange, strict, route
 				if err := store.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 					// Issue a bounded-staleness read over the keys. If using strict
 					// bounded staleness, use an error wait policy so that we'll hear an
-					// error (LockConflictError) under conditions that would otherwise
+					// error (WriteIntentError) under conditions that would otherwise
 					// cause us to block on an intent. Otherwise, allow the request to be
 					// redirected to the leaseholder and to block on intents.
 					ba := &kvpb.BatchRequest{}
@@ -747,7 +753,7 @@ func testPrepareForRetry(t *testing.T, isoLevel isolation.Level) {
 	require.NoError(t, txn.SetIsoLevel(isoLevel))
 	// Write to "a" in the first epoch.
 	require.NoError(t, txn.Put(ctx, keyA, 1))
-	require.NoError(t, txn.Step(ctx))
+	require.NoError(t, txn.Step(ctx, true /* allowReadTimestampStep */))
 	// Read from "b" to establish a refresh span.
 	res, err := txn.Get(ctx, keyB)
 	require.NoError(t, err)
@@ -824,7 +830,7 @@ func TestPrepareForPartialRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, txn.Put(ctx, keyA, 1))
 	require.NoError(t, txn.ReleaseSavepoint(ctx, stmt1))
-	require.NoError(t, txn.Step(ctx))
+	require.NoError(t, txn.Step(ctx, true /* allowReadTimestampStep */))
 	// Perform a series of reads and writes in the second "statement".
 	stmt2, err := txn.CreateSavepoint(ctx)
 	require.NoError(t, err)
@@ -955,6 +961,105 @@ func TestUpdateStateOnRemoteRetryableErr(t *testing.T) {
 		// Lastly, ensure the TxnCoordSender was not swapped out, even if the
 		// transaction was aborted.
 		require.Equal(t, txn.Sender().TestingCloneTxn().ID, txnIDBefore)
+	}
+}
+
+// TestUpdateStateOnRemoteRetryableErrErrorRanking tests that when multiple
+// errors are provided to UpdateStateOnRemoteRetryableError, the error with the
+// highest priority is used to update the transaction state and errors with
+// lower priority are unable to change the transaction state.
+func TestUpdateStateOnRemoteRetryableErrErrorRanking(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	orderedErrs := []struct {
+		err         *kvpb.Error
+		expNewError bool // if we expect the txn's retryable error to change
+		expNewEpoch bool // if we expect the epoch to be bumped
+		expAborted  bool // if we expect the txn to be aborted
+	}{
+		// Step 1. The txn starts out with no retryable error and restarts when
+		// it hits an uncertainty error.
+		{
+			err:         kvpb.NewError(&kvpb.ReadWithinUncertaintyIntervalError{}),
+			expNewError: true,
+			expNewEpoch: true,
+			expAborted:  false,
+		},
+		// Step 2. The txn ignores any further retryable errors from the same
+		// epoch.
+		{
+			err:         kvpb.NewError(&kvpb.WriteTooOldError{}),
+			expNewError: false,
+			expNewEpoch: false,
+			expAborted:  false,
+		},
+		// Step 3. The txn moves to an aborted state when it hits a txn aborted
+		// error.
+		{
+			err:         kvpb.NewError(&kvpb.TransactionAbortedError{}),
+			expNewError: true,
+			expNewEpoch: false,
+			expAborted:  true,
+		},
+		// Step 4. The txn ignores any further retryable errors.
+		{
+			err:         kvpb.NewError(&kvpb.ReadWithinUncertaintyIntervalError{}),
+			expNewError: false,
+			expNewEpoch: false,
+			expAborted:  true,
+		},
+		// Step 5. The txn ignores any further txn aborted errors.
+		{
+			err:         kvpb.NewError(&kvpb.TransactionAbortedError{}),
+			expNewError: false,
+			expNewEpoch: false,
+			expAborted:  true,
+		},
+	}
+
+	// Unlike TestUpdateStateOnRemoteRetryableErr, use the same txn for all
+	// errors and observe how it changes as each error is consumed.
+	txn := db.NewTxn(ctx, "test")
+	tcs := txn.Sender()
+	txnProto := tcs.TestingCloneTxn()
+	for _, tc := range orderedErrs {
+		retryErrBefore := tcs.GetRetryableErr(ctx)
+		epochBefore := tcs.Epoch()
+
+		pErr := tc.err
+		pErr.SetTxn(txnProto)
+		err := txn.UpdateStateOnRemoteRetryableErr(ctx, pErr)
+		// Ensure what we got back is a TransactionRetryWithProtoRefreshError.
+		require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
+		// Ensure the same thing is stored on the TxnCoordSender as well.
+		retErr := tcs.GetRetryableErr(ctx)
+		require.Equal(t, retErr, err)
+		require.Equal(t, retErr.PrevTxnID, txnProto.ID)
+		require.True(t, retErr.TxnMustRestartFromBeginning())
+
+		// Assert that the transaction's state has changed as expected.
+		if tc.expNewError {
+			require.NotEqual(t, retErr, retryErrBefore)
+		} else {
+			require.Equal(t, retErr, retryErrBefore)
+		}
+		if tc.expNewEpoch {
+			require.Equal(t, epochBefore+1, tcs.Epoch())
+		} else {
+			require.Equal(t, epochBefore, tcs.Epoch())
+		}
+		if tc.expAborted {
+			require.Equal(t, roachpb.ABORTED, tcs.TxnStatus())
+			require.True(t, retErr.PrevTxnAborted())
+		} else {
+			require.Equal(t, roachpb.PENDING, tcs.TxnStatus())
+			require.False(t, retErr.PrevTxnAborted())
+		}
 	}
 }
 

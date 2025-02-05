@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
@@ -103,6 +98,24 @@ func (m *MockTransactionalSender) SetDebugName(name string) {
 	m.txn.Name = name
 }
 
+// GetOmitInRangefeeds is part of the TxnSender interface.
+func (m *MockTransactionalSender) GetOmitInRangefeeds() bool {
+	return m.txn.OmitInRangefeeds
+}
+
+// SetOmitInRangefeeds is part of the TxnSender interface.
+func (m *MockTransactionalSender) SetOmitInRangefeeds() {
+	m.txn.OmitInRangefeeds = true
+}
+
+// SetBufferedWritesEnabled is part of the TxnSender interface.
+func (m *MockTransactionalSender) SetBufferedWritesEnabled(enabled bool) {}
+
+// BufferedWritesEnabled is part of the TxnSender interface.
+func (m *MockTransactionalSender) BufferedWritesEnabled() bool {
+	return false
+}
+
 // String is part of the TxnSender interface.
 func (m *MockTransactionalSender) String() string {
 	return m.txn.String()
@@ -177,7 +190,8 @@ func (m *MockTransactionalSender) GetRetryableErr(
 }
 
 // ClearRetryableErr is part of the TxnSender interface.
-func (m *MockTransactionalSender) ClearRetryableErr(ctx context.Context) {
+func (m *MockTransactionalSender) ClearRetryableErr(ctx context.Context) error {
+	return nil
 }
 
 // IsSerializablePushAndRefreshNotPossible is part of the TxnSender interface.
@@ -200,6 +214,14 @@ func (m *MockTransactionalSender) ReleaseSavepoint(context.Context, SavepointTok
 	panic("unimplemented")
 }
 
+// CanUseSavepoint is part of the kv.TxnSender interface.
+func (m *MockTransactionalSender) CanUseSavepoint(context.Context, SavepointToken) bool {
+	panic("unimplemented")
+}
+
+// Key is part of the TxnSender interface.
+func (m *MockTransactionalSender) Key() roachpb.Key { panic("unimplemented") }
+
 // Epoch is part of the TxnSender interface.
 func (m *MockTransactionalSender) Epoch() enginepb.TxnEpoch { panic("unimplemented") }
 
@@ -220,7 +242,7 @@ func (m *MockTransactionalSender) Active() bool {
 func (m *MockTransactionalSender) DisablePipelining() error { return nil }
 
 // Step is part of the TxnSender interface.
-func (m *MockTransactionalSender) Step(_ context.Context) error {
+func (m *MockTransactionalSender) Step(context.Context, bool) error {
 	// At least one test (e.g sql/TestPortalsDestroyedOnTxnFinish) requires
 	// the ability to run simple statements that do not access storage,
 	// and that requires a non-panicky Step().

@@ -26,6 +26,7 @@ go_library(
         "//pkg/util/buildutil",
         "//pkg/util/envutil",
         "//pkg/util/version",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -49,7 +50,6 @@ go_proto_library(
 go_test(
     name = "build_test",
     srcs = ["info_test.go"],
-    args = ["-test.timeout=295s"],
     embed = [":build"],
     deps = ["@com_github_stretchr_testify//require"],
 )

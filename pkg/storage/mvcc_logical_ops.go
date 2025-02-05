@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -84,11 +79,11 @@ var _ Batch = &OpLoggerBatch{}
 
 // LogLogicalOp implements the Writer interface.
 func (ol *OpLoggerBatch) LogLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
-	ol.logLogicalOp(op, details)
+	ol.LogLogicalOpOnly(op, details)
 	ol.Batch.LogLogicalOp(op, details)
 }
 
-func (ol *OpLoggerBatch) logLogicalOp(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
+func (ol *OpLoggerBatch) LogLogicalOpOnly(op MVCCLogicalOpType, details MVCCLogicalOpDetails) {
 	if keys.IsLocal(details.Key) {
 		// Ignore mvcc operations on local keys.
 		if bytes.HasPrefix(details.Key, keys.LocalRangeLockTablePrefix) {

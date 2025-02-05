@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -18,9 +13,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/errors"
 )
 
 type valuesNode struct {
+	zeroInputPlanNode
+
 	// Note: the columns can be renamed in place (see planMutableColumns).
 	columns colinfo.ResultColumns
 	tuples  [][]tree.TypedExpr
@@ -61,6 +59,10 @@ type valuesRun struct {
 }
 
 func (n *valuesNode) startExec(params runParams) error {
+	if n.coldataBatch != nil {
+		return errors.AssertionFailedf("planning error: valuesNode started with coldata.Batch")
+	}
+
 	if n.rows != nil {
 		// n.rows was already created in newContainerValuesNode.
 		// Nothing to do here.

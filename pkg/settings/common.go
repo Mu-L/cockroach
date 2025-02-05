@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package settings
 
@@ -24,9 +19,11 @@ type common struct {
 	name          SettingName
 	description   string
 	visibility    Visibility
+	unsafe        bool
 	slot          slotIdx
 	nonReportable bool
 	retired       bool
+	sensitive     bool
 }
 
 // slotIdx is an integer in the range [0, MaxSetting) which is uniquely
@@ -78,6 +75,10 @@ func (c *common) isRetired() bool {
 	return c.retired
 }
 
+func (c *common) isSensitive() bool {
+	return c.sensitive
+}
+
 func (c *common) ErrorHint() (bool, string) {
 	return false, ""
 }
@@ -110,6 +111,13 @@ func (c *common) setRetired() {
 	c.retired = true
 }
 
+// setSensitive marks the setting as sensitive, which means that it will always
+// be redacted in any output. It also makes the setting non-reportable.
+func (c *common) setSensitive() {
+	c.sensitive = true
+	c.nonReportable = true
+}
+
 // setName is used to override the name of the setting.
 // Refer to the WithName option for details.
 func (c *common) setName(name SettingName) {
@@ -117,6 +125,17 @@ func (c *common) setName(name SettingName) {
 		panic(errors.AssertionFailedf("duplicate use of WithName"))
 	}
 	c.name = name
+}
+
+// setUnsafe is used to override the unsafe status of the setting.
+// Refer to the WithUnsafe option for details.
+func (c *common) setUnsafe() {
+	c.unsafe = true
+}
+
+// IsUnsafe indicates whether the setting is unsafe.
+func (c *common) IsUnsafe() bool {
+	return c.unsafe
 }
 
 // SetOnChange installs a callback to be called when a setting's value changes.
@@ -131,8 +150,7 @@ type internalSetting interface {
 
 	init(class Class, key InternalKey, description string, slot slotIdx)
 	isRetired() bool
-	setToDefault(ctx context.Context, sv *Values)
-
+	isSensitive() bool
 	getSlot() slotIdx
 
 	// isReportable indicates whether the value of the setting can be
@@ -143,11 +161,33 @@ type internalSetting interface {
 	// it cannot be listed, but can be accessed with `SHOW CLUSTER
 	// SETTING enterprise.license` or SET CLUSTER SETTING.
 	isReportable() bool
+
+	setToDefault(ctx context.Context, sv *Values)
+
+	// decodeAndSet sets the setting after decoding the encoded value.
+	decodeAndSet(ctx context.Context, sv *Values, encoded string) error
+
+	// decodeAndOverrideDefault overrides the default value for the respective
+	// setting to newVal. It does not change the current value. Validation checks
+	// are not run against the decoded value.
+	decodeAndSetDefaultOverride(ctx context.Context, sv *Values, encoded string) error
 }
 
-// numericSetting is used for settings that can be set using an integer value.
-type numericSetting interface {
-	internalSetting
-	DecodeValue(value string) (int64, error)
-	set(ctx context.Context, sv *Values, value int64) error
+// TestingIsReportable is used in testing for reportability.
+func TestingIsReportable(s Setting) bool {
+	if _, ok := s.(*MaskedSetting); ok {
+		return false
+	}
+	if e, ok := s.(internalSetting); ok {
+		return e.isReportable()
+	}
+	return true
+}
+
+// TestingIsSensitive is used in testing for sensitivity.
+func TestingIsSensitive(s Setting) bool {
+	if e, ok := s.(internalSetting); ok {
+		return e.isSensitive()
+	}
+	return false
 }

@@ -1,5 +1,3 @@
-# LogicTest: !local-mixed-22.2-23.1
-
 ## Tests for span construction/manipulation builtins
 
 subtest tenant_span_0_arg
@@ -28,7 +26,7 @@ skipif config 3node-tenant-default-configs
 query T
 SELECT crdb_internal.tenant_span('foo-bar')
 ----
-{"\\xfe8a","\\xfe8b"}
+{"\\xfe8b","\\xfe8c"}
 
 subtest end
 

@@ -1,20 +1,17 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
@@ -27,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -46,6 +44,29 @@ import (
 // path for some reason), and the async pool is full (i.e. the system is
 // under load), then it makes sense to abandon the cleanup before too long.
 const asyncRollbackTimeout = time.Minute
+
+// MaxInternalTxnAutoRetries controls the maximum number of auto-retries a call
+// to kv.DB.Txn will perform before aborting the transaction and returning an
+// error. This is used to prevent infinite retry loops where a transaction has
+// little chance of succeeding in the future but continues to hold locks from
+// earlier epochs.
+var MaxInternalTxnAutoRetries = settings.RegisterIntSetting(
+	settings.ApplicationLevel,
+	"kv.transaction.internal.max_auto_retries",
+	"controls the maximum number of auto-retries an internal KV transaction will "+
+		"perform before aborting and returning an error. Can be set to 0 to disable any "+
+		"retry attempt.",
+	100,
+	settings.NonNegativeInt,
+)
+
+var ErrAutoRetryLimitExhausted = errors.New("retry limit exhausted")
+
+// IsAutoRetryLimitExhaustedError checks if the given error indicates
+// that the maximum number of transaction auto-retries has been reached.
+func IsAutoRetryLimitExhaustedError(err error) bool {
+	return errors.Is(err, ErrAutoRetryLimitExhausted)
+}
 
 // Txn is an in-progress distributed database transaction. A Txn is safe for
 // concurrent use by multiple goroutines.
@@ -139,6 +160,8 @@ func NewTxnWithAdmissionControl(
 		now.ToTimestamp(),
 		db.clock.MaxOffset().Nanoseconds(),
 		int32(db.ctx.NodeID.SQLInstanceID()),
+		priority,
+		false, /* omitInRangefeeds */
 	)
 	txn := NewTxnFromProto(ctx, db, gatewayNodeID, now, RootTxn, &kvTxn)
 	txn.admissionHeader = kvpb.AdmissionHeader{
@@ -239,6 +262,14 @@ func (txn *Txn) ID() uuid.UUID {
 	return txn.mu.ID
 }
 
+// Key returns the current "anchor" key of the transaction, or nil if no such
+// key has been set because the transaction has not yet acquired any locks.
+func (txn *Txn) Key() roachpb.Key {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.Key()
+}
+
 // Epoch exports the txn's epoch.
 func (txn *Txn) Epoch() enginepb.TxnEpoch {
 	txn.mu.Lock()
@@ -251,27 +282,25 @@ func (txn *Txn) statusLocked() roachpb.TransactionStatus {
 	return txn.mu.sender.TxnStatus()
 }
 
-// IsCommitted returns true iff the transaction has the committed status.
-func (txn *Txn) IsCommitted() bool {
+// hasStatus returns true iff the transaction has the provided status.
+func (txn *Txn) hasStatus(s roachpb.TransactionStatus) bool {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
-	return txn.statusLocked() == roachpb.COMMITTED
+	return txn.statusLocked() == s
 }
 
+// IsCommitted returns true iff the transaction has the committed status.
+func (txn *Txn) IsCommitted() bool { return txn.hasStatus(roachpb.COMMITTED) }
+
 // IsAborted returns true iff the transaction has the aborted status.
-func (txn *Txn) IsAborted() bool {
-	txn.mu.Lock()
-	defer txn.mu.Unlock()
-	return txn.statusLocked() == roachpb.ABORTED
-}
+func (txn *Txn) IsAborted() bool { return txn.hasStatus(roachpb.ABORTED) }
+
+// IsPrepared returns true iff the transaction has the prepared status.
+func (txn *Txn) IsPrepared() bool { return txn.hasStatus(roachpb.PREPARED) }
 
 // IsOpen returns true iff the transaction is in the open state where
 // it can accept further commands.
-func (txn *Txn) IsOpen() bool {
-	txn.mu.Lock()
-	defer txn.mu.Unlock()
-	return txn.statusLocked() == roachpb.PENDING
-}
+func (txn *Txn) IsOpen() bool { return txn.hasStatus(roachpb.PENDING) }
 
 // isClientFinalized returns true if the client has issued an EndTxn request in
 // an attempt to finalize the transaction.
@@ -368,6 +397,24 @@ func (txn *Txn) debugNameLocked() string {
 	return fmt.Sprintf("%s (id: %s)", txn.mu.debugName, txn.mu.ID)
 }
 
+func (txn *Txn) SetBufferedWritesEnabled(enabled bool) {
+	if txn.typ != RootTxn {
+		panic(errors.AssertionFailedf("SetBufferedWritesEnabled() called on leaf txn"))
+	}
+
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+
+	txn.mu.sender.SetBufferedWritesEnabled(enabled)
+}
+
+func (txn *Txn) BufferedWritesEnabled() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+
+	return txn.mu.sender.BufferedWritesEnabled()
+}
+
 // String returns a string version of this transaction.
 func (txn *Txn) String() string {
 	txn.mu.Lock()
@@ -453,6 +500,25 @@ func (txn *Txn) DisablePipelining() error {
 	return txn.mu.sender.DisablePipelining()
 }
 
+// GetOmitInRangefeeds returns the value of the OmitInRangefeeds attribute of
+// the Transaction proto of the sender.
+func (txn *Txn) GetOmitInRangefeeds() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.GetOmitInRangefeeds()
+}
+
+// SetOmitInRangefeeds sets the OmitInRangefeeds attribute to true in the
+// Transaction proto of the sender.
+//
+// SetOmitInRangefeeds must be called before any operations are performed on the
+// transaction.
+func (txn *Txn) SetOmitInRangefeeds() {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	txn.mu.sender.SetOmitInRangefeeds()
+}
+
 // NewBatch creates and returns a new empty batch object for use with the Txn.
 func (txn *Txn) NewBatch() *Batch {
 	return &Batch{txn: txn, AdmissionHeader: txn.AdmissionHeader()}
@@ -472,16 +538,35 @@ func (txn *Txn) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 }
 
 // GetForUpdate retrieves the value for a key, returning the retrieved key/value
-// or an error. An unreplicated, exclusive lock is acquired on the key, if it
-// exists. It is not considered an error for the key to not exist.
+// or an error. An Exclusive lock with the supplied durability is acquired on
+// the key, if it exists. It is not considered an error for the key not to
+// exist.
 //
 //	r, err := txn.GetForUpdate("a")
 //	// string(r.Key) == "a"
 //
 // key can be either a byte slice or a string.
-func (txn *Txn) GetForUpdate(ctx context.Context, key interface{}) (KeyValue, error) {
+func (txn *Txn) GetForUpdate(
+	ctx context.Context, key interface{}, dur kvpb.KeyLockingDurabilityType,
+) (KeyValue, error) {
 	b := txn.NewBatch()
-	b.GetForUpdate(key)
+	b.GetForUpdate(key, dur)
+	return getOneRow(txn.Run(ctx, b), b)
+}
+
+// GetForShare retrieves the value for a key. A shared lock with the supplied
+// durability is acquired on the key, if it exists. A new result will be
+// appended to the batch which will contain a single row.
+//
+//	r, err := txn.GetForShare("a")
+//	// string(r.Key) == "a"
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) GetForShare(
+	ctx context.Context, key interface{}, dur kvpb.KeyLockingDurabilityType,
+) (KeyValue, error) {
+	b := txn.NewBatch()
+	b.GetForShare(key, dur)
 	return getOneRow(txn.Run(ctx, b), b)
 }
 
@@ -546,20 +631,6 @@ func (txn *Txn) CPut(ctx context.Context, key, value interface{}, expValue []byt
 	return getOneErr(txn.Run(ctx, b), b)
 }
 
-// InitPut sets the first value for a key to value. An error is reported if a
-// value already exists for the key and it's not equal to the value passed in.
-// If failOnTombstones is set to true, tombstones count as mismatched values
-// and will cause a ConditionFailedError.
-//
-// key can be either a byte slice or a string. value can be any key type, a
-// protoutil.Message or any Go primitive type (bool, int, etc). It is illegal to
-// set value to nil.
-func (txn *Txn) InitPut(ctx context.Context, key, value interface{}, failOnTombstones bool) error {
-	b := txn.NewBatch()
-	b.InitPut(key, value, failOnTombstones)
-	return getOneErr(txn.Run(ctx, b), b)
-}
-
 // Inc increments the integer value at key. If the key does not exist it will
 // be created with an initial value of 0 which will then be incremented. If the
 // key exists but was set using Put or CPut an error will be returned.
@@ -575,13 +646,18 @@ func (txn *Txn) Inc(ctx context.Context, key interface{}, value int64) (KeyValue
 }
 
 func (txn *Txn) scan(
-	ctx context.Context, begin, end interface{}, maxRows int64, isReverse, forUpdate bool,
+	ctx context.Context,
+	begin, end interface{},
+	maxRows int64,
+	isReverse bool,
+	str kvpb.KeyLockingStrengthType,
+	dur kvpb.KeyLockingDurabilityType,
 ) ([]KeyValue, error) {
 	b := txn.NewBatch()
 	if maxRows > 0 {
 		b.Header.MaxSpanRequestKeys = maxRows
 	}
-	b.scan(begin, end, isReverse, forUpdate)
+	b.scan(begin, end, isReverse, str, dur)
 	r, err := getOneResult(txn.Run(ctx, b), b)
 	return r.Rows, err
 }
@@ -596,21 +672,35 @@ func (txn *Txn) scan(
 func (txn *Txn) Scan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, false /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.NonLocking, kvpb.Invalid)
 }
 
 // ScanForUpdate retrieves the rows between begin (inclusive) and end
-// (exclusive) in ascending order. Unreplicated, exclusive locks are acquired on
-// each of the returned keys.
+// (exclusive) in ascending order. Exclusive locks with the supplied durability
+// are acquired on each of the returned keys.
 //
 // The returned []KeyValue will contain up to maxRows elements (or all results
 // when zero is supplied).
 //
 // key can be either a byte slice or a string.
 func (txn *Txn) ScanForUpdate(
-	ctx context.Context, begin, end interface{}, maxRows int64,
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, true /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForUpdate, dur)
+}
+
+// ScanForShare retrieves the rows between begin (inclusive) and end (exclusive)
+// in ascending order. Shared locks[1] are acquired on each of the returned
+// keys.
+//
+// The returned []KeyValue will contain up to maxRows elements (or all results
+// when zero is supplied).
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) ScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
+) ([]KeyValue, error) {
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForShare, dur)
 }
 
 // ReverseScan retrieves the rows between begin (inclusive) and end (exclusive)
@@ -623,21 +713,35 @@ func (txn *Txn) ScanForUpdate(
 func (txn *Txn) ReverseScan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, false /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.NonLocking, kvpb.Invalid)
 }
 
 // ReverseScanForUpdate retrieves the rows between begin (inclusive) and end
-// (exclusive) in descending order. Unreplicated, exclusive locks are acquired
-// on each of the returned keys.
+// (exclusive) in descending order. Exclusive locks with the supplied durability
+// are acquired on each of the returned keys.
 //
 // The returned []KeyValue will contain up to maxRows elements (or all results
 // when zero is supplied).
 //
 // key can be either a byte slice or a string.
 func (txn *Txn) ReverseScanForUpdate(
-	ctx context.Context, begin, end interface{}, maxRows int64,
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, true /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForUpdate, dur)
+}
+
+// ReverseScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in descending order. Shared locks with the supplied durability
+// are acquired on each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements (or all results
+// when zero is supplied).
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) ReverseScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
+) ([]KeyValue, error) {
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForShare, dur)
 }
 
 // Iterate performs a paginated scan and applying the function f to every page.
@@ -791,7 +895,7 @@ func (txn *Txn) UpdateDeadline(ctx context.Context, deadline hlc.Timestamp) erro
 // the current time, except in extraordinary circumstances. In cases where
 // considering it helps, it helps a lot. In cases where considering it
 // does not help, it does not hurt much.
-func (txn *Txn) DeadlineLikelySufficient(sv *settings.Values) bool {
+func (txn *Txn) DeadlineLikelySufficient() bool {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	// Instead of using the current HLC clock we will
@@ -803,6 +907,7 @@ func (txn *Txn) DeadlineLikelySufficient(sv *settings.Values) bool {
 	// 3) If we are writing to non-blocking ranges than any
 	//    push will be into the future.
 	getTargetTS := func() hlc.Timestamp {
+		sv := txn.db.SettingsValues()
 		now := txn.db.Clock().NowAsClockTimestamp()
 		maxClockOffset := txn.db.Clock().MaxOffset()
 		lagTargetDuration := closedts.TargetDuration.Get(sv)
@@ -901,6 +1006,21 @@ func (txn *Txn) rollback(ctx context.Context) *kvpb.Error {
 	return nil
 }
 
+// Prepare sends an EndTxnRequest with Prepare=true. Once a transaction is
+// prepared, it cannot be used to perform any more reads or writes. A prepared
+// transaction can only be committed or rolled back.
+func (txn *Txn) Prepare(ctx context.Context) error {
+	if txn.typ != RootTxn {
+		return errors.WithContextTags(errors.AssertionFailedf("Prepare() called on leaf txn"), ctx)
+	}
+
+	et := endTxnReq(true, txn.deadline())
+	et.req.Prepare = true
+	ba := &kvpb.BatchRequest{Requests: et.unionArr[:]}
+	_, pErr := txn.Send(ctx, ba)
+	return pErr.GoError()
+}
+
 // AddCommitTrigger adds a closure to be executed on successful commit
 // of the transaction.
 func (txn *Txn) AddCommitTrigger(trigger func(ctx context.Context)) {
@@ -952,7 +1072,10 @@ func (e *AutoCommitError) Error() string {
 func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) (err error) {
 	// Run fn in a retry loop until we encounter a success or
 	// error condition this loop isn't capable of handling.
-	for {
+	retryOpts := base.DefaultRetryOptions()
+	retryOpts.InitialBackoff = 20 * time.Millisecond
+	retryOpts.MaxBackoff = 200 * time.Millisecond
+	for r := retry.Start(retryOpts); r.Next(); {
 		if err := ctx.Err(); err != nil {
 			return errors.Wrap(err, "txn exec")
 		}
@@ -997,7 +1120,7 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 					// TransactionRetryWithProtoRefreshError if the closure ran another
 					// transaction internally and let the error propagate upwards instead
 					// of handling it.
-					return errors.Wrapf(err, "retryable error from another txn")
+					return errors.Wrap(errors.Opaque(err), "retryable error from another txn")
 				}
 				if txn.isClientFinalized() {
 					// We've already committed or rolled back, so we can't retry. The
@@ -1011,6 +1134,38 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 
 		if !retryable {
 			break
+		}
+
+		// Determine whether the transaction has exceeded the maximum number of
+		// automatic retries. We check this after each failed attempt to allow the
+		// cluster setting to be changed while a transaction is stuck in a retry
+		// loop.
+		maxRetries := math.MaxInt64
+		if txn.db.ctx.Settings != nil {
+			// txn.db.ctx.Settings == nil is only expected in tests.
+			maxRetries = int(MaxInternalTxnAutoRetries.Get(&txn.db.ctx.Settings.SV))
+		}
+		// Add 1 because r.CurrentAttempt() starts at 0.
+		attempt := r.CurrentAttempt() + 1
+		if attempt > maxRetries {
+			// If the retries limit has been exceeded, rollback and return an error.
+			rollbackErr := txn.Rollback(ctx)
+			// NOTE: we don't errors.Wrap the most recent retry error because we want
+			// to terminate it here. Instead, we mark the error to allow callers to
+			// detect this condition and avoid automatic retries. We also include the
+			// original error in the error message.
+			err = errors.Mark(errors.Errorf("have retried transaction: %s %d times, most recently because of the "+
+				"retryable error: %s. Terminating retry loop and returning error due to cluster setting %s (%d). "+
+				"Rollback error: %v.", txn.DebugName(), attempt, err, MaxInternalTxnAutoRetries.Name(), maxRetries, rollbackErr),
+				ErrAutoRetryLimitExhausted)
+			log.Warningf(ctx, "%v", err)
+			break
+		}
+
+		const warnEvery = 10
+		if attempt%warnEvery == 0 {
+			log.Warningf(ctx, "have retried transaction: %s %d times, most recently because of the "+
+				"retryable error: %s. Is the transaction stuck in a retry loop?", txn.DebugName(), attempt, err)
 		}
 
 		if err := txn.PrepareForRetry(ctx); err != nil {
@@ -1068,8 +1223,7 @@ func (txn *Txn) PrepareForRetry(ctx context.Context) error {
 		// If the retryable error doesn't correspond to an aborted transaction,
 		// there's no need to switch out the transaction. We simply clear the
 		// retryable error and proceed.
-		txn.mu.sender.ClearRetryableErr(ctx)
-		return nil
+		return txn.mu.sender.ClearRetryableErr(ctx)
 	}
 
 	return txn.handleTransactionAbortedErrorLocked(ctx, retryErr)
@@ -1103,8 +1257,7 @@ func (txn *Txn) PrepareForPartialRetry(ctx context.Context) error {
 	log.VEventf(ctx, 2, "partially retrying transaction: %s because of a retryable error: %s",
 		txn.debugNameLocked(), retryErr)
 
-	txn.mu.sender.ClearRetryableErr(ctx)
-	return nil
+	return txn.mu.sender.ClearRetryableErr(ctx)
 }
 
 func (txn *Txn) checkRetryErrorTxnIDLocked(
@@ -1561,10 +1714,10 @@ func (txn *Txn) Active() bool {
 //
 // In step-wise execution, reads operate at a snapshot established at
 // the last step, instead of the latest write if not yet enabled.
-func (txn *Txn) Step(ctx context.Context) error {
+func (txn *Txn) Step(ctx context.Context, allowReadTimestampStep bool) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
-	return txn.mu.sender.Step(ctx)
+	return txn.mu.sender.Step(ctx, allowReadTimestampStep)
 }
 
 // GetReadSeqNum gets the read sequence number for this transaction.
@@ -1621,6 +1774,14 @@ func (txn *Txn) ReleaseSavepoint(ctx context.Context, s SavepointToken) error {
 	return txn.mu.sender.ReleaseSavepoint(ctx, s)
 }
 
+// CanUseSavepoint checks whether it would be valid to roll back or release
+// the given savepoint in the current transaction state. It will never error.
+func (txn *Txn) CanUseSavepoint(ctx context.Context, s SavepointToken) bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.CanUseSavepoint(ctx, s)
+}
+
 // DeferCommitWait defers the transaction's commit-wait operation, passing
 // responsibility of commit-waiting from the Txn to the caller of this
 // method. The method returns a function which the caller must eventually
@@ -1641,20 +1802,8 @@ func (txn *Txn) DeferCommitWait(ctx context.Context) func(context.Context) error
 func (txn *Txn) AdmissionHeader() kvpb.AdmissionHeader {
 	h := txn.admissionHeader
 	if txn.mu.sender.IsLocking() {
-		// Assign higher priority to requests by txns that are locking, so that
-		// they release locks earlier. Note that this is a crude approach, and is
-		// worse than priority inheritance used for locks in realtime systems. We
-		// do this because admission control does not have visibility into the
-		// exact locks held by waiters in the admission queue, and cannot compare
-		// that with priorities of waiting requests in the various lock table
-		// queues. This crude approach has shown some benefit in tpcc with 3000
-		// warehouses, where it halved the number of lock waiters, and increased
-		// the transaction throughput by 10+%. In that experiment 40% of the
-		// BatchRequests evaluated by KV had been assigned high priority due to
-		// locking.
-		if h.Priority < int32(admissionpb.LockingPri) {
-			h.Priority = int32(admissionpb.LockingPri)
-		}
+		h.Priority = int32(admissionpb.AdjustedPriorityWhenHoldingLocks(
+			admissionpb.WorkPriority(h.Priority)))
 	}
 	return h
 }

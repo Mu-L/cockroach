@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -35,16 +30,16 @@ func (s *baseStatusServer) UserSQLRoles(
 	var resp serverpb.UserSQLRolesResponse
 	if !isAdmin {
 		for _, privKind := range privilege.GlobalPrivileges {
-			privName := privKind.String()
 			hasPriv, err := s.privilegeChecker.HasGlobalPrivilege(ctx, username, privKind)
 			if err != nil {
 				return nil, srverrors.ServerError(ctx, err)
 			}
+			privName := privKind.DisplayName()
 			if hasPriv {
-				resp.Roles = append(resp.Roles, privName)
+				resp.Roles = append(resp.Roles, string(privName))
 				continue
 			}
-			roleOpt, ok := roleoption.ByName[privName]
+			roleOpt, ok := roleoption.ByName[string(privName)]
 			if !ok {
 				continue
 			}
@@ -53,7 +48,7 @@ func (s *baseStatusServer) UserSQLRoles(
 				return nil, srverrors.ServerError(ctx, err)
 			}
 			if hasRole {
-				resp.Roles = append(resp.Roles, privName)
+				resp.Roles = append(resp.Roles, string(privName))
 			}
 		}
 	} else {

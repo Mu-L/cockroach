@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package persistedsqlstats_test
 
@@ -20,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -39,7 +35,7 @@ import (
 )
 
 type testHelper struct {
-	server           serverutils.ApplicationLayerInterface
+	server           serverutils.TestServerInterface
 	sqlDB            *sqlutils.SQLRunner
 	env              *jobstest.JobSchedulerTestEnv
 	cfg              *scheduledjobs.JobExecutionConfig
@@ -93,7 +89,7 @@ func newTestHelper(
 	require.NotNil(t, helper.cfg)
 
 	helper.sqlDB = sqlutils.MakeSQLRunner(db)
-	helper.server = srv.ApplicationLayer()
+	helper.server = srv
 
 	return helper, func() {
 		srv.Stopper().Stop(context.Background())
@@ -108,12 +104,12 @@ func verifySQLStatsCompactionScheduleCreatedOnStartup(t *testing.T, helper *test
 }
 
 func getSQLStatsCompactionSchedule(t *testing.T, helper *testHelper) *jobs.ScheduledJob {
-	var jobID int64
+	var scheduleID jobspb.ScheduleID
 	helper.sqlDB.
 		QueryRow(t, `SELECT schedule_id FROM system.scheduled_jobs WHERE schedule_name = 'sql-stats-compaction'`).
-		Scan(&jobID)
+		Scan(&scheduleID)
 	schedules := jobs.ScheduledJobDB(helper.server.InternalDB().(isql.DB))
-	sj, err := schedules.Load(context.Background(), helper.env, jobID)
+	sj, err := schedules.Load(context.Background(), helper.env, scheduleID)
 	require.NoError(t, err)
 	require.NotNil(t, sj)
 	return sj
@@ -138,7 +134,7 @@ func TestScheduledSQLStatsCompaction(t *testing.T) {
 	// We run some queries then flush so that we ensure that are some stats in
 	// the system table.
 	helper.sqlDB.Exec(t, "SELECT 1; SELECT 1, 1")
-	helper.server.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+	helper.server.ApplicationLayer().SQLServer().(*sql.Server).GetSQLStatsProvider().MaybeFlush(ctx, helper.server.AppStopper())
 	helper.sqlDB.Exec(t, "SET CLUSTER SETTING sql.stats.persisted_rows.max = 1")
 
 	stmtStatsCnt, txnStatsCnt := getPersistedStatsEntry(t, helper.sqlDB)
@@ -172,7 +168,7 @@ func TestScheduledSQLStatsCompaction(t *testing.T) {
 func TestSQLStatsScheduleOperations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderStressRace(t, "test is too slow to run under race")
+	skip.UnderRace(t, "test is too slow to run under race")
 
 	ctx := context.Background()
 	helper, helperCleanup := newTestHelper(t, &sqlstats.TestingKnobs{JobMonitorUpdateCheckInterval: time.Second})

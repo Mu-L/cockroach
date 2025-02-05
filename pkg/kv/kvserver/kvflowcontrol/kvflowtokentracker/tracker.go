@@ -1,19 +1,15 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvflowtokentracker
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
@@ -29,6 +25,10 @@ import (
 // admissionpb.WorkPriority, for replication along an individual
 // kvflowcontrol.Stream.
 type Tracker struct {
+	// TODO(irfansharif,aaditya): Everytime we track something, we incur a map
+	// assignment (shows up in CPU profiles). We could introduce a struct that
+	// internally embeds this list of tracked deductions, and append there
+	// instead. Do this as part of #104154.
 	trackedM map[admissionpb.WorkPriority][]tracked
 
 	// lowerBound tracks on a per-stream basis the log position below which
@@ -110,11 +110,15 @@ func (dt *Tracker) Track(
 			return false
 		}
 	}
+
+	// TODO(irfansharif,aaditya): The tracked instances here make up about ~0.4%
+	// of allocations under kv0/enc=false/nodes=3/cpu=9. Maybe clean it up as
+	// part of #104154, by using a sync.Pool perhaps.
 	dt.trackedM[pri] = append(dt.trackedM[pri], tracked{
 		tokens:   tokens,
 		position: pos,
 	})
-	if log.ExpensiveLogEnabled(ctx, 1) {
+	if log.V(1) {
 		log.Infof(ctx, "tracking %s flow control tokens for pri=%s stream=%s pos=%s",
 			tokens, pri, dt.stream, pos)
 	}
@@ -145,7 +149,7 @@ func (dt *Tracker) Untrack(
 			break
 		}
 
-		if fn := dt.knobs.UntrackTokensInterceptor; fn != nil {
+		if fn := dt.knobs.V1.UntrackTokensInterceptor; fn != nil {
 			fn(deduction.tokens, deduction.position)
 		}
 
@@ -155,7 +159,7 @@ func (dt *Tracker) Untrack(
 
 	trackedBefore := len(dt.trackedM[pri])
 	dt.trackedM[pri] = dt.trackedM[pri][untracked:]
-	if log.ExpensiveLogEnabled(ctx, 1) {
+	if log.V(1) {
 		remaining := ""
 		if len(dt.trackedM[pri]) > 0 {
 			remaining = fmt.Sprintf(" (%s, ...)", dt.trackedM[pri][0].tokens)
@@ -202,14 +206,13 @@ func (dt *Tracker) Inspect(ctx context.Context) []kvflowinspectpb.TrackedDeducti
 		})
 		return true
 	})
-	sort.Slice(deductions, func(i, j int) bool { // for determinism
-		if deductions[i].Priority != deductions[j].Priority {
-			return deductions[i].Priority < deductions[j].Priority
-		}
-		if deductions[i].RaftLogPosition != deductions[j].RaftLogPosition {
-			return deductions[i].RaftLogPosition.Less(deductions[j].RaftLogPosition)
-		}
-		return deductions[i].Tokens < deductions[j].Tokens
+	slices.SortFunc(deductions, func(a, b kvflowinspectpb.TrackedDeduction) int { // for determinism
+		return cmp.Or(
+			cmp.Compare(a.Priority, b.Priority),
+			cmp.Compare(a.RaftLogPosition.Term, b.RaftLogPosition.Term),
+			cmp.Compare(a.RaftLogPosition.Index, b.RaftLogPosition.Index),
+			cmp.Compare(a.Tokens, b.Tokens),
+		)
 	})
 	return deductions
 }

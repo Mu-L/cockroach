@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security
 
@@ -41,7 +36,7 @@ type TLSSettings interface {
 }
 
 var ocspMode = settings.RegisterEnumSetting(
-	settings.TenantWritable, "security.ocsp.mode",
+	settings.ApplicationLevel, "security.ocsp.mode",
 	"use OCSP to check whether TLS certificates are revoked. If the OCSP "+
 		"server is unreachable, in strict mode all certificates will be rejected "+
 		"and in lax mode all certificates will be accepted.",
@@ -49,7 +44,7 @@ var ocspMode = settings.RegisterEnumSetting(
 	settings.WithPublic)
 
 var ocspTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable, "security.ocsp.timeout",
+	settings.ApplicationLevel, "security.ocsp.timeout",
 	"timeout before considering the OCSP server unreachable",
 	3*time.Second,
 	settings.NonNegativeDuration,

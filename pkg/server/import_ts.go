@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -71,18 +67,20 @@ func maybeImportTS(ctx context.Context, s *topLevelServer) (returnErr error) {
 	// store statuses to map the store timeseries to the node under which they
 	// fall). An alternative to this is setting a FirstStoreID and FirstNodeID that
 	// is not in use in the data set to import.
-	s.node.suppressNodeStatus.Set(true)
+	s.node.suppressNodeStatus.Store(true)
+
+	// Disable raft log synchronization to make the server generally faster.
+	logstore.DisableSyncRaftLog.Override(ctx, &s.cfg.Settings.SV, true)
 
 	// Disable writing of new timeseries, as well as roll-ups and deletion.
 	for _, stmt := range []string{
-		"SET CLUSTER SETTING kv.raft_log.synchronization.disabled = 'true';",
 		"SET CLUSTER SETTING timeseries.storage.enabled = 'false';",
 		"SET CLUSTER SETTING timeseries.storage.resolution_10s.ttl = '99999h';",
 		"SET CLUSTER SETTING timeseries.storage.resolution_30m.ttl = '99999h';",
 	} {
 		if _, err := s.sqlServer.internalExecutor.ExecEx(
 			ctx, "tsdump-cfg", nil, /* txn */
-			sessiondata.RootUserSessionDataOverride,
+			sessiondata.NodeUserSessionDataOverride,
 			stmt,
 		); err != nil {
 			return errors.Wrapf(err, "%s", stmt)

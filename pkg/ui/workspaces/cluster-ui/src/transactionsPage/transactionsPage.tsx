@@ -1,44 +1,44 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { InlineAlert } from "@cockroachlabs/ui-components";
 import classNames from "classnames/bind";
-import styles from "../statementsPage/statementsPage.module.scss";
+import flatMap from "lodash/flatMap";
+import isString from "lodash/isString";
+import merge from "lodash/merge";
+import moment from "moment-timezone";
+import React from "react";
 import { RouteComponentProps } from "react-router-dom";
+
 import {
-  makeTransactionsColumns,
-  TransactionInfo,
-  TransactionsTable,
-} from "../transactionsTable";
+  SqlStatsSortType,
+  createCombinedStmtsRequest,
+  StatementsRequest,
+  SqlStatsSortOptions,
+  SqlStatsResponse,
+} from "src/api/statementsApi";
+import { SearchCriteria } from "src/searchCriteria/searchCriteria";
+import { TimeScaleLabel } from "src/timeScaleDropdown/timeScaleLabel";
+import { Timestamp, TimestampToMoment, syncHistory, unique } from "src/util";
 import {
-  handleSortSettingFromQueryString,
-  ISortedTablePagination,
-  SortSetting,
-  updateSortSettingQueryParamsOnTab,
-} from "../sortedtable";
-import { Pagination, ResultsPerPageLabel } from "../pagination";
-import { statisticsClasses } from "./transactionsPageClasses";
-import {
-  generateRegion,
-  generateRegionNode,
-  getTrxAppFilterOptions,
-  searchTransactionsData,
-  filterTransactions,
-} from "./utils";
-import { flatMap, merge } from "lodash";
-import { unique, syncHistory } from "src/util";
-import { EmptyTransactionsPlaceholder } from "./emptyTransactionsPlaceholder";
-import { Loading } from "../loading";
+  STATS_LONG_LOADING_DURATION,
+  getSortLabel,
+  getSortColumn,
+  getSubsetWarning,
+  getReqSortColumn,
+} from "src/util/sqlActivityConstants";
+
+import { RequestState } from "../api";
+import ColumnsSelector from "../columnsSelector/columnsSelector";
+import { isSelectedColumn } from "../columnsSelector/utils";
+import { commonStyles } from "../common";
 import { Delayed } from "../delayed";
+import { Loading } from "../loading";
+import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
 import { PageConfig, PageConfigItem } from "../pageConfig";
-import { Search } from "../search";
+import { Pagination, ResultsPerPageLabel } from "../pagination";
 import {
   Filter,
   Filters,
@@ -47,44 +47,44 @@ import {
   updateFiltersQueryParamsOnTab,
   SelectedFilters,
 } from "../queryFilter";
-import { UIConfigState } from "../store";
+import { Search } from "../search";
 import {
-  SqlStatsSortType,
-  createCombinedStmtsRequest,
-  StatementsRequest,
-  SqlStatsSortOptions,
-  SqlStatsResponse,
-} from "src/api/statementsApi";
-import ColumnsSelector from "../columnsSelector/columnsSelector";
-import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
+  handleSortSettingFromQueryString,
+  ISortedTablePagination,
+  SortSetting,
+  updateSortSettingQueryParamsOnTab,
+} from "../sortedtable";
+import ClearStats from "../sqlActivity/clearStats";
+import LoadingError from "../sqlActivity/errorComponent";
+import styles from "../statementsPage/statementsPage.module.scss";
 import {
   getLabel,
   StatisticTableColumnKeys,
 } from "../statsTableUtil/statsTableUtil";
-import ClearStats from "../sqlActivity/clearStats";
-import LoadingError from "../sqlActivity/errorComponent";
-import { commonStyles } from "../common";
+import { UIConfigState } from "../store";
 import {
   TimeScale,
   timeScale1hMinOptions,
   getValidOption,
   toRoundedDateRange,
 } from "../timeScaleDropdown";
-import { InlineAlert } from "@cockroachlabs/ui-components";
-import { TransactionViewType } from "./transactionsPageTypes";
-import { isSelectedColumn } from "../columnsSelector/utils";
-import {
-  STATS_LONG_LOADING_DURATION,
-  getSortLabel,
-  getSortColumn,
-  getSubsetWarning,
-  getReqSortColumn,
-} from "src/util/sqlActivityConstants";
-import { SearchCriteria } from "src/searchCriteria/searchCriteria";
 import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
-import { FormattedTimescale } from "../timeScaleDropdown/formattedTimeScale";
-import { RequestState } from "../api";
-import moment from "moment-timezone";
+import {
+  makeTransactionsColumns,
+  TransactionInfo,
+  TransactionsTable,
+} from "../transactionsTable";
+
+import { EmptyTransactionsPlaceholder } from "./emptyTransactionsPlaceholder";
+import { statisticsClasses } from "./transactionsPageClasses";
+import { TransactionViewType } from "./transactionsPageTypes";
+import {
+  generateRegion,
+  generateRegionNode,
+  getTrxAppFilterOptions,
+  searchTransactionsData,
+  filterTransactions,
+} from "./utils";
 
 const cx = classNames.bind(styles);
 const timeScaleStylesCx = classNames.bind(timeScaleStyles);
@@ -110,6 +110,7 @@ export interface TransactionsPageStateProps {
   sortSetting: SortSetting;
   hasAdminRole?: UIConfigState["hasAdminRole"];
   requestTime: moment.Moment;
+  oldestDataAvailable: Timestamp;
 }
 
 export interface TransactionsPageDispatchProps {
@@ -181,7 +182,7 @@ export class TransactionsPage extends React.Component<
 
     // Search query.
     const searchQuery = searchParams.get("q") || undefined;
-    if (onSearchComplete && searchQuery && search != searchQuery) {
+    if (onSearchComplete && searchQuery && search !== searchQuery) {
       onSearchComplete(searchQuery);
     }
 
@@ -244,7 +245,7 @@ export class TransactionsPage extends React.Component<
     const searchParams = new URLSearchParams(history.location.search);
     const currentTab = searchParams.get("tab") || "";
     const searchQueryString = searchParams.get("q") || "";
-    if (currentTab === tab && search && search != searchQueryString) {
+    if (currentTab === tab && search && search !== searchQueryString) {
       syncHistory(
         {
           q: search,
@@ -290,7 +291,7 @@ export class TransactionsPage extends React.Component<
 
   isSortSettingSameAsReqSort = (): boolean => {
     return (
-      getSortColumn(this.props.reqSortSetting) ==
+      getSortColumn(this.props.reqSortSetting) ===
       this.props.sortSetting.columnTitle
     );
   };
@@ -440,8 +441,9 @@ export class TransactionsPage extends React.Component<
 
   hasReqSortOption = (): boolean => {
     let found = false;
-    Object.values(SqlStatsSortOptions).forEach((option: SqlStatsSortType) => {
-      if (getSortColumn(option) == this.props.sortSetting.columnTitle) {
+    Object.values(SqlStatsSortOptions).forEach(option => {
+      const optionString = isString(option) ? option : getSortColumn(option);
+      if (optionString === this.props.sortSetting.columnTitle) {
         found = true;
       }
     });
@@ -460,7 +462,7 @@ export class TransactionsPage extends React.Component<
     } = this.props;
     const data = this.props.txnsResp.data;
     const { pagination, filters } = this.state;
-    const internal_app_name_prefix = data?.internal_app_name_prefix || "";
+    const internalAppNamePrefix = data?.internal_app_name_prefix || "";
     const statements = data?.statements || [];
 
     // We apply the search filters and app name filters prior to aggregating across Node IDs
@@ -472,7 +474,7 @@ export class TransactionsPage extends React.Component<
       filterTransactions(
         searchTransactionsData(search, data?.transactions || [], statements),
         filters,
-        internal_app_name_prefix,
+        internalAppNamePrefix,
         statements,
         nodeRegions,
         isTenant,
@@ -480,7 +482,7 @@ export class TransactionsPage extends React.Component<
 
     const appNames = getTrxAppFilterOptions(
       data?.transactions || [],
-      internal_app_name_prefix,
+      internalAppNamePrefix,
     );
 
     const transactionsToDisplay: TransactionInfo[] = filteredTransactions.map(
@@ -506,7 +508,7 @@ export class TransactionsPage extends React.Component<
 
     // Creates a list of all possible columns,
     // hiding nodeRegions if is not multi-region and
-    // hiding columns that won't be displayed for tenants.
+    // hiding columns that won't be displayed for virtual clusters.
     const columns = makeTransactionsColumns(
       transactionsToDisplay,
       statements,
@@ -535,12 +537,6 @@ export class TransactionsPage extends React.Component<
       isSelectedColumn(userSelectedColumnsToShow, c),
     );
 
-    const period = (
-      <FormattedTimescale
-        ts={this.props.timeScale}
-        requestTime={moment(this.props.requestTime)}
-      />
-    );
     const sortSettingLabel = getSortLabel(
       this.props.reqSortSetting,
       "Transaction",
@@ -548,7 +544,7 @@ export class TransactionsPage extends React.Component<
     const showSortWarning =
       !this.isSortSettingSameAsReqSort() &&
       this.hasReqSortOption() &&
-      transactionsToDisplay.length == this.props.limit;
+      transactionsToDisplay.length === this.props.limit;
 
     return (
       <>
@@ -587,8 +583,14 @@ export class TransactionsPage extends React.Component<
           <PageConfig className={cx("float-right")}>
             <PageConfigItem>
               <p className={timeScaleStylesCx("time-label")}>
-                Showing aggregated stats from{" "}
-                <span className={timeScaleStylesCx("bold")}>{period}</span>
+                <TimeScaleLabel
+                  timeScale={this.props.timeScale}
+                  requestTime={moment(this.props.requestTime)}
+                  oldestDataTime={
+                    this.props.oldestDataAvailable &&
+                    TimestampToMoment(this.props.oldestDataAvailable)
+                  }
+                />
                 {", "}
                 <ResultsPerPageLabel
                   pagination={{
@@ -689,6 +691,10 @@ export class TransactionsPage extends React.Component<
               LoadingError({
                 statsType: "transactions",
                 error: this.props.txnsResp.error,
+                sourceTables: this.props.txnsResp?.data?.txns_source_table && [
+                  this.props.txnsResp?.data?.txns_source_table,
+                  this.props.txnsResp?.data?.stmts_source_table,
+                ],
               })
             }
           />

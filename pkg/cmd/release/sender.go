@@ -1,18 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
 	"fmt"
 	htmltemplate "html/template"
+	"log"
 	"net/smtp"
 	"net/textproto"
 	"path/filepath"
@@ -215,7 +211,7 @@ func sendMailPickSHA(args messageDataPickSHA, opts sendOpts) error {
 	return sendmail(msg, opts)
 }
 
-func sendMailUpdateVersions(args messageDataUpdateVersions, opts sendOpts, dryRun bool) error {
+func sendMailUpdateVersions(args messageDataUpdateVersions, opts sendOpts) error {
 	template := messageTemplates{
 		SubjectPrefix: templatePrefixUpdateVersions,
 		BodyPrefixes:  []string{templatePrefixUpdateVersions},
@@ -224,14 +220,8 @@ func sendMailUpdateVersions(args messageDataUpdateVersions, opts sendOpts, dryRu
 	if err != nil {
 		return fmt.Errorf("newMessage: %w", err)
 	}
-
-	if dryRun {
-		email := fmt.Sprintf("Subject: %s\n\n%s\n", msg.Subject, msg.TextBody)
-		fmt.Printf("dry-run: sendMailUpdateVersions:\n%s", email)
-		// We proceed to actually sending the mail in dry-runs because the
-		// TeamCity script sets the destination email address to the
-		// release-dev team's email.
-	}
+	log.Printf("dry-run: sendMailUpdateVersions:\n")
+	log.Printf("Subject: %s\n\n%s\n", msg.Subject, msg.TextBody)
 	return sendmail(msg, opts)
 }
 
@@ -239,7 +229,6 @@ func sendMailUpdateVersions(args messageDataUpdateVersions, opts sendOpts, dryRu
 // sendmail is specified as a function closure to allow for testing
 // of sendMail* methods.
 var sendmail = func(content *message, smtpOpts sendOpts) error {
-
 	e := &email.Email{
 		To:      smtpOpts.to,
 		From:    smtpOpts.from,

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -36,7 +32,7 @@ func declareKeysMigrate(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
+) error {
 	// TODO(irfansharif): This will eventually grow to capture the super set of
 	// all keys accessed by all migrations defined here. That could get
 	// cumbersome. We could spruce up the migration type and allow authors to
@@ -45,6 +41,7 @@ func declareKeysMigrate(
 
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeVersionKey(rs.GetRangeID())})
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+	return nil
 }
 
 // migrationRegistry is a global registry of all KV-level migrations. See
@@ -85,6 +82,13 @@ func Migrate(
 	// as all below-raft migrations (the only users of Migrate) were introduced
 	// after it.
 	pd.Replicated.State.Version = &migrationVersion
+	// Set DoTimelyApplicationToAllReplicas so that migrates are applied on all
+	// replicas. This is done since MigrateRequests trigger a call to
+	// waitForApplication (see Replica.executeWriteBatch).
+	if cArgs.EvalCtx.ClusterSettings().Version.IsActive(ctx, clusterversion.V25_1_AddRangeForceFlushKey) ||
+		cArgs.EvalCtx.EvalKnobs().OverrideDoTimelyApplicationToAllReplicas {
+		pd.Replicated.DoTimelyApplicationToAllReplicas = true
+	}
 	return pd, nil
 }
 

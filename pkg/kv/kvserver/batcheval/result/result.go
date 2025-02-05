@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package result
 
@@ -52,6 +47,9 @@ type LocalResult struct {
 	// commit fails, or we may accidentally make uncommitted values
 	// live.
 	EndTxns []EndTxnIntents
+	// PopulateBarrierResponse will populate a BarrierResponse with the lease
+	// applied index and range descriptor when applied.
+	PopulateBarrierResponse bool
 
 	// When set (in which case we better be the first range), call
 	// GossipFirstRange if the Replica holds the lease.
@@ -79,6 +77,7 @@ func (lResult *LocalResult) IsZero() bool {
 		lResult.ResolvedLocks == nil &&
 		lResult.UpdatedTxns == nil &&
 		lResult.EndTxns == nil &&
+		!lResult.PopulateBarrierResponse &&
 		!lResult.GossipFirstRange &&
 		!lResult.MaybeGossipSystemConfig &&
 		!lResult.MaybeGossipSystemConfigIfHaveFailure &&
@@ -93,13 +92,13 @@ func (lResult *LocalResult) String() string {
 	return fmt.Sprintf("LocalResult (reply: %v, "+
 		"#encountered intents: %d, #acquired locks: %d, #resolved locks: %d"+
 		"#updated txns: %d #end txns: %d, "+
-		"GossipFirstRange:%t MaybeGossipSystemConfig:%t "+
+		"PopulateBarrierResponse:%t GossipFirstRange:%t MaybeGossipSystemConfig:%t "+
 		"MaybeGossipSystemConfigIfHaveFailure:%t MaybeAddToSplitQueue:%t "+
 		"MaybeGossipNodeLiveness:%s ",
 		lResult.Reply,
 		len(lResult.EncounteredIntents), len(lResult.AcquiredLocks), len(lResult.ResolvedLocks),
 		len(lResult.UpdatedTxns), len(lResult.EndTxns),
-		lResult.GossipFirstRange, lResult.MaybeGossipSystemConfig,
+		lResult.PopulateBarrierResponse, lResult.GossipFirstRange, lResult.MaybeGossipSystemConfig,
 		lResult.MaybeGossipSystemConfigIfHaveFailure, lResult.MaybeAddToSplitQueue,
 		lResult.MaybeGossipNodeLiveness)
 }
@@ -144,6 +143,17 @@ func (lResult *LocalResult) DetachEndTxns(alwaysOnly bool) []EndTxnIntents {
 		}
 	}
 	lResult.EndTxns = nil
+	return r
+}
+
+// DetachPopulateBarrierResponse returns (and removes) the
+// PopulateBarrierResponse value from the local result.
+func (lResult *LocalResult) DetachPopulateBarrierResponse() bool {
+	if lResult == nil {
+		return false
+	}
+	r := lResult.PopulateBarrierResponse
+	lResult.PopulateBarrierResponse = false
 	return r
 }
 
@@ -229,7 +239,6 @@ func (p *Result) MergeAndDestroy(q Result) error {
 			return errors.AssertionFailedf("conflicting TruncatedState")
 		}
 		q.Replicated.State.TruncatedState = nil
-		q.Replicated.RaftExpectedFirstIndex = 0
 
 		if q.Replicated.State.GCThreshold != nil {
 			if p.Replicated.State.GCThreshold == nil {
@@ -257,11 +266,28 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		if q.Replicated.State.Stats != nil {
 			return errors.AssertionFailedf("must not specify Stats")
 		}
+		if q.Replicated.State.ForceFlushIndex != (roachpb.ForceFlushIndex{}) {
+			return errors.AssertionFailedf("must not specify ForceFlushIndex")
+		}
 		if (*q.Replicated.State != kvserverpb.ReplicaState{}) {
 			log.Fatalf(context.TODO(), "unhandled EvalResult: %s",
 				pretty.Diff(*q.Replicated.State, kvserverpb.ReplicaState{}))
 		}
 		q.Replicated.State = nil
+	}
+
+	if p.Replicated.RaftTruncatedState == nil {
+		p.Replicated.RaftTruncatedState = q.Replicated.RaftTruncatedState
+		p.Replicated.RaftExpectedFirstIndex = q.Replicated.RaftExpectedFirstIndex
+	} else if q.Replicated.RaftTruncatedState != nil {
+		return errors.AssertionFailedf("conflicting RaftTruncatedState")
+	}
+	q.Replicated.RaftTruncatedState = nil
+	q.Replicated.RaftExpectedFirstIndex = 0
+
+	if p.Replicated.State != nil && p.Replicated.State.TruncatedState != nil &&
+		p.Replicated.RaftTruncatedState != nil {
+		return errors.AssertionFailedf("conflicting RaftTruncatedState")
 	}
 
 	if p.Replicated.Split == nil {
@@ -306,6 +332,13 @@ func (p *Result) MergeAndDestroy(q Result) error {
 	}
 	q.Replicated.AddSSTable = nil
 
+	if p.Replicated.LinkExternalSSTable == nil {
+		p.Replicated.LinkExternalSSTable = q.Replicated.LinkExternalSSTable
+	} else if q.Replicated.LinkExternalSSTable != nil {
+		return errors.AssertionFailedf("conflicting LinkExternalSSTable")
+	}
+	q.Replicated.LinkExternalSSTable = nil
+
 	if p.Replicated.MVCCHistoryMutation == nil {
 		p.Replicated.MVCCHistoryMutation = q.Replicated.MVCCHistoryMutation
 	} else if q.Replicated.MVCCHistoryMutation != nil {
@@ -332,6 +365,11 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		p.Replicated.IsProbe = q.Replicated.IsProbe
 	}
 	q.Replicated.IsProbe = false
+
+	if q.Replicated.DoTimelyApplicationToAllReplicas {
+		p.Replicated.DoTimelyApplicationToAllReplicas = true
+	}
+	q.Replicated.DoTimelyApplicationToAllReplicas = false
 
 	if p.Local.EncounteredIntents == nil {
 		p.Local.EncounteredIntents = q.Local.EncounteredIntents
@@ -367,6 +405,14 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		p.Local.EndTxns = append(p.Local.EndTxns, q.Local.EndTxns...)
 	}
 	q.Local.EndTxns = nil
+
+	if !p.Local.PopulateBarrierResponse {
+		p.Local.PopulateBarrierResponse = q.Local.PopulateBarrierResponse
+	} else {
+		// PopulateBarrierResponse is only valid for a single Barrier response.
+		return errors.AssertionFailedf("multiple PopulateBarrierResponse results")
+	}
+	q.Local.PopulateBarrierResponse = false
 
 	if p.Local.MaybeGossipNodeLiveness == nil {
 		p.Local.MaybeGossipNodeLiveness = q.Local.MaybeGossipNodeLiveness

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -22,8 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -57,17 +50,12 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 				DisableGCQueue:    true,
 			},
 			SpanConfig: &spanconfig.TestingKnobs{
-				StoreKVSubscriberOverride: mockSubscriber,
+				StoreKVSubscriberOverride: func(spanconfig.KVSubscriber) spanconfig.KVSubscriber { return mockSubscriber },
 			},
 		},
 	}
 	s := serverutils.StartServerOnly(t, args)
 	defer s.Stopper().Stop(context.Background())
-
-	_, err := s.InternalExecutor().(isql.Executor).ExecEx(ctx, "inline-exec", nil,
-		sessiondata.RootUserSessionDataOverride,
-		`SET CLUSTER SETTING spanconfig.store.enabled = true`)
-	require.NoError(t, err)
 
 	key, err := s.ScratchRange()
 	require.NoError(t, err)
@@ -81,7 +69,6 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	require.NoError(t, err)
 	deleted, added := spanConfigStore.Apply(
 		ctx,
-		false, /* dryrun */
 		add,
 	)
 	require.Empty(t, deleted)
@@ -94,7 +81,8 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	mockSubscriber.callback(ctx, span) // invoke the callback
 	testutils.SucceedsSoon(t, func() error {
 		repl := store.LookupReplica(keys.MustAddr(key))
-		gotConfig := repl.SpanConfig()
+		gotConfig, err := repl.LoadSpanConfig(ctx)
+		require.NoError(t, err)
 		if !gotConfig.Equal(conf) {
 			return errors.Newf("expected config=%s, got config=%s", conf.String(), gotConfig.String())
 		}
@@ -126,17 +114,12 @@ func TestFallbackSpanConfigOverride(t *testing.T) {
 				DisableGCQueue:    true,
 			},
 			SpanConfig: &spanconfig.TestingKnobs{
-				StoreKVSubscriberOverride: mockSubscriber,
+				StoreKVSubscriberOverride: func(spanconfig.KVSubscriber) spanconfig.KVSubscriber { return mockSubscriber },
 			},
 		},
 	}
 	s := serverutils.StartServerOnly(t, args)
 	defer s.Stopper().Stop(context.Background())
-
-	_, err := s.InternalDB().(isql.DB).Executor().ExecEx(ctx, "inline-exec", nil,
-		sessiondata.RootUserSessionDataOverride,
-		`SET CLUSTER SETTING spanconfig.store.enabled = true`)
-	require.NoError(t, err)
 
 	key, err := s.ScratchRange()
 	require.NoError(t, err)
@@ -152,7 +135,8 @@ func TestFallbackSpanConfigOverride(t *testing.T) {
 	mockSubscriber.callback(ctx, span) // invoke the callback
 	testutils.SucceedsSoon(t, func() error {
 		repl := store.LookupReplica(keys.MustAddr(key))
-		gotConfig := repl.SpanConfig()
+		gotConfig, err := repl.LoadSpanConfig(ctx)
+		require.NoError(t, err)
 		if !gotConfig.Equal(conf) {
 			return errors.Newf("expected config=%s, got config=%s", conf.String(), gotConfig.String())
 		}
@@ -191,7 +175,7 @@ func (m *mockSpanConfigSubscriber) ComputeSplitKey(
 
 func (m *mockSpanConfigSubscriber) GetSpanConfigForKey(
 	ctx context.Context, key roachpb.RKey,
-) (roachpb.SpanConfig, error) {
+) (roachpb.SpanConfig, roachpb.Span, error) {
 	return m.Store.GetSpanConfigForKey(ctx, key)
 }
 

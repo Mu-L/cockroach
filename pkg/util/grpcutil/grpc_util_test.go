@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package grpcutil_test
 
@@ -14,8 +9,8 @@ import (
 	"fmt"
 	"testing"
 
-	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/util/circuit"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -58,7 +53,7 @@ func TestRequestDidNotStart_Errors(t *testing.T) {
 		"unauthenticated":     {status.Error(codes.Unauthenticated, "unauthenticated"), true},
 		"permission denied":   {status.Error(codes.PermissionDenied, "permission denied"), true},
 		"failed precondition": {status.Error(codes.FailedPrecondition, "failed precondition"), true},
-		"circuit breaker":     {circuit.ErrBreakerOpen, true},
+		"circuit breaker":     {circuit.ErrBreakerOpen, false},
 		"plain":               {errors.New("foo"), false},
 	}
 	for name, tc := range testcases {

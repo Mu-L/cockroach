@@ -1,10 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -13,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
@@ -70,6 +68,7 @@ func (e parquetEventType) DString() *tree.DString {
 type parquetCloudStorageSink struct {
 	wrapped     *cloudStorageSink
 	compression parquet.CompressionCodec
+	everyN      log.EveryN
 }
 
 func makeParquetCloudStorageSink(
@@ -78,6 +77,7 @@ func makeParquetCloudStorageSink(
 	parquetSink := &parquetCloudStorageSink{
 		wrapped:     baseCloudStorageSink,
 		compression: parquet.CompressionNone,
+		everyN:      log.Every(5 * time.Second),
 	}
 	if baseCloudStorageSink.compression.enabled() {
 		switch baseCloudStorageSink.compression {
@@ -192,7 +192,7 @@ func (parquetSink *parquetCloudStorageSink) EncodeAndEmitRow(
 	if err != nil {
 		return err
 	}
-	file.alloc.Merge(&alloc)
+	file.mergeAlloc(&alloc)
 
 	if file.parquetCodec == nil {
 		var err error
@@ -207,8 +207,36 @@ func (parquetSink *parquetCloudStorageSink) EncodeAndEmitRow(
 	if err := file.parquetCodec.addData(updatedRow, prevRow, updated, mvcc); err != nil {
 		return err
 	}
+	file.numMessages += 1
 
-	if int64(file.buf.Len()) > s.targetMaxFileSize {
+	// The parquet codec itself buffers data in an uncompressed form. When we
+	// call flush(), it compresses the data and writes it to the file buffer.
+	// We want to continuously flush data into file buffer we compare
+	// compressed data with s.targetMaxFileSize instead of uncompressed data.
+	//
+	// Flushing every 1MB below is done because 1MB is big enough that the
+	// parquet writer can compress more bits into a small size. 1MB is small
+	// enough that we won't overshoot s.targetMaxFileSize by an excessive amount.
+	if file.parquetCodec.estimatedBufferedBytes() > 1<<20 {
+		if err := file.parquetCodec.flush(); err != nil {
+			return err
+		}
+	}
+	bufferedBytesEstimate := file.parquetCodec.estimatedBufferedBytes()
+
+	// The size of the alloc associated with all the rows in the file should be
+	// the number of bytes in the file and the number of buffered bytes.
+	prevAllocSize := file.alloc.Bytes()
+	newAllocSize := int64(file.buf.Len()) + bufferedBytesEstimate
+	file.adjustBytesToTarget(ctx, newAllocSize)
+
+	if log.V(1) && parquetSink.everyN.ShouldLog() {
+		log.Infof(ctx, "topic: %d/%d, written: %d, buffered %d, new alloc: %d, old alloc: %d",
+			topic.GetTopicIdentifier().TableID, topic.GetTopicIdentifier().FamilyID, int64(file.buf.Len()),
+			bufferedBytesEstimate, prevAllocSize, newAllocSize)
+	}
+
+	if int64(file.buf.Len())+bufferedBytesEstimate > s.targetMaxFileSize {
 		s.metrics.recordSizeBasedFlush()
 
 		if err = file.parquetCodec.close(); err != nil {

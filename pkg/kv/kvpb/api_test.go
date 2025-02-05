@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvpb
 
@@ -317,32 +312,36 @@ func TestContentionEvent_SafeFormat(t *testing.T) {
 
 func TestTenantConsumptionAddSub(t *testing.T) {
 	a := TenantConsumption{
-		RU:                1,
-		ReadBatches:       2,
-		ReadRequests:      3,
-		ReadBytes:         4,
-		WriteBatches:      5,
-		WriteRequests:     6,
-		WriteBytes:        7,
-		SQLPodsCPUSeconds: 8,
-		PGWireEgressBytes: 9,
-		KVRU:              10,
+		RU:                   1,
+		ReadBatches:          2,
+		ReadRequests:         3,
+		ReadBytes:            4,
+		WriteBatches:         5,
+		WriteRequests:        6,
+		WriteBytes:           7,
+		SQLPodsCPUSeconds:    8,
+		PGWireEgressBytes:    9,
+		KVRU:                 10,
+		CrossRegionNetworkRU: 11,
+		EstimatedCPUSeconds:  12,
 	}
 	var b TenantConsumption
 	for i := 0; i < 10; i++ {
 		b.Add(&a)
 	}
 	if exp := (TenantConsumption{
-		RU:                10,
-		ReadBatches:       20,
-		ReadRequests:      30,
-		ReadBytes:         40,
-		WriteBatches:      50,
-		WriteRequests:     60,
-		WriteBytes:        70,
-		SQLPodsCPUSeconds: 80,
-		PGWireEgressBytes: 90,
-		KVRU:              100,
+		RU:                   10,
+		ReadBatches:          20,
+		ReadRequests:         30,
+		ReadBytes:            40,
+		WriteBatches:         50,
+		WriteRequests:        60,
+		WriteBytes:           70,
+		SQLPodsCPUSeconds:    80,
+		PGWireEgressBytes:    90,
+		KVRU:                 100,
+		CrossRegionNetworkRU: 110,
+		EstimatedCPUSeconds:  120,
 	}); b != exp {
 		t.Errorf("expected\n%#v\ngot\n%#v", exp, b)
 	}
@@ -350,16 +349,18 @@ func TestTenantConsumptionAddSub(t *testing.T) {
 	c := b
 	c.Sub(&a)
 	if exp := (TenantConsumption{
-		RU:                9,
-		ReadBatches:       18,
-		ReadRequests:      27,
-		ReadBytes:         36,
-		WriteBatches:      45,
-		WriteRequests:     54,
-		WriteBytes:        63,
-		SQLPodsCPUSeconds: 72,
-		PGWireEgressBytes: 81,
-		KVRU:              90,
+		RU:                   9,
+		ReadBatches:          18,
+		ReadRequests:         27,
+		ReadBytes:            36,
+		WriteBatches:         45,
+		WriteRequests:        54,
+		WriteBytes:           63,
+		SQLPodsCPUSeconds:    72,
+		PGWireEgressBytes:    81,
+		KVRU:                 90,
+		CrossRegionNetworkRU: 99,
+		EstimatedCPUSeconds:  108,
 	}); c != exp {
 		t.Errorf("expected\n%#v\ngot\n%#v", exp, c)
 	}
@@ -378,9 +379,12 @@ func TestFlagCombinations(t *testing.T) {
 		&AddSSTableRequest{SSTTimestampToRequestTimestamp: hlc.Timestamp{Logical: 1}},
 		&DeleteRangeRequest{Inline: true},
 		&DeleteRangeRequest{UseRangeTombstone: true},
-		&GetRequest{KeyLocking: lock.Exclusive},
-		&ReverseScanRequest{KeyLocking: lock.Exclusive},
-		&ScanRequest{KeyLocking: lock.Exclusive},
+		&GetRequest{KeyLockingStrength: lock.Shared, KeyLockingDurability: lock.Unreplicated},
+		&GetRequest{KeyLockingStrength: lock.Exclusive, KeyLockingDurability: lock.Replicated},
+		&ScanRequest{KeyLockingStrength: lock.Shared, KeyLockingDurability: lock.Unreplicated},
+		&ScanRequest{KeyLockingStrength: lock.Exclusive, KeyLockingDurability: lock.Replicated},
+		&ReverseScanRequest{KeyLockingStrength: lock.Shared, KeyLockingDurability: lock.Unreplicated},
+		&ReverseScanRequest{KeyLockingStrength: lock.Exclusive, KeyLockingDurability: lock.Replicated},
 	}
 
 	reqTypes := []Request{}
@@ -427,4 +431,14 @@ func TestRequestHeaderRoundTrip(t *testing.T) {
 	require.NoError(t, protoutil.Unmarshal(sl, &rh))
 
 	require.Equal(t, exp, rh.KVNemesisSeq.Get())
+}
+
+func TestBatchRequestEmptySize(t *testing.T) {
+	ba := &BatchRequest{}
+	require.Equal(t, 22, ba.Size())
+}
+
+func TestBatchResponseEmptySize(t *testing.T) {
+	br := &BatchResponse{}
+	require.Equal(t, 6, br.Size())
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -16,7 +11,6 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -283,12 +276,7 @@ func TestNodelocalNotAdmin(t *testing.T) {
 	_, err := rootDB.Exec("CREATE USER " + smithUser)
 	require.NoError(t, err)
 
-	pgURL, cleanupGoDB := sqlutils.PGUrlWithOptionalClientCerts(
-		t, s.ApplicationLayer().AdvSQLAddr(), "notAdmin", url.User(smithUser), false, /* withCerts */
-	)
-	defer cleanupGoDB()
-	pgURL.RawQuery = "sslmode=disable"
-	userDB, err := gosql.Open("postgres", pgURL.String())
+	userDB, err := s.ApplicationLayer().SQLConnE(serverutils.User(smithUser), serverutils.CertsDirPrefix("notAdmin"), serverutils.ClientCerts(false))
 	require.NoError(t, err)
 	defer userDB.Close()
 
@@ -299,7 +287,7 @@ func TestNodelocalNotAdmin(t *testing.T) {
 	writeFile(t, testSendFile, fileContent)
 
 	err = runCopyFile(t, userDB, smithUserName, testSendFile, sql.NodelocalFileUploadTable)
-	expectedErr := "only users with the admin role are allowed to upload"
+	expectedErr := "only users with the admin role are allowed to upload to nodelocal"
 	require.True(t, testutils.IsError(err, expectedErr))
 }
 
@@ -326,12 +314,7 @@ func TestUserfileNotAdmin(t *testing.T) {
 	_, err = rootDB.Exec("GRANT CREATE ON DATABASE defaultdb TO " + smithUser)
 	require.NoError(t, err)
 
-	pgURL, cleanupGoDB := sqlutils.PGUrlWithOptionalClientCerts(
-		t, s.ApplicationLayer().AdvSQLAddr(), "notAdmin", url.User(smithUser), false, /* withCerts */
-	)
-	defer cleanupGoDB()
-	pgURL.RawQuery = "sslmode=disable"
-	userDB, err := gosql.Open("postgres", pgURL.String())
+	userDB, err := s.ApplicationLayer().SQLConnE(serverutils.User(smithUser), serverutils.CertsDirPrefix("notAdmin"), serverutils.ClientCerts(false))
 	require.NoError(t, err)
 	defer userDB.Close()
 

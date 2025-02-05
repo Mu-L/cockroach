@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -31,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -41,6 +37,7 @@ import (
 // It works by writing a lot of data and waiting for the GC heuristic to allow
 // for GC. Because of this, it's very slow and expensive. It should
 // potentially be made cheaper by injecting hooks to force GC.
+// TODO(pavelkalinnikov): use the GCHint for this.
 //
 // Probably this test should always be skipped until it is made cheaper,
 // nevertheless it's a useful test.
@@ -70,6 +67,9 @@ func TestProtectedTimestamps(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = conn.Exec("SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'") // speeds up the test
+	require.NoError(t, err)
+
+	_, err = conn.Exec("SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '200ms'") // speeds up the test
 	require.NoError(t, err)
 
 	_, err = conn.Exec("SET CLUSTER SETTING kv.enqueue_in_replicate_queue_on_span_config_update.enabled = true") // speeds up the test
@@ -136,7 +136,7 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 	waitForRangeMaxBytes := func(maxBytes int64) {
 		testutils.SucceedsSoon(t, func() error {
 			_, r := getStoreAndReplica()
-			if r.GetMaxBytes() != maxBytes {
+			if r.GetMaxBytes(ctx) != maxBytes {
 				return errors.New("waiting for range_max_bytes to be applied")
 			}
 			return nil
@@ -147,8 +147,10 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 		testutils.SucceedsSoon(t, func() error {
 			upsertUntilBackpressure()
 			s, repl := getStoreAndReplica()
-			trace, _, err := s.Enqueue(ctx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
+			traceCtx, rec := tracing.ContextWithRecordingSpan(ctx, s.GetStoreConfig().Tracer(), "trace-enqueue")
+			_, err := s.Enqueue(traceCtx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
 			require.NoError(t, err)
+			trace := rec()
 			if !processedRegexp.MatchString(trace.String()) {
 				return errors.Errorf("%q does not match %q", trace.String(), processedRegexp)
 			}
@@ -180,6 +182,12 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 		Target:    ptpb.MakeSchemaObjectsTarget([]descpb.ID{getTableID()}),
 	}
 	require.NoError(t, ptsWithDB.Protect(ctx, &ptsRec))
+	// Verify that the record did indeed make its way down into KV where the
+	// replica can read it from.
+	ptsReader := tc.GetFirstStoreFromServer(t, 0).GetStoreConfig().ProtectedTimestampReader
+	ptutil.TestingWaitForProtectedTimestampToExistOnSpans(
+		ctx, t, s0, ptsReader, ptsRec.Timestamp, ptsRec.DeprecatedSpans,
+	)
 	upsertUntilBackpressure()
 	// We need to be careful choosing a time. We're a little limited because the
 	// ttl is defined in seconds and we need to wait for the threshold to be
@@ -190,27 +198,20 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 	s, repl := getStoreAndReplica()
 	// The protectedts record will prevent us from aging the MVCC garbage bytes
 	// past the oldest record so shouldQueue should be false. Verify that.
-	trace, _, err := s.Enqueue(ctx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
+	traceCtx, rec := tracing.ContextWithRecordingSpan(ctx, s.GetStoreConfig().Tracer(), "trace-enqueue")
+	_, err = s.Enqueue(traceCtx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
 	require.NoError(t, err)
-	require.Regexp(t, "(?s)shouldQueue=false", trace.String())
+	require.Regexp(t, "(?s)shouldQueue=false", rec().String())
 
 	// If we skipShouldQueue then gc will run but it should only run up to the
 	// timestamp of our record at the latest.
-	trace, _, err = s.Enqueue(ctx, "mvccGC", repl, true /* skipShouldQueue */, false /* async */)
+	traceCtx, rec = tracing.ContextWithRecordingSpan(ctx, s.GetStoreConfig().Tracer(), "trace-enqueue")
+	_, err = s.Enqueue(traceCtx, "mvccGC", repl, true /* skipShouldQueue */, false /* async */)
 	require.NoError(t, err)
-	require.Regexp(t, "(?s)done with GC evaluation for 0 keys", trace.String())
+	trace := rec()
+	require.Regexp(t, "(?s)handled \\d+ incoming point keys; deleted \\d+", trace.String())
 	thresh := thresholdFromTrace(trace)
 	require.Truef(t, thresh.Less(ptsRec.Timestamp), "threshold: %v, protected %v %q", thresh, ptsRec.Timestamp, trace)
-
-	// Verify that the record did indeed make its way down into KV where the
-	// replica can read it from.
-	ptsReader := tc.GetFirstStoreFromServer(t, 0).GetStoreConfig().ProtectedTimestampReader
-	require.NoError(
-		t,
-		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
-			ctx, t, s0, ptsReader, ptsRec.Timestamp, ptsRec.DeprecatedSpans,
-		),
-	)
 
 	// Make a new record that is doomed to fail.
 	failedRec := ptsRec
@@ -224,11 +225,8 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 	// Verify that the record did indeed make its way down into KV where the
 	// replica can read it from. We then verify (below) that the failed record
 	// does not affect the ability to GC.
-	require.NoError(
-		t,
-		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
-			ctx, t, s0, ptsReader, failedRec.Timestamp, failedRec.DeprecatedSpans,
-		),
+	ptutil.TestingWaitForProtectedTimestampToExistOnSpans(
+		ctx, t, s0, ptsReader, failedRec.Timestamp, failedRec.DeprecatedSpans,
 	)
 
 	// Add a new record that is after the old record.
@@ -237,19 +235,18 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 	laterRec.Timestamp = afterWrites
 	laterRec.Timestamp.Logical = 0
 	require.NoError(t, ptsWithDB.Protect(ctx, &laterRec))
-	require.NoError(
-		t,
-		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
-			ctx, t, s0, ptsReader, laterRec.Timestamp, laterRec.DeprecatedSpans,
-		),
+	ptutil.TestingWaitForProtectedTimestampToExistOnSpans(
+		ctx, t, s0, ptsReader, laterRec.Timestamp, laterRec.DeprecatedSpans,
 	)
 
 	// Release the record that had succeeded and ensure that GC eventually
 	// happens up to the protected timestamp of the new record.
 	require.NoError(t, ptsWithDB.Release(ctx, ptsRec.ID.GetUUID()))
 	testutils.SucceedsSoon(t, func() error {
-		trace, _, err = s.Enqueue(ctx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
+		traceCtx, rec := tracing.ContextWithRecordingSpan(ctx, s.GetStoreConfig().Tracer(), "trace-enqueue")
+		_, err = s.Enqueue(traceCtx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
 		require.NoError(t, err)
+		trace := rec()
 		if !processedRegexp.MatchString(trace.String()) {
 			return errors.Errorf("%q does not match %q", trace.String(), processedRegexp)
 		}

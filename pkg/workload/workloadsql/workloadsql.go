@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package workloadsql
 
@@ -103,31 +98,8 @@ func Split(ctx context.Context, db *gosql.DB, table workload.Table, concurrency 
 		return err
 	}
 
-	// Check to see if we're allowed to perform any splits - if we're in a tenant,
-	// we can't perform splits.
-	_, err := db.Exec("SHOW RANGES FROM TABLE system.descriptor")
-	if err != nil {
-		if strings.Contains(err.Error(), "not fully contained in tenant") ||
-			strings.Contains(err.Error(), errorutil.UnsupportedWithMultiTenancyMessage) {
-			log.Infof(ctx, `skipping workload splits; can't split on tenants'`)
-			//nolint:returnerrcheck
-			return nil
-		}
-		return err
-	}
-
 	if table.Splits.NumBatches <= 0 {
 		return nil
-	}
-
-	// Test that we can actually perform a scatter.
-	if _, err := db.Exec("ALTER TABLE system.jobs SCATTER"); err != nil {
-		if strings.Contains(err.Error(), "tenant cluster setting sql.virtual_cluster.feature_access.manual_range_scatter.enabled disabled") {
-			log.Infof(ctx, `skipping workload splits; can't scatter on tenants'`)
-			//nolint:returnerrcheck
-			return nil
-		}
-		return err
 	}
 
 	splitPoints := make([][]interface{}, 0, table.Splits.NumBatches)
@@ -171,9 +143,12 @@ func Split(ctx context.Context, db *gosql.DB, table workload.Table, concurrency 
 					// not) help you.
 					stmt := buf.String()
 					if _, err := db.Exec(stmt); err != nil {
-						if strings.Contains(err.Error(), errorutil.UnsupportedWithMultiTenancyMessage) {
+						if strings.Contains(err.Error(), errorutil.UnsupportedUnderClusterVirtualizationMessage) {
 							// We don't care about split errors if we're running a workload
-							// in multi-tenancy mode; we can't do them so we'll just continue
+							// with virtual clusters; we can't do them so we'll just continue.
+							//
+							// TODO(knz): This seems incorrect: this should be possible
+							// with the right capability. See: #109422.
 							break
 						}
 						return errors.Wrapf(err, "executing %s", stmt)

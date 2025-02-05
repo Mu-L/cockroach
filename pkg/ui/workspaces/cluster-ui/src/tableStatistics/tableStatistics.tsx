@@ -1,20 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import classNames from "classnames/bind";
+import moment from "moment-timezone";
 import React from "react";
-import { statisticsClasses } from "../transactionsPage/transactionsPageClasses";
-import { ISortedTablePagination } from "../sortedtable";
+
 import { Button } from "src/button";
 import { ResultsPerPageLabel } from "src/pagination";
-import classNames from "classnames/bind";
+import { TimeScale } from "src/timeScaleDropdown";
+import { TimeScaleLabel } from "src/timeScaleDropdown/timeScaleLabel";
+
+import { ISortedTablePagination } from "../sortedtable";
 import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
+import { statisticsClasses } from "../transactionsPage/transactionsPageClasses";
 
 const { statistic, countTitle } = statisticsClasses;
 const timeScaleStylesCx = classNames.bind(timeScaleStyles);
@@ -26,7 +26,8 @@ interface TableStatistics {
   activeFilters: number;
   search?: string;
   onClearFilters?: () => void;
-  period?: string;
+  timeScale?: TimeScale;
+  requestTime?: moment.Moment;
 }
 
 // TableStatistics shows statistics about the results being
@@ -41,14 +42,14 @@ export const TableStatistics: React.FC<TableStatistics> = ({
   arrayItemName,
   onClearFilters,
   activeFilters,
-  period,
+  timeScale,
+  requestTime,
 }) => {
-  const periodLabel = (
+  const periodLabel = timeScale && requestTime && (
     <>
       &nbsp;&nbsp;&nbsp;| &nbsp;
       <p className={timeScaleStylesCx("time-label")}>
-        Showing aggregated stats from{" "}
-        <span className={timeScaleStylesCx("bold")}>{period}</span>
+        <TimeScaleLabel timeScale={timeScale} requestTime={requestTime} />
       </p>
     </>
   );
@@ -60,7 +61,7 @@ export const TableStatistics: React.FC<TableStatistics> = ({
         pageName={arrayItemName}
         search={search}
       />
-      {period && periodLabel}
+      {periodLabel}
     </>
   );
 
@@ -76,7 +77,7 @@ export const TableStatistics: React.FC<TableStatistics> = ({
   const resultsCountAndClear = (
     <>
       {totalCount} {totalCount === 1 ? "result" : "results"}
-      {period && periodLabel}
+      {periodLabel}
       &nbsp;&nbsp;&nbsp;{onClearFilters && clearBtn}
     </>
   );

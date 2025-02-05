@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schedulerlatency
 
@@ -40,6 +35,7 @@ type runtimeHistogram struct {
 var _ metric.Iterable = &runtimeHistogram{}
 var _ metric.PrometheusExportable = &runtimeHistogram{}
 var _ metric.WindowedHistogram = (*runtimeHistogram)(nil)
+var _ metric.CumulativeHistogram = (*runtimeHistogram)(nil)
 
 // newRuntimeHistogram creates a histogram with the given metadata configured
 // with the given buckets. The buckets must be a strict subset of what this
@@ -51,6 +47,7 @@ func newRuntimeHistogram(metadata metric.Metadata, buckets []float64) *runtimeHi
 	if buckets[0] == math.Inf(-1) {
 		buckets = buckets[1:]
 	}
+	metadata.MetricType = prometheusgo.MetricType_HISTOGRAM
 	h := &runtimeHistogram{
 		Metadata: metadata,
 		// Go runtime histograms as of go1.19 are always in seconds whereas
@@ -135,6 +132,21 @@ func (h *runtimeHistogram) ToPrometheusMetric() *prometheusgo.Metric {
 	return m
 }
 
+// CumulativeSnapshot is part of the metric.CumulativeHistogram interface.
+func (h *runtimeHistogram) CumulativeSnapshot() metric.HistogramSnapshot {
+	return metric.MakeHistogramSnapshot(h.ToPrometheusMetric().Histogram)
+}
+
+// WindowedSnapshot is part of the metric.WindowedHistogram interface.
+// TODO(#116690): runtimeHistogram isn't windowed, so why does it implement
+// the WindowedHistogram interface? My best guess is because it was
+// the path of least resistance to get the metric exposed in /_status/vars.
+// It should either be truly windowed, should not implement the interface,
+// or should be deleted in favor of metric.Histogram.
+func (h *runtimeHistogram) WindowedSnapshot() metric.HistogramSnapshot {
+	return metric.MakeHistogramSnapshot(h.ToPrometheusMetric().Histogram)
+}
+
 // GetMetadata is part of the PrometheusExportable interface.
 func (h *runtimeHistogram) GetMetadata() metric.Metadata {
 	return h.Metadata
@@ -142,33 +154,6 @@ func (h *runtimeHistogram) GetMetadata() metric.Metadata {
 
 // Inspect is part of the Iterable interface.
 func (h *runtimeHistogram) Inspect(f func(interface{})) { f(h) }
-
-// TotalWindowed implements the WindowedHistogram interface.
-func (h *runtimeHistogram) TotalWindowed() (int64, float64) {
-	return h.Total()
-}
-
-// Total implements the WindowedHistogram interface.
-func (h *runtimeHistogram) Total() (int64, float64) {
-	pHist := h.ToPrometheusMetric().Histogram
-	return int64(pHist.GetSampleCount()), pHist.GetSampleSum()
-}
-
-// ValueAtQuantileWindowed implements the WindowedHistogram interface.
-func (h *runtimeHistogram) ValueAtQuantileWindowed(q float64) float64 {
-	return metric.ValueAtQuantileWindowed(h.ToPrometheusMetric().Histogram, q)
-}
-
-// MeanWindowed implements the WindowedHistogram interface.
-func (h *runtimeHistogram) MeanWindowed() float64 {
-	return h.Mean()
-}
-
-// Mean implements the WindowedHistogram interface.
-func (h *runtimeHistogram) Mean() float64 {
-	pHist := h.ToPrometheusMetric().Histogram
-	return pHist.GetSampleSum() / float64(pHist.GetSampleCount())
-}
 
 // reBucketExpAndTrim takes a list of bucket boundaries (lower bound inclusive)
 // and down samples the buckets to those a multiple of base apart. The end

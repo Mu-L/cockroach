@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keys
 
@@ -15,6 +10,10 @@ import "github.com/cockroachdb/cockroach/pkg/roachpb"
 var (
 	// EverythingSpan is a span that covers everything.
 	EverythingSpan = roachpb.Span{Key: roachpb.KeyMin, EndKey: roachpb.KeyMax}
+
+	// ExcludeFromBackupSpan is a span that covers the keyspace that we exclude
+	// from full cluster backup and do not place protected timestamps on.
+	ExcludeFromBackupSpan = roachpb.Span{Key: roachpb.KeyMin, EndKey: TableDataMin}
 
 	// Meta1Span holds all first level addressing records.
 	Meta1Span = roachpb.Span{Key: roachpb.KeyMin, EndKey: Meta2Prefix}

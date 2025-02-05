@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -14,10 +9,15 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
+	_ "embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
+	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -32,88 +32,46 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/DataExMachina-dev/side-eye-go/sideeyeclient"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestflags"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util/httputil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq"
-	"github.com/spf13/pflag"
+	"golang.org/x/sys/unix"
 )
 
 func init() {
 	_ = roachprod.InitProviders()
 }
 
+//go:embed tsdump-run.sh
+var tsdumpRunSh string
+
 var (
-	// user-specified path to crdb binary
-	cockroachPath string
 	// maps cpuArch to the corresponding crdb binary's absolute path
 	cockroach = make(map[vm.CPUArch]string)
-	// user-specified path to crdb binary with runtime assertions enabled (EA)
-	cockroachEAPath string
 	// maps cpuArch to the corresponding crdb binary with runtime assertions enabled (EA)
 	cockroachEA = make(map[vm.CPUArch]string)
-	// user-specified path to workload binary
-	workloadPath string
 	// maps cpuArch to the corresponding workload binary's absolute path
 	workload = make(map[vm.CPUArch]string)
 	// maps cpuArch to the corresponding dynamically-linked libraries' absolute paths
 	libraryFilePaths = make(map[vm.CPUArch][]string)
-	cloud            = spec.GCE
-	// encryptionProbability controls when encryption-at-rest is enabled
-	// in a cluster for tests that have opted-in to metamorphic
-	// encryption (EncryptionMetamorphic).
-	//
-	// Tests that have opted-in to metamorphic encryption will run with
-	// encryption enabled by default (probability 1). In order to run
-	// them with encryption disabled (perhaps to reproduce a test
-	// failure), roachtest can be invoked with --metamorphic-encryption-probability=0
-	encryptionProbability float64
-	// Total probability with which new ARM64 clusters are provisioned, modulo test specs. which are incompatible.
-	// N.B. if all selected tests are incompatible with ARM64, then arm64Probability is effectively 0.
-	// In other words, ClusterSpec.Arch takes precedence over the arm64Probability flag.
-	arm64Probability float64
-	// Conditional probability with which new FIPS clusters are provisioned, modulo test specs. The total probability
-	// is the product of this and 1-arm64Probability.
-	// As in the case of arm64Probability, ClusterSpec.Arch takes precedence over the fipsProbability flag.
-	fipsProbability float64
-
-	instanceType              string
-	localSSDArg               bool
-	deprecatedRoachprodBinary string
-	// overrideOpts contains vm.CreateOpts override values passed from the cli.
-	overrideOpts vm.CreateOpts
-	// overrideFlagset represents the flags passed from the cli for
-	// `run` command (used to know if the value of a flag changed,
-	// for example: overrideFlagset("lifetime").Changed().
-	// TODO(ahmad/healthy-pod): extract runCmd (and other commands) from main
-	// to make it global and operate on runCmd.Flags() directly.
-	overrideFlagset  *pflag.FlagSet
-	overrideNumNodes = -1
-	clusterName      string
-	clusterWipe      bool
-	zonesF           string
-	teamCity         bool
-	disableIssue     bool
-)
-
-const (
-	defaultEncryptionProbability = 1
-	defaultFIPSProbability       = 0
-	defaultARM64Probability      = 0
 )
 
 type errBinaryOrLibraryNotFound struct {
@@ -176,7 +134,7 @@ func findBinary(
 
 func findLibrary(libraryName string, os string, arch vm.CPUArch) (string, error) {
 	suffix := ".so"
-	if cloud == spec.Local {
+	if roachtestflags.Cloud == spec.Local {
 		switch runtime.GOOS {
 		case "linux":
 		case "freebsd":
@@ -206,7 +164,9 @@ func findLibrary(libraryName string, os string, arch vm.CPUArch) (string, error)
 // binOrLib is either 'bin' or 'lib'; nameSuffix is either empty, '.so', '.dll', or '.dylib'.
 // Both osName and arch are used to derive a fully qualified binary or library name by inserting the
 // corresponding arch suffix (see install.ArchInfoForOS), e.g. '.linux-arm64' or '.darwin-amd64'.
-// That is, each hardcoded path is searched for a file named 'name' or 'name.nameSuffix.archSuffix', respectively.
+//
+// Each resulting path is searched for a file named 'name', 'name.nameSuffix.archSuffix', or 'name.nameSuffix', in
+// the specified order.
 //
 // If no binary or library is found, an error is returned.
 // Otherwise, if multiple binaries or libraries are located at the above paths, the first one found is returned.
@@ -252,13 +212,13 @@ func findBinaryOrLibrary(
 	for _, dir := range dirs {
 		var path string
 
-		if path, err = exec.LookPath(filepath.Join(dir, name+nameSuffix)); err == nil {
-			return validateBinaryFormat(path, arch, checkEA)
-		}
 		for _, archSuffix := range archSuffixes {
 			if path, err = exec.LookPath(filepath.Join(dir, name+archSuffix+nameSuffix)); err == nil {
 				return validateBinaryFormat(path, arch, checkEA)
 			}
+		}
+		if path, err = exec.LookPath(filepath.Join(dir, name+nameSuffix)); err == nil {
+			return validateBinaryFormat(path, arch, checkEA)
 		}
 	}
 	return "", errBinaryOrLibraryNotFound{name}
@@ -306,9 +266,9 @@ func initBinariesAndLibraries() {
 	//	see https://github.com/cockroachdb/cockroach/issues/104029.
 	defaultOSName := "linux"
 	defaultArch := vm.ArchAMD64
-	if cloud == spec.Local {
+	if roachtestflags.Cloud == spec.Local {
 		defaultOSName = runtime.GOOS
-		if arm64Probability == 1 {
+		if roachtestflags.ARM64Probability == 1 {
 			// N.B. if arm64Probability != 1, then we're running a local cluster with both arm64 and amd64.
 			defaultArch = vm.ArchARM64
 		}
@@ -359,14 +319,18 @@ func initBinariesAndLibraries() {
 	// We need to verify we have at least both the cockroach and the workload binaries.
 	var err error
 
+	cockroachPath := roachtestflags.CockroachPath
+	cockroachEAPath := roachtestflags.CockroachEAPath
+	workloadPath := roachtestflags.WorkloadPath
 	cockroach[defaultArch], _ = resolveBinary("cockroach", cockroachPath, defaultArch, true, false)
-	workload[defaultArch], _ = resolveBinary("workload", workloadPath, defaultArch, true, false)
+	// Let the test runner verify the workload binary exists if TestSpec.RequiresDeprecatedWorkload is true.
+	workload[defaultArch], _ = resolveBinary("workload", workloadPath, defaultArch, false, false)
 	cockroachEA[defaultArch], err = resolveBinary("cockroach-ea", cockroachEAPath, defaultArch, false, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: unable to find %q for %q: %s\n", "cockroach-ea", defaultArch, err)
 	}
 
-	if arm64Probability > 0 && defaultArch != vm.ArchARM64 {
+	if roachtestflags.ARM64Probability > 0 && defaultArch != vm.ArchARM64 {
 		fmt.Printf("Locating and verifying binaries for os=%q, arch=%q\n", defaultOSName, vm.ArchARM64)
 		// We need to verify we have all the required binaries for arm64.
 		cockroach[vm.ArchARM64], _ = resolveBinary("cockroach", cockroachPath, vm.ArchARM64, true, false)
@@ -376,7 +340,7 @@ func initBinariesAndLibraries() {
 			fmt.Fprintf(os.Stderr, "WARN: unable to find %q for %q: %s\n", "cockroach-ea", vm.ArchARM64, err)
 		}
 	}
-	if fipsProbability > 0 && defaultArch != vm.ArchFIPS {
+	if roachtestflags.FIPSProbability > 0 && defaultArch != vm.ArchFIPS {
 		fmt.Printf("Locating and verifying binaries for os=%q, arch=%q\n", defaultOSName, vm.ArchFIPS)
 		// We need to verify we have all the required binaries for fips.
 		cockroach[vm.ArchFIPS], _ = resolveBinary("cockroach", cockroachPath, vm.ArchFIPS, true, false)
@@ -390,11 +354,11 @@ func initBinariesAndLibraries() {
 	// In v20.2 or higher, optionally expect certain library files to exist.
 	// Since they may not be found in older versions, do not hard error if they are not found.
 	for _, arch := range []vm.CPUArch{vm.ArchAMD64, vm.ArchARM64, vm.ArchFIPS} {
-		if arm64Probability == 0 && defaultArch != vm.ArchARM64 && arch == vm.ArchARM64 {
+		if roachtestflags.ARM64Probability == 0 && defaultArch != vm.ArchARM64 && arch == vm.ArchARM64 {
 			// arm64 isn't used, skip finding libs for it.
 			continue
 		}
-		if fipsProbability == 0 && arch == vm.ArchFIPS {
+		if roachtestflags.FIPSProbability == 0 && arch == vm.ArchFIPS {
 			// fips isn't used, skip finding libs for it.
 			continue
 		}
@@ -459,10 +423,8 @@ func (r *clusterRegistry) registerCluster(c *clusterImpl) error {
 		return fmt.Errorf("cluster named %q already exists in registry", c.name)
 	}
 	r.mu.clusters[c.name] = c
-	if err := c.addLabels(map[string]string{
-		VmLabelTestRunID: runID,
-	}); err != nil && c.l != nil {
-		c.l.Printf("failed to add %s label to cluster: %s", VmLabelTestRunID, err)
+	if err := c.addLabels(map[string]string{VmLabelTestRunID: runID}); err != nil && c.l != nil {
+		c.l.Printf("failed to add label to cluster [%s] - %s", c.name, err)
 	}
 	return nil
 }
@@ -476,7 +438,7 @@ func (r *clusterRegistry) unregisterCluster(c *clusterImpl) bool {
 		return false
 	}
 	if err := c.removeLabels([]string{VmLabelTestRunID}); err != nil && c.l != nil {
-		c.l.Printf("failed to remove %s label from cluster: %s", VmLabelTestRunID, err)
+		c.l.Printf("failed to remove label from cluster [%s] - %s", c.name, err)
 	}
 	delete(r.mu.clusters, c.name)
 	if c.tag != "" {
@@ -572,19 +534,12 @@ func (r *clusterRegistry) destroyAllClusters(ctx context.Context, l *logger.Logg
 	}
 }
 
-func makeGCEClusterName(name string) string {
-	name = strings.ToLower(name)
-	name = regexp.MustCompile(`[^-a-z0-9]+`).ReplaceAllString(name, "-")
-	name = regexp.MustCompile(`-+`).ReplaceAllString(name, "-")
-	return name
-}
-
 func makeClusterName(name string) string {
-	return makeGCEClusterName(name)
+	return vm.DNSSafeName(name)
 }
 
-// MachineTypeToCPUs returns a CPU count for either a GCE or AWS
-// machine type.
+// MachineTypeToCPUs returns a CPU count for GCE, AWS, and Azure machine types.
+// -1 is returned for unknown machine types.
 func MachineTypeToCPUs(s string) int {
 	{
 		// GCE machine types.
@@ -596,6 +551,9 @@ func MachineTypeToCPUs(s string) int {
 			return v
 		}
 		if _, err := fmt.Sscanf(s, "n2-highcpu-%d", &v); err == nil {
+			return v
+		}
+		if _, err := fmt.Sscanf(s, "n2-custom-%d", &v); err == nil {
 			return v
 		}
 		if _, err := fmt.Sscanf(s, "n2-highmem-%d", &v); err == nil {
@@ -630,29 +588,35 @@ func MachineTypeToCPUs(s string) int {
 
 	// Azure doesn't have a standard way to size machines.
 	// This method is implemented for the default machine type.
-	// Not all of Azure machine types contain the number of vCPUs int he size and
+	// Not all of Azure machine types contain the number of vCPUs in the size and
 	// the sizing naming scheme is dependent on the machine type family.
 	switch s {
-	case "Standard_D2_v3":
+	case "Standard_D2ds_v5", "Standard_D2pds_v5", "Standard_D2lds_v5",
+		"Standard_D2plds_v5", "Standard_E2ds_v5", "Standard_E2pds_v5":
 		return 2
-	case "Standard_D4_v3":
+	case "Standard_D4ds_v5", "Standard_D4pds_v5", "Standard_D4lds_v5",
+		"Standard_D4plds_v5", "Standard_E4ds_v5", "Standard_E4pds_v5":
 		return 4
-	case "Standard_D8_v3":
+	case "Standard_D8ds_v5", "Standard_D8pds_v5", "Standard_D8lds_v5",
+		"Standard_D8plds_v5", "Standard_E8ds_v5", "Standard_E8pds_v5":
 		return 8
-	case "Standard_D16_v3":
+	case "Standard_D16ds_v5", "Standard_D16pds_v5", "Standard_D16lds_v5",
+		"Standard_D16plds_v5", "Standard_E16ds_v5", "Standard_E16pds_v5":
 		return 16
-	case "Standard_D32_v3":
+	case "Standard_D32ds_v5", "Standard_D32pds_v5", "Standard_D32lds_v5",
+		"Standard_D32plds_v5", "Standard_E32ds_v5", "Standard_E32pds_v5":
 		return 32
-	case "Standard_D48_v3":
+	case "Standard_D48ds_v5", "Standard_D48pds_v5", "Standard_D48lds_v5",
+		"Standard_D48plds_v5", "Standard_E48ds_v5", "Standard_E48pds_v5":
 		return 48
-	case "Standard_D64_v3":
+	case "Standard_D64ds_v5", "Standard_D64pds_v5", "Standard_D64lds_v5",
+		"Standard_D64plds_v5", "Standard_E64ds_v5", "Standard_E64pds_v5":
 		return 64
+	case "Standard_D96ds_v5", "Standard_D96pds_v5", "Standard_D96lds_v5",
+		"Standard_D96plds_v5", "Standard_E96ds_v5", "Standard_E96pds_v5":
+		return 96
 	}
-
-	// TODO(pbardea): Non-default Azure machine types are not supported
-	// and will return unknown machine type error.
-	fmt.Fprintf(os.Stderr, "unknown machine type: %s\n", s)
-	os.Exit(1)
+	// Unknown or unsupported machine type.
 	return -1
 }
 
@@ -665,10 +629,12 @@ type nodeSelector interface {
 
 // It is safe for concurrent use by multiple goroutines.
 type clusterImpl struct {
-	name string
-	tag  string
-	spec spec.ClusterSpec
-	t    test.Test
+	name  string
+	tag   string
+	cloud spec.Cloud
+	spec  spec.ClusterSpec
+	t     test.Test
+	f     roachtestutil.Fataler
 	// r is the registry tracking this cluster. Destroying the cluster will
 	// unregister it.
 	r *clusterRegistry
@@ -682,13 +648,47 @@ type clusterImpl struct {
 	expiration    time.Time
 	encAtRest     bool // use encryption at rest
 
-	// clusterSettings are additional cluster settings set on cluster startup.
+	// clusterSettings are additional cluster settings set on the storage cluster startup.
 	clusterSettings map[string]string
+	// virtualClusterSettings are additional cluster settings to set on the
+	// virtual cluster startup.
+	virtualClusterSettings map[string]string
+	// goCoverDir is the directory for Go coverage data (if coverage is enabled).
+	// BAZEL_COVER_DIR will be set to this value when starting a node.
+	goCoverDir string
 
-	os   string     // OS of the cluster
-	arch vm.CPUArch // CPU architecture of the cluster
+	os         string     // OS of the cluster
+	arch       vm.CPUArch // CPU architecture of the cluster
+	randomSeed struct {
+		mu   syncutil.Mutex
+		seed *int64
+	}
+
+	// defaultVirtualCluster, when set, changes the default virtual
+	// cluster tests connect to by default.
+	defaultVirtualCluster string
+
 	// destroyState contains state related to the cluster's destruction.
 	destroyState destroyState
+
+	// grafanaTags contains the cluster and test information that grafana will separate
+	// test runs by. This is used by the roachtest grafana API to create appropriately
+	// tagged grafana annotations. If empty, grafana is not available.
+	grafanaTags               []string
+	disableGrafanaAnnotations atomic.Bool
+
+	// sideEyeClient, if set, is the client used to communicate with the Side-Eye
+	// debugging service.
+	sideEyeClient *sideeyeclient.SideEyeClient
+
+	// State that can be accessed concurrently (in particular, read from the UI
+	// HTML generator).
+	mu struct {
+		syncutil.Mutex
+		// sideEyeEnvName is the name of the environment used by the Side-Eye agents
+		// running on this cluster. Empty if the Side-Eye integration is not active.
+		sideEyeEnvName string
+	}
 }
 
 // Name returns the cluster name, i.e. something like `teamcity-....`
@@ -716,6 +716,20 @@ func (c *clusterImpl) workerStatus(args ...interface{}) {
 	}
 }
 
+// sideEyeEnvName is the name of the environment used by the Side-Eye agents
+// running on this cluster. Empty if the Side-Eye integration is not active.
+func (c *clusterImpl) sideEyeEnvName() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mu.sideEyeEnvName
+}
+
+func (c *clusterImpl) setSideEyeEnvName(newEnv string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.sideEyeEnvName = newEnv
+}
+
 func (c *clusterImpl) String() string {
 	return fmt.Sprintf("%s [tag:%s] (%d nodes)", c.name, c.tag, c.Spec().NodeCount)
 }
@@ -726,10 +740,6 @@ type destroyState struct {
 	// an existing roachprod cluster.
 	// If not set, Destroy() only wipes the cluster.
 	owned bool
-
-	// alloc is set if owned is set. If set, it represents resources in a
-	// QuotaPool that need to be released when the cluster is destroyed.
-	alloc *quotapool.IntAlloc
 
 	mu struct {
 		syncutil.Mutex
@@ -769,11 +779,18 @@ type clusterConfig struct {
 	username     string
 	localCluster bool
 	useIOBarrier bool
-	alloc        *quotapool.IntAlloc
 	// Specifies CPU architecture which may require a custom AMI and cockroach binary.
 	arch vm.CPUArch
 	// Specifies the OS which may require a custom AMI and cockroach binary.
 	os string
+	// sideEyeToken, if not empty, is the token used to authenticate with the
+	// Side-Eye. If set, each node in the cluster will run the Side-Eye agent.
+	// These agents are configured to allow monitoring of cockroach processes.
+	// app.side-eye.io will list all currently-running clusters. The test runner's
+	// Side-Eye client can be used to programmatically take snapshots of this
+	// cluster using the cluster's name; snapshots are taken when the test times
+	// out.
+	sideEyeToken string
 }
 
 // clusterFactory is a creator of clusters.
@@ -782,7 +799,7 @@ type clusterFactory struct {
 	namePrefix string
 	// counter is incremented with every new cluster. It's used as part of the cluster's name.
 	// Accessed atomically.
-	counter uint64
+	counter atomic.Uint64
 	// The registry with whom all clustered will be registered.
 	r *clusterRegistry
 	// artifactsDir is the directory in which the cluster creation log file will be placed.
@@ -790,10 +807,18 @@ type clusterFactory struct {
 	// sem is a semaphore throttling the creation of clusters (because AWS has
 	// ridiculous API calls limits).
 	sem chan struct{}
+	// sideEyeClient, if set, is the client used to communicate with the Side-Eye
+	// debugging service.
+	sideEyeClient *sideeyeclient.SideEyeClient
 }
 
 func newClusterFactory(
-	user string, clustersID string, artifactsDir string, r *clusterRegistry, concurrentCreations int,
+	user string,
+	clustersID string,
+	artifactsDir string,
+	r *clusterRegistry,
+	concurrentCreations int,
+	sideEyeClient *sideeyeclient.SideEyeClient,
 ) *clusterFactory {
 	secs := timeutil.Now().Unix()
 	var prefix string
@@ -803,10 +828,11 @@ func newClusterFactory(
 		prefix = fmt.Sprintf("%s-%d-", user, secs)
 	}
 	return &clusterFactory{
-		sem:          make(chan struct{}, concurrentCreations),
-		namePrefix:   prefix,
-		artifactsDir: artifactsDir,
-		r:            r,
+		sem:           make(chan struct{}, concurrentCreations),
+		namePrefix:    prefix,
+		artifactsDir:  artifactsDir,
+		r:             r,
+		sideEyeClient: sideEyeClient,
 	}
 }
 
@@ -828,35 +854,30 @@ func (f *clusterFactory) genName(cfg clusterConfig) string {
 	if cfg.nameOverride != "" {
 		return cfg.nameOverride
 	}
-	count := atomic.AddUint64(&f.counter, 1)
+	count := f.counter.Add(1)
 	return makeClusterName(
 		fmt.Sprintf("%s-%02d-%s", f.namePrefix, count, cfg.spec.String()))
 }
 
 // createFlagsOverride updates opts with the override values passed from the cli.
-func createFlagsOverride(flags *pflag.FlagSet, opts *vm.CreateOpts) {
-	if flags != nil {
-		if flags.Changed("lifetime") {
-			opts.Lifetime = overrideOpts.Lifetime
-		}
-		if flags.Changed("roachprod-local-ssd") {
-			opts.SSDOpts.UseLocalSSD = overrideOpts.SSDOpts.UseLocalSSD
-		}
-		if flags.Changed("filesystem") {
-			opts.SSDOpts.FileSystem = overrideOpts.SSDOpts.FileSystem
-		}
-		if flags.Changed("local-ssd-no-ext4-barrier") {
-			opts.SSDOpts.NoExt4Barrier = overrideOpts.SSDOpts.NoExt4Barrier
-		}
-		if flags.Changed("os-volume-size") {
-			opts.OsVolumeSize = overrideOpts.OsVolumeSize
-		}
-		if flags.Changed("geo") {
-			opts.GeoDistributed = overrideOpts.GeoDistributed
-		}
-		if flags.Changed("label") {
-			opts.CustomLabels = overrideOpts.CustomLabels
-		}
+func createFlagsOverride(opts *vm.CreateOpts) {
+	if roachtestflags.Changed(&roachtestflags.Lifetime) != nil {
+		opts.Lifetime = roachtestflags.Lifetime
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideUseLocalSSD) != nil {
+		opts.SSDOpts.UseLocalSSD = roachtestflags.OverrideUseLocalSSD
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideFilesystem) != nil {
+		opts.SSDOpts.FileSystem = roachtestflags.OverrideFilesystem
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideNoExt4Barrier) != nil {
+		opts.SSDOpts.NoExt4Barrier = roachtestflags.OverrideNoExt4Barrier
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideOSVolumeSizeGB) != nil {
+		opts.OsVolumeSize = roachtestflags.OverrideOSVolumeSizeGB
+	}
+	if roachtestflags.Changed(&roachtestflags.OverrideGeoDistributed) != nil {
+		opts.GeoDistributed = roachtestflags.OverrideGeoDistributed
 	}
 }
 
@@ -866,8 +887,13 @@ func (f *clusterFactory) clusterMock(cfg clusterConfig) *clusterImpl {
 		name:       f.genName(cfg),
 		expiration: timeutil.Now().Add(24 * time.Hour),
 		r:          f.r,
+		spec:       cfg.spec,
 	}
 }
+
+// create is a hook for tests to inject their own cluster create implementation.
+// i.e. unit tests that don't want to actually access a provider.
+var create = roachprod.Create
 
 // newCluster creates a new roachprod cluster.
 //
@@ -882,8 +908,8 @@ func (f *clusterFactory) newCluster(
 		return nil, nil, errors.Wrap(ctx.Err(), "newCluster")
 	}
 
-	if overrideFlagset != nil && overrideFlagset.Changed("nodes") {
-		cfg.spec.NodeCount = overrideNumNodes
+	if roachtestflags.Changed(&roachtestflags.OverrideNumNodes) != nil {
+		cfg.spec.NodeCount = roachtestflags.OverrideNumNodes
 	}
 
 	if cfg.spec.NodeCount == 0 {
@@ -908,20 +934,27 @@ func (f *clusterFactory) newCluster(
 	defer setStatus("idle")
 
 	providerOptsContainer := vm.CreateProviderOptionsContainer()
+	workloadProviderOptsContainer := vm.CreateProviderOptionsContainer()
+
+	clusterCloud := roachtestflags.Cloud
+	params := spec.RoachprodClusterConfig{
+		Cloud:                  clusterCloud,
+		UseIOBarrierOnLocalSSD: cfg.useIOBarrier,
+		PreferredArch:          cfg.arch,
+	}
+	params.Defaults.MachineType = roachtestflags.InstanceType
+	params.Defaults.Zones = roachtestflags.Zones
+	params.Defaults.PreferLocalSSD = roachtestflags.PreferLocalSSD
+
 	// The ClusterName is set below in the retry loop to ensure
 	// that each create attempt gets a unique cluster name.
-	createVMOpts, providerOpts, err := cfg.spec.RoachprodOpts("", cfg.useIOBarrier, cfg.arch)
+	// N.B. selectedArch may not be the same as PreferredArch, depending on (spec.CPU, spec.Mem)
+	createVMOpts, providerOpts, workloadProviderOpts, selectedArch, err := cfg.spec.RoachprodOpts(params)
 	if err != nil {
-		// We must release the allocation because cluster creation is not possible at this point.
-		cfg.alloc.Release()
-
 		return nil, nil, err
 	}
-	if cfg.spec.Cloud != spec.Local {
-		providerOptsContainer.SetProviderOpts(cfg.spec.Cloud, providerOpts)
-	}
 
-	createFlagsOverride(overrideFlagset, &createVMOpts)
+	createFlagsOverride(&createVMOpts)
 	// Make sure expiration is changed if --lifetime override flag
 	// is passed.
 	cfg.spec.Lifetime = createVMOpts.Lifetime
@@ -931,45 +964,73 @@ func (f *clusterFactory) newCluster(
 	maxAttempts := 3
 	if cfg.nameOverride != "" {
 		// Usually when retrying we pick a new name (to avoid repeat failures due to
-		// partially created resources), but we were were asked to use a specific
+		// partially created resources), but we were asked to use a specific
 		// name. To keep things simple, disable retries in that case.
 		maxAttempts = 1
 	}
 	// loop assumes maxAttempts is atleast (1).
 	for i := 1; ; i++ {
-		c := &clusterImpl{
-			// NB: this intentionally avoids re-using the name across iterations in
-			// the loop. See:
-			//
-			// https://github.com/cockroachdb/cockroach/issues/67906#issuecomment-887477675
-			name:       f.genName(cfg),
-			spec:       cfg.spec,
-			expiration: cfg.spec.Expiration(),
-			r:          f.r,
-			arch:       cfg.arch,
-			os:         cfg.os,
-			destroyState: destroyState{
-				owned: true,
-				alloc: cfg.alloc,
-			},
+		// NB: this intentionally avoids re-using the name across iterations in
+		// the loop. See:
+		//
+		// https://github.com/cockroachdb/cockroach/issues/67906#issuecomment-887477675
+		genName := f.genName(cfg)
+
+		// Set the zones used for the cluster. We call this in the loop as the default GCE zone
+		// is randomized to avoid zone exhaustion errors.
+		providerOpts, workloadProviderOpts = cfg.spec.SetRoachprodOptsZones(providerOpts, workloadProviderOpts, params, string(selectedArch))
+		if clusterCloud != spec.Local {
+			providerOptsContainer.SetProviderOpts(clusterCloud.String(), providerOpts)
+			workloadProviderOptsContainer.SetProviderOpts(clusterCloud.String(), workloadProviderOpts)
 		}
-		c.status("creating cluster")
 
 		// Logs for creating a new cluster go to a dedicated log file.
 		var retryStr string
 		if i > 1 {
 			retryStr = "-retry" + strconv.Itoa(i-1)
 		}
-		logPath := filepath.Join(f.artifactsDir, runnerLogsDir, "cluster-create", c.name+retryStr+".log")
+		logPath := filepath.Join(f.artifactsDir, runnerLogsDir, "cluster-create", genName+retryStr+".log")
 		l, err := logger.RootLogger(logPath, teeOpt)
 		if err != nil {
-			log.Fatalf(ctx, "%v", err)
+			log.Fatalf("%v", err)
 		}
+
+		c := &clusterImpl{
+			cloud:      clusterCloud,
+			name:       genName,
+			spec:       cfg.spec,
+			expiration: cfg.spec.Expiration(),
+			r:          f.r,
+			arch:       selectedArch,
+			os:         cfg.os,
+			destroyState: destroyState{
+				owned: true,
+			},
+			sideEyeClient: f.sideEyeClient,
+			l:             l,
+		}
+		c.status("creating cluster")
 
 		l.PrintfCtx(ctx, "Attempting cluster creation (attempt #%d/%d)", i, maxAttempts)
 		createVMOpts.ClusterName = c.name
-		err = roachprod.Create(ctx, l, cfg.username, cfg.spec.NodeCount, createVMOpts, providerOptsContainer)
+		opts := []*cloud.ClusterCreateOpts{{Nodes: cfg.spec.NodeCount, CreateOpts: createVMOpts, ProviderOptsContainer: providerOptsContainer}}
+		// There can only be one local cluster so creating two sequentially overwrites the first.
+		// There isn't a point to creating a different sized vm for local clusters, so skip it.
+		if cfg.spec.WorkloadNode && !cfg.localCluster {
+			opts = []*cloud.ClusterCreateOpts{
+				{Nodes: cfg.spec.NodeCount - cfg.spec.WorkloadNodeCount, CreateOpts: createVMOpts, ProviderOptsContainer: providerOptsContainer},
+				{Nodes: cfg.spec.WorkloadNodeCount, CreateOpts: createVMOpts, ProviderOptsContainer: workloadProviderOptsContainer},
+			}
+		}
+		err = create(ctx, l, cfg.username, opts...)
 		if err == nil {
+			// Start the Side-Eye agents on all the nodes if we are configured to do so. Side-Eye
+			// doesn't currently support ARM64, so skip those clusters.
+			if cfg.sideEyeToken != "" && !cfg.localCluster && c.arch != vm.ArchARM64 {
+				if err := c.StartSideEyeAgents(ctx, l, cfg.sideEyeToken); err != nil {
+					l.Errorf("failed to start Side-Eye agents. Continuing without them.\nError: %s", err)
+				}
+			}
 			if err := f.r.registerCluster(c); err != nil {
 				return nil, nil, err
 			}
@@ -984,16 +1045,13 @@ func (f *clusterFactory) newCluster(
 			// or a destroy from the previous iteration failed.
 			return nil, nil, err
 		}
+		if errors.HasType(err, (*roachprod.MalformedClusterNameError)(nil)) {
+			return nil, nil, err
+		}
 
 		l.PrintfCtx(ctx, "cluster creation failed, cleaning up in case it was partially created: %s", err)
-		// Set the alloc to nil so that Destroy won't release it.
-		// This is ugly, but given that the alloc is created very far away from this code
-		// (when selecting the test) it's the best we can do for now.
-		c.destroyState.alloc = nil
 		c.Destroy(ctx, closeLogger, l)
 		if i >= maxAttempts {
-			// Here we have to release the alloc, as we are giving up.
-			cfg.alloc.Release()
 			return nil, nil, err
 		}
 		// Try again to create the cluster.
@@ -1051,8 +1109,8 @@ func attachToExistingCluster(
 			return nil, err
 		}
 		if !opt.skipWipe {
-			if clusterWipe {
-				if err := c.WipeE(ctx, l, false /* preserveCerts */, c.All()); err != nil {
+			if roachtestflags.ClusterWipe {
+				if err := roachprod.Wipe(ctx, l, c.MakeNodes(c.All()), false /* preserveCerts */); err != nil {
 					return nil, err
 				}
 			} else {
@@ -1070,37 +1128,13 @@ func attachToExistingCluster(
 // TODO(andrei): Get rid of c.t, c.l and of this method.
 func (c *clusterImpl) setTest(t test.Test) {
 	c.t = t
+	c.f = t
 	c.l = t.L()
-}
-
-// StopCockroachGracefullyOnNode stops a running cockroach instance on the requested
-// node before a version upgrade.
-func (c *clusterImpl) StopCockroachGracefullyOnNode(
-	ctx context.Context, l *logger.Logger, node int,
-) error {
-	// A graceful shutdown is sending SIGTERM to the node, then waiting
-	// some reasonable amount of time, then sending a non-graceful SIGKILL.
-	gracefulOpts := option.DefaultStopOpts()
-	gracefulOpts.RoachprodOpts.Sig = 15 // SIGTERM
-	gracefulOpts.RoachprodOpts.Wait = true
-	gracefulOpts.RoachprodOpts.MaxWait = 60
-	if err := c.StopE(ctx, l, gracefulOpts, c.Node(node)); err != nil {
-		return err
-	}
-
-	// NB: we still call Stop to make sure the process is dead when we
-	// try to restart it (in case it takes longer than `MaxWait` for it
-	// to finish).
-	return c.StopE(ctx, l, option.DefaultStopOpts(), c.Node(node))
 }
 
 // Save marks the cluster as "saved" so that it doesn't get destroyed.
 func (c *clusterImpl) Save(ctx context.Context, msg string, l *logger.Logger) {
 	l.PrintfCtx(ctx, "saving cluster %s for debugging (--debug specified)", c)
-	// TODO(andrei): should we extend the cluster here? For how long?
-	if c.destroyState.owned { // we won't have an alloc for an unowned cluster
-		c.destroyState.alloc.Freeze()
-	}
 	c.r.markClusterAsSaved(c, msg)
 	c.destroyState.mu.Lock()
 	c.destroyState.mu.saved = true
@@ -1131,18 +1165,24 @@ func (c *clusterImpl) validate(
 	if len(cDetails.VMs) < c.spec.NodeCount {
 		return fmt.Errorf("cluster has %d nodes, test requires at least %d", len(cDetails.VMs), c.spec.NodeCount)
 	}
+	crdbNodes := c.spec.NodeCount - c.spec.WorkloadNodeCount
 	if cpus := nodes.CPUs; cpus != 0 {
 		for i, vm := range cDetails.VMs {
+			nodeID := i + 1
+			// If we are using a workload node, workload nodes may have a different cpu count.
+			if nodeID > crdbNodes && c.spec.WorkloadNode {
+				cpus = c.spec.WorkloadNodeCPUs
+			}
 			vmCPUs := MachineTypeToCPUs(vm.MachineType)
 			// vmCPUs will be negative if the machine type is unknown. Give unknown
 			// machine types the benefit of the doubt.
 			if vmCPUs > 0 && vmCPUs < cpus {
-				return fmt.Errorf("node %d has %d CPUs, test requires %d", i, vmCPUs, cpus)
+				return fmt.Errorf("node %d has %d CPUs, test requires %d", nodeID, vmCPUs, cpus)
 			}
 			// Clouds typically don't support odd numbers of vCPUs; they can result in subtle performance issues.
 			// N.B. Some machine families, e.g., n2 in GCE, do not support 1 vCPU. (See AWSMachineType and GCEMachineType.)
 			if vmCPUs > 1 && vmCPUs&1 == 1 {
-				return fmt.Errorf("node %d has an _odd_ number of CPUs (%d)", i, vmCPUs)
+				return fmt.Errorf("node %d has an _odd_ number of CPUs (%d)", nodeID, vmCPUs)
 			}
 		}
 	}
@@ -1151,14 +1191,18 @@ func (c *clusterImpl) validate(
 
 func (c *clusterImpl) lister() option.NodeLister {
 	fatalf := func(string, ...interface{}) {}
-	if c.t != nil { // accommodates poorly set up tests
-		fatalf = c.t.Fatalf
+	if c.f != nil { // accommodates poorly set up tests
+		fatalf = c.f.Fatalf
 	}
-	return option.NodeLister{NodeCount: c.spec.NodeCount, Fatalf: fatalf}
+	return option.NodeLister{NodeCount: c.spec.NodeCount, WorkloadNodeCount: c.spec.WorkloadNodeCount, Fatalf: fatalf}
 }
 
 func (c *clusterImpl) All() option.NodeListOption {
 	return c.lister().All()
+}
+
+func (c *clusterImpl) CRDBNodes() option.NodeListOption {
+	return c.lister().CRDBNodes()
 }
 
 func (c *clusterImpl) Range(begin, end int) option.NodeListOption {
@@ -1173,6 +1217,10 @@ func (c *clusterImpl) Node(i int) option.NodeListOption {
 	return c.lister().Node(i)
 }
 
+func (c *clusterImpl) WorkloadNode() option.NodeListOption {
+	return c.lister().WorkloadNode()
+}
+
 // FetchLogs downloads the logs from the cluster using `roachprod get`.
 // The logs will be placed in the test's artifacts dir.
 func (c *clusterImpl) FetchLogs(ctx context.Context, l *logger.Logger) error {
@@ -1181,32 +1229,24 @@ func (c *clusterImpl) FetchLogs(ctx context.Context, l *logger.Logger) error {
 		return nil
 	}
 
-	l.Printf("fetching logs\n")
 	c.status("fetching logs")
 
-	// Don't hang forever if we can't fetch the logs.
-	return timeutil.RunWithTimeout(ctx, "fetch logs", 2*time.Minute, func(ctx context.Context) error {
-		path := filepath.Join(c.t.ArtifactsDir(), "logs", "unredacted")
-		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-			return err
+	err := roachprod.FetchLogs(ctx, l, c.name, c.t.ArtifactsDir(), 5*time.Minute)
+
+	var logFileFull string
+	if l.File != nil {
+		logFileFull = l.File.Name()
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			l.Printf("(note: incoming context was canceled: %s)", err)
+			return ctxErr
 		}
 
-		if err := c.Get(ctx, c.l, "logs" /* src */, path /* dest */); err != nil {
-			l.Printf("failed to fetch logs: %v", err)
-			if ctx.Err() != nil {
-				return errors.Wrap(err, "cluster.FetchLogs")
-			}
-		}
-
-		if err := c.RunE(ctx, c.All(), fmt.Sprintf("mkdir -p logs/redacted && %s debug merge-logs --redact logs/*.log > logs/redacted/combined.log", test.DefaultCockroachPath)); err != nil {
-			l.Printf("failed to redact logs: %v", err)
-			if ctx.Err() != nil {
-				return err
-			}
-		}
-		dest := filepath.Join(c.t.ArtifactsDir(), "logs/cockroach.log")
-		return errors.Wrap(c.Get(ctx, c.l, "logs/redacted/combined.log" /* src */, dest), "cluster.FetchLogs")
-	})
+		l.Printf("> result: %s", err)
+		createFailedFile(logFileFull)
+	}
+	return err
 }
 
 // saveDiskUsageToLogsDir collects a summary of the disk usage to logs/diskusage.txt on each node.
@@ -1221,8 +1261,11 @@ func saveDiskUsageToLogsDir(ctx context.Context, c cluster.Cluster) error {
 
 	// Don't hang forever.
 	return timeutil.RunWithTimeout(ctx, "disk usage", 20*time.Second, func(ctx context.Context) error {
-		return c.RunE(ctx, c.All(),
-			"du -c /mnt/data1 --exclude lost+found >> logs/diskusage.txt")
+		return c.RunE(
+			ctx,
+			option.WithNodes(c.All()),
+			"du {store-dir} -c --exclude lost+found >> logs/diskusage.txt",
+		)
 	})
 }
 
@@ -1252,7 +1295,7 @@ func (c *clusterImpl) CopyRoachprodState(ctx context.Context) error {
 //
 // `COCKROACH_DEBUG_TS_IMPORT_FILE=tsdump.gob ./cockroach start-single-node --insecure --store=$(mktemp -d)`
 func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, l *logger.Logger) error {
-	l.Printf("fetching timeseries data\n")
+	l.Printf("fetching timeseries data")
 	return timeutil.RunWithTimeout(ctx, "fetch tsdata", 5*time.Minute, func(ctx context.Context) error {
 		node := 1
 		for ; node <= c.spec.NodeCount; node++ {
@@ -1272,14 +1315,18 @@ func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, l *logger.Logger)
 		}
 		sec := "--insecure"
 		if c.IsSecure() {
-			certs := "certs"
+			certs := install.CockroachNodeCertsDir
 			if c.IsLocal() {
 				certs = c.localCertsDir
 			}
 			sec = fmt.Sprintf("--certs-dir=%s", certs)
 		}
 		if err := c.RunE(
-			ctx, c.Node(node), fmt.Sprintf("%s debug tsdump %s --format=raw > tsdump.gob", test.DefaultCockroachPath, sec),
+			ctx, option.WithNodes(c.Node(node)),
+			fmt.Sprintf(
+				"%s debug tsdump %s --port={pgport%s:%s} --format=raw > tsdump.gob",
+				test.DefaultCockroachPath, sec, c.Node(node), install.SystemInterfaceName,
+			),
 		); err != nil {
 			return err
 		}
@@ -1316,26 +1363,32 @@ func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, l *logger.Logger)
 		if err := os.WriteFile(tsDumpGob+".yaml", buf.Bytes(), 0644); err != nil {
 			return err
 		}
-		return os.WriteFile(tsDumpGob+"-run.sh", []byte(`#!/usr/bin/env bash
-
-COCKROACH_DEBUG_TS_IMPORT_FILE=tsdump.gob cockroach start-single-node --insecure $*
-`), 0755)
+		return os.WriteFile(tsDumpGob+"-run.sh", []byte(tsdumpRunSh), 0755)
 	})
 }
 
 // FetchDebugZip downloads the debug zip from the cluster using `roachprod ssh`.
 // The logs will be placed at `dest`, relative to the test's artifacts dir.
-func (c *clusterImpl) FetchDebugZip(ctx context.Context, l *logger.Logger, dest string) error {
+//
+// By default, FetchDebugZip will attempt to download the zip from the first
+// node, and if that fails, it will try subsequent nodes. The caller may pass a
+// list of nodes via opts if they want to target which node(s) to grab the debug
+// zip from.
+func (c *clusterImpl) FetchDebugZip(
+	ctx context.Context, l *logger.Logger, dest string, opts ...option.Option,
+) error {
 	if c.spec.NodeCount == 0 {
 		// No nodes can happen during unit tests and implies nothing to do.
 		return nil
 	}
 
-	l.Printf("fetching debug zip\n")
+	l.Printf("fetching debug zip")
 	c.status("fetching debug zip")
 
+	nodes := selectedNodesOrDefault(opts, c.All())
+
 	// Don't hang forever if we can't fetch the debug zip.
-	return timeutil.RunWithTimeout(ctx, "debug zip", 5*time.Minute, func(ctx context.Context) error {
+	return timeutil.RunWithTimeout(ctx, "debug zip", 10*time.Minute, func(ctx context.Context) error {
 		const zipName = "debug.zip"
 		path := filepath.Join(c.t.ArtifactsDir(), dest)
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -1344,62 +1397,106 @@ func (c *clusterImpl) FetchDebugZip(ctx context.Context, l *logger.Logger, dest 
 		// Some nodes might be down, so try to find one that works. We make the
 		// assumption that a down node will refuse the connection, so it won't
 		// waste our time.
-		for i := 1; i <= c.spec.NodeCount; i++ {
+		for _, node := range nodes {
+			pgURLOpts := roachprod.PGURLOptions{
+				// `cockroach debug zip` does not support non root authentication.
+				Auth: install.AuthRootCert,
+				// request the system tenant specifically in case the test
+				// changed the default virtual cluster.
+				VirtualClusterName: install.SystemInterfaceName,
+			}
+			nodePgUrl, err := c.InternalPGUrl(ctx, l, c.Node(node), pgURLOpts)
+			if err != nil {
+				l.Printf("cluster.FetchDebugZip failed to retrieve PGUrl on node %d: %v", node, err)
+				continue
+			}
+
 			// `cockroach debug zip` is noisy. Suppress the output unless it fails.
 			//
-			// Ignore the files in the the log directory; we pull the logs separately anyway
+			// Ignore the files in the log directory; we pull the logs separately anyway
 			// so this would only cause duplication.
-			excludeFiles := "*.log,*.txt,*.pprof"
+			excludeFiles := "*.log,*.pprof"
+
 			cmd := roachtestutil.NewCommand("%s debug zip", test.DefaultCockroachPath).
 				Option("include-range-info").
 				Flag("exclude-files", fmt.Sprintf("'%s'", excludeFiles)).
-				Flag("url", fmt.Sprintf("{pgurl:%d}", i)).
-				MaybeFlag(c.IsSecure(), "certs-dir", "certs").
+				Flag("url", fmt.Sprintf("'%s'", nodePgUrl[0])).
+				MaybeFlag(c.IsSecure(), "certs-dir", install.CockroachNodeCertsDir).
 				Arg(zipName).
 				String()
-			if err := c.RunE(ctx, c.Node(i), cmd); err != nil {
-				l.Printf("%s debug zip failed on node %d: %v", test.DefaultCockroachPath, i, err)
-				if i < c.spec.NodeCount {
-					continue
-				}
-				return err
+			if err = c.RunE(ctx, option.WithNodes(c.Node(node)), cmd); err != nil {
+				l.Printf("%s debug zip failed on node %d: %v", test.DefaultCockroachPath, node, err)
+				continue
 			}
-			return errors.Wrap(c.Get(ctx, c.l, zipName /* src */, path /* dest */, c.Node(i)), "cluster.FetchDebugZip")
+			return errors.Wrap(c.Get(ctx, c.l, zipName /* src */, path /* dest */, c.Node(node)), "cluster.FetchDebugZip")
 		}
 		return nil
 	})
 }
 
-// checkNoDeadNode returns an error if at least one of the nodes that have a populated
-// data dir are found to be not running. It prints both to t.L() and the test
-// output.
-func (c *clusterImpl) assertNoDeadNode(ctx context.Context, t test.Test) error {
-	if c.spec.NodeCount == 0 {
-		// No nodes can happen during unit tests and implies nothing to do.
+// FetchVMSpecs saves the VM specs for each VM in the cluster.
+// The logs will be placed in the test's artifacts dir.
+func (c *clusterImpl) FetchVMSpecs(ctx context.Context, l *logger.Logger) error {
+	if c.IsLocal() {
 		return nil
 	}
 
-	t.L().Printf("checking for dead nodes")
-	eventsCh, err := roachprod.Monitor(ctx, t.L(), c.name, install.MonitorOpts{OneShot: true, IgnoreEmptyNodes: true})
+	l.Printf("fetching VM specs")
 
-	// An error here means there was a problem initialising a SyncedCluster.
-	if err != nil {
+	vmSpecsFolder := filepath.Join(c.t.ArtifactsDir(), "vm_specs")
+	if err := os.MkdirAll(vmSpecsFolder, 0755); err != nil {
 		return err
 	}
 
-	deadNodes := 0
-	for info := range eventsCh {
-		t.L().Printf("%s", info)
+	// Don't hang forever if we can't fetch the VM specs.
+	return timeutil.RunWithTimeout(ctx, "fetch logs", 5*time.Minute, func(ctx context.Context) error {
+		cachedCluster, err := getCachedCluster(c.name)
+		if err != nil {
+			return err
+		}
+		providerToVMs := bucketVMsByProvider(cachedCluster)
 
-		if _, isDeath := info.Event.(install.MonitorNodeDead); isDeath {
-			deadNodes++
+		for provider, vms := range providerToVMs {
+			p := vm.Providers[provider]
+			vmSpecs, err := p.GetVMSpecs(l, vms)
+			if err != nil {
+				l.Errorf("failed to get VM spec for provider %s: %s", provider, err)
+				continue
+			}
+			for name, vmSpec := range vmSpecs {
+				dest := filepath.Join(vmSpecsFolder, name+".json")
+				specJSON, err := json.MarshalIndent(vmSpec, "", "  ")
+				if err != nil {
+					l.Errorf("Failed to marshal JSON: %v", err)
+					continue
+				}
+
+				err = os.WriteFile(dest, specJSON, 0644)
+				if err != nil {
+					l.Printf("Failed to write spec to file for %s", name)
+					continue
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func selectedNodesOrDefault(
+	opts []option.Option, defaultNodes option.NodeListOption,
+) option.NodeListOption {
+	var nodes option.NodeListOption
+	for _, o := range opts {
+		if s, ok := o.(nodeSelector); ok {
+			nodes = s.Merge(nodes)
 		}
 	}
 
-	if deadNodes > 0 {
-		return errors.Newf("%d dead node(s) detected", deadNodes)
+	if len(nodes) == 0 {
+		return defaultNodes
 	}
-	return nil
+
+	return nodes
 }
 
 type HealthStatusResult struct {
@@ -1418,20 +1515,28 @@ func newHealthStatusResult(node int, status int, body []byte, err error) *Health
 	}
 }
 
-// HealthStatus returns the result of the /health?ready=1 endpoint for each node.
+// HealthStatus returns the result of the /health?ready=1 endpoint for the
+// specified nodes.
 func (c *clusterImpl) HealthStatus(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption,
 ) ([]*HealthStatusResult, error) {
-	if len(node) < 1 {
+	nodeCount := len(nodes)
+	if nodeCount < 1 {
 		return nil, nil // unit tests
 	}
-	adminAddrs, err := c.ExternalAdminUIAddr(ctx, l, node)
+
+	adminAddrs, err := c.ExternalAdminUIAddr(ctx, l, nodes)
 	if err != nil {
 		return nil, errors.WithDetail(err, "Unable to get admin UI address(es)")
 	}
-	getStatus := func(ctx context.Context, node int) *HealthStatusResult {
-		url := fmt.Sprintf(`http://%s/health?ready=1`, adminAddrs[node-1])
-		resp, err := httputil.Get(ctx, url)
+	client := roachtestutil.DefaultHTTPClient(c, l)
+	protocol := "http"
+	if c.IsSecure() {
+		protocol = "https"
+	}
+	getStatus := func(ctx context.Context, nodeIndex, node int) *HealthStatusResult {
+		url := fmt.Sprintf(`%s://%s/health?ready=1`, protocol, adminAddrs[nodeIndex])
+		resp, err := client.Get(ctx, url)
 		if err != nil {
 			return newHealthStatusResult(node, 0, nil, err)
 		}
@@ -1442,16 +1547,26 @@ func (c *clusterImpl) HealthStatus(
 		return newHealthStatusResult(node, resp.StatusCode, body, err)
 	}
 
-	results := make([]*HealthStatusResult, c.spec.NodeCount)
+	results := make([]*HealthStatusResult, nodeCount)
 
 	_ = timeutil.RunWithTimeout(ctx, "health status", 15*time.Second, func(ctx context.Context) error {
 		var wg sync.WaitGroup
-		wg.Add(c.spec.NodeCount)
-		for i := 1; i <= c.spec.NodeCount; i++ {
-			go func(node int) {
+		wg.Add(nodeCount)
+		for i := 0; i < nodeCount; i++ {
+			go func() {
 				defer wg.Done()
-				results[node-1] = getStatus(ctx, node)
-			}(i)
+				for {
+					results[i] = getStatus(ctx, i, nodes[i])
+					if results[i].Err == nil && results[i].Status == http.StatusOK {
+						return
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(3 * time.Second):
+					}
+				}
+			}()
 		}
 		wg.Wait()
 		return nil
@@ -1460,27 +1575,15 @@ func (c *clusterImpl) HealthStatus(
 	return results, nil
 }
 
-// assertValidDescriptors fails the test if there exists any descriptors in
-// the crdb_internal.invalid_objects virtual table.
-func (c *clusterImpl) assertValidDescriptors(ctx context.Context, db *gosql.DB, t *testImpl) error {
-	t.L().Printf("checking for invalid descriptors")
-	return timeutil.RunWithTimeout(
-		ctx, "invalid descriptors check", 1*time.Minute,
-		func(ctx context.Context) error {
-			return roachtestutil.CheckInvalidDescriptors(ctx, db)
-		},
-	)
-}
-
 // assertConsistentReplicas fails the test if
-// crdb_internal.check_consistency(true, ”, ”) indicates that any ranges'
+// crdb_internal.check_consistency(false, ”, ”) indicates that any ranges'
 // replicas are inconsistent with each other.
 func (c *clusterImpl) assertConsistentReplicas(
 	ctx context.Context, db *gosql.DB, t *testImpl,
 ) error {
 	t.L().Printf("checking for replica divergence")
 	return timeutil.RunWithTimeout(
-		ctx, "consistency check", 5*time.Minute,
+		ctx, "consistency check", 20*time.Minute,
 		func(ctx context.Context) error {
 			return roachtestutil.CheckReplicaDivergenceOnDB(ctx, t.L(), db)
 		},
@@ -1496,7 +1599,7 @@ func (c *clusterImpl) FetchDmesg(ctx context.Context, l *logger.Logger) error {
 		return nil
 	}
 
-	l.Printf("fetching dmesg\n")
+	l.Printf("fetching dmesg")
 	c.status("fetching dmesg")
 
 	// Don't hang forever.
@@ -1511,7 +1614,7 @@ func (c *clusterImpl) FetchDmesg(ctx context.Context, l *logger.Logger) error {
 		cmd := []string{"/bin/bash", "-c", "'sudo dmesg -T > " + name + "'"}
 		var results []install.RunResultDetails
 		var combinedDmesgError error
-		if results, combinedDmesgError = c.RunWithDetails(ctx, nil, c.All(), cmd...); combinedDmesgError != nil {
+		if results, combinedDmesgError = c.RunWithDetails(ctx, nil, option.WithNodes(c.All()), cmd...); combinedDmesgError != nil {
 			return errors.Wrap(combinedDmesgError, "cluster.FetchDmesg")
 		}
 
@@ -1547,7 +1650,7 @@ func (c *clusterImpl) FetchJournalctl(ctx context.Context, l *logger.Logger) err
 		return nil
 	}
 
-	l.Printf("fetching journalctl\n")
+	l.Printf("fetching journalctl")
 	c.status("fetching journalctl")
 
 	// Don't hang forever.
@@ -1562,7 +1665,7 @@ func (c *clusterImpl) FetchJournalctl(ctx context.Context, l *logger.Logger) err
 		cmd := []string{"/bin/bash", "-c", "'sudo journalctl > " + name + "'"}
 		var results []install.RunResultDetails
 		var combinedJournalctlError error
-		if results, combinedJournalctlError = c.RunWithDetails(ctx, nil, c.All(), cmd...); combinedJournalctlError != nil {
+		if results, combinedJournalctlError = c.RunWithDetails(ctx, nil, option.WithNodes(c.All()), cmd...); combinedJournalctlError != nil {
 			return errors.Wrap(combinedJournalctlError, "cluster.FetchJournalctl")
 		}
 
@@ -1602,11 +1705,11 @@ func (c *clusterImpl) FetchCores(ctx context.Context, l *logger.Logger) error {
 		// from having the cores, but we should push them straight into a temp
 		// bucket on S3 instead. OTOH, the ROI of this may be low; I don't know
 		// of a recent example where we've wanted the Core dumps.
-		l.Printf("skipped fetching cores\n")
+		l.Printf("skipped fetching cores")
 		return nil
 	}
 
-	l.Printf("fetching cores\n")
+	l.Printf("fetching cores")
 	c.status("fetching cores")
 
 	// Don't hang forever. The core files can be large, so we give a generous
@@ -1614,6 +1717,51 @@ func (c *clusterImpl) FetchCores(ctx context.Context, l *logger.Logger) error {
 	return timeutil.RunWithTimeout(ctx, "cores", 60*time.Second, func(ctx context.Context) error {
 		path := filepath.Join(c.t.ArtifactsDir(), "cores")
 		return errors.Wrap(c.Get(ctx, c.l, "/mnt/data1/cores" /* src */, path /* dest */), "cluster.FetchCores")
+	})
+}
+
+// FetchPebbleCheckpoints fetches any Pebble checkpoints on the cluster. These
+// are typically generated by failed consistency checks, i.e. replica
+// divergence, and only contain data for the inconsistent ranges.
+func (c *clusterImpl) FetchPebbleCheckpoints(ctx context.Context, l *logger.Logger) error {
+	// Don't grab checkpoints on empty clusters.
+	if c.spec.NodeCount == 0 {
+		return nil
+	}
+
+	// Checkpoints can be large. Bail out after 3 minutes.
+	return timeutil.RunWithTimeout(ctx, "checkpoints", 3*time.Minute, func(ctx context.Context) error {
+		numStores := 1
+		if ssds := c.spec.SSDs; ssds > 1 {
+			numStores = ssds
+		}
+		for storeIdx := 1; storeIdx <= numStores; storeIdx++ {
+			// Find any checkpoints.
+			checkpointsPath := fmt.Sprintf("{store-dir:%d}/auxiliary/checkpoints", storeIdx)
+			var checkpointNodes option.NodeListOption
+			results, err := c.RunWithDetails(ctx, l, option.WithNodes(c.All()), fmt.Sprintf("test -d %s", checkpointsPath))
+			if err != nil {
+				return err
+			}
+			for _, result := range results {
+				if result.Err == nil && result.RemoteExitStatus == 0 {
+					l.Printf("found Pebble checkpoints in n%d:%s", result.Node, checkpointsPath)
+					checkpointNodes = append(checkpointNodes, int(result.Node))
+				}
+			}
+
+			// Fetch checkpoints.
+			if len(checkpointNodes) > 0 {
+				dest := filepath.Join(c.t.ArtifactsDir(), "checkpoints", fmt.Sprintf("data%d", storeIdx))
+				if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+					return err
+				}
+				if err := c.Get(ctx, c.l, checkpointsPath, dest, checkpointNodes); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 }
 
@@ -1679,24 +1827,19 @@ func (c *clusterImpl) doDestroy(ctx context.Context, l *logger.Logger) <-chan st
 		return inFlight
 	}
 
-	if clusterWipe {
+	if roachtestflags.ClusterWipe {
 		if c.destroyState.owned {
 			l.PrintfCtx(ctx, "destroying cluster %s...", c)
 			c.status("destroying cluster")
 			// We use a non-cancelable context for running this command. Once we got
 			// here, the cluster cannot be destroyed again, so we really want this
 			// command to succeed.
-			if err := roachprod.Destroy(l, false /* destroyAllMine */, false /* destroyAllLocal */, c.name); err != nil {
+			if err := roachprod.Destroy(l, "" /* optionalUsername */, false, /* destroyAllMine */
+				false, /* destroyAllLocal */
+				c.name); err != nil {
 				l.ErrorfCtx(ctx, "error destroying cluster %s: %s", c, err)
 			} else {
 				l.PrintfCtx(ctx, "destroying cluster %s... done", c)
-			}
-			if c.destroyState.alloc != nil {
-				// We should usually have an alloc here, but if we're getting into this
-				// code path while retrying cluster creation, we don't want the alloc
-				// to be released (as we're going to retry cluster creation) and it will
-				// be nil here.
-				c.destroyState.alloc.Release()
 			}
 		} else {
 			l.PrintfCtx(ctx, "wiping cluster %s", c)
@@ -1712,7 +1855,7 @@ func (c *clusterImpl) doDestroy(ctx context.Context, l *logger.Logger) <-chan st
 			}
 		}
 	} else {
-		l.Printf("skipping cluster wipe\n")
+		l.Printf("skipping cluster wipe")
 	}
 	c.r.unregisterCluster(c)
 	c.destroyState.mu.Lock()
@@ -1723,7 +1866,9 @@ func (c *clusterImpl) doDestroy(ctx context.Context, l *logger.Logger) <-chan st
 }
 
 func (c *clusterImpl) addLabels(labels map[string]string) error {
-	return roachprod.AddLabels(c.l, c.name, labels)
+	// N.B. we must sanitize the values; e.g., some test names can exceed the maximum length (63 chars in GCE).
+	// N.B. we don't sanitize the keys; unlike values, they are typically _not_ (dynamically) generated.
+	return roachprod.AddLabels(c.l, c.name, vm.SanitizeLabelValues(labels))
 }
 
 func (c *clusterImpl) removeLabels(labels []string) error {
@@ -1733,11 +1878,11 @@ func (c *clusterImpl) removeLabels(labels []string) error {
 func (c *clusterImpl) ListSnapshots(
 	ctx context.Context, vslo vm.VolumeSnapshotListOpts,
 ) ([]vm.VolumeSnapshot, error) {
-	return roachprod.ListSnapshots(ctx, c.l, c.spec.Cloud, vslo)
+	return roachprod.ListSnapshots(ctx, c.l, c.Cloud().String(), vslo)
 }
 
 func (c *clusterImpl) DeleteSnapshots(ctx context.Context, snapshots ...vm.VolumeSnapshot) error {
-	return roachprod.DeleteSnapshots(ctx, c.l, c.spec.Cloud, snapshots...)
+	return roachprod.DeleteSnapshots(ctx, c.l, c.Cloud().String(), snapshots...)
 }
 
 func (c *clusterImpl) CreateSnapshot(
@@ -1755,7 +1900,7 @@ func (c *clusterImpl) CreateSnapshot(
 func (c *clusterImpl) ApplySnapshots(ctx context.Context, snapshots []vm.VolumeSnapshot) error {
 	opts := vm.VolumeCreateOpts{
 		Size: c.spec.VolumeSize,
-		Type: c.spec.GCEVolumeType, // TODO(irfansharif): This is only applicable to GCE. Change that.
+		Type: c.spec.GCE.VolumeType, // TODO(irfansharif): This is only applicable to GCE. Change that.
 		Labels: map[string]string{
 			vm.TagUsage: "roachtest",
 		},
@@ -1767,7 +1912,7 @@ func (c *clusterImpl) ApplySnapshots(ctx context.Context, snapshots []vm.VolumeS
 // Put is DEPRECATED. Use PutE instead.
 func (c *clusterImpl) Put(ctx context.Context, src, dest string, nodes ...option.Option) {
 	if err := c.PutE(ctx, c.l, src, dest, nodes...); err != nil {
-		c.t.Fatal(err)
+		c.f.Fatal(err)
 	}
 }
 
@@ -1784,16 +1929,11 @@ func (c *clusterImpl) PutE(
 	return errors.Wrap(roachprod.Put(ctx, l, c.MakeNodes(nodes...), src, dest, true /* useTreeDist */), "cluster.PutE")
 }
 
-// PutDefaultCockroach uploads the cockroach binary passed in the
-// command line to `test.DefaultCockroachPath` in every node in the
-// cluster. This binary is used by the test runner to collect failure
-// artifacts since tests are free to upload the cockroach binary they
-// use to any location they desire.
-func (c *clusterImpl) PutDefaultCockroach(
-	ctx context.Context, l *logger.Logger, cockroachPath string,
-) error {
-	c.status("uploading default cockroach binary to nodes")
-	return c.PutE(ctx, l, cockroachPath, test.DefaultCockroachPath, c.All())
+// PutCockroach uploads a binary with or without runtime assertions enabled,
+// as determined by t.Cockroach(). Note that we upload to all nodes even if they
+// don't use the binary, so that the test runner can always fetch logs.
+func (c *clusterImpl) PutCockroach(ctx context.Context, l *logger.Logger, t *testImpl) error {
+	return c.PutE(ctx, l, t.Cockroach(), test.DefaultCockroachPath, c.All())
 }
 
 // PutLibraries inserts the specified libraries, by name, into all nodes on the cluster
@@ -1810,7 +1950,7 @@ func (c *clusterImpl) PutLibraries(
 	c.status("uploading library files")
 	defer c.status("")
 
-	if err := c.RunE(ctx, c.All(), "mkdir", "-p", libraryDir); err != nil {
+	if err := c.RunE(ctx, option.WithNodes(c.All()), "mkdir", "-p", libraryDir); err != nil {
 		return err
 	}
 
@@ -1832,6 +1972,20 @@ func (c *clusterImpl) PutLibraries(
 		); err != nil {
 			return errors.Wrap(err, "cluster.PutLibraries")
 		}
+	}
+	return nil
+}
+
+// PutDeprecatedWorkload checks if the test requires the deprecated
+// workload and that it has a workload node provisioned. If it does,
+// then it auto-uploads the workload binary to the workload node.
+// If the test requires the binary but doesn't have a workload node,
+// it should handle uploading it in the test itself.
+func (c *clusterImpl) PutDeprecatedWorkload(
+	ctx context.Context, l *logger.Logger, t *testImpl,
+) error {
+	if t.spec.RequiresDeprecatedWorkload && t.spec.Cluster.WorkloadNode {
+		return c.PutE(ctx, l, t.DeprecatedWorkload(), test.DefaultDeprecatedWorkloadPath, c.WorkloadNode())
 	}
 	return nil
 }
@@ -1864,7 +2018,7 @@ func (c *clusterImpl) Get(
 	return errors.Wrap(roachprod.Get(ctx, l, c.MakeNodes(opts...), src, dest), "cluster.Get")
 }
 
-// Put a string into the specified file on the remote(s).
+// PutString into the specified file on the remote(s).
 func (c *clusterImpl) PutString(
 	ctx context.Context, content, dest string, mode os.FileMode, nodes ...option.Option,
 ) error {
@@ -1910,18 +2064,13 @@ func (c *clusterImpl) GitClone(
   		fi
   		'`, dest, branch, src),
 	}
-	return errors.Wrap(c.RunE(ctx, nodes, cmd...), "cluster.GitClone")
+	return errors.Wrap(c.RunE(ctx, option.WithNodes(nodes), cmd...), "cluster.GitClone")
 }
 
 func (c *clusterImpl) setStatusForClusterOpt(
 	operation string, worker bool, nodesOptions ...option.Option,
 ) {
-	var nodes option.NodeListOption
-	for _, o := range nodesOptions {
-		if s, ok := o.(nodeSelector); ok {
-			nodes = s.Merge(nodes)
-		}
-	}
+	nodes := selectedNodesOrDefault(nodesOptions, nil)
 
 	nodesString := " cluster"
 	if len(nodes) != 0 {
@@ -1943,6 +2092,38 @@ func (c *clusterImpl) clearStatusForClusterOpt(worker bool) {
 	}
 }
 
+func (c *clusterImpl) configureClusterSettingOptions(
+	defaultClusterSettings install.ClusterSettingsOption, settings install.ClusterSettings,
+) []install.ClusterSettingOption {
+	setUnlessExists := func(name string, value interface{}) {
+		if !envExists(settings.Env, name) {
+			settings.Env = append(settings.Env, fmt.Sprintf("%s=%s", name, fmt.Sprint(value)))
+		}
+	}
+	// Set the same seed on every node, to be used by builds with
+	// runtime assertions enabled.
+	setUnlessExists("COCKROACH_RANDOM_SEED", c.cockroachRandomSeed())
+
+	// Panic on span use-after-Finish, so we catch such bugs.
+	setUnlessExists("COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH", true)
+
+	if c.goCoverDir != "" {
+		settings.Env = append(settings.Env, fmt.Sprintf("BAZEL_COVER_DIR=%s", c.goCoverDir))
+	}
+
+	return []install.ClusterSettingOption{
+		install.TagOption(settings.Tag),
+		install.PGUrlCertsDirOption(settings.PGUrlCertsDir),
+		install.SecureOption(settings.Secure),
+		install.UseTreeDistOption(settings.UseTreeDist),
+		install.EnvOption(settings.Env),
+		install.NumRacksOption(settings.NumRacks),
+		install.BinaryOption(settings.Binary),
+		defaultClusterSettings,
+		install.ClusterSettingsOption(settings.ClusterSettings),
+	}
+}
+
 // StartE starts cockroach nodes on a subset of the cluster. The nodes parameter
 // can either be a specific node, empty (to indicate all nodes), or a pair of
 // nodes indicating a range.
@@ -1961,11 +2142,6 @@ func (c *clusterImpl) StartE(
 
 	startOpts.RoachprodOpts.EncryptedStores = c.encAtRest
 
-	if !envExists(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH") {
-		// Panic on span use-after-Finish, so we catch such bugs.
-		settings.Env = append(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH=true")
-	}
-
 	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
 	// Remove in v23.2.
 	if !envExists(settings.Env, "COCKROACH_FORCE_DEPRECATED_SHOW_RANGE_BEHAVIOR") {
@@ -1974,17 +2150,25 @@ func (c *clusterImpl) StartE(
 		settings.Env = append(settings.Env, "COCKROACH_FORCE_DEPRECATED_SHOW_RANGE_BEHAVIOR=false")
 	}
 
-	clusterSettingsOpts := []install.ClusterSettingOption{
-		install.TagOption(settings.Tag),
-		install.PGUrlCertsDirOption(settings.PGUrlCertsDir),
-		install.SecureOption(settings.Secure),
-		install.UseTreeDistOption(settings.UseTreeDist),
-		install.EnvOption(settings.Env),
-		install.NumRacksOption(settings.NumRacks),
-		install.BinaryOption(settings.Binary),
-		install.ClusterSettingsOption(c.clusterSettings),
-		install.ClusterSettingsOption(settings.ClusterSettings),
+	// Make crdb_internal.check_consistency() take storage checkpoints and
+	// terminate nodes on inconsistencies. This is done in post-test assertions
+	// across most roachtests, see CheckReplicaDivergenceOnDB().
+	if !envExists(settings.Env, "COCKROACH_INTERNAL_CHECK_CONSISTENCY_FATAL") {
+		settings.Env = append(settings.Env, "COCKROACH_INTERNAL_CHECK_CONSISTENCY_FATAL=true")
 	}
+
+	if roachtestflags.ForceCpuProfile {
+		settings.ClusterSettings["server.cpu_profile.duration"] = "20s"
+		settings.ClusterSettings["server.cpu_profile.interval"] = "1m"
+		// NB: the docs say that the profiling becomes unconditional if
+		// you set the threshold to 0. This is incorrect, the database
+		// has no such functionality. We set it to 1 as we expect the
+		// CPU usage % to be greater than 1% either way.
+		settings.ClusterSettings["server.cpu_profile.cpu_usage_combined_threshold"] = "1"
+		settings.ClusterSettings["server.cpu_profile.total_dump_size_limit"] = "256 MiB"
+	}
+
+	clusterSettingsOpts := c.configureClusterSettingOptions(c.clusterSettings, settings)
 
 	if err := roachprod.Start(ctx, l, c.MakeNodes(opts...), startOpts.RoachprodOpts, clusterSettingsOpts...); err != nil {
 		return err
@@ -1997,7 +2181,121 @@ func (c *clusterImpl) StartE(
 			return err
 		}
 	}
+	nodes := selectedNodesOrDefault(opts, c.CRDBNodes())
+	// N.B. If `SkipInit` is set, we don't wait for SQL since node(s) may not join the cluster in any definite time.
+	if !startOpts.RoachprodOpts.SkipInit {
+		// Wait for SQL to be ready on all nodes, for 'system' tenant, only.
+		for _, n := range nodes {
+			conn, err := c.ConnE(ctx, l, nodes[0], option.VirtualClusterName(install.SystemInterfaceName))
+			if err != nil {
+				return errors.Wrapf(err, "failed to connect to n%d", n)
+			}
+			defer conn.Close()
+
+			// N.B. We must ensure SQL session is fully initialized before attempting to execute any SQL commands.
+			if err := roachtestutil.WaitForSQLReady(ctx, conn); err != nil {
+				return errors.Wrap(err, "failed to wait for SQL to be ready")
+			}
+		}
+	}
+
+	if startOpts.WaitForReplicationFactor > 0 {
+		l.Printf("WaitForReplicationFactor: waiting for replication factor of at least %d", startOpts.WaitForReplicationFactor)
+		// N.B. We must explicitly pass the virtual cluster name to `ConnE`, otherwise the default may turn out to be a
+		// secondary tenant, in which case we would only check the tenant's key range, not the whole system's.
+		// See "Unhidden Bug" in https://github.com/cockroachdb/cockroach/issues/137988
+		conn, err := c.ConnE(ctx, l, nodes[0], option.VirtualClusterName(install.SystemInterfaceName))
+		if err != nil {
+			return errors.Wrapf(err, "failed to connect to n%d", nodes[0])
+		}
+		defer conn.Close()
+
+		if err := roachtestutil.WaitForReplication(
+			ctx, l, conn, startOpts.WaitForReplicationFactor, roachtestutil.AtLeastReplicationFactor,
+		); err != nil {
+			return errors.Wrap(err, "failed to wait for replication after starting cockroach")
+		}
+	}
+
 	return nil
+}
+
+// StartServiceForVirtualClusterE can start either external or shared
+// process virtual clusters. This can be specified by the `startOpts`
+// passed. See the `option.Start*VirtualClusterOpts` functions.
+func (c *clusterImpl) StartServiceForVirtualClusterE(
+	ctx context.Context,
+	l *logger.Logger,
+	startOpts option.StartOpts,
+	settings install.ClusterSettings,
+) error {
+	l.Printf("starting virtual cluster")
+	clusterSettingsOpts := c.configureClusterSettingOptions(c.virtualClusterSettings, settings)
+
+	// By default, we assume every node in the cluster is part of the
+	// storage cluster the virtual cluster needs to connect to. If the
+	// user customized the storage cluster in the `StartOpts`, we use
+	// that.
+	storageCluster := c.All()
+	if len(startOpts.StorageNodes) > 0 {
+		storageCluster = startOpts.StorageNodes
+	}
+
+	// If the user indicated nodes where the virtual cluster should be
+	// started, we indicate that in the roachprod opts.
+	if len(startOpts.SeparateProcessNodes) > 0 {
+		startOpts.RoachprodOpts.VirtualClusterLocation = c.MakeNodes(startOpts.SeparateProcessNodes)
+	}
+	if err := roachprod.StartServiceForVirtualCluster(
+		ctx, l, c.MakeNodes(storageCluster), startOpts.RoachprodOpts, clusterSettingsOpts...,
+	); err != nil {
+		return err
+	}
+
+	if settings.Secure {
+		if err := c.RefetchCertsFromNode(ctx, 1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *clusterImpl) StartServiceForVirtualCluster(
+	ctx context.Context,
+	l *logger.Logger,
+	startOpts option.StartOpts,
+	settings install.ClusterSettings,
+) {
+	if err := c.StartServiceForVirtualClusterE(ctx, l, startOpts, settings); err != nil {
+		c.f.Fatal(err)
+	}
+}
+
+// StopServiceForVirtualClusterE stops the service associated with the
+// virtual cluster identified in the `StopOpts` passed. For shared
+// process virtual clusters, the corresponding service is stopped. For
+// separate process, the OS process is killed.
+func (c *clusterImpl) StopServiceForVirtualClusterE(
+	ctx context.Context, l *logger.Logger, stopOpts option.StopOpts,
+) error {
+	l.Printf("stoping virtual cluster")
+
+	nodes := c.All()
+	if len(stopOpts.SeparateProcessNodes) > 0 {
+		nodes = stopOpts.SeparateProcessNodes
+	}
+
+	return roachprod.StopServiceForVirtualCluster(
+		ctx, l, c.MakeNodes(nodes), c.IsSecure(), stopOpts.RoachprodOpts,
+	)
+}
+
+func (c *clusterImpl) StopServiceForVirtualCluster(
+	ctx context.Context, l *logger.Logger, stopOpts option.StopOpts,
+) {
+	if err := c.StopServiceForVirtualClusterE(ctx, l, stopOpts); err != nil {
+		c.f.Fatal(err)
+	}
 }
 
 func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error {
@@ -2011,18 +2309,51 @@ func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error 
 	// existing dir. Without `--local`, it'll create a new subdir to house the
 	// certs. Bypass that distinction (which should be fixed independently, but
 	// that might cause fallout) by using a non-existing dir here.
-	c.localCertsDir = filepath.Join(c.localCertsDir, "certs")
+	c.localCertsDir = filepath.Join(c.localCertsDir, install.CockroachNodeCertsDir)
 	// Get the certs from the first node.
-	if err := c.Get(ctx, c.l, "./certs", c.localCertsDir, c.Node(node)); err != nil {
+	if err := c.Get(ctx, c.l, fmt.Sprintf("./%s", install.CockroachNodeCertsDir), c.localCertsDir, c.Node(node)); err != nil {
 		return errors.Wrap(err, "cluster.StartE")
 	}
 	// Need to prevent world readable files or lib/pq will complain.
-	return filepath.Walk(c.localCertsDir, func(path string, info fs.FileInfo, err error) error {
-		if info.IsDir() {
+	return filepath.WalkDir(c.localCertsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return errors.Wrap(err, "walking localCertsDir failed")
+		}
+		if d.IsDir() {
 			return nil
 		}
 		return os.Chmod(path, 0600)
 	})
+}
+
+func (c *clusterImpl) SetDefaultVirtualCluster(name string) {
+	c.defaultVirtualCluster = name
+}
+
+// SetRandomSeed sets the random seed to be used by the cluster. If
+// not called, clusters generate a random seed from the global
+// generator in the `rand` package. This function must be called
+// before any nodes in the cluster start.
+func (c *clusterImpl) SetRandomSeed(seed int64) {
+	c.randomSeed.seed = &seed
+}
+
+// cockroachRandomSeed returns the `COCKROACH_RANDOM_SEED` to be used
+// by this cluster. The seed may have been previously set by a
+// previous call to `StartE`, or by the user via `SetRandomSeed`. If
+// not set, this function will generate a seed and return it.
+func (c *clusterImpl) cockroachRandomSeed() int64 {
+	c.randomSeed.mu.Lock()
+	defer c.randomSeed.mu.Unlock()
+
+	// If the user provided a seed via environment variable, always use
+	// that, even if the test attempts to set a different seed.
+	if c.randomSeed.seed == nil {
+		seed := rand.Int63()
+		c.randomSeed.seed = &seed
+	}
+
+	return *c.randomSeed.seed
 }
 
 // Start is like StartE() except that it will fatal the test on error.
@@ -2034,7 +2365,7 @@ func (c *clusterImpl) Start(
 	opts ...option.Option,
 ) {
 	if err := c.StartE(ctx, l, startOpts, settings, opts...); err != nil {
-		c.t.Fatal(err)
+		c.f.Fatal(err)
 	}
 }
 
@@ -2060,11 +2391,22 @@ func (c *clusterImpl) StopE(
 	}
 	c.setStatusForClusterOpt("stopping", stopOpts.RoachtestOpts.Worker, nodes...)
 	defer c.clearStatusForClusterOpt(stopOpts.RoachtestOpts.Worker)
+
+	if c.goCoverDir != "" && stopOpts.RoachprodOpts.Sig == int(unix.SIGKILL) {
+		// If we are trying to collect coverage, we first send a SIGUSR1
+		// which dumps coverage data and exits. Note that Cockroach v23.1
+		// and earlier ignore SIGUSR1, so we still want to send SIGKILL,
+		// and that's the underlying behaviour of `Stop`.
+		l.Printf("coverage mode: first trying to stop using SIGUSR1")
+		stopOpts.RoachprodOpts.Sig = 10 // SIGUSR1
+		stopOpts.RoachprodOpts.Wait = true
+		stopOpts.RoachprodOpts.GracePeriod = 10
+	}
 	return errors.Wrap(roachprod.Stop(ctx, l, c.MakeNodes(nodes...), stopOpts.RoachprodOpts), "cluster.StopE")
 }
 
 // Stop is like StopE, except instead of returning an error, it does
-// c.t.Fatal(). c.t needs to be set.
+// c.f.Fatal(). c.t needs to be set.
 func (c *clusterImpl) Stop(
 	ctx context.Context, l *logger.Logger, stopOpts option.StopOpts, opts ...option.Option,
 ) {
@@ -2073,7 +2415,7 @@ func (c *clusterImpl) Stop(
 		return
 	}
 	if err := c.StopE(ctx, l, stopOpts, opts...); err != nil {
-		c.t.Fatal(err)
+		c.f.Fatal(err)
 	}
 }
 
@@ -2091,7 +2433,7 @@ func (c *clusterImpl) SignalE(
 }
 
 // Signal is like SignalE, except instead of returning an error, it does
-// c.t.Fatal(). c.t needs to be set.
+// c.f.Fatal(). c.t needs to be set.
 func (c *clusterImpl) Signal(
 	ctx context.Context, l *logger.Logger, sig int, nodes ...option.Option,
 ) {
@@ -2100,15 +2442,15 @@ func (c *clusterImpl) Signal(
 		return
 	}
 	if err := c.SignalE(ctx, l, sig, nodes...); err != nil {
-		c.t.Fatal(err)
+		c.f.Fatal(err)
 	}
 }
 
 // WipeE wipes a subset of the nodes in a cluster. See cluster.Start() for a
 // description of the nodes parameter.
 func (c *clusterImpl) WipeE(
-	ctx context.Context, l *logger.Logger, preserveCerts bool, nodes ...option.Option,
-) error {
+	ctx context.Context, l *logger.Logger, nodes ...option.Option,
+) (retErr error) {
 	if ctx.Err() != nil {
 		return errors.Wrap(ctx.Err(), "cluster.WipeE")
 	}
@@ -2118,25 +2460,25 @@ func (c *clusterImpl) WipeE(
 	}
 	c.setStatusForClusterOpt("wiping", false, nodes...)
 	defer c.clearStatusForClusterOpt(false)
-	return roachprod.Wipe(ctx, l, c.MakeNodes(nodes...), preserveCerts)
+	return roachprod.Wipe(ctx, l, c.MakeNodes(nodes...), c.IsSecure())
 }
 
 // Wipe is like WipeE, except instead of returning an error, it does
-// c.t.Fatal(). c.t needs to be set.
-func (c *clusterImpl) Wipe(ctx context.Context, preserveCerts bool, nodes ...option.Option) {
+// c.f.Fatal(). c.t needs to be set.
+func (c *clusterImpl) Wipe(ctx context.Context, nodes ...option.Option) {
 	if ctx.Err() != nil {
 		return
 	}
-	if err := c.WipeE(ctx, c.l, preserveCerts, nodes...); err != nil {
-		c.t.Fatal(err)
+	if err := c.WipeE(ctx, c.l, nodes...); err != nil {
+		c.f.Fatal(err)
 	}
 }
 
 // Run a command on the specified nodes and call test.Fatal if there is an error.
-func (c *clusterImpl) Run(ctx context.Context, node option.NodeListOption, args ...string) {
-	err := c.RunE(ctx, node, args...)
+func (c *clusterImpl) Run(ctx context.Context, options install.RunOptions, args ...string) {
+	err := c.RunE(ctx, options, args...)
 	if err != nil {
-		c.t.Fatal(err)
+		c.f.Fatal(err)
 	}
 }
 
@@ -2144,10 +2486,11 @@ func (c *clusterImpl) Run(ctx context.Context, node option.NodeListOption, args 
 // will be redirected to a file which is logged via the cluster-wide logger in
 // case of an error. Logs will sort chronologically. Failing invocations will
 // have an additional marker file with a `.failed` extension instead of `.log`.
-func (c *clusterImpl) RunE(ctx context.Context, nodes option.NodeListOption, args ...string) error {
+func (c *clusterImpl) RunE(ctx context.Context, options install.RunOptions, args ...string) error {
 	if len(args) == 0 {
 		return errors.New("No command passed")
 	}
+	nodes := option.FromInstallNodes(options.Nodes)
 	l, logFile, err := c.loggerForCmd(nodes, args...)
 	if err != nil {
 		return err
@@ -2155,17 +2498,34 @@ func (c *clusterImpl) RunE(ctx context.Context, nodes option.NodeListOption, arg
 	defer l.Close()
 
 	cmd := strings.Join(args, " ")
-	c.t.L().Printf("running cmd `%s` on nodes [%v]; details in %s.log", roachprod.TruncateString(cmd, 30), nodes, logFile)
+	c.f.L().Printf("running cmd `%s` on nodes [%v]", roachprod.TruncateString(cmd, 30), nodes)
+	if c.l.File != nil {
+		c.f.L().Printf("details in %s.log", logFile)
+	}
 	l.Printf("> %s", cmd)
-	if err := roachprod.Run(ctx, l, c.MakeNodes(nodes), "", "", c.IsSecure(), l.Stdout, l.Stderr, args); err != nil {
+	expanderCfg := install.ExpanderConfig{
+		DefaultVirtualCluster: c.defaultVirtualCluster,
+	}
+	if err := roachprod.Run(
+		ctx, l, c.MakeNodes(nodes), "", "", c.IsSecure(),
+		l.Stdout, l.Stderr, args, options.WithExpanderConfig(expanderCfg),
+	); err != nil {
 		if err := ctx.Err(); err != nil {
 			l.Printf("(note: incoming context was canceled: %s)", err)
 			return err
 		}
 
 		l.Printf("> result: %s", err)
-		createFailedFile(l.File.Name())
-		return errors.Wrapf(err, "full command output in %s.log", logFile)
+		var logFileName string
+		if l.File != nil {
+			logFileName = l.File.Name()
+		}
+		createFailedFile(logFileName)
+		if c.l.File != nil {
+			return errors.Wrapf(err, "full command output in %s.log", logFile)
+		} else {
+			return err
+		}
 	}
 	l.Printf("> result: <ok>")
 	return nil
@@ -2176,25 +2536,29 @@ func (c *clusterImpl) RunE(ctx context.Context, nodes option.NodeListOption, arg
 // you treat an error from the command. This makes error checking easier / friendlier
 // and helps us avoid code replication.
 func (c *clusterImpl) RunWithDetailsSingleNode(
-	ctx context.Context, testLogger *logger.Logger, nodes option.NodeListOption, args ...string,
+	ctx context.Context, testLogger *logger.Logger, options install.RunOptions, args ...string,
 ) (install.RunResultDetails, error) {
+	nodes := option.FromInstallNodes(options.Nodes)
 	if len(nodes) != 1 {
 		return install.RunResultDetails{}, errors.Newf("RunWithDetailsSingleNode received %d nodes. Use RunWithDetails if you need to run on multiple nodes.", len(nodes))
 	}
-	results, err := c.RunWithDetails(ctx, testLogger, nodes, args...)
+	results, err := c.RunWithDetails(ctx, testLogger, options, args...)
 	return results[0], errors.CombineErrors(err, results[0].Err)
 }
 
-// RunWithDetails runs a command on the specified nodes, returning the results
-// details and a `roachprod` error. The output will be redirected to a file which is logged
-// via the cluster-wide logger in case of an error. Failing invocations will have
-// an additional marker file with a `.failed` extension instead of `.log`.
+// RunWithDetails runs a command on the specified nodes (option.WithNodes),
+// returning the results details and a `roachprod` error. The output will be
+// redirected to a file which is logged via the cluster-wide logger in case of
+// an error. Failing invocations will have an additional marker file with a
+// `.failed` extension instead of `.log`.
+// See install.RunOptions for more details on available options.
 func (c *clusterImpl) RunWithDetails(
-	ctx context.Context, testLogger *logger.Logger, nodes option.NodeListOption, args ...string,
+	ctx context.Context, testLogger *logger.Logger, options install.RunOptions, args ...string,
 ) ([]install.RunResultDetails, error) {
 	if len(args) == 0 {
 		return nil, errors.New("No command passed")
 	}
+	nodes := option.FromInstallNodes(options.Nodes)
 	l, logFile, err := c.loggerForCmd(nodes, args...)
 	if err != nil {
 		return nil, err
@@ -2209,9 +2573,18 @@ func (c *clusterImpl) RunWithDetails(
 	}
 
 	l.Printf("> %s", cmd)
-	results, err := roachprod.RunWithDetails(ctx, l, c.MakeNodes(nodes), "" /* SSHOptions */, "" /* processTag */, c.IsSecure(), args)
+	expanderCfg := install.ExpanderConfig{
+		DefaultVirtualCluster: c.defaultVirtualCluster,
+	}
+	results, err := roachprod.RunWithDetails(
+		ctx, l, c.MakeNodes(nodes), "" /* SSHOptions */, "", /* processTag */
+		c.IsSecure(), args, options.WithExpanderConfig(expanderCfg),
+	)
 
-	logFileFull := l.File.Name()
+	var logFileFull string
+	if l.File != nil {
+		logFileFull = l.File.Name()
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			l.Printf("(note: incoming context was canceled: %s)", err)
@@ -2294,18 +2667,23 @@ func (c *clusterImpl) loggerForCmd(
 	return l, logFile, nil
 }
 
-// pgURLErr returns the Postgres endpoint for the specified node. It accepts a
+// pgURLErr returns the Postgres endpoint for the specified nodes. It accepts a
 // flag specifying whether the URL should include the node's internal or
 // external IP address. In general, inter-cluster communication and should use
 // internal IPs and communication from a test driver to nodes in a cluster
 // should use external IPs.
 func (c *clusterImpl) pgURLErr(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption, external bool, tenant string,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption, opts roachprod.PGURLOptions,
 ) ([]string, error) {
-	urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(node), c.localCertsDir, roachprod.PGURLOptions{
-		External:   external,
-		Secure:     c.localCertsDir != "",
-		TenantName: tenant})
+	opts.Secure = c.IsSecure()
+
+	// Use CockroachNodeCertsDir if it's an internal url with access to the node.
+	certsDir := install.CockroachNodeCertsDir
+	if opts.External {
+		certsDir = c.localCertsDir
+	}
+	opts.VirtualClusterName = c.virtualCluster(opts.VirtualClusterName)
+	urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(nodes), certsDir, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -2317,9 +2695,9 @@ func (c *clusterImpl) pgURLErr(
 
 // InternalPGUrl returns the internal Postgres endpoint for the specified nodes.
 func (c *clusterImpl) InternalPGUrl(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption, tenant string,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption, opts roachprod.PGURLOptions,
 ) ([]string, error) {
-	return c.pgURLErr(ctx, l, node, false, tenant)
+	return c.pgURLErr(ctx, l, nodes, opts)
 }
 
 // Silence unused warning.
@@ -2327,9 +2705,10 @@ var _ = (&clusterImpl{}).InternalPGUrl
 
 // ExternalPGUrl returns the external Postgres endpoint for the specified nodes.
 func (c *clusterImpl) ExternalPGUrl(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption, tenant string,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption, opts roachprod.PGURLOptions,
 ) ([]string, error) {
-	return c.pgURLErr(ctx, l, node, true, tenant)
+	opts.External = true
+	return c.pgURLErr(ctx, l, nodes, opts)
 }
 
 func addrToAdminUIAddr(addr string) (string, error) {
@@ -2373,27 +2752,87 @@ func addrToHostPort(addr string) (string, int, error) {
 }
 
 // InternalAdminUIAddr returns the internal Admin UI address in the form host:port
-// for the specified node.
+// for the specified nodes.
 func (c *clusterImpl) InternalAdminUIAddr(
-	_ context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption, opts ...option.OptionFunc,
 ) ([]string, error) {
-	return c.adminUIAddr(l, node, false)
+	var virtualClusterOptions option.VirtualClusterOptions
+	if err := option.Apply(&virtualClusterOptions, opts...); err != nil {
+		return nil, err
+	}
+
+	return c.adminUIAddr(ctx, l, nodes, virtualClusterOptions, false /* external */)
 }
 
 // ExternalAdminUIAddr returns the external Admin UI address in the form host:port
-// for the specified node.
+// for the specified nodes.
 func (c *clusterImpl) ExternalAdminUIAddr(
-	_ context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption, opts ...option.OptionFunc,
 ) ([]string, error) {
-	return c.adminUIAddr(l, node, true)
+	var virtualClusterOptions option.VirtualClusterOptions
+	if err := option.Apply(&virtualClusterOptions, opts...); err != nil {
+		return nil, err
+	}
+
+	return c.adminUIAddr(ctx, l, nodes, virtualClusterOptions, true /* external */)
+}
+
+func (c *clusterImpl) SQLPorts(
+	ctx context.Context,
+	l *logger.Logger,
+	nodes option.NodeListOption,
+	tenant string,
+	sqlInstance int,
+) ([]int, error) {
+	return roachprod.SQLPorts(
+		ctx, l, c.MakeNodes(nodes), c.IsSecure(), c.virtualCluster(tenant), sqlInstance,
+	)
+}
+
+func (c *clusterImpl) AdminUIPorts(
+	ctx context.Context,
+	l *logger.Logger,
+	nodes option.NodeListOption,
+	tenant string,
+	sqlInstance int,
+) ([]int, error) {
+	return roachprod.AdminPorts(
+		ctx, l, c.MakeNodes(nodes), c.IsSecure(), c.virtualCluster(tenant), sqlInstance,
+	)
+}
+
+// virtualCluster returns the name of the virtual cluster that we
+// should use when the requested `tenant` name was passed by the
+// user. When a specific virtual cluster was required, we use
+// it. Otherwise, we fallback to the cluster's default virtual
+// cluster, if any.
+func (c *clusterImpl) virtualCluster(name string) string {
+	if name != "" {
+		return name
+	}
+
+	return c.defaultVirtualCluster
 }
 
 func (c *clusterImpl) adminUIAddr(
-	l *logger.Logger, node option.NodeListOption, external bool,
+	ctx context.Context,
+	l *logger.Logger,
+	nodes option.NodeListOption,
+	opts option.VirtualClusterOptions,
+	external bool,
 ) ([]string, error) {
 	var addrs []string
-	adminURLs, err := roachprod.AdminURL(l, c.MakeNodes(node), "", "",
-		external, false, false)
+	adminURLs, err := roachprod.AdminURL(
+		ctx,
+		l,
+		c.MakeNodes(nodes),
+		c.virtualCluster(opts.VirtualClusterName),
+		opts.SQLInstance,
+		"", /* path */
+		external,
+		false,
+		false,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -2413,32 +2852,32 @@ func (c *clusterImpl) adminUIAddr(
 
 // InternalIP returns the internal IP addresses for the specified nodes.
 func (c *clusterImpl) InternalIP(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption,
 ) ([]string, error) {
-	return roachprod.IP(l, c.MakeNodes(node), false)
+	return roachprod.IP(l, c.MakeNodes(nodes), false)
 }
 
 // InternalAddr returns the internal address in the form host:port for the
 // specified nodes.
 func (c *clusterImpl) InternalAddr(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption,
 ) ([]string, error) {
-	return c.addr(ctx, l, node, false)
+	return c.addr(ctx, l, nodes, false)
 }
 
 // ExternalAddr returns the external address in the form host:port for the
-// specified node.
+// specified nodes.
 func (c *clusterImpl) ExternalAddr(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption,
 ) ([]string, error) {
-	return c.addr(ctx, l, node, true)
+	return c.addr(ctx, l, nodes, true)
 }
 
 func (c *clusterImpl) addr(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption, external bool,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption, external bool,
 ) ([]string, error) {
 	var addrs []string
-	urls, err := c.pgURLErr(ctx, l, node, external, "")
+	urls, err := c.pgURLErr(ctx, l, nodes, roachprod.PGURLOptions{External: external})
 	if err != nil {
 		return nil, err
 	}
@@ -2452,12 +2891,12 @@ func (c *clusterImpl) addr(
 	return addrs, nil
 }
 
-// ExternalIP returns the external IP addresses for the specified node.
+// ExternalIP returns the external IP addresses for the specified nodes.
 func (c *clusterImpl) ExternalIP(
-	ctx context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption,
 ) ([]string, error) {
 	var ips []string
-	addrs, err := c.ExternalAddr(ctx, l, node)
+	addrs, err := c.ExternalAddr(ctx, l, nodes)
 	if err != nil {
 		return nil, err
 	}
@@ -2476,45 +2915,63 @@ var _ = (&clusterImpl{}).ExternalIP
 
 // Conn returns a SQL connection to the specified node.
 func (c *clusterImpl) Conn(
-	ctx context.Context, l *logger.Logger, node int, opts ...func(*option.ConnOption),
+	ctx context.Context, l *logger.Logger, node int, opts ...option.OptionFunc,
 ) *gosql.DB {
 	db, err := c.ConnE(ctx, l, node, opts...)
 	if err != nil {
-		c.t.Fatal(err)
+		c.f.Fatal(err)
 	}
 	return db
 }
 
 // ConnE returns a SQL connection to the specified node.
 func (c *clusterImpl) ConnE(
-	ctx context.Context, l *logger.Logger, node int, opts ...func(*option.ConnOption),
-) (*gosql.DB, error) {
+	ctx context.Context, l *logger.Logger, node int, opts ...option.OptionFunc,
+) (_ *gosql.DB, retErr error) {
+	// NB: errors.Wrap returns nil if err is nil.
+	defer func() { retErr = errors.Wrapf(retErr, "connecting to node %d", node) }()
 
-	connOptions := &option.ConnOption{}
-	for _, opt := range opts {
-		opt(connOptions)
+	var connOptions option.ConnOptions
+	if err := option.Apply(&connOptions, opts...); err != nil {
+		return nil, err
 	}
-	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node), connOptions.TenantName)
+
+	urls, err := c.ExternalPGUrl(ctx, l, c.Node(node), roachprod.PGURLOptions{
+		VirtualClusterName: connOptions.VirtualClusterName,
+		SQLInstance:        connOptions.SQLInstance,
+		Auth:               connOptions.AuthMode,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	dataSourceName := urls[0]
+	u, err := url.Parse(urls[0])
+	if err != nil {
+		return nil, err
+	}
+
 	if connOptions.User != "" {
-		u, err := url.Parse(urls[0])
-		if err != nil {
-			return nil, err
-		}
 		u.User = url.User(connOptions.User)
-		dataSourceName = u.String()
 	}
-	if len(connOptions.Options) > 0 {
-		vals := make(url.Values)
-		for k, v := range connOptions.Options {
-			vals.Add(k, v)
-		}
-		dataSourceName = dataSourceName + "&" + vals.Encode()
+
+	if connOptions.DBName != "" {
+		u.Path = connOptions.DBName
 	}
+	dataSourceName := u.String()
+
+	vals := make(url.Values)
+	for k, v := range connOptions.ConnectionOptions {
+		vals.Add(k, v)
+	}
+
+	if _, ok := vals["connect_timeout"]; !ok {
+		// connect_timeout is a libpq-specific parameter for the maximum
+		// wait for connection, in seconds. If the caller did not specify
+		// a connection timeout, we set a default.
+		vals.Add("connect_timeout", "60")
+	}
+
+	dataSourceName = dataSourceName + "&" + vals.Encode()
 	db, err := gosql.Open("postgres", dataSourceName)
 	if err != nil {
 		return nil, err
@@ -2530,7 +2987,7 @@ func (c *clusterImpl) ConnE(
 	// for cloud runs, we use the connection pool's default behaviour.
 	//
 	// https://github.com/lib/pq/issues/835
-	if c.spec.Cloud == spec.Local {
+	if c.Cloud() == spec.Local {
 		localConnLifetime := 10 * time.Second
 		db.SetConnMaxLifetime(localConnLifetime)
 	}
@@ -2539,13 +2996,11 @@ func (c *clusterImpl) ConnE(
 }
 
 func (c *clusterImpl) MakeNodes(opts ...option.Option) string {
-	var r option.NodeListOption
-	for _, o := range opts {
-		if s, ok := o.(nodeSelector); ok {
-			r = s.Merge(r)
-		}
-	}
-	return c.name + r.String()
+	return c.name + selectedNodesOrDefault(opts, nil).String()
+}
+
+func (c *clusterImpl) Cloud() spec.Cloud {
+	return c.cloud
 }
 
 func (c *clusterImpl) IsLocal() bool {
@@ -2593,4 +3048,303 @@ func (c *clusterImpl) StartGrafana(
 
 func (c *clusterImpl) StopGrafana(ctx context.Context, l *logger.Logger, dumpDir string) error {
 	return roachprod.StopGrafana(ctx, l, c.name, dumpDir)
+}
+
+// AddGrafanaAnnotation creates a grafana annotation for the centralized grafana instance.
+func (c *clusterImpl) AddGrafanaAnnotation(
+	ctx context.Context, l *logger.Logger, req grafana.AddAnnotationRequest,
+) error {
+	if c.disableGrafanaAnnotations.Load() {
+		return nil
+	}
+
+	// If grafanaTags is empty, then grafana is not set up for this
+	// cluster. We return an annotated error and stop trying to add
+	// annotations in the future. This is to avoid logging the same
+	// error every time the test attempts to add an annotation, which
+	// could add a lot of noise to the logs.
+	if len(c.grafanaTags) == 0 {
+		c.disableGrafanaAnnotations.Store(true)
+		return errors.New("error adding grafana annotation: grafana is not available for this cluster (disabled for the rest of the test)")
+	}
+	// Add grafanaTags so we can filter annotations by test or by cluster.
+	req.Tags = append(req.Tags, c.grafanaTags...)
+
+	// CentralizedGrafanaHost is the host name for the centralized grafana instance that
+	// is set up for every roachtest run on GCE.
+	const CentralizedGrafanaHost = "grafana.testeng.crdb.io"
+
+	// The centralized grafana instance requires auth through Google IDP.
+	return errors.Wrap(roachprod.AddGrafanaAnnotation(ctx, CentralizedGrafanaHost, true /* secure */, req), "error adding grafana annotation")
+}
+
+// AddInternalGrafanaAnnotation creates a grafana annotation for the internal grafana
+// instance spun up in roachtests through StartGrafana.
+func (c *clusterImpl) AddInternalGrafanaAnnotation(
+	ctx context.Context, l *logger.Logger, req grafana.AddAnnotationRequest,
+) error {
+	host, err := roachprod.GrafanaURL(ctx, l, c.name, false /* openInBrowser */)
+	if err != nil {
+		return err
+	}
+	// The internal grafana instance does not require auth.
+	return roachprod.AddGrafanaAnnotation(ctx, host, false /* secure */, req)
+}
+
+func (c *clusterImpl) WipeForReuse(
+	ctx context.Context, l *logger.Logger, newClusterSpec spec.ClusterSpec,
+) error {
+	if c.IsLocal() {
+		return errors.New("cluster reuse is disabled for local clusters to guarantee a clean slate for each test")
+	}
+	l.PrintfCtx(ctx, "Using existing cluster: %s (arch=%q). Wiping", c.name, c.arch)
+	if err := roachprod.Wipe(ctx, l, c.MakeNodes(c.All()), false /* preserveCerts */); err != nil {
+		return err
+	}
+	// We remove the entire shared user directory between tests to ensure we aren't
+	// reusing files from previous tests, i.e. cockroach binaries, perf artifacts.
+	// N.B. we don't remove the entire home directory to safeguard against this ever
+	// running locally and deleting someone's local directory.
+	if err := c.RunE(ctx, option.WithNodes(c.All()), fmt.Sprintf("rm -rf /home/%s/*", config.SharedUser)); err != nil {
+		return errors.Wrapf(err, "failed to remove home directory")
+	}
+	if c.localCertsDir != "" {
+		if err := os.RemoveAll(c.localCertsDir); err != nil {
+			return errors.Wrapf(err,
+				"failed to remove local certs in %s", c.localCertsDir)
+		}
+		c.localCertsDir = ""
+	}
+
+	// Reset the disableGrafanaAnnotations field so that the warning
+	// about Grafana not being available is always printed at least once
+	// for every test.
+	c.disableGrafanaAnnotations.Store(false)
+
+	// Clear DNS records for the cluster.
+	if err := c.DestroyDNS(ctx, l); err != nil {
+		return err
+	}
+	// Overwrite the spec of the cluster with the one coming from the test. In
+	// particular, this overwrites the reuse policy to reflect what the test
+	// intends to do with it.
+	c.spec = newClusterSpec
+	// Reset the default virtual cluster before running a new test on
+	// this cluster.
+	c.defaultVirtualCluster = ""
+
+	return nil
+}
+
+// DestroyDNS destroys the DNS records for the cluster.
+func (c *clusterImpl) DestroyDNS(ctx context.Context, l *logger.Logger) error {
+	return roachprod.DestroyDNS(ctx, l, c.name)
+}
+
+// MaybeExtendCluster checks if the cluster has enough life left for the
+// test plus enough headroom after the test finishes so that the next test
+// can be selected. If it doesn't, extend it.
+func (c *clusterImpl) MaybeExtendCluster(
+	ctx context.Context, l *logger.Logger, testSpec *registry.TestSpec,
+) error {
+	timeout := testTimeout(testSpec)
+	minExp := timeutil.Now().Add(timeout + time.Hour)
+	if c.expiration.Before(minExp) {
+		extend := minExp.Sub(c.expiration)
+		l.PrintfCtx(ctx, "cluster needs to survive until %s, but has expiration: %s. Extending.",
+			minExp, c.expiration)
+		if err := c.Extend(ctx, extend, l); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StartSideEyeAgents starts the Side-Eye agent on all the nodes in the cluster.
+// These agents are configured to allow monitoring of cockroach processes.
+// app.side-eye.io will list all currently-running clusters. The test runner's
+// Side-Eye client can be used to programmatically take snapshots of this
+// cluster using the cluster's name; snapshots are taken when the test times
+// out.
+func (c *clusterImpl) StartSideEyeAgents(
+	ctx context.Context, l *logger.Logger, apiToken string,
+) error {
+	envName := c.Name()
+	err := roachprod.StartSideEyeAgents(ctx, l, c.Name(), envName, apiToken)
+	if err != nil {
+		return err
+	}
+	c.setSideEyeEnvName(envName)
+	return nil
+}
+
+// UpdateSideEyeEnvironmentName updates the environment name used by the
+// Side-Eye agents running on this cluster.
+func (c *clusterImpl) UpdateSideEyeEnvironmentName(
+	ctx context.Context, l *logger.Logger, newEnvName string,
+) error {
+	err := roachprod.UpdateSideEyeEnvironmentName(ctx, l, c.Name(), newEnvName)
+	if err != nil {
+		return err
+	}
+	c.setSideEyeEnvName(newEnvName)
+	return nil
+}
+
+// CaptureSideEyeSnapshot asks the Side-Eye service to take a snapshot of the
+// cockroach processes running on this cluster. All errors are logged and
+// swallowed.
+//
+// Returns the URL of the captured snapshot, or "" if not successful.
+func (c *clusterImpl) CaptureSideEyeSnapshot(ctx context.Context) string {
+	l := c.t.L()
+	l.PrintfCtx(ctx, "capturing snapshot of the cluster with Side-Eye...")
+
+	if c.arch == vm.ArchARM64 {
+		l.Printf("Side-Eye does not support ARM64 machines; skipping snapshot")
+		return ""
+	}
+
+	if c.sideEyeClient == nil {
+		l.Printf("WARNING: Side-Eye client is not configured")
+		return ""
+	}
+
+	envName := c.sideEyeEnvName()
+	if envName == "" {
+		l.PrintfCtx(ctx, "cluster does not have Side-Eye agents set up; skipping snapshot")
+		return ""
+	}
+
+	snapURL, ok := roachprod.CaptureSideEyeSnapshot(ctx, l, envName, c.sideEyeClient)
+	if !ok {
+		return ""
+	}
+	l.PrintfCtx(ctx, "captured Side-Eye snapshot: %s", snapURL)
+	annotation := fmt.Sprintf("Captured Side-Eye snapshot: %s", snapURL)
+	if err := c.AddGrafanaAnnotation(ctx, l, grafana.AddAnnotationRequest{Text: annotation}); err != nil {
+		l.PrintfCtx(ctx, "error adding Grafana annotation for snapshot: %s", err)
+	}
+	return snapURL
+}
+
+// archForTest determines the CPU architecture to use for a test. If the test
+// doesn't specify it, one is chosen randomly depending on flags.
+func archForTest(ctx context.Context, l *logger.Logger, testSpec registry.TestSpec) vm.CPUArch {
+	if testSpec.Cluster.Arch != "" {
+		l.PrintfCtx(ctx, "Using specified arch=%q, %s", testSpec.Cluster.Arch, testSpec.Name)
+		return testSpec.Cluster.Arch
+	}
+
+	// CPU architecture is unspecified, choose one according to the
+	// probability distribution.
+	var arch vm.CPUArch
+	if prng.Float64() < roachtestflags.ARM64Probability {
+		arch = vm.ArchARM64
+	} else if prng.Float64() < roachtestflags.FIPSProbability {
+		// N.B. branch is taken with probability
+		//   (1 - arm64Probability) * fipsProbability
+		// which is P(fips & amd64).
+		// N.B. FIPS is only supported on 'amd64' at this time.
+		arch = vm.ArchFIPS
+	} else {
+		arch = vm.ArchAMD64
+	}
+	if roachtestflags.Cloud == spec.GCE && arch == vm.ArchARM64 {
+		// N.B. T2A support is rather limited, both in terms of supported
+		// regions and no local SSDs. Thus, we must fall back to AMD64 in
+		// those cases. See #122035.
+		if testSpec.Cluster.GCE.Zones != "" &&
+			!gce.IsSupportedT2AZone(strings.Split(testSpec.Cluster.GCE.Zones, ",")) {
+			l.PrintfCtx(ctx, "%q specified one or more GCE regions unsupported by T2A, falling back to AMD64; see #122035", testSpec.Name)
+			return vm.ArchAMD64
+		}
+		if roachtestflags.PreferLocalSSD && testSpec.Cluster.VolumeSize == 0 && testSpec.Cluster.SSDs > 1 {
+			l.PrintfCtx(ctx, "%q specified multiple _local_ SSDs unsupported by T2A, falling back to AMD64; see #122035", testSpec.Name)
+			return vm.ArchAMD64
+		}
+	}
+	l.PrintfCtx(ctx, "Using randomly chosen arch=%q, %s", arch, testSpec.Name)
+
+	return arch
+}
+
+// bucketVMsByProvider buckets cachedCluster.VMs by provider.
+func bucketVMsByProvider(cachedCluster *cloud.Cluster) map[string][]vm.VM {
+	providerToVMs := make(map[string][]vm.VM)
+	for _, vm := range cachedCluster.VMs {
+		providerToVMs[vm.Provider] = append(providerToVMs[vm.Provider], vm)
+	}
+	return providerToVMs
+}
+
+// getCachedCluster checks if the passed cluster name is present in cached clusters
+// and returns an error if not found.
+func getCachedCluster(clusterName string) (*cloud.Cluster, error) {
+	cachedCluster, ok := roachprod.CachedCluster(clusterName)
+	if !ok {
+		var availableClusters []string
+		roachprod.CachedClusters(func(name string, _ int) {
+			availableClusters = append(availableClusters, name)
+		})
+
+		err := errors.Wrapf(errClusterNotFound, "%q", clusterName)
+		return nil, errors.WithHintf(err, "\nAvailable clusters:\n%s", strings.Join(availableClusters, "\n"))
+	}
+
+	return cachedCluster, nil
+}
+
+// GetPreemptedVMs gets any VMs that were part of the cluster but preempted by cloud vendor.
+func (c *clusterImpl) GetPreemptedVMs(
+	ctx context.Context, l *logger.Logger,
+) ([]vm.PreemptedVM, error) {
+	if c.IsLocal() || !c.spec.UseSpotVMs {
+		return nil, nil
+	}
+
+	cachedCluster, err := getCachedCluster(c.name)
+	if err != nil {
+		return nil, err
+	}
+	providerToVMs := bucketVMsByProvider(cachedCluster)
+
+	var allPreemptedVMs []vm.PreemptedVM
+	for provider, vms := range providerToVMs {
+		p := vm.Providers[provider]
+		if p.SupportsSpotVMs() {
+			preemptedVMS, err := p.GetPreemptedSpotVMs(l, vms, cachedCluster.CreatedAt)
+			if err != nil {
+				l.Errorf("failed to get preempted VMs for provider %s: %s", provider, err)
+				continue
+			}
+			allPreemptedVMs = append(allPreemptedVMs, preemptedVMS...)
+		}
+	}
+	return allPreemptedVMs, nil
+}
+
+// GetHostErrorVMs gets any VMs that were part of the cluster but has a host error.
+func (c *clusterImpl) GetHostErrorVMs(ctx context.Context, l *logger.Logger) ([]string, error) {
+	if c.IsLocal() {
+		return nil, nil
+	}
+
+	cachedCluster, err := getCachedCluster(c.name)
+	if err != nil {
+		return nil, err
+	}
+	providerToVMs := bucketVMsByProvider(cachedCluster)
+
+	var allHostErrorVMs []string
+	for provider, vms := range providerToVMs {
+		p := vm.Providers[provider]
+		hostErrorVMS, err := p.GetHostErrorVMs(l, vms, cachedCluster.CreatedAt)
+		if err != nil {
+			l.Errorf("failed to get hostError VMs for provider %s: %s", provider, err)
+			continue
+		}
+		allHostErrorVMs = append(allHostErrorVMs, hostErrorVMS...)
+	}
+	return allHostErrorVMs, nil
 }

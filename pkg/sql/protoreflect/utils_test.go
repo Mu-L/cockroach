@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package protoreflect_test
 
@@ -16,11 +11,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
-	protoreflecttest "github.com/cockroachdb/cockroach/pkg/sql/protoreflect/test"
+	gprotoreflecttest "github.com/cockroachdb/cockroach/pkg/sql/protoreflect/gprototest"
+	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect/test"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	jsonb "github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -70,12 +66,12 @@ func TestMessageToJSONBRoundTrip(t *testing.T) {
 				Unique:              true,
 				KeyColumnNames:      []string{"foo", "bar", "buz"},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
-				GeoConfig: geoindex.Config{
-					S2Geography: &geoindex.S2GeographyConfig{S2Config: &geoindex.S2Config{
+				GeoConfig: geopb.Config{
+					S2Geography: &geopb.S2GeographyConfig{S2Config: &geopb.S2Config{
 						MinLevel: 123,
 						MaxLevel: 321,
 					}},
-					S2Geometry: &geoindex.S2GeometryConfig{
+					S2Geometry: &geopb.S2GeometryConfig{
 						MinX: 567,
 						MaxX: 765,
 					},
@@ -258,6 +254,27 @@ func TestInvalidConversions(t *testing.T) {
 	t.Run("must be message type", func(t *testing.T) {
 		// Valid proto enum, but we require types.
 		_, err := protoreflect.DecodeMessage("cockroach.sql.sqlbase.SystemColumnKind", nil)
+		require.Error(t, err)
+	})
+}
+
+func TestNewMessageFromFileDescriptor(t *testing.T) {
+	msg := "Hello, World"
+	in := gprotoreflecttest.Inner{
+		Value: msg,
+	}
+	fd := gprotoreflecttest.File_sql_protoreflect_gprototest_gprototest_proto
+	bin, err := protoutil.TODOMarshal(&in)
+	require.Nil(t, err)
+
+	t.Run("successfully gets message from FileDescriptor", func(t *testing.T) {
+		out, err := protoreflect.NewJSONMessageFromFileDescriptor("Inner", fd, bin, nil)
+		require.Nil(t, err)
+		require.Equal(t, msg, fetchPath(t, out, "value"))
+	})
+	t.Run("fails if name is  incorrect", func(t *testing.T) {
+		out, err := protoreflect.NewJSONMessageFromFileDescriptor("foo", fd, bin, nil)
+		require.Nil(t, out)
 		require.Error(t, err)
 	})
 }

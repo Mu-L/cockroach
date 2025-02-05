@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -25,8 +20,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -110,6 +107,10 @@ type StmtBuf struct {
 		// the buffer.
 		lastPos CmdPos
 	}
+
+	// PipelineCount, if non-nil, is a gauge that measures how many commands are
+	// in all client-facing StmtBuf instances.
+	PipelineCount *metric.Gauge
 }
 
 // Command is an interface implemented by all commands pushed by pgwire into the
@@ -134,11 +135,11 @@ type ExecStmt struct {
 
 	// TimeReceived is the time at which the exec message was received
 	// from the client. Used to compute the service latency.
-	TimeReceived time.Time
+	TimeReceived crtime.Mono
 	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
 	// stats reporting.
-	ParseStart time.Time
-	ParseEnd   time.Time
+	ParseStart crtime.Mono
+	ParseEnd   crtime.Mono
 
 	// LastInBatch indicates if this command contains the last query in a
 	// simple protocol Query message that contains a batch of 1 or more queries.
@@ -181,7 +182,7 @@ type ExecPortal struct {
 	Limit int
 	// TimeReceived is the time at which the exec message was received
 	// from the client. Used to compute the service latency.
-	TimeReceived time.Time
+	TimeReceived crtime.Mono
 	// FollowedBySync is true if the next command after this is a Sync. This is
 	// used to enable the 1PC txn fast path in the extended protocol.
 	FollowedBySync bool
@@ -213,8 +214,8 @@ type PrepareStmt struct {
 	// RawTypeHints is the representation of type hints exactly as specified by
 	// the client.
 	RawTypeHints []oid.Oid
-	ParseStart   time.Time
-	ParseEnd     time.Time
+	ParseStart   crtime.Mono
+	ParseEnd     crtime.Mono
 }
 
 // command implements the Command interface.
@@ -367,16 +368,21 @@ type CopyIn struct {
 	// Conn is the network connection. Execution of the CopyFrom statement takes
 	// control of the connection.
 	Conn pgwirebase.Conn
-	// CopyDone is decremented once execution finishes, signaling that control of
-	// the connection is being handed back to the network routine.
-	CopyDone *sync.WaitGroup
+	// CopyDone is used to signal that control of the connection is being handed
+	// back to the network routine.
+	CopyDone struct {
+		// WaitGroup is decremented once execution finishes.
+		*sync.WaitGroup
+		// Once is used to decrement the WaitGroup exactly once.
+		*sync.Once
+	}
 	// TimeReceived is the time at which the message was received
 	// from the client. Used to compute the service latency.
-	TimeReceived time.Time
+	TimeReceived crtime.Mono
 	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
 	// stats reporting.
-	ParseStart time.Time
-	ParseEnd   time.Time
+	ParseStart crtime.Mono
+	ParseEnd   crtime.Mono
 }
 
 // command implements the Command interface.
@@ -401,11 +407,11 @@ type CopyOut struct {
 	Stmt       *tree.CopyTo
 	// TimeReceived is the time at which the message was received
 	// from the client. Used to compute the service latency.
-	TimeReceived time.Time
+	TimeReceived crtime.Mono
 	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
 	// stats reporting.
-	ParseStart time.Time
-	ParseEnd   time.Time
+	ParseStart crtime.Mono
+	ParseEnd   crtime.Mono
 }
 
 // command implements the Command interface.
@@ -463,9 +469,14 @@ func (s SendError) String() string {
 var _ Command = SendError{}
 
 // NewStmtBuf creates a StmtBuf.
-func NewStmtBuf() *StmtBuf {
+// - toReserve, if positive, indicates the initial capacity of the command
+// buffer.
+func NewStmtBuf(toReserve int) *StmtBuf {
 	var buf StmtBuf
 	buf.Init()
+	if toReserve > 0 {
+		buf.mu.data.Reserve(toReserve)
+	}
 	return &buf
 }
 
@@ -501,6 +512,9 @@ func (buf *StmtBuf) Push(ctx context.Context, cmd Command) error {
 	}
 	buf.mu.data.AddLast(cmd)
 	buf.mu.lastPos++
+	if buf.PipelineCount != nil {
+		buf.PipelineCount.Inc(1)
+	}
 
 	buf.mu.cond.Signal()
 	return nil
@@ -588,6 +602,9 @@ func (buf *StmtBuf) AdvanceOne() CmdPos {
 	defer buf.mu.Unlock()
 	prev := buf.mu.curPos
 	buf.mu.curPos++
+	if buf.PipelineCount != nil {
+		buf.PipelineCount.Dec(1)
+	}
 	return prev
 }
 
@@ -663,6 +680,9 @@ func (buf *StmtBuf) Rewind(ctx context.Context, pos CmdPos) {
 	defer buf.mu.Unlock()
 	if pos < buf.mu.startPos {
 		log.Fatalf(ctx, "attempting to rewind below buffer start")
+	}
+	if buf.PipelineCount != nil {
+		buf.PipelineCount.Inc(int64(buf.mu.curPos - pos))
 	}
 	buf.mu.curPos = pos
 }
@@ -832,6 +852,10 @@ type RestrictedCommandResult interface {
 	// ClientComm.createStatementResult.
 	ResetStmtType(stmt tree.Statement)
 
+	// GetFormatCode returns the format code that will be used to serialize the
+	// data in the provided column when sending messages to the client.
+	GetFormatCode(colIdx int) (pgwirebase.FormatCode, error)
+
 	// AddRow accumulates a result row.
 	//
 	// The implementation cannot hold on to the row slice; it needs to make a
@@ -845,17 +869,17 @@ type RestrictedCommandResult interface {
 	// soon as AddBatch returns.
 	AddBatch(ctx context.Context, batch coldata.Batch) error
 
+	// SupportsAddBatch returns whether this command result supports AddBatch
+	// method of adding the data. If false is returned, then the behavior of
+	// AddBatch is undefined.
+	SupportsAddBatch() bool
+
 	// BufferedResultsLen returns the length of the results buffer.
 	BufferedResultsLen() int
 
 	// TruncateBufferedResults clears any results that have been buffered after
 	// given index, and returns true iff any results were actually truncated.
 	TruncateBufferedResults(idx int) bool
-
-	// SupportsAddBatch returns whether this command result supports AddBatch
-	// method of adding the data. If false is returned, then the behavior of
-	// AddBatch is undefined.
-	SupportsAddBatch() bool
 
 	// SetRowsAffected sets RowsAffected counter to n. This is used for all
 	// result types other than tree.Rows.
@@ -1097,7 +1121,15 @@ func (r *streamingCommandResult) SendNotice(ctx context.Context, notice pgnotice
 
 // ResetStmtType is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) ResetStmtType(stmt tree.Statement) {
-	panic("unimplemented")
+	// This command result doesn't care about the stmt type since it doesn't
+	// produce pgwire messages.
+}
+
+// GetFormatCode is part of the sql.RestrictedCommandResult interface.
+func (r *streamingCommandResult) GetFormatCode(colIdx int) (pgwirebase.FormatCode, error) {
+	// Rows aren't serialized in the streamingCommandResult, so this format code
+	// doesn't really matter - return the default.
+	return pgwirebase.FormatText, nil
 }
 
 // AddRow is part of the RestrictedCommandResult interface.
@@ -1120,20 +1152,21 @@ func (r *streamingCommandResult) AddBatch(context.Context, coldata.Batch) error 
 	panic("unimplemented")
 }
 
+// SupportsAddBatch is part of the RestrictedCommandResult interface.
+func (r *streamingCommandResult) SupportsAddBatch() bool {
+	return false
+}
+
 // BufferedResultsLen is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) BufferedResultsLen() int {
-	// Since this implementation is streaming, there is no sensible return
-	// value here.
-	panic("unimplemented")
+	// Since this implementation is streaming, we cannot truncate some buffered
+	// results. This is achieved by unconditionally returning false in
+	// TruncateBufferedResults, so this return value doesn't actually matter.
+	return 0
 }
 
 // TruncateBufferedResults is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) TruncateBufferedResults(int) bool {
-	return false
-}
-
-// SupportsAddBatch is part of the RestrictedCommandResult interface.
-func (r *streamingCommandResult) SupportsAddBatch() bool {
 	return false
 }
 

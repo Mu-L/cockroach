@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,6 +13,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpch"
@@ -33,9 +30,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 		c cluster.Cluster,
 		disableStreamer bool,
 	) {
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, numNodes-1))
-		c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(numNodes))
-		c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings(), c.Range(1, numNodes-1))
+		c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), install.MakeClusterSettings(), c.CRDBNodes())
 
 		conn := c.Conn(ctx, t.L(), 1)
 		if disableStreamer {
@@ -45,16 +40,16 @@ func registerTPCHConcurrency(r registry.Registry) {
 		}
 
 		if err := loadTPCHDataset(
-			ctx, t, c, conn, 1 /* sf */, c.NewMonitor(ctx, c.Range(1, numNodes-1)),
-			c.Range(1, numNodes-1), true /* disableMergeQueue */, false, /* secure */
+			ctx, t, c, conn, 1 /* sf */, c.NewMonitor(ctx, c.CRDBNodes()),
+			c.CRDBNodes(), true, /* disableMergeQueue */
 		); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	restartCluster := func(ctx context.Context, c cluster.Cluster, t test.Test) {
-		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Range(1, numNodes-1))
-		c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings(), c.Range(1, numNodes-1))
+		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.CRDBNodes())
+		c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), install.MakeClusterSettings(), c.CRDBNodes())
 	}
 
 	// checkConcurrency returns an error if at least one node of the cluster
@@ -63,7 +58,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 	checkConcurrency := func(ctx context.Context, t test.Test, c cluster.Cluster, concurrency int) error {
 		// Make sure to kill any workloads running from the previous
 		// iteration.
-		_ = c.RunE(ctx, c.Node(numNodes), "killall workload")
+		_ = c.RunE(ctx, option.WithNodes(c.WorkloadNode()), "killall workload")
 
 		restartCluster(ctx, c, t)
 
@@ -74,7 +69,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 			t.Fatal(err)
 		}
 		scatterTables(t, conn, tpchTables)
-		err := WaitFor3XReplication(ctx, t, conn)
+		err := roachtestutil.WaitFor3XReplication(ctx, t.L(), conn)
 		require.NoError(t, err)
 
 		// Populate the range cache on each node.
@@ -90,7 +85,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 			}
 		}
 
-		m := c.NewMonitor(ctx, c.Range(1, numNodes-1))
+		m := c.NewMonitor(ctx, c.CRDBNodes())
 		m.Go(func(ctx context.Context) error {
 			t.Status(fmt.Sprintf("running with concurrency = %d", concurrency))
 			// Run each query once on each connection.
@@ -141,11 +136,11 @@ func registerTPCHConcurrency(r registry.Registry) {
 				// Use very short duration for --display-every parameter so that
 				// all query runs are logged.
 				cmd := fmt.Sprintf(
-					"./workload run tpch {pgurl:1-%d} --display-every=1ns --tolerate-errors "+
+					"./cockroach workload run tpch {pgurl%s} --display-every=1ns --tolerate-errors "+
 						"--count-errors --queries=%d --concurrency=%d --max-ops=%d",
-					numNodes-1, queryNum, concurrency, maxOps,
+					c.CRDBNodes(), queryNum, concurrency, maxOps,
 				)
-				if err := c.RunE(ctx, c.Node(numNodes), cmd); err != nil {
+				if err := c.RunE(ctx, option.WithNodes(c.WorkloadNode()), cmd); err != nil {
 					return err
 				}
 			}
@@ -161,11 +156,11 @@ func registerTPCHConcurrency(r registry.Registry) {
 		disableStreamer bool,
 	) {
 		setupCluster(ctx, t, c, disableStreamer)
-		// Run at concurrency 1000. We often can push this a bit higher, but
-		// then the iterations also get longer. 1000 concurrently running
-		// analytical queries on the 3 node cluster that doesn't crash is much
-		// more than we expect our users to run.
-		const concurrency = 1000
+		// Run at concurrency 500. We often can push this higher, but then the
+		// iterations also get longer. 500 concurrently running analytical
+		// queries on the 3 node cluster that doesn't crash is much more than we
+		// expect our users to run.
+		const concurrency = 500
 		// Each iteration can take on the order of 3 hours, so we choose the
 		// iteration count such that it'd be definitely completed with 18 hour
 		// timeout.
@@ -200,11 +195,19 @@ func registerTPCHConcurrency(r registry.Registry) {
 	// the test as "weekly").
 	const timeout = 18 * time.Hour
 
+	// We run this test without runtime assertions as it pushes the VMs way past
+	// the overload point, so it cannot withstand any metamorphic perturbations.
+	cockroachBinary := registry.StandardCockroach
 	r.Add(registry.TestSpec{
 		Name:    "tpch_concurrency",
 		Owner:   registry.OwnerSQLQueries,
 		Timeout: timeout,
-		Cluster: r.MakeClusterSpec(numNodes),
+		Cluster: r.MakeClusterSpec(numNodes, spec.WorkloadNode()),
+		// Uses gs://cockroach-fixtures-us-east1. See:
+		// https://github.com/cockroachdb/cockroach/issues/105968
+		CompatibleClouds: registry.Clouds(spec.GCE, spec.Local),
+		Suites:           registry.Suites(registry.Nightly),
+		CockroachBinary:  cockroachBinary,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCHConcurrency(ctx, t, c, false /* disableStreamer */)
 		},
@@ -214,7 +217,12 @@ func registerTPCHConcurrency(r registry.Registry) {
 		Name:    "tpch_concurrency/no_streamer",
 		Owner:   registry.OwnerSQLQueries,
 		Timeout: timeout,
-		Cluster: r.MakeClusterSpec(numNodes),
+		Cluster: r.MakeClusterSpec(numNodes, spec.WorkloadNode()),
+		// Uses gs://cockroach-fixtures-us-east1. See:
+		// https://github.com/cockroachdb/cockroach/issues/105968
+		CompatibleClouds: registry.Clouds(spec.GCE, spec.Local),
+		Suites:           registry.Suites(registry.Nightly),
+		CockroachBinary:  cockroachBinary,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCHConcurrency(ctx, t, c, true /* disableStreamer */)
 		},

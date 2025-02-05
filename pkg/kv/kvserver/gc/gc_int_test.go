@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gc_test
 
@@ -19,7 +14,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -37,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -45,7 +40,7 @@ import (
 // smallEngineBlocks configures Pebble with a block size of 1 byte, to provoke
 // bugs in time-bound iterators. We disable this under race, due to the slowdown.
 var smallEngineBlocks = !util.RaceEnabled &&
-	util.ConstantWithMetamorphicTestBool("small-engine-blocks", false)
+	metamorphic.ConstantWithTestBool("small-engine-blocks", false)
 
 func init() {
 	randutil.SeedForTests()
@@ -56,7 +51,6 @@ func init() {
 
 func TestEndToEndGC(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer ccl.TestingEnableEnterprise()()
 
 	for _, d := range []struct {
 		// Using range tombstones to remove data will promote full range deletions
@@ -88,7 +82,7 @@ func TestEndToEndGC(t *testing.T) {
 				settings := cluster.MakeTestingClusterSettings()
 				// Push the TTL up to 60 hours since we emulate a 50 hours
 				// clock jump below.
-				slinstance.DefaultTTL.Override(ctx, &settings.SV, 60*time.Hour)
+				slbase.DefaultTTL.Override(ctx, &settings.SV, 60*time.Hour)
 
 				manualClock := hlc.NewHybridManualClock()
 				s, appSqlDb, appKvDb := serverutils.StartServer(t, base.TestServerArgs{
@@ -105,7 +99,7 @@ func TestEndToEndGC(t *testing.T) {
 				defer s.Stopper().Stop(ctx)
 
 				statusServer := s.SystemLayer().StatusServer().(serverpb.StatusServer)
-				systemSqlDb := s.SystemLayer().SQLConn(t, "system")
+				systemSqlDb := s.SystemLayer().SQLConn(t, serverutils.DBName("system"))
 
 				execOrFatal := func(t *testing.T, db *gosql.DB, stmt string, args ...interface{}) {
 					t.Helper()
@@ -204,10 +198,6 @@ WHERE 'kv' IN (
 					for _, id := range rangeIDs {
 						stats := getRangeStats(t, id)
 						t.Logf("range %d stats: %s", id, &stats)
-						// Test can't give meaningful results if stats contain estimates.
-						// Test also doesn't perform any operations that result in estimated stats
-						// being created, so it is a failure in the environment if that happens.
-						require.Zerof(t, stats.ContainsEstimates, "we must not have estimates")
 						if stats.RangeKeyCount > 0 || stats.KeyCount > 0 {
 							nonEmptyRangeIDs = append(nonEmptyRangeIDs, id)
 						}

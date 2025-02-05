@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -29,15 +24,19 @@ type LogMetrics interface {
 	// The LogMetrics implementation must have metadata defined
 	// for the given MetricName within its own scope. See
 	// pkg/util/log/logmetrics for details.
-	IncrementCounter(metric MetricName, amount int64)
+	IncrementCounter(metric Metric, amount int64)
 }
 
-// MetricName represents the name of a metric registered &
-// used within the log package, available to use in the LogMetrics
-// interface.
-type MetricName string
+// Metric is the enum representation of each metric supported within the log package.
+// NB: The metric also needs to be added to pkg/util/log/logmetrics, where we
+// need to register the metric and define its metadata.
+type Metric int
 
-// FluentSinkConnectionError is the MetricName for the metric
-// used to count fluent-server log sink connection errors. Please
-// refer to its metric metadata for more details (hint: see usages).
-const FluentSinkConnectionError MetricName = "fluent.sink.conn.errors"
+const (
+	FluentSinkConnectionAttempt Metric = iota
+	FluentSinkConnectionError
+	FluentSinkWriteAttempt
+	FluentSinkWriteError
+	BufferedSinkMessagesDropped
+	LogMessageCount
+)

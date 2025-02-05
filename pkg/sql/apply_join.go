@@ -1,19 +1,13 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 	"strconv"
-	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -21,7 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -40,7 +33,7 @@ type applyJoinNode struct {
 	joinType descpb.JoinType
 
 	// The data source with no outer columns.
-	input planDataSource
+	singleInputPlanNode
 
 	// pred represents the join predicate.
 	pred *joinPredicate
@@ -82,7 +75,7 @@ type applyJoinNode struct {
 
 func newApplyJoinNode(
 	joinType descpb.JoinType,
-	left planDataSource,
+	left planNode,
 	rightCols colinfo.ResultColumns,
 	pred *joinPredicate,
 	planRightSideFn exec.ApplyJoinPlanRightSideFn,
@@ -97,12 +90,12 @@ func newApplyJoinNode(
 	}
 
 	return &applyJoinNode{
-		joinType:        joinType,
-		input:           left,
-		pred:            pred,
-		rightTypes:      getTypesFromResultColumns(rightCols),
-		planRightSideFn: planRightSideFn,
-		columns:         pred.cols,
+		joinType:            joinType,
+		singleInputPlanNode: singleInputPlanNode{left},
+		pred:                pred,
+		rightTypes:          getTypesFromResultColumns(rightCols),
+		planRightSideFn:     planRightSideFn,
+		columns:             pred.cols,
 	}, nil
 }
 
@@ -200,7 +193,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 		}
 
 		// We need a new row on the left.
-		ok, err := a.input.plan.Next(params)
+		ok, err := a.input.Next(params)
 		if err != nil {
 			return false, err
 		}
@@ -212,7 +205,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 
 		// Extract the values of the outer columns of the other side of the apply
 		// from the latest input row.
-		leftRow := a.input.plan.Values()
+		leftRow := a.input.Values()
 		a.run.leftRow = leftRow
 		a.iterationCount++
 
@@ -256,7 +249,8 @@ func (a *applyJoinNode) runNextRightSideIteration(params runParams, leftRow tree
 	plan := p.(*planComponents)
 	rowResultWriter := NewRowResultWriter(&a.run.rightRows)
 	if err := runPlanInsidePlan(
-		ctx, params, plan, rowResultWriter, nil, /* deferredRoutineSender */
+		ctx, params, plan, rowResultWriter,
+		nil /* deferredRoutineSender */, "", /* stmtForDistSQLDiagram */
 	); err != nil {
 		return err
 	}
@@ -272,6 +266,7 @@ func runPlanInsidePlan(
 	plan *planComponents,
 	resultWriter rowResultWriter,
 	deferredRoutineSender eval.DeferredRoutineSender,
+	stmtForDistSQLDiagram string,
 ) error {
 	defer plan.close(ctx)
 	execCfg := params.ExecCfg()
@@ -291,27 +286,16 @@ func runPlanInsidePlan(
 	// before we can produce any "outer" rows to be returned to the client, so
 	// we make sure to unset pausablePortal field on the planner.
 	plannerCopy.pausablePortal = nil
-	evalCtxFactory := func() *extendedEvalContext {
-		plannerCopy.extendedEvalCtx = *params.p.ExtendedEvalContextCopy()
-		evalCtx := &plannerCopy.extendedEvalCtx
-		evalCtx.Planner = &plannerCopy
-		evalCtx.StreamManagerFactory = &plannerCopy
-		if deferredRoutineSender != nil {
-			evalCtx.RoutineSender = deferredRoutineSender
-		}
-		return evalCtx
-	}
+
+	// planner object embeds the extended eval context, so we will modify that
+	// (which won't affect the outer planner's extended eval context), and we'll
+	// use it as the golden version going forward.
+	plannerCopy.extendedEvalCtx.Planner = &plannerCopy
+	plannerCopy.extendedEvalCtx.StreamManagerFactory = &plannerCopy
+	plannerCopy.extendedEvalCtx.RoutineSender = deferredRoutineSender
+	evalCtxFactory := plannerCopy.ExtendedEvalContextCopy
 
 	if len(plan.subqueryPlans) != 0 {
-		// We currently don't support cases when both the "inner" and the
-		// "outer" plans have subqueries due to limitations of how we're
-		// propagating the results of the subqueries.
-		// TODO(mgartner): We should be able to lift this restriction for
-		// apply-joins, similarly to how subqueries within UDFs are planned - as
-		// routines instead of subqueries.
-		if len(params.p.curPlan.subqueryPlans) != 0 {
-			return unimplemented.NewWithIssue(66447, `apply joins with subqueries in the "inner" and "outer" contexts are not supported`)
-		}
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we
 		// return from this method (after the main query is executed).
@@ -325,34 +309,35 @@ func runPlanInsidePlan(
 			recv,
 			&subqueryResultMemAcc,
 			false, /* skipDistSQLDiagramGeneration */
-			atomic.LoadUint32(&params.p.atomic.innerPlansMustUseLeafTxn) == 1,
+			params.p.mustUseLeafTxn(),
 		) {
 			return resultWriter.Err()
 		}
-	} else {
-		// We don't have "inner" subqueries, so the apply join can only refer to
-		// the "outer" ones.
-		plannerCopy.curPlan.subqueryPlans = params.p.curPlan.subqueryPlans
 	}
 
-	distributePlan := getPlanDistribution(
+	distributePlan, distSQLProhibitedErr := getPlanDistribution(
 		ctx, plannerCopy.Descriptors().HasUncommittedTypes(),
-		plannerCopy.SessionData().DistSQLMode, plan.main,
+		plannerCopy.SessionData(), plan.main, &plannerCopy.distSQLVisitor,
 	)
-	distributeType := DistributionType(DistributionTypeNone)
+	distributeType := DistributionType(LocalDistribution)
 	if distributePlan.WillDistribute() {
-		distributeType = DistributionTypeAlways
+		distributeType = FullDistribution
 	}
 	evalCtx := evalCtxFactory()
 	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, &plannerCopy, plannerCopy.txn, distributeType)
+	planCtx.distSQLProhibitedErr = distSQLProhibitedErr
 	planCtx.stmtType = recv.stmtType
-	planCtx.mustUseLeafTxn = atomic.LoadUint32(&params.p.atomic.innerPlansMustUseLeafTxn) == 1
+	planCtx.mustUseLeafTxn = params.p.mustUseLeafTxn()
+	planCtx.stmtForDistSQLDiagram = stmtForDistSQLDiagram
 
-	finishedSetupFn, cleanup := getFinishedSetupFn(&plannerCopy)
-	defer cleanup()
-	execCfg.DistSQLPlanner.PlanAndRun(
-		ctx, evalCtx, planCtx, plannerCopy.Txn(), plan.main, recv, finishedSetupFn,
-	)
+	// Wrap PlanAndRun in a function call so that we clean up immediately.
+	func() {
+		finishedSetupFn, cleanup := getFinishedSetupFn(&plannerCopy)
+		defer cleanup()
+		execCfg.DistSQLPlanner.PlanAndRun(
+			ctx, evalCtx, planCtx, plannerCopy.Txn(), plan.main, recv, finishedSetupFn,
+		)
+	}()
 
 	// Check if there was an error interacting with the resultWriter.
 	if recv.commErr != nil {
@@ -362,13 +347,19 @@ func runPlanInsidePlan(
 		return resultWriter.Err()
 	}
 
-	evalCtxFactory2 := func(usedConcurrently bool) *extendedEvalContext {
-		return evalCtxFactory()
-	}
-
-	execCfg.DistSQLPlanner.PlanAndRunCascadesAndChecks(
-		ctx, &plannerCopy, evalCtxFactory2, &plannerCopy.curPlan.planComponents, recv,
+	plannerCopy.autoCommit = false
+	execCfg.DistSQLPlanner.PlanAndRunPostQueries(
+		ctx,
+		&plannerCopy,
+		func(usedConcurrently bool) *extendedEvalContext {
+			return evalCtxFactory()
+		},
+		&plannerCopy.curPlan.planComponents,
+		recv,
 	)
+	// We might have appended some cascades or checks to the plannerCopy, so we
+	// need to update the plan for cleanup purposes before proceeding.
+	*plan = plannerCopy.curPlan.planComponents
 	if recv.commErr != nil {
 		return recv.commErr
 	}
@@ -381,7 +372,7 @@ func (a *applyJoinNode) Values() tree.Datums {
 }
 
 func (a *applyJoinNode) Close(ctx context.Context) {
-	a.input.plan.Close(ctx)
+	a.input.Close(ctx)
 	a.run.rightRows.Close(ctx)
 	if a.run.rightRowsIterator != nil {
 		a.run.rightRowsIterator.Close()

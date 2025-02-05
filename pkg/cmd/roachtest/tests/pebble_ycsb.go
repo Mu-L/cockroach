@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
@@ -38,25 +34,25 @@ func registerPebbleYCSB(r registry.Registry) {
 			// which creates a well-known directory structure that is in-turn
 			// relied-upon by the javascript on the Pebble Benchmarks webpage.
 			name := fmt.Sprintf("pebble/ycsb/size=%d", size)
-			tag := "pebble_nightly_ycsb"
+			suites := registry.Suites(registry.PebbleNightlyYCSB)
 
 			// For the shorter benchmark runs, we append a suffix to the name to avoid
 			// a name collision. This is safe to do as these tests are not executed as
-			// part of the nightly benchmark runs (see the tag used to filter, found
-			// in build/teamcity-nightly-pebble.sh).
+			// part of the nightly benchmark runs.
 			if dur != 90 {
-				tag = "pebble"
+				suites = registry.Suites(registry.Pebble)
 				name += fmt.Sprintf("/duration=%d", dur)
 			}
 
 			d := dur
 			r.Add(registry.TestSpec{
-				Name:      name,
-				Owner:     registry.OwnerStorage,
-				Benchmark: true,
-				Timeout:   12 * time.Hour,
-				Cluster:   r.MakeClusterSpec(5, spec.CPU(16)),
-				Tags:      registry.Tags(tag),
+				Name:             name,
+				Owner:            registry.OwnerStorage,
+				Benchmark:        true,
+				Timeout:          12 * time.Hour,
+				Cluster:          r.MakeClusterSpec(5, spec.CPU(16)),
+				CompatibleClouds: registry.AllClouds,
+				Suites:           suites,
 				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 					runPebbleYCSB(ctx, t, c, size, pebble, d, nil, true /* artifacts */)
 				},
@@ -66,13 +62,14 @@ func registerPebbleYCSB(r registry.Registry) {
 
 	// Add the race build.
 	r.Add(registry.TestSpec{
-		Name:      "pebble/ycsb/A/race/duration=30",
-		Owner:     registry.OwnerStorage,
-		Benchmark: true,
-		Timeout:   12 * time.Hour,
-		Cluster:   r.MakeClusterSpec(5, spec.CPU(16)),
-		Leases:    registry.MetamorphicLeases,
-		Tags:      registry.Tags("pebble_nightly_ycsb_race"),
+		Name:             "pebble/ycsb/A/race/duration=30",
+		Owner:            registry.OwnerStorage,
+		Benchmark:        true,
+		Timeout:          12 * time.Hour,
+		Cluster:          r.MakeClusterSpec(5, spec.CPU(16)),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllClouds,
+		Suites:           registry.Suites(registry.PebbleNightlyYCSBRace),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPebbleYCSB(ctx, t, c, 64, pebble, 30, []string{"A"}, false /* artifacts */)
 		},
@@ -107,7 +104,7 @@ func runPebbleYCSB(
 	// larger value sizes, so we do this once and reuse the same DB state on
 	// all of the workloads.
 	runPebbleCmd(ctx, t, c, fmt.Sprintf(
-		"(./pebble bench ycsb %s"+
+		"./pebble bench ycsb %s"+
 			" --wipe "+
 			" --workload=read=100"+
 			" --concurrency=1"+
@@ -115,7 +112,7 @@ func runPebbleYCSB(
 			" --initial-keys=%d"+
 			" --cache=%d"+
 			" --num-ops=1 && "+
-			"rm -f %s && tar cvPf %s %s) > init.log 2>&1",
+			"rm -f %s && tar cvPf %s %s",
 		benchDir, size, initialKeys, cache, dataTar, dataTar, benchDir))
 
 	for _, workload := range workloads {
@@ -162,7 +159,7 @@ func runPebbleYCSB(
 // runPebbleCmd runs the given command on all worker nodes in the test cluster.
 func runPebbleCmd(ctx context.Context, t test.Test, c cluster.Cluster, cmd string) {
 	t.L().PrintfCtx(ctx, "> %s", cmd)
-	err := c.RunE(ctx, c.All(), cmd)
+	err := c.RunE(ctx, option.WithNodes(c.All()), cmd)
 	t.L().Printf("> result: %+v", err)
 	if err := ctx.Err(); err != nil {
 		t.L().Printf("(note: incoming context was canceled: %s", err)

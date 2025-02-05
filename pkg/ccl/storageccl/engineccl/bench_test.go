@@ -1,10 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package engineccl
 
@@ -20,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testfixtures"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -28,31 +26,36 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-// loadTestData writes numKeys keys in numBatches separate batches. Keys are
-// written in order. Every key in a given batch has the same MVCC timestamp;
-// batch timestamps start at batchTimeSpan and increase in intervals of
-// batchTimeSpan.
+// loadTestData writes numKeys keys in numBatches separate batches. Each key is
+// in the form 'key-XXXXX' where XXXXXX is an ascending-encoded uvarint of the
+// key index. Keys are written in order. Every batch is assigned a minimum MVCC
+// timestamp T_min. All keys within the batch have timestamps in the interval
+// [T_min,T_min+batchTimeSpan). Each successive batch has a T_min that's
+// batchTimeSpan higher than the previous. Thus batches are disjoint in both
+// user key space and MVCC timestamps.
 //
-// Importantly, writing keys in order convinces RocksDB to output one SST per
-// batch, where each SST contains keys of only one timestamp. E.g., writing A,B
-// at t0 and C at t1 will create two SSTs: one for A,B that only contains keys
-// at t0, and one for C that only contains keys at t1. Conversely, writing A, C
-// at t0 and B at t1 would create just one SST that contained A,B,C (due to an
-// immediate compaction).
+// After each batch is committed, a memtable flush is forced to compel Pebble
+// into separating batches into separate sstables where each sstable contains
+// keys only for a single batch (and a single `batchTimeSpan` time window).
 //
-// The creation of the database is time consuming, so the caller can choose
-// whether to use a temporary or permanent location.
+// The creation of the database is mildly time consuming, so it's cached as a
+// test fixture (see testfixtures.ReuseOrGenerate).
+//
+// TODO(jackson): This test was initially written when time-bound iteration
+// could only optimize iteration by skipping entire sstables. With the
+// introduction of block-property filters in 22.1, this is no longer the case.
+// The test could be adapted to test more granular iteration, if useful.
 func loadTestData(
 	tb testing.TB, dirPrefix string, numKeys, numBatches, batchTimeSpan, valueBytes int,
 ) storage.Engine {
 	ctx := context.Background()
 
-	verStr := fmt.Sprintf("v%s", clusterversion.TestingBinaryVersion.String())
+	verStr := fmt.Sprintf("v%s", clusterversion.Latest.String())
 	name := fmt.Sprintf("%s_v%s_%d_%d_%d_%d", dirPrefix, verStr, numKeys, numBatches, batchTimeSpan, valueBytes)
 	dir := testfixtures.ReuseOrGenerate(tb, name, func(dir string) {
 		eng, err := storage.Open(
 			ctx,
-			storage.Filesystem(dir),
+			fs.MustInitPhysicalTestingEnv(dir),
 			cluster.MakeTestingClusterSettings())
 		if err != nil {
 			tb.Fatal(err)
@@ -68,9 +71,9 @@ func loadTestData(
 			keys[i] = roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(i)))
 		}
 
-		sstTimestamps := make([]int64, numBatches)
-		for i := 0; i < len(sstTimestamps); i++ {
-			sstTimestamps[i] = int64((i + 1) * batchTimeSpan)
+		minSStableTimestamps := make([]int64, numBatches)
+		for i := 0; i < len(minSStableTimestamps); i++ {
+			minSStableTimestamps[i] = int64(i * batchTimeSpan)
 		}
 
 		var batch storage.Batch
@@ -88,12 +91,15 @@ func loadTestData(
 					}
 				}
 				batch = eng.NewBatch()
-				minWallTime = sstTimestamps[i/scaled]
+				minWallTime = minSStableTimestamps[i/scaled]
 			}
 			timestamp := hlc.Timestamp{WallTime: minWallTime + rand.Int63n(int64(batchTimeSpan))}
+			if timestamp.Less(hlc.MinTimestamp) {
+				timestamp = hlc.MinTimestamp
+			}
 			value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, valueBytes))
 			value.InitChecksum(key)
-			if err := storage.MVCCPut(ctx, batch, key, timestamp, value, storage.MVCCWriteOptions{}); err != nil {
+			if _, err := storage.MVCCPut(ctx, batch, key, timestamp, value, storage.MVCCWriteOptions{}); err != nil {
 				tb.Fatal(err)
 			}
 		}
@@ -110,7 +116,7 @@ func loadTestData(
 	log.Infof(context.Background(), "using test data: %s", dir)
 	eng, err := storage.Open(
 		ctx,
-		storage.Filesystem(dir),
+		fs.MustInitPhysicalTestingEnv(dir),
 		cluster.MakeTestingClusterSettings(),
 		storage.MustExist,
 	)
@@ -136,7 +142,7 @@ func runIterate(
 
 	// Store the database in this directory so we don't have to regenerate it on
 	// each benchmark run.
-	eng := loadTestData(b, "mvcc_data", numKeys, numBatches, batchTimeSpan, valueBytes)
+	eng := loadTestData(b, "mvcc_data_v3", numKeys, numBatches, batchTimeSpan, valueBytes)
 	defer eng.Close()
 
 	b.SetBytes(int64(numKeys * valueBytes))
@@ -176,15 +182,15 @@ func BenchmarkTimeBoundIterate(b *testing.B) {
 		b.Run(fmt.Sprintf("LoadFactor=%.2f", loadFactor), func(b *testing.B) {
 			b.Run("NormalIterator", func(b *testing.B) {
 				runIterate(b, loadFactor, func(e storage.Engine, _, _ hlc.Timestamp) (storage.MVCCIterator, error) {
-					return e.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
+					return e.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{UpperBound: roachpb.KeyMax})
 				})
 			})
 			b.Run("TimeBoundIterator", func(b *testing.B) {
 				runIterate(b, loadFactor, func(e storage.Engine, startTime, endTime hlc.Timestamp) (storage.MVCCIterator, error) {
-					return e.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-						MinTimestampHint: startTime,
-						MaxTimestampHint: endTime,
-						UpperBound:       roachpb.KeyMax,
+					return e.NewMVCCIterator(context.Background(), storage.MVCCKeyIterKind, storage.IterOptions{
+						MinTimestamp: startTime,
+						MaxTimestamp: endTime,
+						UpperBound:   roachpb.KeyMax,
 					})
 				})
 			})

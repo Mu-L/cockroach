@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -85,8 +80,14 @@ func (s *subquery) Walk(v tree.Visitor) tree.Expr {
 
 // TypeCheck is part of the tree.Expr interface.
 func (s *subquery) TypeCheck(
-	_ context.Context, _ *tree.SemaContext, desired *types.T,
+	_ context.Context, semaCtx *tree.SemaContext, desired *types.T,
 ) (tree.TypedExpr, error) {
+	if semaCtx != nil && semaCtx.Properties.IsSet(tree.RejectSubqueries) {
+		// This is the same error as in tree.Subquery.TypeCheck.
+		return nil, pgerror.Newf(pgcode.FeatureNotSupported,
+			"subqueries are not allowed in %s", semaCtx.Properties.Context())
+	}
+
 	if s.typ != nil {
 		return s, nil
 	}
@@ -219,29 +220,6 @@ func (s *subquery) buildSubquery(desiredTypes []*types.T) {
 	// as outer columns.
 	outScope := s.scope.builder.buildStmt(s.Subquery.Select, desiredTypes, s.scope.push())
 
-	desireAnyType := len(desiredTypes) == 0 ||
-		(len(desiredTypes) == 1 && desiredTypes[0].Family() == types.AnyFamily)
-	// If the SELECT list expressions are not allowed to be any number of items
-	// (as detected from the desiredTypes slice), count the number of items
-	// "desired" and the actual number of selected items, and error out if they
-	// don't match.
-	numSubqueryCols := len(outScope.cols)
-	if !desireAnyType && len(desiredTypes) != numSubqueryCols {
-		if s.wrapInTuple && numSubqueryCols == 1 {
-			if tupleExpr, ok := outScope.cols[0].scalar.(*memo.TupleExpr); ok {
-				numSubqueryCols = len(tupleExpr.Elems)
-			}
-		}
-		if len(desiredTypes) != numSubqueryCols {
-			qualifier := "few"
-			if numSubqueryCols > len(desiredTypes) {
-				qualifier = "many"
-			}
-			panic(pgerror.Newf(pgcode.Syntax,
-				"subquery has too %s columns", qualifier))
-		}
-	}
-
 	ord := outScope.ordering
 
 	// Treat the subquery result as an anonymous data source (i.e. column names
@@ -250,15 +228,41 @@ func (s *subquery) buildSubquery(desiredTypes []*types.T) {
 	outScope.setTableAlias("")
 	outScope.removeHiddenCols()
 
-	if s.desiredNumColumns > 0 && len(outScope.cols) != s.desiredNumColumns {
-		n := len(outScope.cols)
-		switch s.desiredNumColumns {
-		case 1:
-			panic(pgerror.Newf(pgcode.Syntax,
-				"subquery must return only one column, found %d", n))
-		default:
-			panic(pgerror.Newf(pgcode.Syntax,
-				"subquery must return %d columns, found %d", s.desiredNumColumns, n))
+	if s.desiredNumColumns > 0 {
+		if len(outScope.cols) != s.desiredNumColumns {
+			n := len(outScope.cols)
+			switch s.desiredNumColumns {
+			case 1:
+				panic(pgerror.Newf(pgcode.Syntax,
+					"subquery must return only one column, found %d", n))
+			default:
+				panic(pgerror.Newf(pgcode.Syntax,
+					"subquery must return %d columns, found %d", s.desiredNumColumns, n))
+			}
+		}
+	} else {
+		desireAnyType := len(desiredTypes) == 0 ||
+			(len(desiredTypes) == 1 && desiredTypes[0].Family() == types.AnyFamily)
+		// If the SELECT list expressions are not allowed to be any number of items
+		// (as detected from the desiredTypes slice), count the number of items
+		// "desired" and the actual number of selected items, and error out if they
+		// don't match.
+		numSubqueryCols := len(outScope.cols)
+		if !desireAnyType && len(desiredTypes) != numSubqueryCols {
+			if s.wrapInTuple && numSubqueryCols == 1 {
+				colTyp := outScope.cols[0].typ
+				if colTyp.Family() == types.TupleFamily {
+					numSubqueryCols = len(colTyp.TupleContents())
+				}
+			}
+			if len(desiredTypes) != numSubqueryCols {
+				qualifier := "few"
+				if numSubqueryCols > len(desiredTypes) {
+					qualifier = "many"
+				}
+				panic(pgerror.Newf(pgcode.Syntax,
+					"subquery has too %s columns", qualifier))
+			}
 		}
 	}
 
@@ -332,7 +336,12 @@ func (b *Builder) buildSingleRowSubquery(
 ) (out opt.ScalarExpr, outScope *scope) {
 	subqueryPrivate := memo.SubqueryPrivate{OriginalExpr: s.Subquery}
 	if s.Exists {
-		return b.factory.ConstructExists(s.node, &subqueryPrivate), inScope
+		col := b.factory.Metadata().AddColumn("exists", types.Bool)
+		ex := memo.ExistsPrivate{
+			LazyEvalProjectionCol: col,
+			SubqueryPrivate:       subqueryPrivate,
+		}
+		return b.factory.ConstructExists(s.node, &ex), inScope
 	}
 
 	var input memo.RelExpr

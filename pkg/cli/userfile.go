@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -94,7 +89,8 @@ atomic, and all deletions prior to the first failure will occur.
 }
 
 func runUserFileDelete(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -103,7 +99,7 @@ func runUserFileDelete(cmd *cobra.Command, args []string) (resErr error) {
 	glob := args[0]
 
 	var deletedFiles []string
-	if deletedFiles, err = deleteUserFile(context.Background(), conn, glob); err != nil {
+	if deletedFiles, err = deleteUserFile(ctx, conn, glob); err != nil {
 		return err
 	}
 
@@ -116,7 +112,8 @@ func runUserFileDelete(cmd *cobra.Command, args []string) (resErr error) {
 }
 
 func runUserFileList(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -128,7 +125,7 @@ func runUserFileList(cmd *cobra.Command, args []string) (resErr error) {
 	}
 
 	var files []string
-	if files, err = listUserFile(context.Background(), conn, glob); err != nil {
+	if files, err = listUserFile(ctx, conn, glob); err != nil {
 		return err
 	}
 
@@ -187,7 +184,8 @@ func uploadUserFileRecursive(conn clisqlclient.Conn, srcDir, dstDir string) erro
 }
 
 func runUserFileUpload(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -205,7 +203,7 @@ func runUserFileUpload(cmd *cobra.Command, args []string) (resErr error) {
 			return err
 		}
 	} else {
-		uploadedFile, err := uploadUserFile(context.Background(), conn, source,
+		uploadedFile, err := uploadUserFile(ctx, conn, source,
 			destination)
 		if err != nil {
 			return err
@@ -218,12 +216,13 @@ func runUserFileUpload(cmd *cobra.Command, args []string) (resErr error) {
 }
 
 func runUserFileGet(cmd *cobra.Command, args []string) (resErr error) {
-	conn, err := makeSQLClient("cockroach userfile", useDefaultDb)
+	ctx := context.Background()
+
+	conn, err := makeSQLClient(ctx, "cockroach userfile", useDefaultDb)
 	if err != nil {
 		return err
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
-	ctx := context.Background()
 
 	var dest string
 	if len(args) > 1 {

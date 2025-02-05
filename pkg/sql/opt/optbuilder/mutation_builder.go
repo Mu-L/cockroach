@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -14,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
@@ -25,10 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
@@ -64,6 +62,8 @@ type mutationBuilder struct {
 	// inserted into the target table. It is only populated for INSERT
 	// expressions. It is currently used to inline constant insert values into
 	// uniqueness checks.
+	//
+	// insertExpr may not be set (e.g. if there are INSERT triggers).
 	insertExpr memo.RelExpr
 
 	// targetColList is an ordered list of IDs of the table columns into which
@@ -80,6 +80,12 @@ type mutationBuilder struct {
 	// inserted are set to 0 (e.g. delete-only mutation columns). insertColIDs
 	// is empty if this is not an Insert/Upsert operator.
 	insertColIDs opt.OptionalColList
+
+	// implicitInsertCols contains columns in insertColIDs which were not given
+	// explicit values in the insert statement, if b.trackSchemaDeps is true.
+	// It does not include columns that were explicitly given the value of
+	// DEFAULT, e.g., INSERT INTO t VALUES (1, DEFAULT).
+	implicitInsertCols opt.ColSet
 
 	// fetchColIDs lists the input column IDs storing values which are fetched
 	// from the target table in order to provide existing values that will form
@@ -133,6 +139,31 @@ type mutationBuilder struct {
 	// the table.
 	partialIndexDelColIDs opt.OptionalColList
 
+	// vectorIndexDelPartitionColIDs lists the input column IDs storing the keys
+	// for the partitions that the deleted or updated rows should be removed from.
+	// The length is always equal to the number of vector indexes on the table.
+	vectorIndexDelPartitionColIDs opt.OptionalColList
+
+	// vectorIndexPutPartitionColIDs lists the input column IDs storing the keys
+	// for the partitions that the inserted or updated rows should be added to.
+	// The length is always equal to the number of vector indexes on the table.
+	vectorIndexPutPartitionColIDs opt.OptionalColList
+
+	// vectorIndexPutCentroidColIDs lists the input column IDs storing the
+	// centroids for the partitions that the inserted or updated rows should be
+	// added to. Note that centroids are not needed for deletions. The length is
+	// always equal to the number of vector indexes on the table.
+	vectorIndexPutCentroidColIDs opt.OptionalColList
+
+	// triggerColIDs is the set of column IDs used to project the OLD and NEW rows
+	// for row-level AFTER triggers, and possibly also contains the canary column.
+	// It is only populated if the mutation statement has row-level AFTER
+	// triggers.
+	//
+	// NOTE: triggerColIDs may contain columns both contained and not contained in
+	// the lists above.
+	triggerColIDs opt.ColSet
+
 	// canaryColID is the ID of the column that is used to decide whether to
 	// insert or update each row. If the canary column's value is null, then it's
 	// an insert; otherwise it's an update.
@@ -172,11 +203,18 @@ type mutationBuilder struct {
 	// uniqueChecks contains unique check queries; see buildUnique* methods.
 	uniqueChecks memo.UniqueChecksExpr
 
+	// fastPathUniqueChecks contains fast path unique check queries which are used for
+	// insert fast path; see buildInsertionCheck.
+	fastPathUniqueChecks memo.FastPathUniqueChecksExpr
+
 	// fkChecks contains foreign key check queries; see buildFK* methods.
 	fkChecks memo.FKChecksExpr
 
 	// cascades contains foreign key check cascades; see buildFK* methods.
 	cascades memo.FKCascades
+
+	// afterTriggers contains AFTER triggers; see buildRowLevelAfterTriggers.
+	afterTriggers *memo.AfterTriggers
 
 	// withID is nonzero if we need to buffer the input for FK or uniqueness
 	// checks.
@@ -198,6 +236,14 @@ type mutationBuilder struct {
 	// arbiterPredicateHelper is used to prevent allocating the helper
 	// separately.
 	arbiterPredicateHelper arbiterPredicateHelper
+
+	// inputForInsertExpr stores the result of outscope.expr from the most
+	// recent call to buildInputForInsert.
+	inputForInsertExpr memo.RelExpr
+
+	// uniqueWithTombstoneIndexes is the set of unique indexes that ensure uniqueness
+	// by writing tombstones to all partitions
+	uniqueWithTombstoneIndexes intsets.Fast
 }
 
 func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias tree.TableName) {
@@ -211,19 +257,31 @@ func (mb *mutationBuilder) init(b *Builder, opName string, tab cat.Table, alias 
 		alias:  alias,
 	}
 
-	n := tab.ColumnCount()
-	mb.targetColList = make(opt.ColList, 0, n)
+	tabCols := tab.ColumnCount()
+	mb.targetColList = make(opt.ColList, 0, tabCols)
 
 	// Allocate segmented array of column IDs.
 	numPartialIndexes := partialIndexCount(tab)
-	colIDs := make(opt.OptionalColList, n*4+tab.CheckCount()+2*numPartialIndexes)
-	mb.insertColIDs = colIDs[:n]
-	mb.fetchColIDs = colIDs[n : n*2]
-	mb.updateColIDs = colIDs[n*2 : n*3]
-	mb.upsertColIDs = colIDs[n*3 : n*4]
-	mb.checkColIDs = colIDs[n*4 : n*4+tab.CheckCount()]
-	mb.partialIndexPutColIDs = colIDs[n*4+tab.CheckCount() : n*4+tab.CheckCount()+numPartialIndexes]
-	mb.partialIndexDelColIDs = colIDs[n*4+tab.CheckCount()+numPartialIndexes:]
+	numVectorIndexes := vectorIndexCount(tab)
+	numChecks := tab.CheckCount()
+	colIDs := make(opt.OptionalColList, 4*tabCols+numChecks+2*numPartialIndexes+3*numVectorIndexes)
+
+	var start int
+	getSlice := func(n int) opt.OptionalColList {
+		slice := colIDs[start : start+n]
+		start += n
+		return slice
+	}
+	mb.insertColIDs = getSlice(tabCols)
+	mb.fetchColIDs = getSlice(tabCols)
+	mb.updateColIDs = getSlice(tabCols)
+	mb.upsertColIDs = getSlice(tabCols)
+	mb.checkColIDs = getSlice(numChecks)
+	mb.partialIndexPutColIDs = getSlice(numPartialIndexes)
+	mb.partialIndexDelColIDs = getSlice(numPartialIndexes)
+	mb.vectorIndexPutPartitionColIDs = getSlice(numVectorIndexes)
+	mb.vectorIndexPutCentroidColIDs = getSlice(numVectorIndexes)
+	mb.vectorIndexDelPartitionColIDs = getSlice(numVectorIndexes)
 
 	// Add the table and its columns (including mutation columns) to metadata.
 	mb.tabID = mb.md.AddTable(tab, &mb.alias)
@@ -279,6 +337,13 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		telemetry.Inc(sqltelemetry.IndexHintUpdateUseCounter)
 	}
 
+	if mb.b.evalCtx.SessionData().AvoidFullTableScansInMutations {
+		if indexFlags == nil {
+			indexFlags = &tree.IndexFlags{}
+		}
+		indexFlags.AvoidFullScan = true
+	}
+
 	// Fetch columns from different instance of the table metadata, so that it's
 	// possible to remap columns, as in this example:
 	//
@@ -297,6 +362,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 		noRowLocking,
 		inScope,
 		false, /* disableNotVisibleIndex */
+		cat.PolicyScopeUpdate,
 	)
 
 	// Set list of columns that will be fetched by the input expression.
@@ -306,7 +372,7 @@ func (mb *mutationBuilder) buildInputForUpdate(
 	// together with the table being updated.
 	fromClausePresent := len(from) > 0
 	if fromClausePresent {
-		fromScope := mb.b.buildFromTables(from, noRowLocking, inScope)
+		fromScope := mb.b.buildFromTables(from, noLocking, inScope)
 
 		// Check that the same table name is not used multiple times.
 		mb.b.validateJoinTableNames(mb.fetchScope, fromScope)
@@ -389,6 +455,13 @@ func (mb *mutationBuilder) buildInputForDelete(
 		telemetry.Inc(sqltelemetry.IndexHintDeleteUseCounter)
 	}
 
+	if mb.b.evalCtx.SessionData().AvoidFullTableScansInMutations {
+		if indexFlags == nil {
+			indexFlags = &tree.IndexFlags{}
+		}
+		indexFlags.AvoidFullScan = true
+	}
+
 	// Fetch columns from different instance of the table metadata, so that it's
 	// possible to remap columns, as in this example:
 	//
@@ -408,6 +481,7 @@ func (mb *mutationBuilder) buildInputForDelete(
 		noRowLocking,
 		inScope,
 		false, /* disableNotVisibleIndex */
+		cat.PolicyScopeDelete,
 	)
 
 	// Set list of columns that will be fetched by the input expression.
@@ -416,7 +490,7 @@ func (mb *mutationBuilder) buildInputForDelete(
 	// USING
 	usingClausePresent := len(using) > 0
 	if usingClausePresent {
-		usingScope := mb.b.buildFromTables(using, noRowLocking, inScope)
+		usingScope := mb.b.buildFromTables(using, noLocking, inScope)
 
 		// Check that the same table name is not used multiple times.
 		mb.b.validateJoinTableNames(mb.fetchScope, usingScope)
@@ -684,6 +758,11 @@ func (mb *mutationBuilder) addSynthesizedDefaultCols(
 		// Remember id of newly synthesized column.
 		colIDs[i] = newCol
 
+		// Track columns that were not explicitly set in the insert statement.
+		if mb.b.trackSchemaDeps {
+			mb.implicitInsertCols.Add(newCol)
+		}
+
 		// Add corresponding target column.
 		mb.targetColList = append(mb.targetColList, tabColID)
 		mb.targetColSet.Add(tabColID)
@@ -792,7 +871,8 @@ func (mb *mutationBuilder) addCheckConstraintCols(isUpdate bool) {
 		mutationCols := mb.mutationColumnIDs()
 
 		for i, n := 0, mb.tab.CheckCount(); i < n; i++ {
-			expr, err := parser.ParseExpr(mb.tab.Check(i).Constraint)
+			check := mb.tab.Check(i)
+			expr, err := parser.ParseExpr(check.Constraint())
 			if err != nil {
 				panic(err)
 			}
@@ -815,12 +895,62 @@ func (mb *mutationBuilder) addCheckConstraintCols(isUpdate bool) {
 			// expression are being mutated.
 			if !isUpdate || referencedCols.Intersects(mutationCols) {
 				mb.checkColIDs[i] = scopeCol.id
+
+				// TODO(michae2): Under weaker isolation levels we need to use shared
+				// locking to enforce multi-column-family check constraints. Disallow it
+				// for now.
+				//
+				// When do we need the locking? If:
+				// - The check constraint involves a column family that is updated
+				//   (otherwise we don't need to do anything to maintain this constraint)
+				// - And the check constraint involves a column family that is *not*
+				//   updated, but *is* read. In this case we don't have an intent, so
+				//   we need a lock. But we're not currently taking that lock.
+				if mb.b.evalCtx.TxnIsoLevel != isolation.Serializable {
+					// Find the columns referenced in the check constraint that are being
+					// read and updated.
+					var readColOrds, updateColOrds intsets.Fast
+					for j, n := 0, check.ColumnCount(); j < n; j++ {
+						ord := check.ColumnOrdinal(j)
+						if mb.fetchColIDs[ord] != 0 {
+							readColOrds.Add(ord)
+						}
+						if mb.updateColIDs[ord] != 0 {
+							updateColOrds.Add(ord)
+						}
+					}
+					// If some of the check constraint column families are being updated
+					// but others are only being read, return an error.
+					if updateColOrds.Len() > 0 {
+						readColFamilies := getColumnFamilySet(readColOrds, mb.tab)
+						updateColFamilies := getColumnFamilySet(updateColOrds, mb.tab)
+						if readColFamilies.Difference(updateColFamilies).Len() > 0 {
+							panic(unimplemented.NewWithIssuef(112488,
+								"multi-column-family check constraints are not yet supported under read committed isolation",
+							))
+						}
+					}
+				}
 			}
 		}
 
 		mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 		mb.outScope = projectionsScope
 	}
+}
+
+// getColumnFamilySet gets the set of column families represented in colOrdinals.
+func getColumnFamilySet(colOrdinals intsets.Fast, tab cat.Table) intsets.Fast {
+	families := intsets.Fast{}
+	for i := 0; i < tab.FamilyCount(); i++ {
+		fam := tab.Family(i)
+		for j := 0; j < fam.ColumnCount(); j++ {
+			if colOrdinals.Contains(fam.Column(j).Ordinal) {
+				families.Add(i)
+			}
+		}
+	}
+	return families
 }
 
 // mutationColumnIDs returns the set of all column IDs that will be mutated.
@@ -851,7 +981,7 @@ func (mb *mutationBuilder) projectPartialIndexPutCols() {
 	mb.projectPartialIndexColsImpl(mb.outScope, nil /* delScope */)
 }
 
-// projectPartialIndexDelCols builds a Project that synthesizes boolean PUT
+// projectPartialIndexDelCols builds a Project that synthesizes boolean DEL
 // columns for each partial index defined on the target table. See
 // partialIndexDelColIDs for more info on these columns.
 func (mb *mutationBuilder) projectPartialIndexDelCols() {
@@ -923,6 +1053,127 @@ func (mb *mutationBuilder) projectPartialIndexColsImpl(putScope, delScope *scope
 	}
 }
 
+// projectVectorIndexCols builds VectorPartitionSearch operators for the input
+// of a non-DELETE mutation. See projectVectorIndexColsImpl for details.
+func (mb *mutationBuilder) projectVectorIndexCols() {
+	mb.projectVectorIndexColsImpl(false /* delete */)
+}
+
+// projectVectorIndexCols builds VectorPartitionSearch operators for the input
+// of a DELETE mutation. See projectVectorIndexColsImpl for details.
+func (mb *mutationBuilder) projectVectorIndexColsForDelete() {
+	mb.projectVectorIndexColsImpl(true /* delete */)
+}
+
+// projectVectorIndexColsImpl builds VectorPartitionSearch operators that
+// project partitions to be the target of index insertions and deletions for
+// each vector index defined on the target table. This is needed because vector
+// indexes must perform a search to determine which partition a given vector
+// belongs to.
+//
+// See the vectorIndexPutPartitionColIDs, vectorIndexPutCentroidColIDs, and
+// vectorIndexDelPartitionColIDs fields for more information.
+func (mb *mutationBuilder) projectVectorIndexColsImpl(delete bool) {
+	if vectorIndexCount(mb.tab) > 0 {
+		var pkCols opt.ColSet
+		getPKCols := func() opt.ColSet {
+			if !pkCols.Empty() {
+				return pkCols
+			}
+			primaryIndex := mb.tab.Index(cat.PrimaryIndex)
+			for i := 0; i < primaryIndex.KeyColumnCount(); i++ {
+				col := primaryIndex.Column(i)
+				pkCols.Add(mb.fetchColIDs[col.Ordinal()])
+			}
+			return pkCols
+		}
+		getPutCol := func(colOrd int) opt.ColumnID {
+			if mb.upsertColIDs[colOrd] != 0 {
+				// If set, the upsert column will have the new value for the column
+				// regardless of whether the row is inserted or updated.
+				return mb.upsertColIDs[colOrd]
+			}
+			if mb.insertColIDs[colOrd] != 0 {
+				// A new value is being inserted for the column.
+				return mb.insertColIDs[colOrd]
+			}
+			// Either the column is being updated, or it does not have a new value.
+			return mb.updateColIDs[colOrd]
+		}
+		getDelCol := func(colOrd int) opt.ColumnID {
+			if !delete && mb.updateColIDs[colOrd] == 0 {
+				// For INSERT, UPDATE, and UPSERT, old index entries are only deleted
+				// for rows where the vector column is being updated.
+				return 0
+			}
+			// If there is an old version of the vector column, delete its entry from
+			// the vector index.
+			return mb.fetchColIDs[colOrd]
+		}
+		addCol := func(name string, typ *types.T) opt.ColumnID {
+			colName := scopeColName("").WithMetadataName(name)
+			sc := mb.b.synthesizeColumn(mb.outScope, colName, typ, nil /* expr */, nil /* expr */)
+			return sc.id
+		}
+		idxOrd := 0
+		for i, n := 0, mb.tab.DeletableIndexCount(); i < n; i++ {
+			index := mb.tab.Index(i)
+
+			// Skip non-vector indexes.
+			if index.Type() != idxtype.VECTOR {
+				continue
+			}
+			vectorColOrd := index.VectorColumn().Ordinal()
+			vectorColTyp := index.VectorColumn().DatumType()
+			if delCol := getDelCol(vectorColOrd); delCol != 0 {
+				partitionCol := addCol(fmt.Sprintf("vector_index_del_partition%d", idxOrd+1), types.Int)
+				outCols := mb.outScope.colSet()
+				outCols.Add(partitionCol)
+				mb.outScope.expr = mb.buildVectorPartitionSearch(
+					mb.outScope.expr, index, delCol, partitionCol, 0 /* centroidCol */, getPKCols(),
+				)
+				mb.vectorIndexDelPartitionColIDs[idxOrd] = partitionCol
+			}
+			if putCol := getPutCol(vectorColOrd); putCol != 0 {
+				partitionCol := addCol(fmt.Sprintf("vector_index_put_partition%d", idxOrd+1), types.Int)
+				centroidCol := addCol(fmt.Sprintf("vector_index_put_centroid%d", idxOrd+1), vectorColTyp)
+				outCols := mb.outScope.colSet()
+				outCols.Add(partitionCol)
+				outCols.Add(centroidCol)
+				mb.outScope.expr = mb.buildVectorPartitionSearch(
+					mb.outScope.expr, index, putCol, partitionCol, centroidCol, opt.ColSet{}, /* pkCols */
+				)
+				mb.vectorIndexPutPartitionColIDs[idxOrd] = partitionCol
+				mb.vectorIndexPutCentroidColIDs[idxOrd] = centroidCol
+			}
+			idxOrd++
+		}
+	}
+}
+
+// buildVectorPartitionSearch builds a VectorPartitionSearch operator that will
+// find the partition (and centroid, if requested) for vectors in the given
+// queryVectorCol.
+//
+// pkCols should only be set for an index del operation. It is used to locate
+// the partition for a specific row in the table.
+func (mb *mutationBuilder) buildVectorPartitionSearch(
+	input memo.RelExpr,
+	index cat.Index,
+	queryVectorCol, partitionCol, centroidCol opt.ColumnID,
+	pkCols opt.ColSet,
+) memo.RelExpr {
+	private := memo.VectorPartitionSearchPrivate{
+		Table:          mb.tabID,
+		Index:          index.Ordinal(),
+		QueryVectorCol: queryVectorCol,
+		PrimaryKeyCols: pkCols,
+		PartitionCol:   partitionCol,
+		CentroidCol:    centroidCol,
+	}
+	return mb.b.factory.ConstructVectorPartitionSearch(input, &private)
+}
+
 // computedColumnScope returns a new scope that can be used to build computed
 // column expressions. Columns will never be ambiguous because each column in
 // the returned scope maps to a single column in the target table.
@@ -990,21 +1241,29 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 	}
 
 	private := &memo.MutationPrivate{
-		Table:               mb.tabID,
-		InsertCols:          checkEmptyList(mb.insertColIDs),
-		FetchCols:           checkEmptyList(mb.fetchColIDs),
-		UpdateCols:          checkEmptyList(mb.updateColIDs),
-		CanaryCol:           mb.canaryColID,
-		ArbiterIndexes:      mb.arbiters.IndexOrdinals(),
-		ArbiterConstraints:  mb.arbiters.UniqueConstraintOrdinals(),
-		CheckCols:           checkEmptyList(mb.checkColIDs),
-		PartialIndexPutCols: checkEmptyList(mb.partialIndexPutColIDs),
-		PartialIndexDelCols: checkEmptyList(mb.partialIndexDelColIDs),
-		FKCascades:          mb.cascades,
+		Table:                       mb.tabID,
+		InsertCols:                  checkEmptyList(mb.insertColIDs),
+		FetchCols:                   checkEmptyList(mb.fetchColIDs),
+		UpdateCols:                  checkEmptyList(mb.updateColIDs),
+		CanaryCol:                   mb.canaryColID,
+		ArbiterIndexes:              mb.arbiters.IndexOrdinals(),
+		ArbiterConstraints:          mb.arbiters.UniqueConstraintOrdinals(),
+		CheckCols:                   checkEmptyList(mb.checkColIDs),
+		PartialIndexPutCols:         checkEmptyList(mb.partialIndexPutColIDs),
+		PartialIndexDelCols:         checkEmptyList(mb.partialIndexDelColIDs),
+		VectorIndexPutPartitionCols: checkEmptyList(mb.vectorIndexPutPartitionColIDs),
+		VectorIndexPutCentroidCols:  checkEmptyList(mb.vectorIndexPutCentroidColIDs),
+		VectorIndexDelPartitionCols: checkEmptyList(mb.vectorIndexDelPartitionColIDs),
+		TriggerCols:                 mb.triggerColIDs,
+		FKCascades:                  mb.cascades,
+		AfterTriggers:               mb.afterTriggers,
+		UniqueWithTombstoneIndexes:  mb.uniqueWithTombstoneIndexes.Ordered(),
 	}
 
-	// If we didn't actually plan any checks or cascades, don't buffer the input.
-	if len(mb.uniqueChecks) > 0 || len(mb.fkChecks) > 0 || len(mb.cascades) > 0 {
+	// If we didn't actually plan any checks, cascades, or triggers, don't buffer
+	// the input.
+	if len(mb.uniqueChecks) > 0 || len(mb.fkChecks) > 0 ||
+		len(mb.cascades) > 0 || mb.afterTriggers != nil {
 		private.WithID = mb.withID
 	}
 
@@ -1393,6 +1652,16 @@ func partialIndexCount(tab cat.Table) int {
 	return count
 }
 
+func vectorIndexCount(tab cat.Table) int {
+	count := 0
+	for i, n := 0, tab.DeletableIndexCount(); i < n; i++ {
+		if tab.Index(i).Type() == idxtype.VECTOR {
+			count++
+		}
+	}
+	return count
+}
+
 type checkInputScanType uint8
 
 const (
@@ -1466,7 +1735,11 @@ func (mb *mutationBuilder) buildCheckInputScan(
 	// TODO(mgartner): We do not currently inline constants for FK checks
 	// because this would break the insert fast path. The fast path can
 	// currently only be planned when FK checks are built with WithScans.
-	if !isFK && mb.insertExpr != nil {
+	//
+	// We also do not inline constants for checks that have row-level triggers
+	// because the triggers may modify the values that are being checked.
+	if !isFK && mb.insertExpr != nil &&
+		!cat.HasRowLevelTriggers(mb.tab, tree.TriggerActionTimeBefore, tree.TriggerEventInsert) {
 		// Find the constant columns produced by the insert expression. All
 		// input columns must be constant in order to inline them.
 		constCols := memo.FindInlinableConstants(mb.insertExpr)

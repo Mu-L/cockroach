@@ -1,17 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package row
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -32,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
@@ -52,7 +49,7 @@ func getKVBatchSize(forceProductionKVBatchSize bool) rowinfra.KeyLimit {
 	return defaultKVBatchSize
 }
 
-var defaultKVBatchSize = rowinfra.KeyLimit(util.ConstantWithMetamorphicTestValue(
+var defaultKVBatchSize = rowinfra.KeyLimit(metamorphic.ConstantWithTestValue(
 	"kv-batch-size",
 	int(rowinfra.ProductionKVBatchSize), /* defaultValue */
 	1,                                   /* metamorphicValue */
@@ -135,7 +132,7 @@ func (s *identifiableSpans) reset() {
 
 // txnKVFetcher handles retrieval of key/values.
 type txnKVFetcher struct {
-	kvBatchFetcherHelper
+	kvBatchMetrics
 	// "Constant" fields, provided by the caller.
 	sendFn sendFunc
 	// spans is the list of Spans that will be read by this KV Fetcher. If an
@@ -174,16 +171,22 @@ type txnKVFetcher struct {
 	scanFormat     kvpb.ScanFormat
 	indexFetchSpec *fetchpb.IndexFetchSpec
 
-	reverse bool
+	reverse       bool
+	rawMVCCValues bool
 	// lockStrength represents the locking mode to use when fetching KVs.
 	lockStrength lock.Strength
 	// lockWaitPolicy represents the policy to be used for handling conflicting
 	// locks held by other active transactions.
 	lockWaitPolicy lock.WaitPolicy
+	// lockDurability represents the locking durability to use.
+	lockDurability lock.Durability
 	// lockTimeout specifies the maximum amount of time that the fetcher will
 	// wait while attempting to acquire a lock on a key or while blocking on an
 	// existing lock in order to perform a non-locking read on a key.
 	lockTimeout time.Duration
+	// DeadlockTimeout specifies the amount of time before pushing the lock holder
+	// for deadlock detection.
+	deadlockTimeout time.Duration
 
 	// alreadyFetched indicates whether fetch() has already been executed at
 	// least once.
@@ -268,17 +271,72 @@ func (f *txnKVFetcher) getBatchKeyLimitForIdx(batchIdx int) rowinfra.KeyLimit {
 	}
 }
 
-func makeTxnKVFetcherDefaultSendFunc(txn *kv.Txn, batchRequestsIssued *int64) sendFunc {
+func makeSendFunc(
+	txn *kv.Txn, ext *fetchpb.IndexFetchSpec_ExternalRowData, batchRequestsIssued *int64,
+) sendFunc {
+	if ext != nil {
+		return makeExternalSpanSendFunc(ext, txn.DB(), batchRequestsIssued)
+	}
 	return func(
 		ctx context.Context,
 		ba *kvpb.BatchRequest,
 	) (*kvpb.BatchResponse, error) {
+		log.VEventf(ctx, 2, "kv fetcher: sending a batch with %d requests", len(ba.Requests))
 		res, err := txn.Send(ctx, ba)
 		if err != nil {
 			return nil, err.GoError()
 		}
-		*batchRequestsIssued++
+		// Note that in some code paths there is no concurrency when using the
+		// sendFunc, but we choose to unconditionally use atomics here since its
+		// overhead should be negligible in the grand scheme of things anyway.
+		atomic.AddInt64(batchRequestsIssued, 1)
 		return res, nil
+	}
+}
+
+func makeExternalSpanSendFunc(
+	ext *fetchpb.IndexFetchSpec_ExternalRowData, db *kv.DB, batchRequestsIssued *int64,
+) sendFunc {
+	return func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
+		for _, req := range ba.Requests {
+			// We only allow external row data for a few known types of request.
+			switch r := req.GetInner().(type) {
+			case *kvpb.GetRequest:
+			case *kvpb.ScanRequest:
+			case *kvpb.ReverseScanRequest:
+			default:
+				return nil, errors.AssertionFailedf("request type %T unsupported for external row data", r)
+			}
+		}
+		log.VEventf(ctx, 2, "kv external fetcher: sending a batch with %d requests", len(ba.Requests))
+
+		// Open a new transaction with fixed timestamp set to the external
+		// timestamp. We must do this with txn.Send rather than using
+		// db.NonTransactionalSender to get the 1-to-1 request-response guarantee
+		// required by txnKVFetcher.
+		// TODO(michae2): Explore whether we should keep this transaction open for
+		// the duration of the surrounding transaction.
+		var res *kvpb.BatchResponse
+		err := db.TxnWithAdmissionControl(
+			ctx, ba.AdmissionHeader.Source, admissionpb.WorkPriority(ba.AdmissionHeader.Priority),
+			kv.SteppingDisabled,
+			func(ctx context.Context, txn *kv.Txn) error {
+				if err := txn.SetFixedTimestamp(ctx, ext.AsOf); err != nil {
+					return err
+				}
+				var err *kvpb.Error
+				res, err = txn.Send(ctx, ba)
+				if err != nil {
+					return err.GoError()
+				}
+				return nil
+			})
+
+		// Note that in some code paths there is no concurrency when using the
+		// sendFunc, but we choose to unconditionally use atomics here since its
+		// overhead should be negligible in the grand scheme of things anyway.
+		atomic.AddInt64(batchRequestsIssued, 1)
+		return res, err
 	}
 }
 
@@ -287,11 +345,14 @@ type newTxnKVFetcherArgs struct {
 	reverse                    bool
 	lockStrength               descpb.ScanLockingStrength
 	lockWaitPolicy             descpb.ScanLockingWaitPolicy
+	lockDurability             descpb.ScanLockingDurability
 	lockTimeout                time.Duration
+	deadlockTimeout            time.Duration
 	acc                        *mon.BoundAccount
 	forceProductionKVBatchSize bool
 	kvPairsRead                *int64
 	batchRequestsIssued        *int64
+	rawMVCCValues              bool
 
 	admission struct { // groups AC-related fields
 		requestHeader  kvpb.AdmissionHeader
@@ -312,9 +373,12 @@ func newTxnKVFetcherInternal(args newTxnKVFetcherArgs) *txnKVFetcher {
 		// Default to BATCH_RESPONSE. The caller will override if needed.
 		scanFormat:                 kvpb.BATCH_RESPONSE,
 		reverse:                    args.reverse,
+		rawMVCCValues:              args.rawMVCCValues,
 		lockStrength:               GetKeyLockingStrength(args.lockStrength),
 		lockWaitPolicy:             GetWaitPolicy(args.lockWaitPolicy),
+		lockDurability:             GetKeyLockingDurability(args.lockDurability),
 		lockTimeout:                args.lockTimeout,
+		deadlockTimeout:            args.deadlockTimeout,
 		acc:                        args.acc,
 		forceProductionKVBatchSize: args.forceProductionKVBatchSize,
 		requestAdmissionHeader:     args.admission.requestHeader,
@@ -326,7 +390,7 @@ func newTxnKVFetcherInternal(args newTxnKVFetcherArgs) *txnKVFetcher {
 		args.admission.pacerFactory,
 		args.admission.settingsValues,
 	)
-	f.kvBatchFetcherHelper.init(f.nextBatch, args.kvPairsRead, args.batchRequestsIssued)
+	f.kvBatchMetrics.init(args.kvPairsRead, args.batchRequestsIssued)
 	return f
 }
 
@@ -338,7 +402,7 @@ func (f *txnKVFetcher) setTxnAndSendFn(txn *kv.Txn, sendFn sendFunc) {
 	f.responseAdmissionQ = txn.DB().SQLKVResponseAdmissionQ
 
 	f.admissionPacer.Close()
-	f.maybeInitAdmissionPacer(txn.AdmissionHeader(), txn.DB().AdmissionPacerFactory, txn.DB().SettingsValues)
+	f.maybeInitAdmissionPacer(txn.AdmissionHeader(), txn.DB().AdmissionPacerFactory, txn.DB().SettingsValues())
 }
 
 // maybeInitAdmissionPacer selectively initializes an admission.Pacer for work
@@ -347,15 +411,14 @@ func (f *txnKVFetcher) setTxnAndSendFn(txn *kv.Txn, sendFn sendFunc) {
 func (f *txnKVFetcher) maybeInitAdmissionPacer(
 	admissionHeader kvpb.AdmissionHeader, pacerFactory admission.PacerFactory, sv *settings.Values,
 ) {
-	if sv == nil {
+	if pacerFactory == nil {
 		// Only nil in tests and in SQL pods (we don't have admission pacing in
 		// the latter anyway).
 		return
 	}
 	admissionPri := admissionpb.WorkPriority(admissionHeader.Priority)
 	if internalLowPriReadElasticControlEnabled.Get(sv) &&
-		admissionPri < admissionpb.UserLowPri &&
-		pacerFactory != nil {
+		admissionPri < admissionpb.UserLowPri {
 
 		f.admissionPacer = pacerFactory.NewPacer(
 			elasticCPUDurationPerLowPriReadResponse.Get(sv),
@@ -487,7 +550,7 @@ func (f *txnKVFetcher) SetupNextFetch(
 
 	// Account for the memory of the spans that we're taking the ownership of.
 	if f.acc != nil {
-		newSpansAccountedFor := spans.MemUsage()
+		newSpansAccountedFor := spans.MemUsageUpToLen()
 		if err := f.acc.Grow(ctx, newSpansAccountedFor); err != nil {
 			return err
 		}
@@ -525,9 +588,20 @@ func (f *txnKVFetcher) SetupNextFetch(
 
 // fetch retrieves spans from the kv layer.
 func (f *txnKVFetcher) fetch(ctx context.Context) error {
+	// Note that spansToRequests below might modify spans, so we need to log the
+	// spans before that.
+	if log.ExpensiveLogEnabled(ctx, 2) {
+		lockStr := ""
+		if f.lockStrength != lock.None {
+			lockStr = fmt.Sprintf(" lock %s (%s, %s)", f.lockStrength.String(), f.lockWaitPolicy.String(), f.lockDurability.String())
+		}
+		log.VEventf(ctx, 2, "Scan %s%s", f.spans.BoundedString(1024 /* bytesHint */), lockStr)
+	}
+
 	ba := &kvpb.BatchRequest{}
 	ba.Header.WaitPolicy = f.lockWaitPolicy
 	ba.Header.LockTimeout = f.lockTimeout
+	ba.Header.DeadlockTimeout = f.deadlockTimeout
 	ba.Header.TargetBytes = int64(f.batchBytesLimit)
 	ba.Header.MaxSpanRequestKeys = int64(f.getBatchKeyLimit())
 	if buildutil.CrdbTestBuild {
@@ -544,11 +618,9 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 		ba.Header.WholeRowsOfSize = int32(f.indexFetchSpec.MaxKeysPerRow)
 	}
 	ba.AdmissionHeader = f.requestAdmissionHeader
-	ba.Requests = spansToRequests(f.spans.Spans, f.scanFormat, f.reverse, f.lockStrength, f.reqsScratch)
-
-	if log.ExpensiveLogEnabled(ctx, 2) {
-		log.VEventf(ctx, 2, "Scan %s", f.spans)
-	}
+	ba.Requests = spansToRequests(
+		f.spans.Spans, f.scanFormat, f.reverse, f.rawMVCCValues, f.lockStrength, f.lockDurability, f.reqsScratch,
+	)
 
 	monitoring := f.acc != nil
 
@@ -625,9 +697,16 @@ func (f *txnKVFetcher) fetch(ctx context.Context) error {
 	// after making sure to nil out the requests in order to lose references to
 	// the underlying Get and Scan requests which could keep large byte slices
 	// alive.
-	f.reqsScratch = ba.Requests
-	for i := range f.reqsScratch {
-		f.reqsScratch[i] = kvpb.RequestUnion{}
+	//
+	// However, we do not re-use the requests slice if we're using the replicated
+	// lock durability, since the requests may be pipelined through raft, which
+	// causes references to the requests to be retained even after their response
+	// has been returned.
+	if f.lockDurability != lock.Replicated {
+		f.reqsScratch = ba.Requests
+		for i := range f.reqsScratch {
+			f.reqsScratch[i] = kvpb.RequestUnion{}
+		}
 	}
 	if monitoring {
 		reqsScratchMemUsage := requestUnionOverhead * int64(cap(f.reqsScratch))
@@ -721,6 +800,16 @@ func popBatch(
 	colBatch, remainingColBatches = colBatches[0], colBatches[1:]
 	colBatches[0] = nil
 	return nil, nil, colBatch, remainingColBatches
+}
+
+// NextBatch implements the KVBatchFetcher interface.
+func (f *txnKVFetcher) NextBatch(ctx context.Context) (KVBatchFetcherResponse, error) {
+	resp, err := f.nextBatch(ctx)
+	if !resp.MoreKVs || err != nil {
+		return resp, err
+	}
+	f.kvBatchMetrics.Record(resp)
+	return resp, nil
 }
 
 func (f *txnKVFetcher) nextBatch(ctx context.Context) (resp KVBatchFetcherResponse, err error) {
@@ -840,7 +929,7 @@ func (f *txnKVFetcher) nextBatch(ctx context.Context) (resp KVBatchFetcherRespon
 		// We have some resume spans.
 		f.spans = f.scratchSpans
 		if f.acc != nil {
-			newSpansMemUsage := f.spans.MemUsage()
+			newSpansMemUsage := f.spans.MemUsageUpToLen()
 			if err := f.acc.Resize(ctx, f.spansAccountedFor, newSpansMemUsage); err != nil {
 				return KVBatchFetcherResponse{}, err
 			}
@@ -885,11 +974,17 @@ const requestUnionOverhead = int64(unsafe.Sizeof(kvpb.RequestUnion{}))
 //
 // The provided reqsScratch is reused if it has enough capacity for all spans,
 // if not, a new slice is allocated.
+//
+// NOTE: any span that results in a Scan or a ReverseScan request is nil-ed out.
+// This is because both callers of this method no longer need the original span
+// unless it resulted in a Get request.
 func spansToRequests(
 	spans roachpb.Spans,
 	scanFormat kvpb.ScanFormat,
 	reverse bool,
-	keyLocking lock.Strength,
+	rawMVCCValues bool,
+	lockStrength lock.Strength,
+	lockDurability lock.Durability,
 	reqsScratch []kvpb.RequestUnion,
 ) []kvpb.RequestUnion {
 	var reqs []kvpb.RequestUnion
@@ -923,8 +1018,9 @@ func spansToRequests(
 				// A span without an EndKey indicates that the caller is requesting a
 				// single key fetch, which can be served using a GetRequest.
 				gets[curGet].req.Key = spans[i].Key
-				gets[curGet].req.KeyLocking = keyLocking
-				// TODO(michae2): Once #100193 is finished, also include locking durability.
+				gets[curGet].req.KeyLockingStrength = lockStrength
+				gets[curGet].req.KeyLockingDurability = lockDurability
+				gets[curGet].req.ReturnRawMVCCValues = rawMVCCValues
 				gets[curGet].union.Get = &gets[curGet].req
 				reqs[i].Value = &gets[curGet].union
 				curGet++
@@ -932,9 +1028,11 @@ func spansToRequests(
 			}
 			curScan := i - curGet
 			scans[curScan].req.SetSpan(spans[i])
+			spans[i] = roachpb.Span{}
 			scans[curScan].req.ScanFormat = scanFormat
-			scans[curScan].req.KeyLocking = keyLocking
-			// TODO(michae2): Once #100193 is finished, also include locking durability.
+			scans[curScan].req.ReturnRawMVCCValues = rawMVCCValues
+			scans[curScan].req.KeyLockingStrength = lockStrength
+			scans[curScan].req.KeyLockingDurability = lockDurability
 			scans[curScan].union.ReverseScan = &scans[curScan].req
 			reqs[i].Value = &scans[curScan].union
 		}
@@ -948,8 +1046,9 @@ func spansToRequests(
 				// A span without an EndKey indicates that the caller is requesting a
 				// single key fetch, which can be served using a GetRequest.
 				gets[curGet].req.Key = spans[i].Key
-				gets[curGet].req.KeyLocking = keyLocking
-				// TODO(michae2): Once #100193 is finished, also include locking durability.
+				gets[curGet].req.KeyLockingStrength = lockStrength
+				gets[curGet].req.KeyLockingDurability = lockDurability
+				gets[curGet].req.ReturnRawMVCCValues = rawMVCCValues
 				gets[curGet].union.Get = &gets[curGet].req
 				reqs[i].Value = &gets[curGet].union
 				curGet++
@@ -957,9 +1056,11 @@ func spansToRequests(
 			}
 			curScan := i - curGet
 			scans[curScan].req.SetSpan(spans[i])
+			spans[i] = roachpb.Span{}
 			scans[curScan].req.ScanFormat = scanFormat
-			scans[curScan].req.KeyLocking = keyLocking
-			// TODO(michae2): Once #100193 is finished, also include locking durability.
+			scans[curScan].req.KeyLockingStrength = lockStrength
+			scans[curScan].req.KeyLockingDurability = lockDurability
+			scans[curScan].req.ReturnRawMVCCValues = rawMVCCValues
 			scans[curScan].union.Scan = &scans[curScan].req
 			reqs[i].Value = &scans[curScan].union
 		}
@@ -967,33 +1068,24 @@ func spansToRequests(
 	return reqs
 }
 
-// kvBatchFetcherHelper is a small helper that extracts common logic for
-// implementing some methods of the KVBatchFetcher interface related to
-// observability.
-type kvBatchFetcherHelper struct {
-	nextBatch func(context.Context) (KVBatchFetcherResponse, error)
-	atomics   struct {
+// kvBatchMetrics tracks metrics and implements some of the methods for
+// the KVBatchFetcher interface related to observability.
+type kvBatchMetrics struct {
+	atomics struct {
 		bytesRead           int64
 		kvPairsRead         *int64
 		batchRequestsIssued *int64
 	}
 }
 
-func (h *kvBatchFetcherHelper) init(
-	nextBatch func(context.Context) (KVBatchFetcherResponse, error),
-	kvPairsRead, batchRequestsIssued *int64,
-) {
-	h.nextBatch = nextBatch
+func (h *kvBatchMetrics) init(kvPairsRead, batchRequestsIssued *int64) {
 	h.atomics.kvPairsRead = kvPairsRead
 	h.atomics.batchRequestsIssued = batchRequestsIssued
 }
 
-// NextBatch implements the KVBatchFetcher interface.
-func (h *kvBatchFetcherHelper) NextBatch(ctx context.Context) (KVBatchFetcherResponse, error) {
-	resp, err := h.nextBatch(ctx)
-	if !resp.MoreKVs || err != nil {
-		return resp, err
-	}
+// Record records metrics for the given batch response. It should be called
+// after each batch is fetched.
+func (h *kvBatchMetrics) Record(resp KVBatchFetcherResponse) {
 	atomic.AddInt64(h.atomics.kvPairsRead, resp.kvPairsRead)
 	// Note that if resp.ColBatch is nil, then GetBatchMemSize will return 0.
 	// TODO(yuzefovich, 23.1): for resp.ColBatch this includes the decoded
@@ -1006,11 +1098,10 @@ func (h *kvBatchFetcherHelper) NextBatch(ctx context.Context) (KVBatchFetcherRes
 		nBytes += len(resp.KVs[i].Value.RawBytes)
 	}
 	atomic.AddInt64(&h.atomics.bytesRead, int64(nBytes))
-	return resp, nil
 }
 
 // GetBytesRead implements the KVBatchFetcher interface.
-func (h *kvBatchFetcherHelper) GetBytesRead() int64 {
+func (h *kvBatchMetrics) GetBytesRead() int64 {
 	if h == nil {
 		return 0
 	}
@@ -1018,7 +1109,7 @@ func (h *kvBatchFetcherHelper) GetBytesRead() int64 {
 }
 
 // GetKVPairsRead implements the KVBatchFetcher interface.
-func (h *kvBatchFetcherHelper) GetKVPairsRead() int64 {
+func (h *kvBatchMetrics) GetKVPairsRead() int64 {
 	if h == nil || h.atomics.kvPairsRead == nil {
 		return 0
 	}
@@ -1026,7 +1117,7 @@ func (h *kvBatchFetcherHelper) GetKVPairsRead() int64 {
 }
 
 // GetBatchRequestsIssued implements the KVBatchFetcher interface.
-func (h *kvBatchFetcherHelper) GetBatchRequestsIssued() int64 {
+func (h *kvBatchMetrics) GetBatchRequestsIssued() int64 {
 	if h == nil || h.atomics.batchRequestsIssued == nil {
 		return 0
 	}

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests_test
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -31,7 +27,7 @@ func TestClusterID(t *testing.T) {
 	expected := tc.ApplicationLayer(0).RPCContext().LogicalClusterID.Get()
 
 	for i := 0; i < 3; i++ {
-		conn := tc.ApplicationLayer(i).SQLConn(t, "system")
+		conn := tc.ApplicationLayer(i).SQLConn(t, serverutils.DBName("system"))
 		db := sqlutils.MakeSQLRunner(conn)
 		var clusterID uuid.UUID
 		db.QueryRow(t, "SELECT crdb_internal.cluster_id()").Scan(&clusterID)

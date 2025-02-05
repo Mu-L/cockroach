@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tsearch
 
@@ -112,8 +107,8 @@ func TestEncodeTSQueryInvertedIndexSpans(t *testing.T) {
 		{`a:1 b:2`, `a <-> (!b|!c)`, true, false, true},
 		{`a:1 c:2`, `a <-> (!b|!c)`, true, false, true},
 		{`a:1 d:2`, `a <-> (!b|!c)`, true, false, true},
-		{`a:1 b:2 c:3 d:4`, `a <-> ((b <-> c) | d)`, true, false, false},
-		{`a:1 b:2 c:3 d:4`, `a <-> (b | (c <-> d))`, true, false, false},
+		{`a:1 b:2 c:3 d:4`, `a <-> ((b <-> c) | d)`, true, false, true},
+		{`a:1 b:2 c:3 d:4`, `a <-> (b | (c <-> d))`, true, false, true},
 	}
 
 	// runTest checks that evaluating `left @@ right` using keys from

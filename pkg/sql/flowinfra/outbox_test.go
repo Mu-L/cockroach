@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra_test
 
@@ -42,11 +37,11 @@ import (
 
 // staticAddressResolver maps StaticSQLInstanceID to the given address.
 func staticAddressResolver(addr net.Addr) nodedialer.AddressResolver {
-	return func(nodeID roachpb.NodeID) (net.Addr, error) {
+	return func(nodeID roachpb.NodeID) (net.Addr, roachpb.Locality, error) {
 		if nodeID == roachpb.NodeID(execinfra.StaticSQLInstanceID) {
-			return addr, nil
+			return addr, roachpb.Locality{}, nil
 		}
-		return nil, errors.Errorf("node %d not found", nodeID)
+		return nil, roachpb.Locality{}, errors.Errorf("node %d not found", nodeID)
 	}
 }
 
@@ -59,7 +54,7 @@ func TestOutbox(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	clock := hlc.NewClockForTesting(nil)
-	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
+	clusterID, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,9 +69,9 @@ func TestOutbox(t *testing.T) {
 		Mon:     evalCtx.TestingMon,
 		ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		Cfg: &execinfra.ServerConfig{
-			Settings:      st,
-			Stopper:       stopper,
-			PodNodeDialer: dialer,
+			Settings:          st,
+			Stopper:           stopper,
+			SQLInstanceDialer: dialer,
 		},
 		NodeID: base.TestingIDContainer,
 	}
@@ -224,7 +219,7 @@ func TestOutboxInitializesStreamBeforeReceivingAnyRows(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	clock := hlc.NewClockForTesting(nil)
-	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
+	clusterID, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,9 +235,9 @@ func TestOutboxInitializesStreamBeforeReceivingAnyRows(t *testing.T) {
 		Mon:     evalCtx.TestingMon,
 		ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		Cfg: &execinfra.ServerConfig{
-			Settings:      st,
-			Stopper:       stopper,
-			PodNodeDialer: dialer,
+			Settings:          st,
+			Stopper:           stopper,
+			SQLInstanceDialer: dialer,
 		},
 		NodeID: base.TestingIDContainer,
 	}
@@ -297,7 +292,7 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
 			clock := hlc.NewClockForTesting(nil)
-			clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
+			clusterID, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -313,9 +308,9 @@ func TestOutboxClosesWhenConsumerCloses(t *testing.T) {
 				Mon:     evalCtx.TestingMon,
 				ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 				Cfg: &execinfra.ServerConfig{
-					Settings:      st,
-					Stopper:       stopper,
-					PodNodeDialer: dialer,
+					Settings:          st,
+					Stopper:           stopper,
+					SQLInstanceDialer: dialer,
 				},
 				NodeID: base.TestingIDContainer,
 			}
@@ -375,7 +370,7 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	clock := hlc.NewClockForTesting(nil)
-	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
+	clusterID, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,9 +386,9 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 		Mon:     evalCtx.TestingMon,
 		ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		Cfg: &execinfra.ServerConfig{
-			Settings:      st,
-			Stopper:       stopper,
-			PodNodeDialer: dialer,
+			Settings:          st,
+			Stopper:           stopper,
+			SQLInstanceDialer: dialer,
 		},
 		NodeID: base.TestingIDContainer,
 	}
@@ -449,8 +444,8 @@ func TestOutboxUnblocksProducers(t *testing.T) {
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 			Stopper:  stopper,
-			// a nil PodNodeDialer will always fail to connect.
-			PodNodeDialer: nil,
+			// a nil SQLInstanceDialer will always fail to connect.
+			SQLInstanceDialer: nil,
 		},
 		NodeID: base.TestingIDContainer,
 	}
@@ -501,7 +496,7 @@ func BenchmarkOutbox(b *testing.B) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(bgCtx)
 	clock := hlc.NewClockForTesting(nil)
-	clusterID, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(bgCtx, clock, stopper, execinfra.StaticSQLInstanceID)
+	clusterID, mockServer, addr, err := flowinfra.StartMockDistSQLServer(bgCtx, clock, stopper, execinfra.StaticSQLInstanceID)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -523,9 +518,9 @@ func BenchmarkOutbox(b *testing.B) {
 				Mon:     evalCtx.TestingMon,
 				ID:      execinfrapb.FlowID{UUID: uuid.MakeV4()},
 				Cfg: &execinfra.ServerConfig{
-					Settings:      st,
-					Stopper:       stopper,
-					PodNodeDialer: dialer,
+					Settings:          st,
+					Stopper:           stopper,
+					SQLInstanceDialer: dialer,
 				},
 				NodeID: base.TestingIDContainer,
 			}

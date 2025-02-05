@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import React from "react";
-import { Anchor } from "src/anchor";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { Tooltip } from "@cockroachlabs/ui-components";
+import React from "react";
+
+import { Anchor } from "src/anchor";
+import { Timezone } from "src/timestamp";
 import {
   contentionTime,
   planningExecutionTime,
@@ -22,7 +18,6 @@ import {
   statementsSql,
   writtenToDisk,
 } from "src/util";
-import { Timezone } from "src/timestamp";
 
 // Single place for column names. Used in table columns and in columns selector.
 export const statisticsColumnLabels = {
@@ -31,16 +26,13 @@ export const statisticsColumnLabels = {
   bytesRead: "Bytes Read",
   clientAddress: "Client IP Address",
   contention: "Contention Time",
-  cpu: "CPU Time",
+  cpu: "SQL CPU Time",
   database: "Database",
   diagnostics: "Diagnostics",
   executionCount: "Execution Count",
   lastExecTimestamp: "Last Execution Time",
   latencyMax: "Max Latency",
   latencyMin: "Min Latency",
-  latencyP50: "P50 Latency",
-  latencyP90: "P90 Latency",
-  latencyP99: "P99 Latency",
   maxMemUsage: "Max Memory",
   maxMemUsed: "Maximum Memory Usage",
   memUsage: "Memory Usage",
@@ -62,6 +54,7 @@ export const statisticsColumnLabels = {
   statementsCount: "Statements",
   status: "Status",
   time: "Time",
+  commitLatency: "Commit Latency",
   transactionFingerprintId: "Transaction Fingerprint ID",
   transactions: "Transactions",
   txnDuration: "Transaction Duration",
@@ -559,6 +552,23 @@ export const statisticsTableTitles: StatisticTableTitleType = {
       </Tooltip>
     );
   },
+  commitLatency: (_statType: StatisticType) => {
+    return (
+      <Tooltip
+        placement="bottom"
+        style="tableTitle"
+        content={
+          <p>
+            Average commit latency of this transaction. The gray bar indicates
+            the mean latency. The blue bar indicates one standard deviation from
+            the mean.
+          </p>
+        }
+      >
+        {getLabel("commitLatency")}
+      </Tooltip>
+    );
+  },
   time: (statType: StatisticType) => {
     let contentModifier = "";
     let fingerprintModifier = "";
@@ -650,8 +660,9 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         content={
           <>
             <p>
-              Average CPU time spent executing within the specified time
-              interval. The gray bar indicates mean CPU time. The blue bar
+              Average SQL CPU time spent executing within the specified time
+              interval. It does not include SQL planning time nor KV execution
+              time. The gray bar indicates mean SQL CPU time. The blue bar
               indicates one standard deviation from the mean.
             </p>
           </>
@@ -946,84 +957,6 @@ export const statisticsTableTitles: StatisticTableTitleType = {
         }
       >
         {getLabel("latencyMin")}
-      </Tooltip>
-    );
-  },
-  latencyP50: (statType: StatisticType) => {
-    let contentModifier = "";
-    switch (statType) {
-      case "transaction":
-        contentModifier = contentModifiers.transaction;
-        break;
-      case "statement":
-        contentModifier = contentModifiers.statement;
-        break;
-    }
-
-    return (
-      <Tooltip
-        placement="bottom"
-        style="tableTitle"
-        content={
-          <p>
-            The 50th latency percentile for sampled {contentModifier} executions
-            with this fingerprint.
-          </p>
-        }
-      >
-        {getLabel("latencyP50")}
-      </Tooltip>
-    );
-  },
-  latencyP90: (statType: StatisticType) => {
-    let contentModifier = "";
-    switch (statType) {
-      case "transaction":
-        contentModifier = contentModifiers.transaction;
-        break;
-      case "statement":
-        contentModifier = contentModifiers.statement;
-        break;
-    }
-
-    return (
-      <Tooltip
-        placement="bottom"
-        style="tableTitle"
-        content={
-          <p>
-            The 90th latency percentile for sampled {contentModifier} executions
-            with this fingerprint.
-          </p>
-        }
-      >
-        {getLabel("latencyP90")}
-      </Tooltip>
-    );
-  },
-  latencyP99: (statType: StatisticType) => {
-    let contentModifier = "";
-    switch (statType) {
-      case "transaction":
-        contentModifier = contentModifiers.transaction;
-        break;
-      case "statement":
-        contentModifier = contentModifiers.statement;
-        break;
-    }
-
-    return (
-      <Tooltip
-        placement="bottom"
-        style="tableTitle"
-        content={
-          <p>
-            The 99th latency percentile for sampled {contentModifier} executions
-            with this fingerprint.
-          </p>
-        }
-      >
-        {getLabel("latencyP99")}
       </Tooltip>
     );
   },

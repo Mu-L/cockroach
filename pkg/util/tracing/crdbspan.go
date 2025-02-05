@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tracing
 
@@ -594,7 +589,6 @@ func (s *crdbSpan) finish() bool {
 			return false
 		}
 		s.mu.finished = true
-
 		if s.recordingType() != tracingpb.RecordingOff {
 			duration := timeutil.Since(s.startTime)
 			if duration == 0 {
@@ -766,7 +760,7 @@ func (s *crdbSpan) getVerboseRecording(includeDetachedChildren bool, finishing b
 		result.StructuredRecordsSizeBytes += result.Root.StructuredRecordsSizeBytes
 		for i := range oldEvents {
 			size := int64(oldEvents[i].Size())
-			if result.StructuredRecordsSizeBytes+size < maxStructuredBytesPerTrace {
+			if result.StructuredRecordsSizeBytes+size <= maxStructuredBytesPerTrace {
 				result.Root.AddStructuredRecord(oldEvents[i])
 				result.StructuredRecordsSizeBytes += size
 			}
@@ -889,14 +883,25 @@ func (s *crdbSpan) recordFinishedChildrenLocked(childRec Trace) {
 		childRec.Root.ParentSpanID = s.spanID
 		s.mu.recording.finishedChildren.addChildren([]Trace{childRec}, maxRecordedSpansPerTrace, maxStructuredBytesPerTrace)
 	case tracingpb.RecordingStructured:
-		buf := childRec.appendStructuredEventsRecursively(nil /* buffer */)
-		for i := range buf {
-			event := &buf[i]
-			if s.mu.recording.finishedChildren.StructuredRecordsSizeBytes+int64(event.MemorySize()) < maxStructuredBytesPerTrace {
-				size := s.mu.recording.finishedChildren.Root.AddStructuredRecord(*event)
-				s.mu.recording.finishedChildren.StructuredRecordsSizeBytes += size
+		fc := &s.mu.recording.finishedChildren
+		num := len(fc.Root.StructuredRecords)
+		fc.Root.StructuredRecords = childRec.appendStructuredEventsRecursively(fc.Root.StructuredRecords)
+		// Account for the size of the structured records that were appended,
+		// breaking out of the loop if we hit the byte limit. This incorporates
+		// the byte size accounting logic from RecordedSpan.AddStructuredRecord.
+		for ; num < len(fc.Root.StructuredRecords); num++ {
+			size := int64(fc.Root.StructuredRecords[num].MemorySize())
+			if fc.StructuredRecordsSizeBytes+size > maxStructuredBytesPerTrace {
+				break
 			}
+			fc.Root.StructuredRecordsSizeBytes += size
+			fc.StructuredRecordsSizeBytes += size
 		}
+		// Trim any remaining entries if we hit the byte limit.
+		for i := num; i < len(fc.Root.StructuredRecords); i++ {
+			fc.Root.StructuredRecords[i] = tracingpb.StructuredRecord{}
+		}
+		fc.Root.StructuredRecords = fc.Root.StructuredRecords[:num]
 	case tracingpb.RecordingOff:
 		break
 	default:
@@ -1096,9 +1101,11 @@ func (s *crdbSpan) appendStructuredEventsRecursivelyLocked(
 	for _, c := range s.mu.openChildren {
 		if c.collectRecording || includeDetachedChildren {
 			sp := c.span()
-			sp.mu.Lock()
-			buffer = sp.appendStructuredEventsRecursivelyLocked(buffer, includeDetachedChildren)
-			sp.mu.Unlock()
+			buffer = func() []tracingpb.StructuredRecord {
+				sp.mu.Lock()
+				defer sp.mu.Unlock()
+				return sp.appendStructuredEventsRecursivelyLocked(buffer, includeDetachedChildren)
+			}()
 		}
 	}
 	return s.mu.recording.finishedChildren.appendStructuredEventsRecursively(buffer)
@@ -1134,10 +1141,12 @@ func (s *crdbSpan) getChildrenMetadataRecursivelyLocked(
 	for _, c := range s.mu.openChildren {
 		if c.collectRecording || includeDetachedChildren {
 			sp := c.span()
-			sp.mu.Lock()
-			sp.getChildrenMetadataRecursivelyLocked(childrenMetadata,
-				true /*includeRootMetadata */, includeDetachedChildren)
-			sp.mu.Unlock()
+			func() {
+				sp.mu.Lock()
+				defer sp.mu.Unlock()
+				sp.getChildrenMetadataRecursivelyLocked(childrenMetadata,
+					true /*includeRootMetadata */, includeDetachedChildren)
+			}()
 		}
 	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package privilege
 
@@ -21,7 +16,7 @@ var targetObjectToPrivilegeObject = map[TargetObjectType]ObjectType{
 	Sequences: Sequence,
 	Schemas:   Schema,
 	Types:     Type,
-	Functions: Function,
+	Routines:  Routine,
 }
 
 // ToObjectType returns the privilege.ObjectType corresponding to
@@ -38,7 +33,7 @@ const (
 	Sequences TargetObjectType = 2
 	Types     TargetObjectType = 3
 	Schemas   TargetObjectType = 4
-	Functions TargetObjectType = 5
+	Routines  TargetObjectType = 5
 )
 
 // GetTargetObjectTypes returns a slice of all the
@@ -49,7 +44,7 @@ func GetTargetObjectTypes() []TargetObjectType {
 		Sequences,
 		Types,
 		Schemas,
-		Functions,
+		Routines,
 	}
 }
 
@@ -64,8 +59,8 @@ func (t TargetObjectType) String() string {
 		return "types"
 	case Schemas:
 		return "schemas"
-	case Functions:
-		return "functions"
+	case Routines:
+		return "routines"
 	default:
 		panic(errors.AssertionFailedf("unknown TargetObjectType value: %d", t))
 	}

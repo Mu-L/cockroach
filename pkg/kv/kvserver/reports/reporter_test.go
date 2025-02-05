@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -20,10 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/keysutils"
@@ -33,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -44,9 +36,8 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	// This test takes seconds because of replication vagaries.
 	skip.UnderShort(t)
-	// Under stressrace, replication changes seem to hit 1m deadline errors and
+	// Under race, replication changes seem to hit 1m deadline errors and
 	// don't make progress.
-	skip.UnderStressRace(t)
 	skip.UnderRace(t, "takes >1min under race")
 	// Similarly, skip the test under deadlock builds.
 	skip.UnderDeadlock(t, "takes >1min under deadlock")
@@ -128,6 +119,11 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderStressWithIssue(t, 134948)
+	skip.UnderRaceWithIssue(t, 134948)
+	skip.UnderShort(t)
+
 	ctx := context.Background()
 	// 2 regions, 3 dcs per region.
 	tc := serverutils.StartCluster(t, 6, base.TestClusterArgs{
@@ -375,7 +371,7 @@ func checkZoneReplication(db *gosql.DB, zoneID, total, under, over, unavailable 
 			return fmt.Errorf("expected total: %d, got: %d", total, gotTotal)
 		}
 		if under != gotUnder {
-			return fmt.Errorf("expected under: %d, got: %d", total, gotUnder)
+			return fmt.Errorf("expected under: %d, got: %d", under, gotUnder)
 		}
 		if over != gotOver {
 			return fmt.Errorf("expected over: %d, got: %d", over, gotOver)
@@ -391,7 +387,9 @@ func TestMeta2RangeIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	// First make an interator with a large page size and use it to determine the numner of ranges.
@@ -419,66 +417,6 @@ func TestMeta2RangeIter(t *testing.T) {
 		numRangesPaginated++
 	}
 	require.Equal(t, numRanges, numRangesPaginated)
-}
-
-// Test that a retriable error returned from the range iterator is properly
-// handled by resetting the report.
-func TestRetriableErrorWhenGenerationReport(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-
-	cfg := s.ExecutorConfig().(sql.ExecutorConfig).SystemConfig.GetSystemConfig()
-	dummyNodeChecker := func(id roachpb.NodeID) bool { return true }
-
-	v := makeReplicationStatsVisitor(ctx, cfg, dummyNodeChecker)
-	realIter := makeMeta2RangeIter(db, 10000 /* batchSize */)
-	require.NoError(t, visitRanges(ctx, &realIter, cfg, &v))
-	expReport := v.Report()
-	require.Greater(t, len(expReport), 0, "unexpected empty report")
-
-	realIter = makeMeta2RangeIter(db, 10000 /* batchSize */)
-	errorIter := erroryRangeIterator{
-		iter:           realIter,
-		injectErrAfter: 3,
-	}
-	v = makeReplicationStatsVisitor(ctx, cfg, func(id roachpb.NodeID) bool { return true })
-	require.NoError(t, visitRanges(ctx, &errorIter, cfg, &v))
-	require.Greater(t, len(v.report), 0, "unexpected empty report")
-	require.Equal(t, expReport, v.report)
-}
-
-type erroryRangeIterator struct {
-	iter           meta2RangeIter
-	rangesReturned int
-	injectErrAfter int
-}
-
-var _ RangeIterator = &erroryRangeIterator{}
-
-func (it *erroryRangeIterator) Next(ctx context.Context) (roachpb.RangeDescriptor, error) {
-	if it.rangesReturned == it.injectErrAfter {
-		// Don't inject any more errors.
-		it.injectErrAfter = -1
-
-		var err error
-		err = kvpb.NewTransactionRetryWithProtoRefreshError(
-			"injected err", uuid.Nil, 0 /* prevTxnEpoch */, roachpb.Transaction{})
-		// Let's wrap the error to check the unwrapping.
-		err = errors.Wrap(err, "dummy wrapper")
-		// Feed the error to the underlying iterator to reset it.
-		it.iter.handleErr(ctx, err)
-		return roachpb.RangeDescriptor{}, err
-	}
-	it.rangesReturned++
-	rd, err := it.iter.Next(ctx)
-	return rd, err
-}
-
-func (it *erroryRangeIterator) Close(ctx context.Context) {
-	it.iter.Close(ctx)
 }
 
 func TestZoneChecker(t *testing.T) {
@@ -687,10 +625,6 @@ func (r *recordingRangeVisitor) failed() bool {
 	return false
 }
 
-func (r *recordingRangeVisitor) reset(ctx context.Context) {
-	r.rngs = nil
-}
-
 type visitorEntry struct {
 	newZone bool
 	rng     roachpb.RangeDescriptor
@@ -712,8 +646,4 @@ func (e *errorRangeVisitor) visitSameZone(context.Context, *roachpb.RangeDescrip
 
 func (e *errorRangeVisitor) failed() bool {
 	return e.errorReturned
-}
-
-func (e *errorRangeVisitor) reset(context.Context) {
-	e.errorReturned = false
 }

@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcapabilities
 
@@ -18,13 +13,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // Reader provides access to the global tenant capability state. The global
 // tenant capability state may be arbitrarily stale.
 type Reader interface {
+	// GetInfo returns the tenant information for the specified tenant.
+	GetInfo(id roachpb.TenantID) (_ Entry, _ <-chan struct{}, found bool)
+
 	// GetCapabilities returns the tenant capabilities for the specified tenant.
 	GetCapabilities(id roachpb.TenantID) (_ *tenantcapabilitiespb.TenantCapabilities, found bool)
+
 	// GetGlobalCapabilityState returns the capability state for all tenants.
 	GetGlobalCapabilityState() map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities
 }
@@ -36,6 +36,9 @@ type Reader interface {
 // signals other than just the tenant capability state. For example, request
 // usage pattern over a timespan.
 type Authorizer interface {
+	// HasCrossTenantRead returns true if a tenant can read other tenant spans.
+	HasCrossTenantRead(ctx context.Context, tenID roachpb.TenantID) bool
+
 	// HasCapabilityForBatch returns an error if a tenant, referenced by its ID,
 	// is not allowed to execute the supplied batch request given the capabilities
 	// it possesses.
@@ -75,6 +78,10 @@ type Authorizer interface {
 	// HasProcessDebugCapability returns an error if a tenant, referenced by its ID,
 	// is not allowed to debug the running process.
 	HasProcessDebugCapability(ctx context.Context, tenID roachpb.TenantID) error
+
+	// HasTSDBAllMetricsCapability returns an error if a tenant, referenced by its ID,
+	// is not allowed to query all metrics from the host.
+	HasTSDBAllMetricsCapability(ctx context.Context, tenID roachpb.TenantID) error
 }
 
 // Entry ties together a tenantID with its capabilities.
@@ -94,7 +101,8 @@ func (e Entry) Ready() bool {
 // Update represents an update to the global tenant capability state.
 type Update struct {
 	Entry
-	Deleted bool // whether the entry was deleted or not
+	Deleted   bool // whether the entry was deleted or not
+	Timestamp hlc.Timestamp
 }
 
 func (u Update) String() string {

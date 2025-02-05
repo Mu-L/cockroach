@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package upgrades_test
 
@@ -15,6 +10,7 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -40,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -69,6 +64,7 @@ type schemaChangeTestCase struct {
 // exponential backoff to the system.jobs table, but was retrofitted to prevent
 // regressions.
 func TestMigrationWithFailures(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	const createTableBefore = `
 CREATE TABLE test.test_table (
 	id                INT8      DEFAULT unique_rowid() PRIMARY KEY,
@@ -173,6 +169,7 @@ CREATE TABLE test.test_table (
 // alters a column in a table multiple times with failures at different stages
 // of the migration.
 func TestMigrationWithFailuresMultipleAltersOnSameColumn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 
 	const createTableBefore = `
 CREATE TABLE test.test_table (
@@ -245,8 +242,8 @@ func testMigrationWithFailures(
 
 	// We're going to be migrating from the minimum supported version to the
 	// "next" version. We'll be injecting the migration for the next version.
-	startKey := clusterversion.BinaryMinSupportedVersionKey
-	startCV := clusterversion.ByKey(startKey)
+	startKey := clusterversion.MinSupported
+	startCV := startKey.Version()
 	endCV := startCV
 	endCV.Internal += 2
 
@@ -298,10 +295,9 @@ func testMigrationWithFailures(
 			cancelCtx, cancel := context.WithCancel(ctx)
 			// To intercept the schema-change and the migration job.
 			updateEventChan := make(chan updateEvent)
-			var enableUpdateEventCh syncutil.AtomicBool
-			enableUpdateEventCh.Set(false)
+			var enableUpdateEventCh atomic.Bool
 			beforeUpdate := func(orig, updated jobs.JobMetadata) error {
-				if !enableUpdateEventCh.Get() {
+				if !enableUpdateEventCh.Load() {
 					return nil
 				}
 				ue := updateEvent{
@@ -340,8 +336,7 @@ func testMigrationWithFailures(
 					Knobs: base.TestingKnobs{
 						Server: &server.TestingKnobs{
 							DisableAutomaticVersionUpgrade: make(chan struct{}),
-							BinaryVersionOverride:          startCV,
-							BootstrapVersionKeyOverride:    startKey,
+							ClusterVersionOverride:         startCV,
 						},
 						JobsTestingKnobs: jobsKnobs,
 						SQLExecutor: &sql.ExecutorTestingKnobs{
@@ -366,6 +361,7 @@ func testMigrationWithFailures(
 										endCV,
 										upgrade.NoPrecondition,
 										migrationFunc,
+										upgrade.RestoreActionNotRequired("test"),
 									), true
 								}
 								panic("unexpected version")
@@ -396,7 +392,7 @@ func testMigrationWithFailures(
 			tdb.Exec(t, "DROP TABLE test.test_table")
 			tdb.Exec(t, createTableBefore)
 			expectedDescriptor.Store(desc)
-			enableUpdateEventCh.Set(true)
+			enableUpdateEventCh.Store(true)
 
 			// Run the migration, expecting failure.
 			t.Log("trying migration, expecting to fail")
@@ -510,7 +506,7 @@ func testMigrationWithFailures(
 			})
 			if test.waitForMigrationRestart {
 				// Ensure that we have observed the expected number of ignored schema change jobs.
-				log.Flush()
+				log.FlushFiles()
 				entries, err := log.FetchEntriesFromFiles(
 					0, math.MaxInt64, 10000,
 					regexp.MustCompile("skipping.*operation as the schema change already exists."),
@@ -532,7 +528,7 @@ func cancelJob(
 		// Using this way of canceling because the migration job us non-cancelable.
 		// Canceling in this way skips the check.
 		return s.JobRegistry().(*jobs.Registry).UpdateJobWithTxn(
-			ctx, jobID, txn, false /* useReadLock */, func(
+			ctx, jobID, txn, func(
 				txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
 			) error {
 				ju.UpdateStatus(jobs.StatusCancelRequested)

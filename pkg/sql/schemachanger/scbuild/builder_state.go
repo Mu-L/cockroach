@@ -1,18 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scbuild
 
 import (
+	"context"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -28,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	plpgsql "github.com/cockroachdb/cockroach/pkg/sql/plpgsql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild/internal/scbuildstmt"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdecomp"
@@ -36,11 +34,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 )
 
@@ -48,9 +50,6 @@ var _ scbuildstmt.BuilderState = (*builderState)(nil)
 
 // QueryByID implements the scbuildstmt.BuilderState interface.
 func (b *builderState) QueryByID(id catid.DescID) scbuildstmt.ElementResultSet {
-	if id == catid.InvalidDescID {
-		return nil
-	}
 	b.ensureDescriptor(id)
 	c := b.descCache[id]
 	if c.cachedCollection == nil {
@@ -111,8 +110,13 @@ func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scp
 		dst.target == scpb.ToAbsent &&
 		(target == scpb.ToPublic || target == scpb.Transient) &&
 		dst.metadata.IsLinkedToSchemaChange() {
-		panic(scerrors.NotImplementedErrorf(nil, "attempt to revive a ghost element:"+
-			" [elem=%v],[current=ABSENT],[target=ToAbsent],[newTarget=%v]", dst.element.String(), target.Status()))
+		panic(scerrors.NotImplementedErrorf(
+			nil,
+			redact.Sprintf(
+				"attempt to revive a ghost element: [elem=%v],[current=ABSENT],[target=ToAbsent],[newTarget=%v]",
+				dst.element.String(), target.Status(),
+			),
+		))
 	}
 
 	// Henceforth all possibilities lead to the target and metadata being
@@ -269,6 +273,28 @@ func (b *builderState) LogEventForExistingTarget(e scpb.Element) {
 	es.withLogEvent = true
 }
 
+// LogEventForExistingPayload implements the scbuildstmt.BuilderState interface.
+func (b *builderState) LogEventForExistingPayload(e scpb.Element, payload logpb.EventPayload) {
+	id := screl.GetDescID(e)
+	key := screl.ElementString(e)
+
+	c, ok := b.descCache[id]
+	if !ok {
+		panic(errors.AssertionFailedf(
+			"elements for descriptor ID %d not found in builder state, %s expected", id, key))
+	}
+	i, ok := c.elementIndexMap[key]
+	if !ok {
+		panic(errors.AssertionFailedf("element %s expected in builder state but not found", key))
+	}
+	es := &b.output[i]
+	if es.target == scpb.InvalidTarget {
+		panic(errors.AssertionFailedf("no target set for element %s in builder state", key))
+	}
+	es.withLogEvent = true
+	es.maybePayload = payload
+}
+
 var _ scbuildstmt.PrivilegeChecker = (*builderState)(nil)
 
 // HasOwnership implements the scbuildstmt.PrivilegeChecker interface.
@@ -288,20 +314,21 @@ func (b *builderState) mustOwn(id catid.DescID) {
 	b.ensureDescriptor(id)
 	if c := b.descCache[id]; !c.hasOwnership {
 		panic(pgerror.Newf(pgcode.InsufficientPrivilege,
-			"must be owner of %s %s", c.desc.DescriptorType(), c.desc.GetName()))
+			"must be owner of %s %s", c.desc.DescriptorType(), tree.Name(c.desc.GetName())))
 	}
 }
 
 // CheckPrivilege implements the scbuildstmt.PrivilegeChecker interface.
-func (b *builderState) CheckPrivilege(e scpb.Element, privilege privilege.Kind) {
-	b.checkPrivilege(screl.GetDescID(e), privilege)
+func (b *builderState) CheckPrivilege(e scpb.Element, privilege privilege.Kind) error {
+	return b.checkPrivilege(screl.GetDescID(e), privilege)
 }
 
-func (b *builderState) checkPrivilege(id catid.DescID, priv privilege.Kind) {
+// checkPrivilege checks if current user has privilege `priv` on descriptor with `id`.
+func (b *builderState) checkPrivilege(id catid.DescID, priv privilege.Kind) error {
 	b.ensureDescriptor(id)
 	c := b.descCache[id]
 	if c.hasOwnership {
-		return
+		return nil
 	}
 	err, found := c.privileges[priv]
 	if !found {
@@ -312,7 +339,7 @@ func (b *builderState) checkPrivilege(id catid.DescID, priv privilege.Kind) {
 				b.QueryByID(id),
 				func(current scpb.Status, _ scpb.TargetStatus, e *scpb.SchemaParent) {
 					if current == scpb.Status_PUBLIC {
-						b.checkPrivilege(e.SchemaID, privilege.USAGE)
+						b.requirePrivilege(e.SchemaID, privilege.USAGE)
 					}
 				},
 			)
@@ -320,14 +347,34 @@ func (b *builderState) checkPrivilege(id catid.DescID, priv privilege.Kind) {
 		err = b.auth.CheckPrivilege(b.ctx, c.desc, priv)
 		c.privileges[priv] = err
 	}
-	if err != nil {
+	return err
+}
+
+// requirePrivilege is a must version of checkPrivilege where it panics if non-nil error.
+func (b *builderState) requirePrivilege(id catid.DescID, priv privilege.Kind) {
+	if err := b.checkPrivilege(id, priv); err != nil {
 		panic(err)
 	}
+}
+
+// CheckGlobalPrivilege implements the scbuildstmt.PrivilegeChecker interface.
+func (b *builderState) CheckGlobalPrivilege(privilege privilege.Kind) error {
+	return b.auth.CheckPrivilege(b.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege)
+}
+
+// HasGlobalPrivilegeOrRoleOption implements the scbuildstmt.PrivilegeChecker interface.
+func (b *builderState) HasGlobalPrivilegeOrRoleOption(
+	ctx context.Context, privilege privilege.Kind,
+) (bool, error) {
+	return b.auth.HasGlobalPrivilegeOrRoleOption(ctx, privilege)
 }
 
 // CurrentUserHasAdminOrIsMemberOf implements the scbuildstmt.PrivilegeChecker interface.
 func (b *builderState) CurrentUserHasAdminOrIsMemberOf(role username.SQLUsername) bool {
 	if b.hasAdmin {
+		return true
+	}
+	if b.evalCtx.SessionData().User() == role {
 		return true
 	}
 	memberships, err := b.auth.MemberOfWithAdminOption(b.ctx, role)
@@ -340,6 +387,11 @@ func (b *builderState) CurrentUserHasAdminOrIsMemberOf(role username.SQLUsername
 
 func (b *builderState) CurrentUser() username.SQLUsername {
 	return b.evalCtx.SessionData().User()
+}
+
+// CheckRoleExists implements the scbuild.AuthorizationAccessor interface.
+func (b *builderState) CheckRoleExists(ctx context.Context, role username.SQLUsername) error {
+	return b.auth.CheckRoleExists(ctx, role)
 }
 
 var _ scbuildstmt.TableHelpers = (*builderState)(nil)
@@ -428,6 +480,64 @@ func (b *builderState) NextTableConstraintID(tableID catid.DescID) (ret catid.Co
 		v, _ := screl.Schema.GetAttribute(screl.ConstraintID, e)
 		if id, ok := v.(catid.ConstraintID); ok {
 			if id < catid.ConstraintID(scbuildstmt.TableTentativeIdsStart) && id >= ret {
+				ret = id + 1
+			}
+		}
+	})
+	return ret
+}
+
+// NextTableTriggerID implements the scbuildstmt.TableHelpers interface.
+func (b *builderState) NextTableTriggerID(tableID catid.DescID) (ret catid.TriggerID) {
+	{
+		b.ensureDescriptor(tableID)
+		desc := b.descCache[tableID].desc
+		tbl, ok := desc.(catalog.TableDescriptor)
+		if !ok {
+			panic(errors.AssertionFailedf("Expected table descriptor for ID %d, instead got %s",
+				desc.GetID(), desc.DescriptorType()))
+		}
+		ret = tbl.GetNextTriggerID()
+		if ret == 0 {
+			ret = 1
+		}
+	}
+	// Consult all present element in case they have a larger TriggerID field.
+	b.QueryByID(tableID).ForEach(func(
+		_ scpb.Status, _ scpb.TargetStatus, e scpb.Element,
+	) {
+		v, _ := screl.Schema.GetAttribute(screl.TriggerID, e)
+		if id, ok := v.(catid.TriggerID); ok {
+			if id < catid.TriggerID(scbuildstmt.TableTentativeIdsStart) && id >= ret {
+				ret = id + 1
+			}
+		}
+	})
+	return ret
+}
+
+// NextTablePolicyID implements the scbuildstmt.TableHelpers interface.
+func (b *builderState) NextTablePolicyID(tableID catid.DescID) (ret catid.PolicyID) {
+	{
+		b.ensureDescriptor(tableID)
+		desc := b.descCache[tableID].desc
+		tbl, ok := desc.(catalog.TableDescriptor)
+		if !ok {
+			panic(errors.AssertionFailedf("Expected table descriptor for ID %d, instead got %s",
+				desc.GetID(), desc.DescriptorType()))
+		}
+		ret = tbl.GetNextPolicyID()
+		if ret == 0 {
+			ret = 1
+		}
+	}
+	// Consult all present element in case they have a larger PolicyID field.
+	b.QueryByID(tableID).ForEach(func(
+		_ scpb.Status, _ scpb.TargetStatus, e scpb.Element,
+	) {
+		v, _ := screl.Schema.GetAttribute(screl.PolicyID, e)
+		if id, ok := v.(catid.PolicyID); ok {
+			if id < catid.PolicyID(scbuildstmt.TableTentativeIdsStart) && id >= ret {
 				ret = id + 1
 			}
 		}
@@ -608,10 +718,11 @@ func (b *builderState) ResolveTypeRef(ref tree.ResolvableTypeReference) scpb.Typ
 }
 
 func newTypeT(t *types.T) scpb.TypeT {
-	return scpb.TypeT{Type: t, ClosedTypeIDs: typedesc.GetTypeDescriptorClosure(t).Ordered()}
+	return scpb.TypeT{Type: t, ClosedTypeIDs: typedesc.GetTypeDescriptorClosure(t).Ordered(), TypeName: t.SQLString()}
 }
 
 // WrapExpression implements the scbuildstmt.TableHelpers interface.
+// N.B. The user should ensure that the input expression has UDF names replaced with OID references.
 func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scpb.Expression {
 	// We will serialize and reparse the expression, so that type information
 	// annotations are directly embedded inside, otherwise while parsing the
@@ -692,7 +803,7 @@ func (b *builderState) WrapExpression(tableID catid.DescID, expr tree.Expr) *scp
 			}
 		}
 	}
-	// Collect function IDs
+	// Collect function IDs, assuming that the UDF names has been replaced with OID references.
 	fnIDs, err := schemaexpr.GetUDFIDs(expr)
 	if err != nil {
 		panic(err)
@@ -850,7 +961,7 @@ func (b *builderState) ResolveDatabase(
 		panic(sqlerrors.NewUndefinedDatabaseError(name.String()))
 	}
 	b.ensureDescriptor(db.GetID())
-	b.checkPrivilege(db.GetID(), p.RequiredPrivilege)
+	b.requirePrivilege(db.GetID(), p.RequiredPrivilege)
 	return b.QueryByID(db.GetID())
 }
 
@@ -909,15 +1020,27 @@ func (b *builderState) checkOwnershipOrPrivilegesOnSchemaDesc(
 	name tree.ObjectNamePrefix, sc catalog.SchemaDescriptor, p scbuildstmt.ResolveParams,
 ) {
 	switch sc.SchemaKind() {
-	case catalog.SchemaPublic, catalog.SchemaVirtual, catalog.SchemaTemporary:
-		panic(pgerror.Newf(pgcode.InsufficientPrivilege,
-			"%s permission denied for schema %q", p.RequiredPrivilege.String(), name))
+	case catalog.SchemaTemporary:
+		// Nothing needs to be done.
+	case catalog.SchemaPublic, catalog.SchemaVirtual:
+		if p.RequireOwnership {
+			if ok, err := b.auth.HasOwnership(b.ctx, sc); err != nil {
+				panic(err)
+			} else if !ok {
+				panic(pgerror.Newf(pgcode.InsufficientPrivilege,
+					"must be owner of schema %s", tree.Name(name.Schema())))
+			}
+		} else {
+			if err := b.auth.CheckPrivilege(b.ctx, sc, p.RequiredPrivilege); err != nil {
+				panic(err)
+			}
+		}
 	case catalog.SchemaUserDefined:
 		b.ensureDescriptor(sc.GetID())
 		if p.RequireOwnership {
 			b.mustOwn(sc.GetID())
 		} else {
-			b.checkPrivilege(sc.GetID(), p.RequiredPrivilege)
+			b.requirePrivilege(sc.GetID(), p.RequiredPrivilege)
 		}
 	default:
 		panic(errors.AssertionFailedf("unknown schema kind %d", sc.SchemaKind()))
@@ -928,6 +1051,7 @@ func (b *builderState) checkOwnershipOrPrivilegesOnSchemaDesc(
 func (b *builderState) ResolveUserDefinedTypeType(
 	name *tree.UnresolvedObjectName, p scbuildstmt.ResolveParams,
 ) scbuildstmt.ElementResultSet {
+	p.ResolveTypes = true
 	prefix, typ := b.cr.MayResolveType(b.ctx, *name)
 	if typ == nil {
 		if p.IsExistenceOptional {
@@ -959,6 +1083,9 @@ func (b *builderState) ResolveUserDefinedTypeType(
 	default:
 		panic(errors.AssertionFailedf("unknown type kind %s", typ.GetKind()))
 	}
+	if p.RequireOwnership {
+		b.mustOwn(typ.GetID())
+	}
 	return b.QueryByID(typ.GetID())
 }
 
@@ -970,31 +1097,52 @@ func (b *builderState) ResolveRelation(
 	if c == nil {
 		return nil
 	}
+	if p.RequireOwnership {
+		b.mustOwn(c.desc.GetID())
+	}
 	return b.QueryByID(c.desc.GetID())
 }
 
 func (b *builderState) resolveRelation(
 	name *tree.UnresolvedObjectName, p scbuildstmt.ResolveParams,
 ) *cachedDesc {
-	prefix, rel := b.cr.MayResolveTable(b.ctx, *name)
+	var prefix catalog.ResolvedObjectPrefix
+	var rel catalog.Descriptor
+	prefix, rel = b.cr.MayResolveTable(b.ctx, *name)
 	if rel == nil {
-		if p.IsExistenceOptional {
-			return nil
+		if p.ResolveTypes {
+			prefix, rel = b.cr.MayResolveType(b.ctx, *name)
 		}
-		panic(sqlerrors.NewUndefinedRelationError(name))
-	}
-	if rel.IsVirtualTable() {
-		if prefix.Schema.GetName() == catconstants.PgCatalogName {
-			panic(pgerror.Newf(pgcode.InsufficientPrivilege,
-				"%s is a system catalog", tree.ErrNameString(rel.GetName())))
+		if rel == nil {
+			if p.IsExistenceOptional {
+				return nil
+			}
+			panic(sqlerrors.NewUndefinedRelationError(name))
 		}
-		panic(pgerror.Newf(pgcode.WrongObjectType,
-			"%s is a virtual object and cannot be modified", tree.ErrNameString(rel.GetName())))
 	}
-	if rel.IsTemporary() {
-		panic(scerrors.NotImplementedErrorf(nil /* n */, "dropping a temporary table"))
+	if t, isTable := rel.(catalog.TableDescriptor); isTable {
+		if t.IsVirtualTable() {
+			if prefix.Schema.GetName() == catconstants.PgCatalogName {
+				panic(pgerror.Newf(pgcode.InsufficientPrivilege,
+					"%s is a system catalog", tree.ErrNameString(rel.GetName())))
+			}
+			panic(pgerror.Newf(pgcode.WrongObjectType,
+				"%s is a virtual object and cannot be modified", tree.ErrNameString(rel.GetName())))
+		}
+		if t.IsTemporary() {
+			panic(scerrors.NotImplementedErrorf(nil /* n */, "dropping a temporary table"))
+		}
+	} else if typ, isType := rel.(catalog.TypeDescriptor); isType {
+		if typ.GetKind() == descpb.TypeDescriptor_ALIAS && typ.GetID() == descpb.InvalidID {
+			// This case handles the types in types.PublicSchemaAliases -- BOX2D,
+			// GEOGRAPHY, and GEOMETRY.
+			panic(pgerror.Newf(pgcode.WrongObjectType,
+				"%s is a built-in type and cannot be modified", tree.ErrNameString(typ.GetName())))
+		}
 	}
-	// If we own the schema then we can manipulate the underlying relation.
+
+	// If we own the schema then we can manipulate the underlying relation,
+	// regardless what privilege is required on relation.
 	b.ensureDescriptor(rel.GetID())
 	c := b.descCache[rel.GetID()]
 	b.ensureDescriptor(rel.GetParentSchemaID())
@@ -1002,10 +1150,11 @@ func (b *builderState) resolveRelation(
 		c.hasOwnership = true
 		return c
 	}
+
 	err, found := c.privileges[p.RequiredPrivilege]
 	if !found {
 		// Validate if this descriptor can be resolved under the current schema.
-		b.checkPrivilege(rel.GetParentSchemaID(), privilege.USAGE)
+		b.requirePrivilege(rel.GetParentSchemaID(), privilege.USAGE)
 		err = b.auth.CheckPrivilege(b.ctx, rel, p.RequiredPrivilege)
 		c.privileges[p.RequiredPrivilege] = err
 	}
@@ -1015,11 +1164,16 @@ func (b *builderState) resolveRelation(
 	if p.RequiredPrivilege != privilege.CREATE {
 		panic(err)
 	}
-	relationType := "table"
-	if rel.IsView() {
-		relationType = "view"
-	} else if rel.IsSequence() {
-		relationType = "sequence"
+	relationType := "relation"
+	if t, isTable := rel.(catalog.TableDescriptor); isTable {
+		relationType = "table"
+		if t.IsView() {
+			relationType = "view"
+		} else if t.IsSequence() {
+			relationType = "sequence"
+		}
+	} else if _, isType := rel.(catalog.TypeDescriptor); isType {
+		relationType = "type"
 	}
 	panic(pgerror.Newf(pgcode.InsufficientPrivilege,
 		"must be owner of %s %s or have %s privilege on %s %s",
@@ -1038,8 +1192,25 @@ func (b *builderState) ResolveTable(
 	if c == nil {
 		return nil
 	}
-	if rel := c.desc.(catalog.TableDescriptor); !rel.IsTable() {
-		panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a table", rel.GetName()))
+	if rel, ok := c.desc.(catalog.TableDescriptor); !ok || !rel.IsTable() {
+		panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a table", c.desc.GetName()))
+	}
+	if p.RequireOwnership {
+		b.mustOwn(c.desc.GetID())
+	}
+	return b.QueryByID(c.desc.GetID())
+}
+
+// ResolvePhysicalTable implements the scbuildstmt.NameResolver interface.
+func (b *builderState) ResolvePhysicalTable(
+	name *tree.UnresolvedObjectName, p scbuildstmt.ResolveParams,
+) scbuildstmt.ElementResultSet {
+	c := b.resolveRelation(name, p)
+	if c == nil {
+		return nil
+	}
+	if rel, ok := c.desc.(catalog.TableDescriptor); !ok || !rel.IsPhysicalTable() {
+		panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a table, view, or sequence", c.desc.GetName()))
 	}
 	return b.QueryByID(c.desc.GetID())
 }
@@ -1052,8 +1223,11 @@ func (b *builderState) ResolveSequence(
 	if c == nil {
 		return nil
 	}
-	if rel := c.desc.(catalog.TableDescriptor); !rel.IsSequence() {
-		panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a sequence", rel.GetName()))
+	if rel, ok := c.desc.(catalog.TableDescriptor); !ok || !rel.IsSequence() {
+		panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a sequence", c.desc.GetName()))
+	}
+	if p.RequireOwnership {
+		b.mustOwn(c.desc.GetID())
 	}
 	return b.QueryByID(c.desc.GetID())
 }
@@ -1066,8 +1240,11 @@ func (b *builderState) ResolveView(
 	if c == nil {
 		return nil
 	}
-	if rel := c.desc.(catalog.TableDescriptor); !rel.IsView() {
-		panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a view", rel.GetName()))
+	if rel, ok := c.desc.(catalog.TableDescriptor); !ok || !rel.IsView() {
+		panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a view", c.desc.GetName()))
+	}
+	if p.RequireOwnership {
+		b.mustOwn(c.desc.GetID())
 	}
 	return b.QueryByID(c.desc.GetID())
 }
@@ -1082,7 +1259,7 @@ func (b *builderState) ResolveIndex(
 		panic(pgerror.Newf(pgcode.WrongObjectType,
 			"%q is not an indexable table or a materialized view", rel.GetName()))
 	}
-	b.checkPrivilege(rel.GetID(), p.RequiredPrivilege)
+	b.requirePrivilege(rel.GetID(), p.RequiredPrivilege)
 	elts := b.QueryByID(rel.GetID())
 	var indexID catid.IndexID
 	scpb.ForEachIndexName(elts, func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.IndexName) {
@@ -1112,11 +1289,15 @@ func (b *builderState) ResolveIndexByName(
 ) scbuildstmt.ElementResultSet {
 	// If a table name is specified, confirm it is not a system table first.
 	if tableIndexName.Table.ObjectName != "" {
-		desc := b.resolveRelation(tableIndexName.Table.ToUnresolvedObjectName(), p)
+		un := tableIndexName.Table.ToUnresolvedObjectName()
+		desc := b.resolveRelation(un, p)
 		if desc == nil {
 			return nil
 		}
-		tableDesc := desc.desc.(catalog.TableDescriptor)
+		tableDesc, ok := desc.desc.(catalog.TableDescriptor)
+		if !ok {
+			panic(pgerror.Newf(pgcode.WrongObjectType, "%q is not a table", un))
+		}
 		b.ensureDescriptor(tableDesc.GetParentSchemaID())
 		if catalog.IsSystemDescriptor(tableDesc) {
 			schemaDesc := b.descCache[tableDesc.GetParentSchemaID()].desc
@@ -1138,13 +1319,15 @@ func (b *builderState) ResolveIndexByName(
 }
 
 // ResolveColumn implements the scbuildstmt.NameResolver interface.
+// N.B. Column target statuses should be handled outside of this logic (ex. resolving a column by name that is in the
+// dropping state shouldn't prevent a column of the same name being added).
 func (b *builderState) ResolveColumn(
 	relationID catid.DescID, columnName tree.Name, p scbuildstmt.ResolveParams,
 ) scbuildstmt.ElementResultSet {
 	b.ensureDescriptor(relationID)
 	rel := b.descCache[relationID].desc.(catalog.TableDescriptor)
 	elts := b.QueryByID(rel.GetID())
-	b.checkPrivilege(rel.GetID(), p.RequiredPrivilege)
+	b.requirePrivilege(rel.GetID(), p.RequiredPrivilege)
 	var columnID catid.ColumnID
 	scpb.ForEachColumnName(elts, func(status scpb.Status, _ scpb.TargetStatus, e *scpb.ColumnName) {
 		if tree.Name(e.Name) == columnName {
@@ -1217,44 +1400,104 @@ func (b *builderState) ResolveConstraint(
 	})
 }
 
-func (b *builderState) ResolveUDF(
-	fnObj *tree.FuncObj, p scbuildstmt.ResolveParams,
+func (b *builderState) ResolveRoutine(
+	routineObj *tree.RoutineObj, p scbuildstmt.ResolveParams, routineType tree.RoutineType,
 ) scbuildstmt.ElementResultSet {
-	fd, err := b.cr.ResolveFunction(b.ctx, fnObj.FuncName.ToUnresolvedObjectName().ToUnresolvedName(), b.semaCtx.SearchPath)
+	name := routineObj.FuncName.ToUnresolvedObjectName().ToUnresolvedName()
+	// TODO(mgartner): We can probably make the distinction between the two
+	// types of unresolved routine names at parsing-time (or shortly after),
+	// rather than here. Ideally, the UnresolvedRoutineName interface can be
+	// incorporated with ResolvableFunctionReference.
+	var routineName tree.UnresolvedRoutineName
+	if routineType == tree.ProcedureRoutine {
+		routineName = tree.MakeUnresolvedProcedureName(name)
+	} else {
+		routineName = tree.MakeUnresolvedFunctionName(name)
+	}
+	fd, err := b.cr.ResolveFunction(b.ctx, routineName, b.semaCtx.SearchPath)
 	if err != nil {
-		if p.IsExistenceOptional && errors.Is(err, tree.ErrFunctionUndefined) {
+		if p.IsExistenceOptional && errors.Is(err, tree.ErrRoutineUndefined) {
 			return nil
 		}
 		panic(err)
 	}
 
-	paramTypes, err := fnObj.ParamTypes(b.ctx, b.cr)
+	ol, err := fd.MatchOverload(
+		b.ctx, b.cr, routineObj, b.semaCtx.SearchPath,
+		routineType, p.InDropContext, false, /* tryDefaultExprs */
+	)
 	if err != nil {
-		return nil
-	}
-	ol, err := fd.MatchOverload(paramTypes, fnObj.FuncName.Schema(), b.semaCtx.SearchPath)
-	if err != nil {
-		if p.IsExistenceOptional && errors.Is(err, tree.ErrFunctionUndefined) {
+		if p.IsExistenceOptional && errors.Is(err, tree.ErrRoutineUndefined) {
 			return nil
 		}
 		panic(err)
 	}
 
-	// ResolveUDF is not concerned with builtin functions that are defined using
+	// ResolveRoutine is not concerned with builtin functions that are defined using
 	// a SQL string, so we don't check ol.HasSQLBody() here.
-	if !ol.IsUDF {
+	if ol.Type == tree.BuiltinRoutine {
 		panic(
 			errors.Errorf(
 				"cannot perform schema change on function %s%s because it is required by the database system",
-				fnObj.FuncName.Object(), ol.Signature(true),
+				routineObj.FuncName.Object(), ol.Signature(true),
 			),
 		)
 	}
 
 	fnID := funcdesc.UserDefinedFunctionOIDToID(ol.Oid)
-	b.mustOwn(fnID)
+	if p.RequireOwnership {
+		b.mustOwn(fnID)
+	}
 	b.ensureDescriptor(fnID)
 	return b.QueryByID(fnID)
+}
+
+func (b *builderState) ResolveTrigger(
+	relationID catid.DescID, triggerName tree.Name, p scbuildstmt.ResolveParams,
+) scbuildstmt.ElementResultSet {
+	b.ensureDescriptor(relationID)
+	rel := b.descCache[relationID].desc.(catalog.TableDescriptor)
+	elts := b.QueryByID(rel.GetID())
+	var triggerID catid.TriggerID
+	elts.ForEach(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) {
+		if t, ok := e.(*scpb.TriggerName); ok && t.Name == string(triggerName) {
+			triggerID = t.TriggerID
+		}
+	})
+	if triggerID == 0 {
+		if p.IsExistenceOptional {
+			return nil
+		}
+		panic(sqlerrors.NewUndefinedTriggerError(string(triggerName), rel.GetName()))
+	}
+	return elts.Filter(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) bool {
+		id, _ := screl.Schema.GetAttribute(screl.TriggerID, e)
+		return id != nil && id.(catid.TriggerID) == triggerID
+	})
+}
+
+func (b *builderState) ResolvePolicy(
+	tableID catid.DescID, policyName tree.Name, p scbuildstmt.ResolveParams,
+) scbuildstmt.ElementResultSet {
+	b.ensureDescriptor(tableID)
+	tbl := b.descCache[tableID].desc.(catalog.TableDescriptor)
+	elems := b.QueryByID(tbl.GetID())
+	var policyID catid.PolicyID
+	elems.ForEach(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) {
+		if t, ok := e.(*scpb.PolicyName); ok && t.Name == string(policyName) {
+			policyID = t.PolicyID
+		}
+	})
+	if policyID == 0 {
+		if p.IsExistenceOptional {
+			return nil
+		}
+		panic(sqlerrors.NewUndefinedPolicyError(string(policyName), tbl.GetName()))
+	}
+	return elems.Filter(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) bool {
+		id, _ := screl.Schema.GetAttribute(screl.PolicyID, e)
+		return id != nil && id.(catid.PolicyID) == policyID
+	})
 }
 
 func (b *builderState) newCachedDesc(id descpb.ID) *cachedDesc {
@@ -1287,8 +1530,10 @@ func (b *builderState) resolveBackReferences(c *cachedDesc) {
 	case catalog.DatabaseDescriptor:
 		if !d.HasPublicSchemaWithDescriptor() {
 			panic(scerrors.NotImplementedErrorf(nil, /* n */
-				"database %q (%d) with a descriptorless public schema",
-				d.GetName(), d.GetID()))
+				redact.Sprintf(
+					"database %q (%d) with a descriptorless public schema",
+					d.GetName(), d.GetID()),
+			))
 		}
 		// Handle special case of database children, which may include temporary
 		// schemas, which aren't explicitly referenced in the database's schemas
@@ -1330,12 +1575,22 @@ func (b *builderState) resolveBackReferences(c *cachedDesc) {
 // For newly created descriptors, it merely creates a zero-valued *cacheDesc entry;
 // For existing descriptors, it creates and populate the *cacheDesc entry and
 // decompose it into elements (as tracked in b.output).
+// For descriptorless IDs associated with named ranges, it creates and populates
+// a descriptorless *cacheDesc entry -- decomposing it into NamedRangeZoneConfig
+// elements (as tracked in b.output).
 func (b *builderState) ensureDescriptor(id catid.DescID) {
 	if _, found := b.descCache[id]; found {
 		return
 	}
 	if b.newDescriptors.Contains(id) {
 		b.descCache[id] = b.newCachedDescForNewDesc()
+		return
+	}
+	// For pseudo-table IDs used in named ranges, we take precaution to avoid
+	// reading the descriptor (readDescriptor) as these IDs are descriptor-less.
+	_, ok := zonepb.NamedZonesByID[uint32(id)]
+	if ok {
+		b.ensurePseudoDescriptor(id)
 		return
 	}
 
@@ -1385,12 +1640,33 @@ func (b *builderState) ensureDescriptor(id catid.DescID) {
 	}
 }
 
+func (b *builderState) ensurePseudoDescriptor(id catid.DescID) {
+	crossRefLookupFn := func(id catid.DescID) catalog.Descriptor {
+		return nil
+	}
+	visitorFn := func(status scpb.Status, e scpb.Element) {
+		b.addNewElementState(elementState{
+			element: e,
+			initial: status,
+			current: status,
+			target:  scpb.AsTargetStatus(status),
+		})
+	}
+	b.descCache[id] = b.newCachedDesc(id)
+	scdecomp.WalkNamedRanges(b.ctx, nil, crossRefLookupFn, visitorFn,
+		b.commentGetter, b.zoneConfigReader, b.evalCtx.Settings.Version.ActiveVersion(b.ctx), id)
+}
+
 func (b *builderState) readDescriptor(id catid.DescID) catalog.Descriptor {
+	_, ok := zonepb.NamedZonesByID[uint32(id)]
+	if ok {
+		return nil
+	}
 	if id == catid.InvalidDescID {
 		panic(errors.AssertionFailedf("invalid descriptor ID %d", id))
 	}
 	if id == keys.SystemPublicSchemaID || id == keys.PublicSchemaIDForBackup || id == keys.PublicSchemaID {
-		panic(scerrors.NotImplementedErrorf(nil /* n */, "descriptorless public schema %d", id))
+		panic(scerrors.NotImplementedErrorf(nil /* n */, redact.Sprintf("descriptorless public schema %d", id)))
 	}
 	if tempSchema := b.tempSchemas[id]; tempSchema != nil {
 		return tempSchema
@@ -1430,7 +1706,7 @@ func (b *builderState) BuildUserPrivilegesFromDefaultPrivileges(
 	dbDefaultPrivDesc := dbDesc.GetDefaultPrivilegeDescriptor()
 
 	var scDefaultPrivDesc catalog.DefaultPrivilegeDescriptor
-	if sc != nil {
+	if sc != nil && !sc.IsTemporary {
 		b.ensureDescriptor(sc.SchemaID)
 		scDesc, err := catalog.AsSchemaDescriptor(b.descCache[sc.SchemaID].desc)
 		if err != nil {
@@ -1475,12 +1751,20 @@ func (b *builderState) WrapFunctionBody(
 	fnID descpb.ID,
 	bodyStr string,
 	lang catpb.Function_Language,
+	returnType tree.ResolvableTypeReference,
 	refProvider scbuildstmt.ReferenceProvider,
 ) *scpb.FunctionBody {
-	if lang != catpb.Function_PLPGSQL {
-		// TODO(drewk): fix this to work with PL/pgSQL.
-		bodyStr = b.replaceSeqNamesWithIDs(bodyStr)
-		bodyStr = b.serializeUserDefinedTypes(bodyStr)
+	// Trigger functions do not analyze SQL statements beyond parsing, so type and
+	// sequence names should not be replaced during trigger-function creation.
+	var lazilyEvalSQL bool
+	if returnType != nil {
+		if typ, ok := returnType.(*types.T); ok && typ.Identical(types.Trigger) {
+			lazilyEvalSQL = true
+		}
+	}
+	if !lazilyEvalSQL {
+		bodyStr = b.replaceSeqNamesWithIDs(bodyStr, lang)
+		bodyStr = b.serializeUserDefinedTypes(bodyStr, lang)
 	}
 	fnBody := &scpb.FunctionBody{
 		FunctionID: fnID,
@@ -1514,12 +1798,22 @@ func (b *builderState) WrapFunctionBody(
 		panic(err)
 	}
 
+	fnBody.UsesFunctionIDs = refProvider.ReferencedRoutines().Ordered()
 	fnBody.UsesSequenceIDs = refProvider.ReferencedSequences().Ordered()
 	fnBody.UsesTypeIDs = refProvider.ReferencedTypes().Ordered()
 	return fnBody
 }
 
-func (b *builderState) replaceSeqNamesWithIDs(queryStr string) string {
+func (b *builderState) ReplaceSeqTypeNamesInStatements(
+	queryStr string, lang catpb.Function_Language,
+) string {
+	newQueryStr := b.replaceSeqNamesWithIDs(queryStr, lang)
+	return b.serializeUserDefinedTypes(newQueryStr, lang)
+}
+
+func (b *builderState) replaceSeqNamesWithIDs(
+	queryStr string, lang catpb.Function_Language,
+) string {
 	replaceSeqFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		seqIdentifiers, err := seqexpr.GetUsedSequences(expr)
 		if err != nil {
@@ -1540,31 +1834,43 @@ func (b *builderState) replaceSeqNamesWithIDs(queryStr string) string {
 		return false, newExpr, nil
 	}
 
-	parsedStmts, err := parser.Parse(queryStr)
-	if err != nil {
-		panic(err)
-	}
-
-	stmts := make(tree.Statements, len(parsedStmts))
-	for i, s := range parsedStmts {
-		stmts[i] = s.AST
-	}
-
 	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
-	for i, stmt := range stmts {
-		newStmt, err := tree.SimpleStmtVisit(stmt, replaceSeqFunc)
+	switch lang {
+	case catpb.Function_SQL:
+		parsedStmts, err := parser.Parse(queryStr)
 		if err != nil {
 			panic(err)
 		}
-		if i > 0 {
-			fmtCtx.WriteString("\n")
+		stmts := make(tree.Statements, len(parsedStmts))
+		for i, s := range parsedStmts {
+			stmts[i] = s.AST
 		}
+		for i, stmt := range stmts {
+			newStmt, err := tree.SimpleStmtVisit(stmt, replaceSeqFunc)
+			if err != nil {
+				panic(err)
+			}
+			if i > 0 {
+				fmtCtx.WriteString("\n")
+			}
+			fmtCtx.FormatNode(newStmt)
+			fmtCtx.WriteString(";")
+		}
+	case catpb.Function_PLPGSQL:
+		var stmts plpgsqltree.Statement
+		plstmt, err := plpgsql.Parse(queryStr)
+		if err != nil {
+			panic(errors.Wrap(err, "failed to parse query string"))
+		}
+		stmts = plstmt.AST
+
+		v := plpgsqltree.SQLStmtVisitor{Fn: replaceSeqFunc}
+		newStmt := plpgsqltree.Walk(&v, stmts)
 		fmtCtx.FormatNode(newStmt)
-		fmtCtx.WriteString(";")
+	default:
+		panic(errors.AssertionFailedf("unexpected function language: %s", lang))
 	}
-
 	return fmtCtx.String()
-
 }
 
 func (b *builderState) getSequenceFromName(seqName string) *scpb.Sequence {
@@ -1577,7 +1883,9 @@ func (b *builderState) getSequenceFromName(seqName string) *scpb.Sequence {
 	return seq
 }
 
-func (b *builderState) serializeUserDefinedTypes(queryStr string) string {
+func (b *builderState) serializeUserDefinedTypes(
+	queryStr string, lang catpb.Function_Language,
+) string {
 	replaceFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		var innerExpr tree.Expr
 		var typRef tree.ResolvableTypeReference
@@ -1617,37 +1925,78 @@ func (b *builderState) serializeUserDefinedTypes(queryStr string) string {
 		}
 		return false, parsedExpr, nil
 	}
-
-	var stmts tree.Statements
-	parsedStmts, err := parser.Parse(queryStr)
-	if err != nil {
-		panic(err)
-	}
-	stmts = make(tree.Statements, len(parsedStmts))
-	for i, stmt := range parsedStmts {
-		stmts[i] = stmt.AST
+	// replaceTypeFunc is a visitor function that replaces type annotations
+	// containing user defined types with their IDs. This is currently only
+	// necessary for some kinds of PLpgSQL statements.
+	replaceTypeFunc := func(typ tree.ResolvableTypeReference) (newTyp tree.ResolvableTypeReference, err error) {
+		if typ == nil {
+			return typ, nil
+		}
+		// semaCtx may be nil if this is a virtual view being created at
+		// init time.
+		var typeResolver tree.TypeReferenceResolver
+		if b.semaCtx != nil {
+			typeResolver = b.semaCtx.TypeResolver
+		}
+		var t *types.T
+		t, err = tree.ResolveType(b.ctx, typ, typeResolver)
+		if err != nil {
+			return typ, err
+		}
+		if !t.UserDefined() {
+			return typ, nil
+		}
+		return &tree.OIDTypeReference{OID: t.Oid()}, nil
 	}
 
 	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
-	for i, stmt := range stmts {
-		newStmt, err := tree.SimpleStmtVisit(stmt, replaceFunc)
+	switch lang {
+	case catpb.Function_SQL:
+		var stmts tree.Statements
+		parsedStmts, err := parser.Parse(queryStr)
 		if err != nil {
 			panic(err)
 		}
-		if i > 0 {
-			fmtCtx.WriteString("\n")
+		stmts = make(tree.Statements, len(parsedStmts))
+		for i, stmt := range parsedStmts {
+			stmts[i] = stmt.AST
 		}
+		for i, stmt := range stmts {
+			newStmt, err := tree.SimpleStmtVisit(stmt, replaceFunc)
+			if err != nil {
+				panic(err)
+			}
+			if i > 0 {
+				fmtCtx.WriteString("\n")
+			}
+			fmtCtx.FormatNode(newStmt)
+			fmtCtx.WriteString(";")
+		}
+	case catpb.Function_PLPGSQL:
+		var stmts plpgsqltree.Statement
+		plstmt, err := plpgsql.Parse(queryStr)
+		if err != nil {
+			panic(errors.Wrap(err, "failed to parse query string"))
+		}
+		stmts = plstmt.AST
+
+		v := plpgsqltree.SQLStmtVisitor{Fn: replaceFunc}
+		newStmt := plpgsqltree.Walk(&v, stmts)
+		// Some PLpgSQL statements (i.e., declarations), may contain type
+		// annotations containing the UDT. We need to walk the AST to replace them,
+		// too.
+		v2 := plpgsqltree.TypeRefVisitor{Fn: replaceTypeFunc}
+		newStmt = plpgsqltree.Walk(&v2, newStmt)
 		fmtCtx.FormatNode(newStmt)
-		fmtCtx.WriteString(";")
+	default:
+		panic(errors.AssertionFailedf("unexpected function language: %s", lang))
 	}
 	return fmtCtx.CloseAndGetString()
-
 }
 
 func (b *builderState) ResolveDatabasePrefix(schemaPrefix *tree.ObjectNamePrefix) {
 	if schemaPrefix.SchemaName == "" || !schemaPrefix.ExplicitSchema {
-		panic(errors.AssertionFailedf("schema name empty when resolving database prefix for a " +
-			"schema name"))
+		panic(pgerror.Newf(pgcode.Syntax, "empty schema name"))
 	}
 	if schemaPrefix.CatalogName == "" {
 		schemaPrefix.CatalogName = tree.Name(b.cr.CurrentDatabase())

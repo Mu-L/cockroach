@@ -157,12 +157,12 @@ user root
 statement ok
 GRANT testrole TO testuser
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role      member    isAdmin  role_id  member_id
-admin     root      true     2        1
-testrole  testuser  false    108      100
+role      member    isAdmin
+admin     root      true
+testrole  testuser  false
 
 query TTB colnames,rowsort
 SHOW GRANTS ON ROLE
@@ -183,17 +183,21 @@ GRANT testrole TO testuser WITH ADMIN OPTION
 
 statement ok
 CREATE ROLE child_role;
+
+statement ok
 GRANT testrole to child_role;
+
+statement ok
 GRANT testuser TO child_role;
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role      member      isAdmin  role_id  member_id
-admin     root        true     2        1
-testrole  child_role  false    108      109
-testrole  testuser    true     108      100
-testuser  child_role  false    100      109
+role      member      isAdmin
+admin     root        true
+testrole  child_role  false
+testrole  testuser    true
+testuser  child_role  false
 
 query TTBB colnames,rowsort
 SELECT * FROM "".crdb_internal.kv_inherited_role_members
@@ -257,21 +261,15 @@ user root
 statement ok
 GRANT admin TO testuser
 
-# Verify that is_admin reports the right value.
-query B
-SELECT crdb_internal.is_admin()
-----
-true
-
 # Dropping users/roles deletes all their memberships.
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role      member     isAdmin  role_id  member_id
-admin     root       true     2        1
-admin     testuser   false    2        100
-testrole  testuser   true     108      100
-testrole  testuser2  true     108      107
+role      member     isAdmin
+admin     root       true
+admin     testuser   false
+testrole  testuser   true
+testrole  testuser2  true
 
 query TTB colnames,rowsort
 SHOW GRANTS ON ROLE
@@ -330,21 +328,21 @@ DROP USER testuser
 statement ok
 CREATE USER testuser
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role      member     isAdmin  role_id  member_id
-admin     root       true     2        1
-testrole  testuser2  true     108      107
+role      member     isAdmin
+admin     root       true
+testrole  testuser2  true
 
 statement ok
 DROP ROLE testrole
 
-query TTBOO colnames
-SELECT * FROM system.role_members
+query TTB colnames
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member  isAdmin  role_id  member_id
-admin  root    true     2        1
+role   member  isAdmin
+admin  root    true
 
 # Test cycle detection.
 statement error pq: admin cannot be a member of itself
@@ -468,17 +466,17 @@ testuser
 
 user root
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member    isAdmin  role_id  member_id
-admin  root      true     2        1
-rolea  roleb     true     111      112
-rolea  rolee     false    111      115
-roleb  rolec     false    112      113
-rolec  roled     false    113      114
-rolec  testuser  false    113      110
-roled  testuser  false    114      110
+role   member    isAdmin
+admin  root      true
+rolea  roleb     true
+rolea  rolee     false
+roleb  rolec     false
+rolec  roled     false
+rolec  testuser  false
+roled  testuser  false
 
 statement ok
 DROP ROLE rolea
@@ -486,12 +484,12 @@ DROP ROLE rolea
 statement ok
 DROP ROLE rolec
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member    isAdmin  role_id  member_id
-admin  root      true     2        1
-roled  testuser  false    114      110
+role   member    isAdmin
+admin  root      true
+roled  testuser  false
 
 query TTT rowsort
 SHOW ROLES
@@ -540,13 +538,25 @@ CREATE ROLE roleb
 statement ok
 GRANT rolea,roleb TO testuser WITH ADMIN OPTION
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+statement error role/user "" does not exist
+GRANT rolea TO ""
+
+statement error role/user "" does not exist
+REVOKE rolea FROM ""
+
+statement error role/user "" does not exist
+GRANT "" TO rolea
+
+statement error role/user "" does not exist
+REVOKE "" FROM rolea
+
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member    isAdmin  role_id  member_id
-admin  root      true     2        1
-rolea  testuser  true     116      110
-roleb  testuser  true     117      110
+role   member    isAdmin
+admin  root      true
+rolea  testuser  true
+roleb  testuser  true
 
 user testuser
 
@@ -555,15 +565,15 @@ GRANT rolea,roleb TO root WITH ADMIN OPTION
 
 user root
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member    isAdmin  role_id  member_id
-admin  root      true     2        1
-rolea  root      true     116      1
-rolea  testuser  true     116      110
-roleb  root      true     117      1
-roleb  testuser  true     117      110
+role   member    isAdmin
+admin  root      true
+rolea  root      true
+rolea  testuser  true
+roleb  root      true
+roleb  testuser  true
 
 query TTT colnames,rowsort
 SELECT * FROM information_schema.administrable_role_authorizations
@@ -625,45 +635,45 @@ REVOKE roleb FROM root
 
 user root
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member    isAdmin  role_id  member_id
-admin  root      true     2        1
-rolea  root      true     116      1
-rolea  testuser  false    116      110
-roleb  testuser  true     117      110
+role   member    isAdmin
+admin  root      true
+rolea  root      true
+rolea  testuser  false
+roleb  testuser  true
 
 statement ok
 REVOKE rolea, roleb FROM testuser, root
 
-query TTBOO colnames
-SELECT * FROM system.role_members
+query TTB colnames
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member  isAdmin  role_id  member_id
-admin  root    true     2        1
+role   member  isAdmin
+admin  root    true
 
 # Verify that GRANT/REVOKE are not sensitive to the case of role names.
 
 statement ok
 GRANT roLea,rOleB TO tEstUSER WITH ADMIN OPTION
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member    isAdmin  role_id  member_id
-admin  root      true     2        1
-rolea  testuser  true     116      110
-roleb  testuser  true     117      110
+role   member    isAdmin
+admin  root      true
+rolea  testuser  true
+roleb  testuser  true
 
 statement ok
 REVOKE roleA, roleB FROM TestUser
 
-query TTBOO colnames
-SELECT * FROM system.role_members
+query TTB colnames
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member  isAdmin  role_id  member_id
-admin  root    true     2        1
+role   member  isAdmin
+admin  root    true
 
 # Test privilege checks.
 
@@ -694,13 +704,13 @@ GRANT admin TO newgroup
 
 user testuser
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role      member    isAdmin  role_id  member_id
-admin     newgroup  false    2        118
-admin     root      true     2        1
-newgroup  testuser  false    118      110
+role      member    isAdmin
+admin     newgroup  false
+admin     root      true
+newgroup  testuser  false
 
 
 user root
@@ -734,12 +744,12 @@ CREATE TABLE db2.s1.foo (k int);
 
 user root
 
-query TTBOO colnames,rowsort
-SELECT * FROM system.role_members
+query TTB colnames,rowsort
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role      member    isAdmin  role_id  member_id
-admin     root      true     2        1
-newgroup  testuser  false    118      110
+role      member    isAdmin
+admin     root      true
+newgroup  testuser  false
 
 statement ok
 GRANT ALL ON DATABASE db2 TO newgroup
@@ -819,11 +829,11 @@ DROP TABLE db2.foo
 statement ok
 DROP USER testuser
 
-query TTBOO colnames
-SELECT * FROM system.role_members
+query TTB colnames
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member  isAdmin  role_id  member_id
-admin  root    true     2        1
+role   member  isAdmin
+admin  root    true
 
 statement error cannot drop role/user newgroup: grants still exist on db2
 DROP ROLE newgroup
@@ -877,11 +887,11 @@ REVOKE admin FROM public
 statement ok
 CREATE USER testuser
 
-query TTBOO colnames
-SELECT * FROM system.role_members
+query TTB colnames
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member  isAdmin  role_id  member_id
-admin  root    true     2        1
+role   member  isAdmin
+admin  root    true
 
 
 user testuser
@@ -956,11 +966,11 @@ CREATE ROLE IF NOT EXISTS anotherrolewithcreate2 CREATEROLE
 statement ok
 CREATE ROLE IF NOT EXISTS rolewithoutcreate2 WITH NOCREATEROLE
 
-query TTBOO colnames
-SELECT * FROM system.role_members
+query TTB colnames
+SELECT role, member, "isAdmin" FROM system.role_members
 ----
-role   member  isAdmin  role_id  member_id
-admin  root    true     2        1
+role   member  isAdmin
+admin  root    true
 
 user testuser
 
@@ -1554,7 +1564,7 @@ user testuser
 # Verify that testuser is not allowed to edit some other role that has ADMIN.
 # The error message is important for this test -- we want to make sure it fails
 # because of a missing ADMIN power, not because of a missing CREATEROLE option.
-statement error only users with the admin role are allowed to ALTER ROLE admin
+statement error only users with the admin role are allowed to alter another admin
 ALTER ROLE other_admin NOCREATEDB
 
 subtest pw_hashes
@@ -1664,3 +1674,230 @@ RESET CLUSTER SETTING server.user_login.password_encryption;
 
 statement ok
 RESET CLUSTER SETTING server.user_login.password_hashes.default_cost.scram_sha_256
+
+subtest end
+
+subtest create_role_priv
+
+user root
+
+# Revoke the CREATEROLE role option granted in an earlier subtest.
+statement ok
+ALTER ROLE testuser NOCREATEROLE
+
+user testuser
+
+statement error user testuser does not have CREATEROLE privilege
+CREATE ROLE u_create_role_priv
+
+user root
+
+statement ok
+GRANT SYSTEM CREATEROLE TO testuser
+
+user testuser
+
+statement ok
+CREATE ROLE u_create_role_priv
+
+user root
+
+statement ok
+REVOKE SYSTEM CREATEROLE FROM testuser
+
+user testuser
+
+statement error user testuser does not have CREATEROLE privilege
+DROP ROLE u_create_role_priv
+
+user root
+
+statement ok
+CREATE ROLE parent_with_createrole
+
+statement ok
+GRANT parent_with_createrole TO testuser
+
+statement ok
+GRANT SYSTEM CREATEROLE TO parent_with_createrole
+
+user testuser
+
+statement ok
+DROP ROLE u_create_role_priv
+
+user root
+
+statement ok
+REVOKE SYSTEM CREATEROLE FROM parent_with_createrole
+
+statement ok
+DROP ROLE parent_with_createrole
+
+subtest end
+
+subtest create_login_priv
+
+user root
+
+statement ok
+ALTER ROLE testuser CREATEROLE NOCREATELOGIN
+
+user testuser
+
+statement error user testuser does not have CREATELOGIN privilege
+CREATE USER u_create_login_priv WITH PASSWORD 'roacher4lyfe'
+
+user root
+
+statement ok
+GRANT SYSTEM CREATELOGIN TO testuser
+
+user testuser
+
+statement ok
+CREATE USER u_create_login_priv WITH PASSWORD 'roacher4lyfe'
+
+statement ok
+DROP USER u_create_login_priv
+
+user root
+
+statement ok
+REVOKE SYSTEM CREATELOGIN FROM testuser
+
+user testuser
+
+statement error user testuser does not have CREATELOGIN privilege
+CREATE USER u_create_login_priv WITH PASSWORD 'roacher4lyfe'
+
+user root
+
+statement ok
+CREATE ROLE creator_of_logins
+
+statement ok
+GRANT SYSTEM CREATELOGIN TO creator_of_logins
+
+statement ok
+GRANT creator_of_logins TO testuser
+
+user testuser
+
+statement ok
+CREATE USER u_create_login_priv WITH PASSWORD 'roacher4lyfe'
+
+statement ok
+DROP USER u_create_login_priv
+
+user root
+
+statement ok
+REVOKE SYSTEM CREATELOGIN FROM creator_of_logins
+
+statement ok
+DROP ROLE creator_of_logins
+
+statement ok
+ALTER ROLE testuser NOCREATEROLE
+
+subtest end
+
+subtest create_db_priv
+
+user root
+
+statement ok
+ALTER ROLE testuser NOCREATEDB
+
+user testuser
+
+statement error permission denied to create database
+CREATE DATABASE db_create_db_priv
+
+user root
+
+statement ok
+GRANT SYSTEM CREATEDB TO testuser
+
+user testuser
+
+statement ok
+CREATE DATABASE db_create_db_priv
+
+user root
+
+statement ok
+REVOKE SYSTEM CREATEDB FROM testuser
+
+user testuser
+
+statement error permission denied to rename database
+ALTER DATABASE db_create_db_priv RENAME TO renamed_db_create_db_priv
+
+user root
+
+statement ok
+CREATE ROLE creator_of_databases
+
+statement ok
+GRANT creator_of_databases TO testuser
+
+statement ok
+GRANT SYSTEM CREATEDB TO creator_of_databases
+
+user testuser
+
+statement ok
+ALTER DATABASE db_create_db_priv RENAME TO renamed_db_create_db_priv
+
+user root
+
+statement ok
+DROP DATABASE renamed_db_create_db_priv
+
+statement ok
+REVOKE SYSTEM CREATEDB FROM creator_of_databases
+
+statement ok
+DROP ROLE creator_of_databases
+
+subtest end
+
+subtest subject
+
+skipif config 3node-tenant
+statement error OSS binaries do not include enterprise features
+CREATE ROLE role_with_subject SUBJECT 'foo'
+
+skipif config 3node-tenant
+statement error OSS binaries do not include enterprise features
+ALTER ROLE testuser SUBJECT 'foo'
+
+subtest end
+
+# Validates that drop role will be prevented if the role is in use by
+# any schema objects. This is validates and prevents the regression found
+# in #124441
+subtest drop_role_block_validation
+
+statement ok
+CREATE DATABASE block_db;
+USE block_db;
+CREATE TABLE t(n int);
+CREATE TYPE  typ AS ENUM ('open', 'closed', 'inactive');
+CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;
+CREATE ROLE block_user;
+GRANT ALL ON DATABASE block_db to block_user;
+GRANT ALL ON SCHEMA public to block_user;
+GRANT ALL ON TABLE t to block_user;
+GRANT ALL ON TYPE typ to block_user;
+GRANT ALL ON FUNCTION f to block_user;
+
+statement error pgcode 2BP01 cannot drop role/user block_user: grants still exist on block_db, block_db.public.t, block_db.public, block_db.public.typ, block_db.public.f
+DROP ROLE block_user
+
+statement ok
+USE defaultdb;
+
+subtest end

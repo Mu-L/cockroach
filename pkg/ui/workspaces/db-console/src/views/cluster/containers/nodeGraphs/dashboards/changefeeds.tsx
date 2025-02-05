@@ -1,25 +1,21 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import React from "react";
 
 import LineGraph from "src/views/cluster/components/linegraph";
 import { Axis, Metric } from "src/views/shared/components/metricQuery";
-import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 import {
   GraphDashboardProps,
   nodeDisplayName,
   storeIDsForNode,
 } from "./dashboardUtils";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+
 import TimeSeriesQueryAggregator = cockroach.ts.tspb.TimeSeriesQueryAggregator;
 
 export default function (props: GraphDashboardProps) {
@@ -37,6 +33,7 @@ export default function (props: GraphDashboardProps) {
       isKvGraph={false}
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="count">
         <Metric
@@ -53,7 +50,9 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Commit Latency"
-      tooltip={`The difference between an event's MVCC timestamp and the time it was acknowledged as received by the downstream sink.`}
+      tooltip={`The difference between an event's MVCC timestamp and the time it was
+          acknowledged as received by the downstream sink.`}
+      showMetricsInTooltip={true}
       isKvGraph={false}
       sources={storeSources}
       tenantSource={tenantSource}
@@ -63,21 +62,29 @@ export default function (props: GraphDashboardProps) {
           name="cr.node.changefeed.commit_latency-p99"
           title="99th Percentile"
           downsampleMax
+          aggregateMax
         />
         <Metric
           name="cr.node.changefeed.commit_latency-p90"
           title="90th Percentile"
           downsampleMax
+          aggregateMax
         />
         <Metric
           name="cr.node.changefeed.commit_latency-p50"
           title="50th Percentile"
           downsampleMax
+          aggregateMax
         />
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Emitted Bytes" isKvGraph={false} sources={storeSources}>
+    <LineGraph
+      title="Emitted Bytes"
+      isKvGraph={false}
+      sources={storeSources}
+      showMetricsInTooltip={true}
+    >
       <Axis units={AxisUnits.Bytes} label="bytes">
         <Metric
           name="cr.node.changefeed.emitted_bytes"
@@ -92,6 +99,7 @@ export default function (props: GraphDashboardProps) {
       isKvGraph={false}
       sources={storeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -108,9 +116,14 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
-      title="Max Checkpoint Latency"
+      title="Max Checkpoint Lag"
       isKvGraph={false}
-      tooltip={`The most any changefeed's persisted checkpoint is behind the present.  Larger values indicate issues with successfully ingesting or emitting changes.  If errors cause a changefeed to restart, or the changefeed is paused and unpaused, emitted data up to the last checkpoint may be re-emitted.`}
+      tooltip={`The most any changefeed's persisted checkpoint is behind the present.
+          Larger values indicate issues with successfully ingesting or emitting
+          changes. If errors cause a changefeed to restart, or the changefeed is
+          paused and unpaused, emitted data up to the last checkpoint may be
+          re-emitted.`}
+      showMetricsInTooltip={true}
       tenantSource={tenantSource}
     >
       <Axis units={AxisUnits.Duration} label="time">
@@ -125,7 +138,10 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Changefeed Restarts"
-      tooltip={`The rate of transient non-fatal errors, such as temporary connectivity issues or a rolling upgrade. This rate constantly becoming non-zero may indicate a more persistent issue.`}
+      tooltip={`The rate of transient non-fatal errors, such as temporary connectivity
+          issues or a rolling upgrade. This rate constantly becoming non-zero
+          may indicate a more persistent issue.`}
+      showMetricsInTooltip={true}
       isKvGraph={false}
       sources={storeSources}
       tenantSource={tenantSource}
@@ -141,7 +157,9 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Oldest Protected Timestamp"
-      tooltip={`The oldest data that any changefeed is protecting from being able to be automatically garbage collected.`}
+      tooltip={`The oldest data that any changefeed is protecting from being able to
+          be automatically garbage collected.`}
+      showMetricsInTooltip={true}
       isKvGraph={false}
       sources={storeSources}
     >
@@ -157,7 +175,10 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Backfill Pending Ranges"
-      tooltip={`The number of ranges being backfilled (ex: due to an initial scan or schema change) that are yet to completely enter the Changefeed pipeline.`}
+      tooltip={`The number of ranges being backfilled (ex: due to an initial scan or
+          schema change) that are yet to completely enter the Changefeed
+          pipeline.`}
+      showMetricsInTooltip={true}
       isKvGraph={false}
       sources={storeSources}
     >
@@ -171,13 +192,16 @@ export default function (props: GraphDashboardProps) {
 
     <LineGraph
       title="Schema Registry Registrations"
-      tooltip={`The rate of schema registration requests made by CockroachDB nodes to a configured schema registry endpoint (ex: A Kafka feed pointing to a Confluent Schema Registry)`}
+      tooltip={`The rate of schema registration requests made by CockroachDB nodes to
+          a configured schema registry endpoint (ex: A Kafka feed pointing to a
+          Confluent Schema Registry)`}
+      showMetricsInTooltip={true}
       isKvGraph={false}
       sources={storeSources}
     >
       <Axis units={AxisUnits.Count} label="action">
         <Metric
-          name="cr.node.changefeed.schema_registry_registrations"
+          name="cr.node.changefeed.schema_registry.registrations"
           title="Schema Registry Registrations"
           nonNegativeRate
         />
@@ -188,7 +212,9 @@ export default function (props: GraphDashboardProps) {
       title="Ranges in catchup mode"
       isKvGraph={false}
       sources={storeSources}
-      tooltip="Total number of ranges with an active rangefeed that are performing catchup scan"
+      tooltip={`Total number of ranges with an active rangefeed that are performing
+          catchup scan`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Count} label="ranges">
         <Metric
@@ -203,6 +229,7 @@ export default function (props: GraphDashboardProps) {
       title="RangeFeed catchup scans duration"
       isKvGraph={false}
       sources={storeSources}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="duration">
         {nodeIDs.map(nid => (

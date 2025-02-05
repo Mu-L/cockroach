@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,9 +10,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -26,7 +23,9 @@ import (
 )
 
 func init() {
-	RegisterReadOnlyCommand(kvpb.RefreshRange, DefaultDeclareKeys, RefreshRange)
+	// Depending on the cluster version, Refresh requests  may or may not declare locks.
+	// See DeclareKeysForRefresh for details.
+	RegisterReadOnlyCommand(kvpb.RefreshRange, DeclareKeysForRefresh, RefreshRange)
 }
 
 // RefreshRange checks whether the key range specified has any values written in
@@ -56,7 +55,7 @@ func RefreshRange(
 	}
 
 	log.VEventf(ctx, 2, "refresh %s @[%s-%s]", args.Span(), refreshFrom, refreshTo)
-	return result.Result{}, refreshRange(ctx, reader, args.Span(), refreshFrom, refreshTo, h.Txn.ID)
+	return result.Result{}, refreshRange(ctx, reader, args.Span(), refreshFrom, refreshTo, h.Txn.ID, h.WaitPolicy)
 }
 
 // refreshRange iterates over the specified key span until it discovers a value
@@ -73,18 +72,23 @@ func refreshRange(
 	span roachpb.Span,
 	refreshFrom, refreshTo hlc.Timestamp,
 	txnID uuid.UUID,
+	wp lock.WaitPolicy,
 ) error {
 	// Construct an incremental iterator with the desired time bounds. Incremental
 	// iterators will emit MVCC tombstones by default and will emit intents when
 	// configured to do so (see IntentPolicy).
-	iter := storage.NewMVCCIncrementalIterator(reader.(storage.ReaderWithMustIterators), storage.MVCCIncrementalIterOptions{
+	iter, err := storage.NewMVCCIncrementalIterator(ctx, reader, storage.MVCCIncrementalIterOptions{
 		KeyTypes:     storage.IterKeyTypePointsAndRanges,
 		StartKey:     span.Key,
 		EndKey:       span.EndKey,
 		StartTime:    refreshFrom, // exclusive
 		EndTime:      refreshTo,   // inclusive
 		IntentPolicy: storage.MVCCIncrementalIterIntentPolicyEmit,
+		ReadCategory: fs.BatchEvalReadCategory,
 	})
+	if err != nil {
+		return err
+	}
 	defer iter.Close()
 
 	var meta enginepb.MVCCMetadata
@@ -126,13 +130,20 @@ func refreshRange(
 				} else if !ok {
 					return errors.Errorf("expected provisional value for intent")
 				}
-				if !meta.Timestamp.ToTimestamp().EqOrdering(iter.UnsafeKey().Timestamp) {
+				if meta.Timestamp.ToTimestamp() != iter.UnsafeKey().Timestamp {
 					return errors.Errorf("expected provisional value for intent with ts %s, found %s",
 						meta.Timestamp, iter.UnsafeKey().Timestamp)
 				}
 				continue
 			}
-			return kvpb.NewRefreshFailedError(ctx, kvpb.RefreshFailedError_REASON_INTENT, key.Key, meta.Txn.WriteTimestamp, kvpb.WithConflictingTxn(meta.Txn))
+			// TODO(mira): Remove after V23_2_RemoveLockTableWaiterTouchPush is deleted.
+			if wp == lock.WaitPolicy_Error {
+				// Return a LockConflictError, which will be handled by
+				// the concurrency manager's HandleLockConflictError.
+				return &kvpb.LockConflictError{Locks: []roachpb.Lock{roachpb.MakeLock(meta.Txn, key.Key, lock.Intent)}}
+			} else {
+				return kvpb.NewRefreshFailedError(ctx, kvpb.RefreshFailedError_REASON_INTENT, key.Key, meta.Txn.WriteTimestamp, kvpb.WithConflictingTxn(meta.Txn))
+			}
 		}
 
 		// If a committed value is found, return an error.

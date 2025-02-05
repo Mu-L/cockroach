@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvpb
 
@@ -14,10 +9,12 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -152,10 +149,10 @@ func ErrPriority(err error) ErrorPriority {
 			return ErrorScoreTxnAbort
 		}
 		return ErrorScoreTxnRestart
-	case *ConditionFailedError, *LockConflictError:
+	case *ConditionFailedError, *WriteIntentError:
 		// We particularly care about returning the low ErrorScoreUnambiguousError
 		// because we don't want to transition a transaction that encounters a
-		// ConditionFailedError or a LockConflictError to an error state. More
+		// ConditionFailedError or a WriteIntentError to an error state. More
 		// specifically, we want to allow rollbacks to savepoint after one of these
 		// errors.
 		return ErrorScoreUnambiguousError
@@ -259,8 +256,7 @@ type ErrorDetailInterface interface {
 type ErrorDetailType int
 
 // This lists all ErrorDetail types. The numeric values in this list are used to
-// identify corresponding timeseries. The values correspond to the proto oneof
-// values.
+// identify corresponding timeseries.
 //
 //go:generate stringer -type=ErrorDetailType
 const (
@@ -272,7 +268,7 @@ const (
 	TransactionPushErrType                  ErrorDetailType = 6
 	TransactionRetryErrType                 ErrorDetailType = 7
 	TransactionStatusErrType                ErrorDetailType = 8
-	LockConflictErrType                     ErrorDetailType = 9
+	WriteIntentErrType                      ErrorDetailType = 9
 	WriteTooOldErrType                      ErrorDetailType = 10
 	OpRequiresTxnErrType                    ErrorDetailType = 11
 	ConditionFailedErrType                  ErrorDetailType = 12
@@ -297,6 +293,9 @@ const (
 	MinTimestampBoundUnsatisfiableErrType   ErrorDetailType = 42
 	RefreshFailedErrType                    ErrorDetailType = 43
 	MVCCHistoryMutationErrType              ErrorDetailType = 44
+	LockConflictErrType                     ErrorDetailType = 45
+	ReplicaUnavailableErrType               ErrorDetailType = 46
+	ProxyFailedErrType                      ErrorDetailType = 47
 	// When adding new error types, don't forget to update NumErrors below.
 
 	// CommunicationErrType indicates a gRPC error; this is not an ErrorDetail.
@@ -306,7 +305,7 @@ const (
 	// detail. The value 25 is chosen because it's reserved in the errors proto.
 	InternalErrType ErrorDetailType = 25
 
-	NumErrors int = 45
+	NumErrors int = 48
 )
 
 // Register the migration of all errors that used to be in the roachpb package
@@ -323,7 +322,7 @@ func init() {
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.TransactionPushError", &TransactionPushError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.TransactionRetryError", &TransactionRetryError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.TransactionStatusError", &TransactionStatusError{})
-	errors.RegisterTypeMigration(roachpbPath, "*roachpb.WriteIntentError", &LockConflictError{})
+	errors.RegisterTypeMigration(roachpbPath, "*roachpb.WriteIntentError", &WriteIntentError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.WriteTooOldError", &WriteTooOldError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.OpRequiresTxnError", &OpRequiresTxnError{})
 	errors.RegisterTypeMigration(roachpbPath, "*roachpb.ConditionFailedError", &ConditionFailedError{})
@@ -487,8 +486,6 @@ func (e *NotLeaseHolderError) printError(s Printer) {
 	}
 	if e.Lease != nil {
 		s.Printf("current lease is %s", e.Lease)
-	} else if e.DeprecatedLeaseHolder != nil {
-		s.Printf("replica %s is", *e.DeprecatedLeaseHolder)
 	} else {
 		s.Printf("lease holder unknown")
 	}
@@ -864,6 +861,9 @@ func (e *TransactionRetryError) SafeFormatError(p errors.Printer) (next error) {
 	} else if e.ExtraMsg != "" {
 		msg = redact.Sprintf(" - %s", e.ExtraMsg)
 	}
+	if e.ConflictingTxn != nil {
+		msg = redact.Sprintf("%s - conflicting txn: meta={%s}", msg, e.ConflictingTxn.String())
+	}
 	p.Printf("TransactionRetryError: retry txn (%s%s)", redact.SafeString(TransactionRetryReason_name[int32(e.Reason)]), msg)
 	return nil
 }
@@ -922,17 +922,61 @@ func (e *LockConflictError) SafeFormatError(p errors.Printer) (next error) {
 }
 
 func (e *LockConflictError) printError(buf Printer) {
+	printConflictingLocks(buf, e.Locks)
+}
+
+// Type is part of the ErrorDetailInterface.
+func (e *LockConflictError) Type() ErrorDetailType {
+	return LockConflictErrType
+}
+
+var _ ErrorDetailInterface = &LockConflictError{}
+
+func (e *WriteIntentError) Error() string {
+	return redact.Sprint(e).StripMarkers()
+}
+
+func (e *WriteIntentError) SafeFormatError(p errors.Printer) (next error) {
+	e.printError(p)
+	return nil
+}
+
+func (e *WriteIntentError) printError(buf Printer) {
+	printConflictingLocks(buf, e.Locks)
+
+	switch e.Reason {
+	case WriteIntentError_REASON_UNSPECIFIED:
+		// Nothing to say.
+	case WriteIntentError_REASON_WAIT_POLICY:
+		buf.Printf(" [reason=wait_policy]")
+	case WriteIntentError_REASON_LOCK_TIMEOUT:
+		buf.Printf(" [reason=lock_timeout]")
+	case WriteIntentError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED:
+		buf.Printf(" [reason=lock_wait_queue_max_length_exceeded]")
+	default:
+		// Could panic, better to silently ignore in case new reasons are added.
+	}
+}
+
+// Type is part of the ErrorDetailInterface.
+func (e *WriteIntentError) Type() ErrorDetailType {
+	return WriteIntentErrType
+}
+
+var _ ErrorDetailInterface = &WriteIntentError{}
+
+func printConflictingLocks(buf Printer, locks []roachpb.Lock) {
 	buf.Printf("conflicting locks on ")
 
 	// If we have a lot of locks, we only want to show the first and the last.
 	const maxBegin = 5
 	const maxEnd = 5
 	var begin, end []roachpb.Lock
-	if len(e.Locks) <= maxBegin+maxEnd {
-		begin = e.Locks
+	if len(locks) <= maxBegin+maxEnd {
+		begin = locks
 	} else {
-		begin = e.Locks[0:maxBegin]
-		end = e.Locks[len(e.Locks)-maxEnd : len(e.Locks)]
+		begin = locks[0:maxBegin]
+		end = locks[len(locks)-maxEnd:]
 	}
 
 	for i := range begin {
@@ -950,27 +994,7 @@ func (e *LockConflictError) printError(buf Printer) {
 			buf.Print(end[i].Key)
 		}
 	}
-
-	switch e.Reason {
-	case LockConflictError_REASON_UNSPECIFIED:
-		// Nothing to say.
-	case LockConflictError_REASON_WAIT_POLICY:
-		buf.Printf(" [reason=wait_policy]")
-	case LockConflictError_REASON_LOCK_TIMEOUT:
-		buf.Printf(" [reason=lock_timeout]")
-	case LockConflictError_REASON_LOCK_WAIT_QUEUE_MAX_LENGTH_EXCEEDED:
-		buf.Printf(" [reason=lock_wait_queue_max_length_exceeded]")
-	default:
-		// Could panic, better to silently ignore in case new reasons are added.
-	}
 }
-
-// Type is part of the ErrorDetailInterface.
-func (e *LockConflictError) Type() ErrorDetailType {
-	return LockConflictErrType
-}
-
-var _ ErrorDetailInterface = &LockConflictError{}
 
 // NewWriteTooOldError creates a new write too old error. The function accepts
 // the timestamp of the operation that hit the error, along with the timestamp
@@ -1111,7 +1135,7 @@ func (e *ReadWithinUncertaintyIntervalError) RetryTimestamp() hlc.Timestamp {
 	// advance the txn's timestamp up to the local uncertainty limit on the node
 	// which hit the error. This ensures that no future read after the retry on
 	// this node (ignoring lease complications in ComputeLocalUncertaintyLimit
-	// and values with synthetic timestamps) will throw an uncertainty error,
+	// and values with future-time timestamps) will throw an uncertainty error,
 	// even when reading other keys.
 	//
 	// Note that if the request was not able to establish a local uncertainty
@@ -1125,9 +1149,9 @@ func (e *ReadWithinUncertaintyIntervalError) RetryTimestamp() hlc.Timestamp {
 	// In general, we expect the local uncertainty limit, if set, to be above
 	// the uncertainty value's timestamp. So we expect this Forward to advance
 	// ts. However, this is not always the case. The one exception is if the
-	// uncertain value had a synthetic timestamp, so it was compared against the
-	// global uncertainty limit to determine uncertainty (see IsUncertain). In
-	// such cases, we're ok advancing just past the value's timestamp. Either
+	// uncertain value had a future-time timestamp, so it was compared against
+	// the global uncertainty limit to determine uncertainty (see IsUncertain).
+	// In such cases, we're ok advancing just past the value's timestamp. Either
 	// way, we won't see the same value in our uncertainty interval on a retry.
 	ts.Forward(e.LocalUncertaintyLimit.ToTimestamp())
 	return ts
@@ -1157,7 +1181,13 @@ func (e *ConditionFailedError) Error() string {
 }
 
 func (e *ConditionFailedError) SafeFormatError(p errors.Printer) (next error) {
-	p.Printf("unexpected value: %s", e.ActualValue)
+	if e.HadNewerOriginTimestamp {
+		p.Printf("higher OriginTimestamp but unexpected value: %s", e.ActualValue)
+	} else if e.OriginTimestampOlderThan.IsSet() {
+		p.Printf("OriginTimestamp older than %s", e.OriginTimestampOlderThan)
+	} else {
+		p.Printf("unexpected value: %s", e.ActualValue)
+	}
 	return nil
 }
 
@@ -1186,8 +1216,25 @@ var _ ErrorDetailInterface = &RaftGroupDeletedError{}
 
 // NewReplicaCorruptionError creates a new error indicating a corrupt replica.
 // The supplied error is used to provide additional detail in the error message.
+// NB: Take caution when marking errors as replica corruption errors to be sure
+// that they are actually indicative of replica corruption and should be treated
+// as such; for example while in general a failures to apply a command might be,
+// a timeout or context cancellation error may not be, especially if a user
+// request controls that cancellation/timeout. See the helper below in
+// MaybeWrapReplicaCorruptionError.
 func NewReplicaCorruptionError(err error) *ReplicaCorruptionError {
 	return &ReplicaCorruptionError{ErrorMsg: err.Error()}
+}
+
+// MaybeWrapReplicaCorruptionError wraps a passed error as a replica corruption
+// error unless it matches the error in the passed context, which would suggest
+// the whole operation was cancelled due to the latter rather than indicating a
+// fault which implies replica corruption.
+func MaybeWrapReplicaCorruptionError(ctx context.Context, err error) error {
+	if errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return NewReplicaCorruptionError(err)
 }
 
 func (e *ReplicaCorruptionError) Error() string {
@@ -1313,7 +1360,11 @@ func (e *BatchTimestampBeforeGCError) Error() string {
 }
 
 func (e *BatchTimestampBeforeGCError) SafeFormatError(p errors.Printer) (next error) {
-	p.Printf("batch timestamp %v must be after replica GC threshold %v", e.Timestamp, e.Threshold)
+	p.Printf(
+		"batch timestamp %v must be after replica GC threshold %v (r%d: %s)",
+		e.Timestamp, e.Threshold, e.RangeID,
+		roachpb.RSpan{Key: []byte(e.StartKey), EndKey: []byte(e.EndKey)},
+	)
 	return nil
 }
 
@@ -1558,8 +1609,19 @@ func (e *RefreshFailedError) Type() ErrorDetailType {
 var _ ErrorDetailInterface = &RefreshFailedError{}
 
 func (e *InsufficientSpaceError) Error() string {
-	return fmt.Sprintf("store %d has insufficient remaining capacity to %s (remaining: %s / %.1f%%, min required: %.1f%%)",
-		e.StoreID, e.Op, humanizeutil.IBytes(e.Available), float64(e.Available)/float64(e.Capacity)*100, e.Required*100)
+	return fmt.Sprint(e)
+}
+
+// Format implements fmt.Formatter.
+func (e *InsufficientSpaceError) Format(s fmt.State, verb rune) {
+	errors.FormatError(e, s, verb)
+}
+
+// SafeFormatError implements errors.SafeFormatter.
+func (e *InsufficientSpaceError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("store %d has insufficient remaining capacity to %s (remaining: %s / %.1f%%, min required: %.1f%%)",
+		e.StoreID, redact.SafeString(e.Op), humanizeutil.IBytes(e.Available), float64(e.Available)/float64(e.Capacity)*100, e.Required*100)
+	return nil
 }
 
 // NewNotLeaseHolderError returns a NotLeaseHolderError initialized with the
@@ -1589,10 +1651,6 @@ func NewNotLeaseHolderError(
 		if stillMember {
 			err.Lease = new(roachpb.Lease)
 			*err.Lease = l
-			// TODO(arul): We only need to return this for the 22.1 <-> 22.2 mixed
-			// version state, as v22.1 use this field to log NLHE messages. We can
-			// get rid of this, and the field, in v23.1.
-			err.DeprecatedLeaseHolder = &err.Lease.Replica
 		}
 	}
 	return err
@@ -1627,10 +1685,135 @@ func (e *MissingRecordError) SafeFormatError(p errors.Printer) (next error) {
 	return nil
 }
 
+// DescNotFoundError is reported when a descriptor is missing.
+type DescNotFoundError struct {
+	id      int32
+	isStore bool
+}
+
+// NewStoreDescNotFoundError initializes a new DescNotFoundError for a missing
+// store descriptor.
+func NewStoreDescNotFoundError(storeID roachpb.StoreID) *DescNotFoundError {
+	return &DescNotFoundError{
+		id:      int32(storeID),
+		isStore: true,
+	}
+}
+
+// NewNodeDescNotFoundError initializes a new DescNotFoundError for a missing
+// node descriptor.
+func NewNodeDescNotFoundError(nodeID roachpb.NodeID) *DescNotFoundError {
+	return &DescNotFoundError{
+		id:      int32(nodeID),
+		isStore: false,
+	}
+}
+
+func (e *DescNotFoundError) Error() string {
+	return redact.Sprint(e).StripMarkers()
+}
+
+func (e *DescNotFoundError) SafeFormatError(p errors.Printer) (next error) {
+	s := redact.SafeString("node")
+	if e.isStore {
+		s = "store"
+	}
+	p.Printf("%s descriptor with %s ID %d was not found", s, s, e.id)
+	return nil
+}
+
+// Type is part of the ErrorDetailInterface.
+func (e *ReplicaUnavailableError) Type() ErrorDetailType {
+	return ReplicaUnavailableErrType
+}
+
+var _ ErrorDetailInterface = &ReplicaUnavailableError{}
+
+// Type is part of the ErrorDetailInterface.
+func (e *ProxyFailedError) Type() ErrorDetailType {
+	return ProxyFailedErrType
+}
+
+// Error is part of the builtin err interface
+func (e *ProxyFailedError) Error() string {
+	return redact.Sprint(e).StripMarkers()
+}
+
+// Format implements fmt.Formatter.
+func (e *ProxyFailedError) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }
+
+// SafeFormatError is part of the SafeFormatter
+func (e *ProxyFailedError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("proxy failed with send error")
+	return nil
+}
+
+// Unwrap implements errors.Wrapper.
+func (e *ProxyFailedError) Unwrap() error {
+	return errors.DecodeError(context.Background(), e.Cause)
+}
+
+// NewProxyFailedError returns an ProxyFailedError wrapping (via
+// errors.Wrapper) the supplied error.
+func NewProxyFailedError(err error) *ProxyFailedError {
+	return &ProxyFailedError{
+		Cause: errors.EncodeError(context.Background(), err),
+	}
+}
+
+var _ ErrorDetailInterface = &ProxyFailedError{}
+var _ errors.SafeFormatter = (*ProxyFailedError)(nil)
+var _ fmt.Formatter = (*ProxyFailedError)(nil)
+var _ errors.Wrapper = (*ProxyFailedError)(nil)
+
+// KeyCollisionError represents a failed attempt to ingest the same key twice.
+type KeyCollisionError struct {
+	Key   roachpb.Key
+	Value []byte
+}
+
+// Format implements fmt.Formatter.
+func (d *KeyCollisionError) Format(s fmt.State, verb rune) {
+	errors.FormatError(d, s, verb)
+}
+
+func (d *KeyCollisionError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("ingested key collides with an existing one: %s", d.Key)
+	return nil
+}
+
+func (d *KeyCollisionError) Error() string {
+	return fmt.Sprint(d)
+}
+
+// NewKeyCollisionError constructs a KeyCollisionError, copying its input.
+func NewKeyCollisionError(key roachpb.Key, value []byte) error {
+	ret := &KeyCollisionError{
+		Key:   key.Clone(),
+		Value: slices.Clone(value),
+	}
+	return ret
+}
+
+func init() {
+	encode := func(ctx context.Context, err error) (msgPrefix string, safeDetails []string, payload proto.Message) {
+		errors.As(err, &payload) // payload = err.(proto.Message)
+		return "", nil, payload
+	}
+	decode := func(ctx context.Context, cause error, msgPrefix string, safeDetails []string, payload proto.Message) error {
+		return payload.(*ProxyFailedError)
+	}
+	typeName := errors.GetTypeKey((*ProxyFailedError)(nil))
+	errors.RegisterWrapperEncoder(typeName, encode)
+	errors.RegisterWrapperDecoder(typeName, decode)
+}
+
 func init() {
 	errors.RegisterLeafDecoder(errors.GetTypeKey((*MissingRecordError)(nil)), func(_ context.Context, _ string, _ []string, _ proto.Message) error {
 		return &MissingRecordError{}
 	})
+	errorutilpath := reflect.TypeOf(errorutil.TempSentinel{}).PkgPath()
+	errors.RegisterTypeMigration(errorutilpath, "*errorutil.descriptorNotFound", &DescNotFoundError{})
 }
 
 var _ errors.SafeFormatter = &MissingRecordError{}
@@ -1668,3 +1851,6 @@ var _ errors.SafeFormatter = &MinTimestampBoundUnsatisfiableError{}
 var _ errors.SafeFormatter = &RefreshFailedError{}
 var _ errors.SafeFormatter = &MVCCHistoryMutationError{}
 var _ errors.SafeFormatter = &UnhandledRetryableError{}
+var _ errors.SafeFormatter = &ReplicaUnavailableError{}
+var _ errors.SafeFormatter = &ProxyFailedError{}
+var _ errors.SafeFormatter = &KeyCollisionError{}

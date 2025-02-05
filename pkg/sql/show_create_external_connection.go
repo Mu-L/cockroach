@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -30,15 +26,13 @@ var showCreateExternalConnectionColumns = colinfo.ResultColumns{
 	{Name: "create_statement", Typ: types.String},
 }
 
-func loadExternalConnections(
-	params runParams, n *tree.ShowCreateExternalConnections,
-) ([]externalconn.ExternalConnection, error) {
-	var connections []externalconn.ExternalConnection
+func getConnectionNames(
+	params runParams, connectionLabel tree.Expr, checkUsagePrivilege bool,
+) ([]string, error) {
 	var rows []tree.Datums
-
-	if n.ConnectionLabel != nil {
+	if connectionLabel != nil {
 		name, err := params.p.ExprEvaluator(externalConnectionOp).String(
-			params.ctx, n.ConnectionLabel,
+			params.ctx, connectionLabel,
 		)
 		if err != nil {
 			return nil, err
@@ -56,10 +50,41 @@ func loadExternalConnections(
 		rows = append(rows, datums...)
 	}
 
+	names := make([]string, 0, len(rows))
 	for _, row := range rows {
-		connectionName := tree.MustBeDString(row[0])
+		name := string(tree.MustBeDString(row[0]))
+
+		if checkUsagePrivilege {
+			// Check that the user has USAGE privileges on the External Connection object.
+			ecPrivilege := &syntheticprivilege.ExternalConnectionPrivilege{
+				ConnectionName: name,
+			}
+			hasPriv, err := params.p.HasPrivilege(params.ctx, ecPrivilege,
+				privilege.USAGE, params.p.User())
+			if err != nil {
+				return nil, err
+			}
+			if !hasPriv && connectionLabel != nil {
+				return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
+					"must have %s privilege or be owner of the External Connection %q",
+					privilege.USAGE, name)
+			}
+			if !hasPriv {
+				continue
+			}
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func loadExternalConnections(
+	params runParams, connectionNames []string,
+) ([]externalconn.ExternalConnection, error) {
+	var connections []externalconn.ExternalConnection
+	for _, name := range connectionNames {
 		connection, err := externalconn.LoadExternalConnection(
-			params.ctx, string(connectionName), params.p.InternalSQLTxn(),
+			params.ctx, name, params.p.InternalSQLTxn(),
 		)
 		if err != nil {
 			return nil, err
@@ -69,17 +94,26 @@ func loadExternalConnections(
 	return connections, nil
 }
 
+// ShowCreateExternalConnection returns the `CREATE EXTERNAL CONNECTION ...`
+// statements for the external connections. User must have `VIEWCLUSTERMETADATA`
+// privilege to use this query.
 func (p *planner) ShowCreateExternalConnection(
 	ctx context.Context, n *tree.ShowCreateExternalConnections,
 ) (planNode, error) {
+	const (
+		connNameIdx = iota
+		createStmtIdx
+	)
+
 	var hasPrivileges bool
 	var err error
-	if hasPrivileges, err = p.UserHasAdminRole(ctx, p.User()); err != nil {
+	if hasPrivileges, err = p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERMETADATA, p.User()); err != nil {
 		return nil, err
 	}
 
-	// If the user is not admin, and is running a `SHOW CREATE EXTERNAL CONNECTION foo`
-	// check if the user is the owner of the object.
+	// If the user does not have VIEWCLUSTERMETADATA, and is running a `SHOW
+	// CREATE EXTERNAL CONNECTION foo` check if the user is the owner of the
+	// object.
 	exprEval := p.ExprEvaluator(externalConnectionOp)
 	if !hasPrivileges && n.ConnectionLabel != nil {
 		name, err := exprEval.String(ctx, n.ConnectionLabel)
@@ -94,10 +128,10 @@ func (p *planner) ShowCreateExternalConnection(
 			return nil, err
 		}
 		if !isOwner {
-			return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "must be admin or owner of the External Connection %q", name)
+			return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "must have %s privilege or be owner of the External Connection %q", privilege.VIEWCLUSTERMETADATA, name)
 		}
 	} else if !hasPrivileges {
-		return nil, pgerror.New(pgcode.InsufficientPrivilege, "must be admin to run `SHOW CREATE ALL EXTERNAL CONNECTIONS")
+		return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "must have %s privilege to run `SHOW CREATE ALL EXTERNAL CONNECTIONS`", privilege.VIEWCLUSTERMETADATA)
 	}
 
 	sqltelemetry.IncrementShowCounter(sqltelemetry.CreateExternalConnection)
@@ -111,23 +145,23 @@ func (p *planner) ShowCreateExternalConnection(
 		name:    name,
 		columns: showCreateExternalConnectionColumns,
 		constructor: func(ctx context.Context, p *planner) (planNode, error) {
-			connections, err := loadExternalConnections(
-				runParams{ctx: ctx, p: p, extendedEvalCtx: &p.extendedEvalCtx}, n)
+			params := runParams{ctx: ctx, p: p, extendedEvalCtx: &p.extendedEvalCtx}
+			connectionNames, err := getConnectionNames(params, n.ConnectionLabel, false)
 			if err != nil {
 				return nil, err
 			}
 
-			var rows []tree.Datums
-			for _, conn := range connections {
-				row := tree.Datums{
-					scheduleID: tree.NewDString(conn.ConnectionName()),
-					createStmt: tree.NewDString(conn.UnredactedConnectionStatement()),
-				}
-				rows = append(rows, row)
+			connections, err := loadExternalConnections(params, connectionNames)
+			if err != nil {
+				return nil, err
 			}
 
-			v := p.newContainerValuesNode(showCreateTableColumns, len(rows))
-			for _, row := range rows {
+			v := p.newContainerValuesNode(showCreateExternalConnectionColumns, len(connections))
+			for _, conn := range connections {
+				row := tree.Datums{
+					connNameIdx:   tree.NewDString(conn.ConnectionName()),
+					createStmtIdx: tree.NewDString(conn.UnredactedConnectionStatement()),
+				}
 				if _, err := v.rows.AddRow(ctx, row); err != nil {
 					v.Close(ctx)
 					return nil, err

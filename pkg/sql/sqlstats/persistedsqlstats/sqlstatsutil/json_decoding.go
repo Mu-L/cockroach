@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlstatsutil
 
@@ -45,11 +40,30 @@ func DecodeStmtStatsMetadataJSON(
 	return (*stmtStatsMetadata)(result).jsonFields().decodeJSON(metadata)
 }
 
+// DecodeStmtStatsMetadataFlagsOnlyJSON decodes the 'metadata' flags only fields
+// of the JSON representation of the statement statistics into
+// appstatspb.CollectedStatementStatistics. This avoids the overhead of query
+// string and query summary decoding.
+func DecodeStmtStatsMetadataFlagsOnlyJSON(
+	metadata json.JSON, result *appstatspb.CollectedStatementStatistics,
+) error {
+	return (*stmtStatsMetadata)(result).jsonFlagsOnlyFields().decodeJSON(metadata)
+}
+
 // DecodeAggregatedMetadataJSON decodes the 'aggregated metadata' represented by appstatspb.AggregatedStatementMetadata.
 func DecodeAggregatedMetadataJSON(
 	metadata json.JSON, result *appstatspb.AggregatedStatementMetadata,
 ) error {
 	return (*aggregatedMetadata)(result).jsonFields().decodeJSON(metadata)
+}
+
+// DecodeAggregatedMetadataAggregatedFieldsOnlyJSON decodes the 'aggregated metadata' represented by
+// appstatspb.AggregatedStatementMetadata. It only includes the fields that are
+// aggregated across multiple statements.
+func DecodeAggregatedMetadataAggregatedFieldsOnlyJSON(
+	metadata json.JSON, result *appstatspb.AggregatedStatementMetadata,
+) error {
+	return (*aggregatedMetadata)(result).jsonAggregatedFields().decodeJSON(metadata)
 }
 
 // DecodeStmtStatsStatisticsJSON decodes the 'statistics' field and the

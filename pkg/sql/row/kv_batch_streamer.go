@@ -1,23 +1,20 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package row
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -26,10 +23,16 @@ import (
 
 // txnKVStreamer handles retrieval of key/values.
 type txnKVStreamer struct {
-	kvBatchFetcherHelper
-	streamer   *kvstreamer.Streamer
-	keyLocking lock.Strength
+	kvBatchMetrics
+	streamer       *kvstreamer.Streamer
+	lockStrength   lock.Strength
+	lockDurability lock.Durability
+	rawMVCCValues  bool
 
+	// spans contains the last set of spans provided in SetupNextFetch. The
+	// original span is only needed when handling Get responses, so each span is
+	// nil-ed out when it resulted in a Scan request (i.e. it had both Key and
+	// EndKey set).
 	spans       roachpb.Spans
 	spanIDs     []int
 	reqsScratch []kvpb.RequestUnion
@@ -53,16 +56,20 @@ var _ KVBatchFetcher = &txnKVStreamer{}
 func newTxnKVStreamer(
 	streamer *kvstreamer.Streamer,
 	lockStrength descpb.ScanLockingStrength,
+	lockDurability descpb.ScanLockingDurability,
 	acc *mon.BoundAccount,
 	kvPairsRead *int64,
 	batchRequestsIssued *int64,
+	rawMVCCValues bool,
 ) KVBatchFetcher {
 	f := &txnKVStreamer{
-		streamer:   streamer,
-		keyLocking: GetKeyLockingStrength(lockStrength),
-		acc:        acc,
+		streamer:       streamer,
+		lockStrength:   GetKeyLockingStrength(lockStrength),
+		lockDurability: GetKeyLockingDurability(lockDurability),
+		acc:            acc,
+		rawMVCCValues:  rawMVCCValues,
 	}
-	f.kvBatchFetcherHelper.init(f.nextBatch, kvPairsRead, batchRequestsIssued)
+	f.kvBatchMetrics.init(kvPairsRead, batchRequestsIssued)
 	return f
 }
 
@@ -80,7 +87,11 @@ func (f *txnKVStreamer) SetupNextFetch(
 	}
 	f.reset(ctx)
 	if log.ExpensiveLogEnabled(ctx, 2) {
-		log.VEventf(ctx, 2, "Scan %s", spans)
+		lockStr := ""
+		if f.lockStrength != lock.None {
+			lockStr = fmt.Sprintf(" lock %s (%s)", f.lockStrength.String(), f.lockDurability.String())
+		}
+		log.VEventf(ctx, 2, "Scan %s%s", spans.BoundedString(1024 /* bytesHint */), lockStr)
 	}
 	// Make sure to nil out the requests past the length that will be used in
 	// spansToRequests so that we lose references to the underlying Get and Scan
@@ -99,16 +110,30 @@ func (f *txnKVStreamer) SetupNextFetch(
 		reqsScratch[i] = kvpb.RequestUnion{}
 	}
 	// TODO(yuzefovich): consider supporting COL_BATCH_RESPONSE scan format.
-	reqs := spansToRequests(spans, kvpb.BATCH_RESPONSE, false /* reverse */, f.keyLocking, reqsScratch)
+	reqs := spansToRequests(spans, kvpb.BATCH_RESPONSE, false /* reverse */, f.rawMVCCValues, f.lockStrength, f.lockDurability, reqsScratch)
 	if err := f.streamer.Enqueue(ctx, reqs); err != nil {
-		return err
+		// Mark this error as having come from the storage layer. This will
+		// allow us to avoid creating a sentry report since this error isn't
+		// actionable (e.g. we can get stop.ErrUnavailable here, which would be
+		// treated as "internal error" by the ColIndexJoin, which later would
+		// result in treating it as assertion failure because the error doesn't
+		// have the PG code - marking it as a storage error will skip that).
+		return colexecerror.NewStorageError(err)
 	}
+	// For the spans slice we only need to account for the overhead of
+	// roachpb.Span objects. This is because spans that correspond to
+	// - Scan requests just got nil-ed out in `spansToRequests`,
+	// - Get requests have each key being shared directly (i.e. memory aliased)
+	//   with the Get requests, and the streamer will account for the latter.
+	//   Thus, in order to not double-count memory usage, we do no accounting
+	//   here.
+	spansMemUsage := roachpb.SpanOverhead * int64(cap(spans))
 	f.spans = spans
 	f.spanIDs = spanIDs
 	// Keep the reference to the requests slice in order to reuse in the future.
 	f.reqsScratch = reqs
 	reqsScratchMemUsage := requestUnionOverhead * int64(cap(f.reqsScratch))
-	return f.acc.ResizeTo(ctx, reqsScratchMemUsage)
+	return f.acc.ResizeTo(ctx, spansMemUsage+reqsScratchMemUsage)
 }
 
 func (f *txnKVStreamer) getSpanID(resultPosition int) int {
@@ -157,6 +182,16 @@ func (f *txnKVStreamer) proceedWithLastResult(
 func (f *txnKVStreamer) releaseLastResult(ctx context.Context) {
 	f.lastResultState.Release(ctx)
 	f.lastResultState.Result = kvstreamer.Result{}
+}
+
+// NextBatch implements the KVBatchFetcher interface.
+func (f *txnKVStreamer) NextBatch(ctx context.Context) (KVBatchFetcherResponse, error) {
+	resp, err := f.nextBatch(ctx)
+	if !resp.MoreKVs || err != nil {
+		return resp, err
+	}
+	f.kvBatchMetrics.Record(resp)
+	return resp, nil
 }
 
 func (f *txnKVStreamer) nextBatch(ctx context.Context) (resp KVBatchFetcherResponse, _ error) {
@@ -214,6 +249,7 @@ func (f *txnKVStreamer) reset(ctx context.Context) {
 func (f *txnKVStreamer) Close(ctx context.Context) {
 	f.reset(ctx)
 	f.streamer.Close(ctx)
+	f.acc.Clear(ctx)
 	// Preserve observability-related fields.
-	*f = txnKVStreamer{kvBatchFetcherHelper: f.kvBatchFetcherHelper}
+	*f = txnKVStreamer{kvBatchMetrics: f.kvBatchMetrics}
 }

@@ -1,18 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfigkvsubscriber
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -81,6 +76,14 @@ func TestGetProtectionTimestamps(t *testing.T) {
 	// Mark sp43 as excluded from backup.
 	sp43Cfg.cfg.ExcludeDataFromBackup = true
 
+	excludedKeyspaceConfig := makeSpanAndSpanConfigWithProtectionPolicies(keys.ExcludeFromBackupSpan, []roachpb.ProtectionPolicy{
+		{ProtectedTimestamp: ts4},
+	})
+
+	nodelivenessKeyspaceConfig := makeSpanAndSpanConfigWithProtectionPolicies(keys.NodeLivenessSpan, []roachpb.ProtectionPolicy{
+		{ProtectedTimestamp: ts4},
+	})
+
 	const timeDeltaFromTS1 = 10
 	mt := timeutil.NewManualTime(ts1.GoTime())
 	mt.AdvanceTo(ts1.Add(timeDeltaFromTS1, 0).GoTime())
@@ -97,7 +100,7 @@ func TestGetProtectionTimestamps(t *testing.T) {
 		nil,
 	)
 	m := &manualStore{
-		spanAndConfigs: []spanAndSpanConfig{sp42Cfg, sp43Cfg},
+		spanAndConfigs: []spanAndSpanConfig{sp42Cfg, sp43Cfg, excludedKeyspaceConfig, nodelivenessKeyspaceConfig},
 	}
 	subscriber.mu.internal = m
 
@@ -110,8 +113,8 @@ func TestGetProtectionTimestamps(t *testing.T) {
 			func(t *testing.T, m *manualStore, subscriber *KVSubscriber) {
 				protections, _, err := subscriber.GetProtectionTimestamps(ctx, sp42)
 				require.NoError(t, err)
-				sort.SliceIsSorted(protections, func(i, j int) bool {
-					return protections[i].Less(protections[j])
+				slices.IsSortedFunc(protections, func(a, b hlc.Timestamp) int {
+					return a.Compare(b)
 				})
 				require.Equal(t, []hlc.Timestamp{ts1, ts2}, protections)
 			},
@@ -121,8 +124,8 @@ func TestGetProtectionTimestamps(t *testing.T) {
 			func(t *testing.T, m *manualStore, subscriber *KVSubscriber) {
 				protections, _, err := subscriber.GetProtectionTimestamps(ctx, sp43)
 				require.NoError(t, err)
-				sort.SliceIsSorted(protections, func(i, j int) bool {
-					return protections[i].Less(protections[j])
+				slices.IsSortedFunc(protections, func(a, b hlc.Timestamp) int {
+					return a.Compare(b)
 				})
 				require.Equal(t, []hlc.Timestamp{ts4}, protections)
 			},
@@ -132,8 +135,44 @@ func TestGetProtectionTimestamps(t *testing.T) {
 			func(t *testing.T, m *manualStore, subscriber *KVSubscriber) {
 				protections, _, err := subscriber.GetProtectionTimestamps(ctx, sp4243)
 				require.NoError(t, err)
-				sort.SliceIsSorted(protections, func(i, j int) bool {
-					return protections[i].Less(protections[j])
+				slices.IsSortedFunc(protections, func(a, b hlc.Timestamp) int {
+					return a.Compare(b)
+				})
+				require.Equal(t, []hlc.Timestamp{ts1, ts2, ts4}, protections)
+			},
+		},
+		{
+			"ExcludeFromBackupSpan does not include PTS records",
+			func(t *testing.T, m *manualStore, subscriber *KVSubscriber) {
+				protections, _, err := subscriber.GetProtectionTimestamps(ctx, keys.ExcludeFromBackupSpan)
+				require.NoError(t, err)
+				slices.IsSortedFunc(protections, func(a, b hlc.Timestamp) int {
+					return a.Compare(b)
+				})
+				require.Empty(t, protections)
+			},
+		},
+		{
+			"NodeLivenessSpan does not include PTS records",
+			func(t *testing.T, m *manualStore, subscriber *KVSubscriber) {
+				protections, _, err := subscriber.GetProtectionTimestamps(ctx, keys.NodeLivenessSpan)
+				require.NoError(t, err)
+				slices.IsSortedFunc(protections, func(a, b hlc.Timestamp) int {
+					return a.Compare(b)
+				})
+				require.Empty(t, protections)
+			},
+		},
+		{
+			"span across back up boundary includes PTS records",
+			func(t *testing.T, m *manualStore, subscriber *KVSubscriber) {
+				protections, _, err := subscriber.GetProtectionTimestamps(
+					ctx,
+					roachpb.Span{Key: keys.MinKey, EndKey: sp43.EndKey},
+				)
+				require.NoError(t, err)
+				slices.IsSortedFunc(protections, func(a, b hlc.Timestamp) int {
+					return a.Compare(b)
 				})
 				require.Equal(t, []hlc.Timestamp{ts1, ts2, ts4}, protections)
 			},
@@ -167,7 +206,7 @@ type manualStore struct {
 
 // Apply implements the spanconfig.Store interface.
 func (m *manualStore) Apply(
-	context.Context, bool, ...spanconfig.Update,
+	context.Context, ...spanconfig.Update,
 ) (deleted []spanconfig.Target, added []spanconfig.Record) {
 	panic("unimplemented")
 }
@@ -187,7 +226,7 @@ func (m *manualStore) ComputeSplitKey(
 // GetSpanConfigForKey implements the spanconfig.Store interface.
 func (m *manualStore) GetSpanConfigForKey(
 	context.Context, roachpb.RKey,
-) (roachpb.SpanConfig, error) {
+) (roachpb.SpanConfig, roachpb.Span, error) {
 	panic("unimplemented")
 }
 

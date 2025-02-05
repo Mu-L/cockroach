@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schematelemetrycontroller
 
@@ -39,7 +34,7 @@ const SchemaTelemetryScheduleName = "sql-schema-telemetry"
 // SchemaTelemetryRecurrence is the cron-tab string specifying the recurrence
 // for schema telemetry job.
 var SchemaTelemetryRecurrence = settings.RegisterStringSetting(
-	settings.TenantReadOnly,
+	settings.SystemVisible,
 	"sql.schema.telemetry.recurrence",
 	"cron-tab recurrence for SQL schema telemetry job",
 	"@weekly", /* defaultValue */
@@ -149,7 +144,7 @@ func updateSchedule(ctx context.Context, db isql.DB, st *cluster.Settings, clust
 					return err
 				}
 				if id == 0 {
-					sj, err = CreateSchemaTelemetrySchedule(ctx, txn, st)
+					sj, err = CreateSchemaTelemetrySchedule(ctx, txn, st, clusterID)
 				} else {
 					sj, err = jobs.ScheduledJobTxn(txn).Load(ctx, scheduledjobs.ProdJobSchedulerEnv, id)
 				}
@@ -164,7 +159,7 @@ func updateSchedule(ctx context.Context, db isql.DB, st *cluster.Settings, clust
 			if sj.ScheduleExpr() == cronExpr {
 				return nil
 			}
-			if err := sj.SetSchedule(cronExpr); err != nil {
+			if err := sj.SetScheduleAndNextRun(cronExpr); err != nil {
 				return err
 			}
 			sj.SetScheduleStatus(string(jobs.StatusPending))
@@ -211,7 +206,7 @@ func CreateSchemaTelemetryJobRecord(createdByName string, createdByID int64) job
 // the scheduled job subsystem so that the schema telemetry job can be run
 // periodically. This is done during the cluster startup upgrade.
 func CreateSchemaTelemetrySchedule(
-	ctx context.Context, txn isql.Txn, st *cluster.Settings,
+	ctx context.Context, txn isql.Txn, st *cluster.Settings, clusterID uuid.UUID,
 ) (*jobs.ScheduledJob, error) {
 	id, err := GetSchemaTelemetryScheduleID(ctx, txn)
 	if err != nil {
@@ -224,13 +219,15 @@ func CreateSchemaTelemetrySchedule(
 	scheduledJob := jobs.NewScheduledJob(scheduledjobs.ProdJobSchedulerEnv)
 
 	schedule := SchemaTelemetryRecurrence.Get(&st.SV)
-	if err := scheduledJob.SetSchedule(schedule); err != nil {
+	if err := scheduledJob.SetScheduleAndNextRun(schedule); err != nil {
 		return nil, err
 	}
 
 	scheduledJob.SetScheduleDetails(jobspb.ScheduleDetails{
-		Wait:    jobspb.ScheduleDetails_SKIP,
-		OnError: jobspb.ScheduleDetails_RETRY_SCHED,
+		Wait:                   jobspb.ScheduleDetails_SKIP,
+		OnError:                jobspb.ScheduleDetails_RETRY_SCHED,
+		ClusterID:              clusterID,
+		CreationClusterVersion: st.Version.ActiveVersion(ctx),
 	})
 
 	scheduledJob.SetScheduleLabel(SchemaTelemetryScheduleName)
@@ -255,7 +252,9 @@ func CreateSchemaTelemetrySchedule(
 
 // GetSchemaTelemetryScheduleID returns the ID of the schema telemetry schedule
 // if it exists, 0 if it does not exist yet.
-func GetSchemaTelemetryScheduleID(ctx context.Context, txn isql.Txn) (id int64, _ error) {
+func GetSchemaTelemetryScheduleID(
+	ctx context.Context, txn isql.Txn,
+) (id jobspb.ScheduleID, _ error) {
 	row, err := txn.QueryRowEx(
 		ctx,
 		"check-existing-schema-telemetry-schedule",
@@ -275,5 +274,5 @@ func GetSchemaTelemetryScheduleID(ctx context.Context, txn isql.Txn) (id int64, 
 	if !ok {
 		return 0, errors.AssertionFailedf("unexpectedly received non-integer value %v", row[0])
 	}
-	return int64(v), nil
+	return jobspb.ScheduleID(v), nil
 }

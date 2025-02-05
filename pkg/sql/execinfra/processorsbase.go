@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfra
 
@@ -57,6 +52,11 @@ type Processor interface {
 	// NB: this method doesn't take the context as parameter because the context
 	// was already captured on Run().
 	Resume(output RowReceiver)
+
+	// Close releases the resources of the processor and possibly its inputs.
+	// Must be called at least once on a given Processor and can be called
+	// multiple times.
+	Close(context.Context)
 }
 
 // DoesNotUseTxn is an interface implemented by some processors to mark that
@@ -73,9 +73,9 @@ type DoesNotUseTxn interface {
 // ProcOutputHelper is a helper type that performs filtering and projection on
 // the output of a processor.
 type ProcOutputHelper struct {
-	// renderExprs has length > 0 if we have a rendering. Only one of renderExprs
-	// and outputCols can be set.
-	renderExprs []execinfrapb.ExprHelper
+	// eh only contains expressions if we have at least one rendering. It will
+	// not be used if outputCols is set.
+	eh execinfrapb.MultiExprHelper
 	// outputCols is non-nil if we have a projection. Only one of renderExprs and
 	// outputCols can be set. Note that 0-length projections are possible, in
 	// which case outputCols will be 0-length but non-nil.
@@ -107,14 +107,12 @@ func (h *ProcOutputHelper) Reset() {
 	// Deeply reset the render expressions and the output row. Note that we
 	// don't bother deeply resetting the types slice since the types are small
 	// objects.
-	for i := range h.renderExprs {
-		h.renderExprs[i] = execinfrapb.ExprHelper{}
-	}
+	h.eh.Reset()
 	for i := range h.outputRow {
 		h.outputRow[i] = rowenc.EncDatum{}
 	}
 	*h = ProcOutputHelper{
-		renderExprs: h.renderExprs[:0],
+		eh:          h.eh,
 		outputRow:   h.outputRow[:0],
 		OutputTypes: h.OutputTypes[:0],
 	}
@@ -125,12 +123,16 @@ func (h *ProcOutputHelper) Reset() {
 // omitted if there is no filtering expression.
 // Note that the types slice may be stored directly; the caller should not
 // modify it.
+//
+// If the provided evalCtx is the same as flowCtx.EvalCtx, then a copy will be
+// made internally when there are render expressions.
 func (h *ProcOutputHelper) Init(
 	ctx context.Context,
 	post *execinfrapb.PostProcessSpec,
 	coreOutputTypes []*types.T,
 	semaCtx *tree.SemaContext,
 	evalCtx *eval.Context,
+	flowCtx *FlowCtx,
 ) error {
 	if !post.Projection && len(post.OutputColumns) > 0 {
 		return errors.Errorf("post-processing has projection unset but output columns set: %s", post)
@@ -159,21 +161,26 @@ func (h *ProcOutputHelper) Init(
 			h.OutputTypes[i] = coreOutputTypes[c]
 		}
 	} else if nRenders := len(post.RenderExprs); nRenders > 0 {
-		if cap(h.renderExprs) >= nRenders {
-			h.renderExprs = h.renderExprs[:nRenders]
-		} else {
-			h.renderExprs = make([]execinfrapb.ExprHelper, nRenders)
+		if evalCtx == flowCtx.EvalCtx {
+			// We haven't created a copy of the eval context, and we have some
+			// renders, then we'll need to create a copy ourselves since we're
+			// going to use the ExprHelper which might mutate the eval context.
+			evalCtx = flowCtx.NewEvalCtx()
 		}
 		if cap(h.OutputTypes) >= nRenders {
 			h.OutputTypes = h.OutputTypes[:nRenders]
 		} else {
 			h.OutputTypes = make([]*types.T, nRenders)
 		}
+		if err := h.eh.Init(ctx, nRenders, coreOutputTypes, semaCtx, evalCtx); err != nil {
+			return err
+		}
 		for i, expr := range post.RenderExprs {
-			if err := h.renderExprs[i].Init(ctx, expr, coreOutputTypes, semaCtx, evalCtx); err != nil {
+			var err error
+			if err = h.eh.AddExpr(ctx, expr, i); err != nil {
 				return err
 			}
-			h.OutputTypes[i] = h.renderExprs[i].Expr.ResolvedType()
+			h.OutputTypes[i] = h.eh.Expr(i).ResolvedType()
 		}
 	} else {
 		// No rendering or projection.
@@ -184,7 +191,7 @@ func (h *ProcOutputHelper) Init(
 		}
 		copy(h.OutputTypes, coreOutputTypes)
 	}
-	if h.outputCols != nil || len(h.renderExprs) > 0 {
+	if h.outputCols != nil || h.eh.ExprCount() > 0 {
 		// We're rendering or projecting, so allocate an output row.
 		if h.outputRow != nil && cap(h.outputRow) >= len(h.OutputTypes) {
 			// In some cases we might have no output columns, so nil outputRow
@@ -278,10 +285,10 @@ func (h *ProcOutputHelper) ProcessRow(
 		return nil, true, nil
 	}
 
-	if len(h.renderExprs) > 0 {
+	if h.eh.ExprCount() > 0 {
 		// Rendering.
-		for i := range h.renderExprs {
-			datum, err := h.renderExprs[i].Eval(ctx, row)
+		for i, n := 0, h.eh.ExprCount(); i < n; i++ {
+			datum, err := h.eh.EvalExpr(ctx, i, row)
 			if err != nil {
 				return nil, false, err
 			}
@@ -349,9 +356,6 @@ type ProcessorBaseNoHelper struct {
 
 	FlowCtx *FlowCtx
 
-	// EvalCtx is used for expression evaluation. It overrides the one in flowCtx.
-	EvalCtx *eval.Context
-
 	// Closed is set by InternalClose(). Once set, the processor's tracing span
 	// has been closed.
 	Closed bool
@@ -364,9 +368,6 @@ type ProcessorBaseNoHelper struct {
 	// origCtx is the context from which ctx was derived. InternalClose() resets
 	// ctx to this.
 	origCtx context.Context
-	// evalOrigCtx is the original context that was stored in the eval.Context.
-	// InternalClose() uses it to correctly reset the eval.Context.
-	evalOrigCtx context.Context
 
 	State procState
 
@@ -734,6 +735,11 @@ func (pb *ProcessorBaseNoHelper) Resume(output RowReceiver) {
 	Run(pb.ctx, pb.self, output)
 }
 
+// Close is part of the Processor interface.
+func (pb *ProcessorBaseNoHelper) Close(context.Context) {
+	pb.self.ConsumerClosed()
+}
+
 // ProcStateOpts contains fields used by the ProcessorBase's family of functions
 // that deal with draining and trailing metadata: the ProcessorBase implements
 // generic useful functionality that needs to call back into the Processor.
@@ -751,6 +757,8 @@ type ProcStateOpts struct {
 // - coreOutputTypes are the type schema of the rows output by the processor
 // core (i.e. the "internal schema" of the processor, see
 // execinfrapb.ProcessorSpec for more details).
+//
+// NB: it is assumed that the caller will not modify the eval context.
 func (pb *ProcessorBase) Init(
 	ctx context.Context,
 	self RowSource,
@@ -762,7 +770,7 @@ func (pb *ProcessorBase) Init(
 	opts ProcStateOpts,
 ) error {
 	return pb.InitWithEvalCtx(
-		ctx, self, post, coreOutputTypes, flowCtx, flowCtx.NewEvalCtx(), processorID, memMonitor, opts,
+		ctx, self, post, coreOutputTypes, flowCtx, flowCtx.EvalCtx, processorID, memMonitor, opts,
 	)
 }
 
@@ -781,7 +789,7 @@ func (pb *ProcessorBase) InitWithEvalCtx(
 	memMonitor *mon.BytesMonitor,
 	opts ProcStateOpts,
 ) error {
-	pb.ProcessorBaseNoHelper.Init(self, flowCtx, evalCtx, processorID, opts)
+	pb.ProcessorBaseNoHelper.Init(self, flowCtx, processorID, opts)
 	pb.MemMonitor = memMonitor
 
 	// Hydrate all types used in the processor.
@@ -789,19 +797,17 @@ func (pb *ProcessorBase) InitWithEvalCtx(
 	if err := resolver.HydrateTypeSlice(ctx, coreOutputTypes); err != nil {
 		return err
 	}
-	pb.SemaCtx = tree.MakeSemaContext()
-	pb.SemaCtx.TypeResolver = &resolver
 
-	return pb.OutputHelper.Init(ctx, post, coreOutputTypes, &pb.SemaCtx, pb.EvalCtx)
+	pb.SemaCtx = tree.MakeSemaContext(&resolver)
+	return pb.OutputHelper.Init(ctx, post, coreOutputTypes, &pb.SemaCtx, evalCtx, flowCtx)
 }
 
 // Init initializes the ProcessorBaseNoHelper.
 func (pb *ProcessorBaseNoHelper) Init(
-	self RowSource, flowCtx *FlowCtx, evalCtx *eval.Context, processorID int32, opts ProcStateOpts,
+	self RowSource, flowCtx *FlowCtx, processorID int32, opts ProcStateOpts,
 ) {
 	pb.self = self
 	pb.FlowCtx = flowCtx
-	pb.EvalCtx = evalCtx
 	pb.ProcessorID = processorID
 	pb.trailingMetaCallback = opts.TrailingMetaCallback
 	if opts.InputsToDrain != nil {
@@ -885,7 +891,6 @@ func (pb *ProcessorBaseNoHelper) StartInternal(
 	if !noSpan {
 		pb.ctx, pb.span = ProcessorSpan(ctx, pb.FlowCtx, name, pb.ProcessorID, eventListeners...)
 	}
-	pb.evalOrigCtx = pb.EvalCtx.SetDeprecatedContext(pb.ctx)
 	return pb.ctx
 }
 
@@ -925,7 +930,6 @@ func (pb *ProcessorBaseNoHelper) InternalClose() bool {
 	// Reset the context so that any incidental uses after this point do not
 	// access the finished span.
 	pb.ctx = pb.origCtx
-	pb.EvalCtx.SetDeprecatedContext(pb.evalOrigCtx)
 	return true
 }
 
@@ -944,9 +948,9 @@ func (pb *ProcessorBaseNoHelper) ConsumerClosed() {
 // memory monitor with the given name and start it. The returned monitor must
 // be closed.
 func NewMonitor(
-	ctx context.Context, parent *mon.BytesMonitor, name redact.RedactableString,
+	ctx context.Context, parent *mon.BytesMonitor, name redact.SafeString,
 ) *mon.BytesMonitor {
-	monitor := mon.NewMonitorInheritWithLimit(name, 0 /* limit */, parent)
+	monitor := mon.NewMonitorInheritWithLimit(name, 0 /* limit */, parent, false /* longLiving */)
 	monitor.StartNoReserved(ctx, parent)
 	return monitor
 }
@@ -958,9 +962,9 @@ func NewMonitor(
 // ServerConfig.TestingKnobs.ForceDiskSpill is set or
 // ServerConfig.TestingKnobs.MemoryLimitBytes if not.
 func NewLimitedMonitor(
-	ctx context.Context, parent *mon.BytesMonitor, flowCtx *FlowCtx, name redact.RedactableString,
+	ctx context.Context, parent *mon.BytesMonitor, flowCtx *FlowCtx, name redact.SafeString,
 ) *mon.BytesMonitor {
-	limitedMon := mon.NewMonitorInheritWithLimit(name, GetWorkMemLimit(flowCtx), parent)
+	limitedMon := mon.NewMonitorInheritWithLimit(name, GetWorkMemLimit(flowCtx), parent, false /* longLiving */)
 	limitedMon.StartNoReserved(ctx, parent)
 	return limitedMon
 }
@@ -969,13 +973,13 @@ func NewLimitedMonitor(
 // guarantees that the monitor's limit is at least minMemoryLimit bytes.
 // flowCtx.Mon is used as the parent for the new monitor.
 func NewLimitedMonitorWithLowerBound(
-	ctx context.Context, flowCtx *FlowCtx, name redact.RedactableString, minMemoryLimit int64,
+	ctx context.Context, flowCtx *FlowCtx, name redact.SafeString, minMemoryLimit int64,
 ) *mon.BytesMonitor {
 	memoryLimit := GetWorkMemLimit(flowCtx)
 	if memoryLimit < minMemoryLimit {
 		memoryLimit = minMemoryLimit
 	}
-	limitedMon := mon.NewMonitorInheritWithLimit(name, memoryLimit, flowCtx.Mon)
+	limitedMon := mon.NewMonitorInheritWithLimit(name, memoryLimit, flowCtx.Mon, false /* longLiving */)
 	limitedMon.StartNoReserved(ctx, flowCtx.Mon)
 	return limitedMon
 }
@@ -987,7 +991,7 @@ func NewLimitedMonitorNoFlowCtx(
 	parent *mon.BytesMonitor,
 	config *ServerConfig,
 	sd *sessiondata.SessionData,
-	name redact.RedactableString,
+	name redact.SafeString,
 ) *mon.BytesMonitor {
 	// Create a fake FlowCtx populating only the required fields.
 	flowCtx := &FlowCtx{

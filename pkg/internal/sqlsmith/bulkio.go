@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
@@ -16,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -88,6 +84,9 @@ func makeAsOf(s *Smither) tree.AsOfClause {
 }
 
 func makeBackup(s *Smither) (tree.Statement, bool) {
+	if !s.bulkIOEnabled() {
+		return nil, false
+	}
 	name := fmt.Sprintf("%s/%s", s.bulkSrv.URL, s.name("backup"))
 	var targets tree.BackupTargetList
 	seen := map[tree.TableName]bool{}
@@ -122,13 +121,16 @@ func makeBackup(s *Smither) (tree.Statement, bool) {
 func makeRestore(s *Smither) (tree.Statement, bool) {
 	var name string
 	var targets tree.BackupTargetList
-	s.lock.Lock()
-	for name, targets = range s.bulkBackups {
-		break
-	}
-	// Only restore each backup once.
-	delete(s.bulkBackups, name)
-	s.lock.Unlock()
+	func() {
+		s.lock.Lock()
+		defer s.lock.Unlock()
+		// TODO(yuzefovich): picking a backup target here is non-deterministic.
+		for name, targets = range s.bulkBackups {
+			break
+		}
+		// Only restore each backup once.
+		delete(s.bulkBackups, name)
+	}()
 
 	if name == "" {
 		return nil, false
@@ -146,7 +148,8 @@ func makeRestore(s *Smither) (tree.Statement, bool) {
 
 	return &tree.Restore{
 		Targets: targets,
-		From:    []tree.StringOrPlaceholderOptList{{tree.NewStrVal(name)}},
+		Subdir:  tree.NewStrVal("LATEST"),
+		From:    tree.StringOrPlaceholderOptList{tree.NewStrVal(name)},
 		AsOf:    makeAsOf(s),
 		Options: tree.RestoreOptions{
 			IntoDB: tree.NewStrVal("into_db"),
@@ -190,9 +193,9 @@ func makeExport(s *Smither) (tree.Statement, bool) {
 	exp := s.name("exp")
 	name := fmt.Sprintf("%s/%s", s.bulkSrv.URL, exp)
 	s.lock.Lock()
+	defer s.lock.Unlock()
 	s.bulkFiles[fmt.Sprintf("/%s%s", exp, exportSchema)] = []byte(schema)
 	s.bulkExports = append(s.bulkExports, string(exp))
-	s.lock.Unlock()
 
 	return &tree.Export{
 		Query:      stmt,
@@ -208,22 +211,28 @@ func makeImport(s *Smither) (tree.Statement, bool) {
 		return nil, false
 	}
 
-	s.lock.Lock()
-	if len(s.bulkExports) == 0 {
-		s.lock.Unlock()
-		return nil, false
-	}
-	exp := s.bulkExports[0]
-	s.bulkExports = s.bulkExports[1:]
-
 	// Find all CSV files created by the EXPORT.
-	var files tree.Exprs
-	for name := range s.bulkFiles {
-		if strings.Contains(name, exp+"/") && !strings.HasSuffix(name, exportSchema) {
-			files = append(files, tree.NewStrVal(s.bulkSrv.URL+name))
+	files, exp := func() (tree.Exprs, string) {
+		s.lock.Lock()
+		defer s.lock.Unlock()
+		if len(s.bulkExports) == 0 {
+			return tree.Exprs{}, ""
 		}
-	}
-	s.lock.Unlock()
+		expr := s.bulkExports[0]
+		s.bulkExports = s.bulkExports[1:]
+		var fileNames []string
+		for name := range s.bulkFiles {
+			if strings.Contains(name, expr+"/") && !strings.HasSuffix(name, exportSchema) {
+				fileNames = append(fileNames, name)
+			}
+		}
+		sort.Strings(fileNames)
+		var f tree.Exprs
+		for _, name := range fileNames {
+			f = append(f, tree.NewStrVal(s.bulkSrv.URL+name))
+		}
+		return f, expr
+	}()
 	// An empty table will produce an EXPORT with zero files.
 	if len(files) == 0 {
 		return nil, false
@@ -231,13 +240,15 @@ func makeImport(s *Smither) (tree.Statement, bool) {
 
 	// Fix the table name in the existing schema file.
 	tab := s.name("tab")
-	s.lock.Lock()
-	schema := fmt.Sprintf("/%s%s", exp, exportSchema)
-	tableSchema := importCreateTableRE.ReplaceAll(
-		s.bulkFiles[schema],
-		[]byte(fmt.Sprintf("CREATE TABLE %s (", tab)),
-	)
-	s.lock.Unlock()
+	tableSchema := func() []byte {
+		s.lock.Lock()
+		defer s.lock.Unlock()
+		schema := fmt.Sprintf("/%s%s", exp, exportSchema)
+		return importCreateTableRE.ReplaceAll(
+			s.bulkFiles[schema],
+			[]byte(fmt.Sprintf("CREATE TABLE %s (", tab)),
+		)
+	}()
 
 	// Create the table to be imported into.
 	_, err := s.db.Exec(string(tableSchema))

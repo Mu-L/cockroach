@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlproxyccl
 
@@ -403,10 +400,10 @@ var waitForShowTransferState = func(
 	}
 
 	// 2. Read DataRow.
-	if err := expectDataRow(ctx, serverConn, func(msg *pgproto3.DataRow, size int) bool {
+	if err := expectDataRow(ctx, serverConn, func(msg *pgproto3.DataRow, size int) (bool, error) {
 		// This has to be 4 since we validated RowDescription earlier.
 		if len(msg.Values) != 4 {
-			return false
+			return false, nil
 		}
 
 		// Validate transfer key. It is possible that the end-user uses the SHOW
@@ -414,7 +411,7 @@ var waitForShowTransferState = func(
 		// for external usage, so it is fine to just terminate here if the
 		// transfer key does not match.
 		if string(msg.Values[3]) != transferKey {
-			return false
+			return false, nil
 		}
 
 		// NOTE: We have to cast to string and copy here since the slice
@@ -426,7 +423,7 @@ var waitForShowTransferState = func(
 		if metrics != nil {
 			metrics.ConnMigrationTransferResponseMessageSize.RecordValue(int64(size))
 		}
-		return true
+		return true, nil
 	}); err != nil {
 		return "", "", "", errors.Wrap(err, "expecting DataRow")
 	}
@@ -493,8 +490,8 @@ var runAndWaitForDeserializeSession = func(
 	}
 
 	// 2. Read DataRow.
-	if err := expectDataRow(ctx, serverConn, func(msg *pgproto3.DataRow, _ int) bool {
-		return len(msg.Values) == 1 && string(msg.Values[0]) == "t"
+	if err := expectDataRow(ctx, serverConn, func(msg *pgproto3.DataRow, _ int) (bool, error) {
+		return len(msg.Values) == 1 && string(msg.Values[0]) == "t", nil
 	}); err != nil {
 		return errors.Wrap(err, "expecting DataRow")
 	}
@@ -515,7 +512,11 @@ var runAndWaitForDeserializeSession = func(
 // writeQuery writes a SimpleQuery to the given writer w.
 func writeQuery(w io.Writer, format string, a ...interface{}) error {
 	query := &pgproto3.Query{String: fmt.Sprintf(format, a...)}
-	_, err := w.Write(query.Encode(nil))
+	buf, err := query.Encode(nil)
+	if err != nil {
+		return errors.Wrap(err, "encoding SimpleQuery")
+	}
+	_, err = w.Write(buf)
 	return err
 }
 
@@ -590,7 +591,11 @@ func waitForSmallRowDescription(
 
 		// Matching fails, so forward the message back to the client, and
 		// continue searching.
-		if _, err := clientConn.Write(msg.Encode(nil)); err != nil {
+		buf, err := msg.Encode(nil)
+		if err != nil {
+			return errors.Wrap(err, "encoding message")
+		}
+		if _, err := clientConn.Write(buf); err != nil {
 			return errors.Wrap(err, "writing message")
 		}
 	}
@@ -610,7 +615,7 @@ func waitForSmallRowDescription(
 func expectDataRow(
 	ctx context.Context,
 	serverConn *interceptor.FrontendConn,
-	validateFn func(*pgproto3.DataRow, int) bool,
+	validateFn func(*pgproto3.DataRow, int) (bool, error),
 ) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -627,7 +632,9 @@ func expectDataRow(
 	if !ok {
 		return errors.Newf("unexpected message: %v", jsonOrRaw(msg))
 	}
-	if !validateFn(pgMsg, size) {
+	if valid, err := validateFn(pgMsg, size); err != nil {
+		return errors.Wrap(err, "validation failure")
+	} else if !valid {
 		return errors.Newf("validation failed for message: %v", jsonOrRaw(msg))
 	}
 	return nil

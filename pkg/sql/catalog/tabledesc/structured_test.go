@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tabledesc_test
 
@@ -19,7 +14,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
@@ -35,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
@@ -201,6 +196,7 @@ func TestColumnTypeSQLString(t *testing.T) {
 		{types.String, "STRING"},
 		{types.MakeString(10), "STRING(10)"},
 		{types.Bytes, "BYTES"},
+		{types.MakePGVector(3), "VECTOR(3)"},
 	}
 	for i, d := range testData {
 		t.Run(d.colType.DebugString(), func(t *testing.T) {
@@ -294,56 +290,6 @@ func TestFitColumnToFamily(t *testing.T) {
 	}
 }
 
-func TestMaybeUpgradeFormatVersion(t *testing.T) {
-	tests := []struct {
-		desc       descpb.TableDescriptor
-		expUpgrade bool
-		verify     func(int, catalog.TableDescriptor) // nil means no extra verification.
-	}{
-		{
-			desc: descpb.TableDescriptor{
-				FormatVersion: descpb.BaseFormatVersion,
-				Columns: []descpb.ColumnDescriptor{
-					{ID: 1, Name: "foo"},
-				},
-				Privileges: catpb.NewBasePrivilegeDescriptor(username.RootUserName()),
-			},
-			expUpgrade: true,
-			verify: func(i int, desc catalog.TableDescriptor) {
-				if len(desc.GetFamilies()) == 0 {
-					t.Errorf("%d: expected families to be set, but it was empty", i)
-				}
-			},
-		},
-		// Test that a version from the future is left alone.
-		{
-			desc: descpb.TableDescriptor{
-				FormatVersion: descpb.InterleavedFormatVersion,
-				Columns: []descpb.ColumnDescriptor{
-					{ID: 1, Name: "foo"},
-				},
-				Privileges: catpb.NewBasePrivilegeDescriptor(username.RootUserName()),
-			},
-			expUpgrade: false,
-			verify:     nil,
-		},
-	}
-	for i, test := range tests {
-		b := NewBuilder(&test.desc)
-		require.NoError(t, b.RunPostDeserializationChanges())
-		desc := b.BuildImmutableTable()
-		changes, err := GetPostDeserializationChanges(desc)
-		require.NoError(t, err)
-		upgraded := changes.Contains(catalog.UpgradedFormatVersion)
-		if upgraded != test.expUpgrade {
-			t.Fatalf("%d: expected upgraded=%t, but got upgraded=%t", i, test.expUpgrade, upgraded)
-		}
-		if test.verify != nil {
-			test.verify(i, desc)
-		}
-	}
-}
-
 func TestMaybeUpgradeIndexFormatVersion(t *testing.T) {
 	tests := []struct {
 		desc        descpb.TableDescriptor
@@ -355,17 +301,19 @@ func TestMaybeUpgradeIndexFormatVersion(t *testing.T) {
 			// upgrades, in particular the primary index will have its format version
 			// properly set.
 			desc: descpb.TableDescriptor{
-				FormatVersion: descpb.BaseFormatVersion,
-				ID:            51,
-				Name:          "tbl",
-				ParentID:      52,
-				NextColumnID:  3,
-				NextIndexID:   2,
+				FormatVersion:    descpb.BaseFormatVersion,
+				ID:               51,
+				Name:             "tbl",
+				ParentID:         52,
+				NextColumnID:     3,
+				NextIndexID:      2,
+				NextConstraintID: 2,
 				Columns: []descpb.ColumnDescriptor{
 					{ID: 1, Name: "foo"},
 					{ID: 2, Name: "bar"},
 				},
 				PrimaryIndex: descpb.IndexDescriptor{
+					ConstraintID:        1,
 					ID:                  descpb.IndexID(1),
 					Name:                "primary",
 					KeyColumnIDs:        []descpb.ColumnID{1, 2},
@@ -642,6 +590,7 @@ func TestUnvalidateConstraints(t *testing.T) {
 	ctx := context.Background()
 
 	desc := NewBuilder(&descpb.TableDescriptor{
+		ID:               2,
 		Name:             "test",
 		ParentID:         descpb.ID(1),
 		NextConstraintID: 2,
@@ -654,10 +603,13 @@ func TestUnvalidateConstraints(t *testing.T) {
 		Privileges:    catpb.NewBasePrivilegeDescriptor(username.AdminRoleName()),
 		OutboundFKs: []descpb.ForeignKeyConstraint{
 			{
-				Name:              "fk",
-				ReferencedTableID: descpb.ID(1),
-				Validity:          descpb.ConstraintValidity_Validated,
-				ConstraintID:      1,
+				Name:                "fk",
+				ReferencedTableID:   descpb.ID(1),
+				Validity:            descpb.ConstraintValidity_Validated,
+				ConstraintID:        1,
+				OriginTableID:       2,
+				OriginColumnIDs:     []descpb.ColumnID{1},
+				ReferencedColumnIDs: []descpb.ColumnID{1},
 			},
 		},
 	}).BuildCreatedMutableTable()
@@ -788,8 +740,9 @@ func TestKeysPerRow(t *testing.T) {
 	// TODO(dan): This server is only used to turn a CREATE TABLE statement into
 	// a descpb.TableDescriptor. It should be possible to move MakeTableDesc into
 	// sqlbase. If/when that happens, use it here instead of this server.
-	s, conn, db := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, conn, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	codec := srv.ApplicationLayer().Codec()
 	if _, err := conn.Exec(`CREATE DATABASE d`); err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -850,7 +803,7 @@ func TestKeysPerRow(t *testing.T) {
 			tableName := fmt.Sprintf("t%d", i)
 			sqlDB.Exec(t, fmt.Sprintf(`CREATE TABLE d.%s %s`, tableName, test.createTable))
 
-			desc := desctestutils.TestingGetPublicTableDescriptor(db, keys.SystemSQLCodec, "d", tableName)
+			desc := desctestutils.TestingGetPublicTableDescriptor(db, codec, "d", tableName)
 			require.NotNil(t, desc)
 			idx, err := catalog.MustFindIndexByID(desc, test.indexID)
 			require.NoError(t, err)
@@ -968,9 +921,13 @@ func TestDefaultExprNil(t *testing.T) {
 // TestStrippedDanglingSelfBackReferences checks the proper behavior of the
 // catalog.StrippedDanglingSelfBackReferences post-deserialization change.
 func TestStrippedDanglingSelfBackReferences(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	codec := srv.ApplicationLayer().Codec()
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 
 	// Create a table.
@@ -978,7 +935,7 @@ func TestStrippedDanglingSelfBackReferences(t *testing.T) {
 	tdb.Exec(t, `CREATE TABLE t.tbl (a INT PRIMARY KEY)`)
 
 	// Get the descriptor for the table.
-	tbl := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "tbl")
+	tbl := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "tbl")
 
 	// Inject some nonsense into the mutation_jobs slice.
 	mut := NewBuilder(tbl.TableDesc()).BuildExistingMutableTable()
@@ -999,48 +956,19 @@ func TestStrippedDanglingSelfBackReferences(t *testing.T) {
 // correctly removed from descriptors of computed columns as part of the
 // RunPostDeserializationChanges suite.
 func TestRemoveDefaultExprFromComputedColumn(t *testing.T) {
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 
 	const expectedErrRE = `.*: computed column \"b\" cannot also have a DEFAULT expression`
 	// Create a table with a computed column.
 	tdb.Exec(t, `CREATE DATABASE t`)
 	tdb.Exec(t, `CREATE TABLE t.tbl (a INT PRIMARY KEY, b INT AS (1) STORED)`)
-
-	// Get the descriptor for the table.
-	tbl := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "tbl")
-
 	// Setting a default value on the computed column should fail.
 	tdb.ExpectErr(t, expectedErrRE, `ALTER TABLE t.tbl ALTER COLUMN b SET DEFAULT 2`)
-
-	// Copy the descriptor proto for the table and modify it by setting a default
-	// expression.
-	var desc *descpb.TableDescriptor
-	{
-		desc = NewBuilder(tbl.TableDesc()).BuildImmutableTable().TableDesc()
-		defaultExpr := "2"
-		desc.Columns[1].DefaultExpr = &defaultExpr
-	}
-
-	// This modified table descriptor should fail validation.
-	{
-		broken := NewBuilder(desc).BuildImmutableTable()
-		require.Error(t, validate.Self(clusterversion.TestingClusterVersion, broken))
-	}
-
-	// This modified table descriptor should be fixed by removing the default
-	// expression.
-	{
-		b := NewBuilder(desc)
-		require.NoError(t, b.RunPostDeserializationChanges())
-		fixed := b.BuildImmutableTable()
-		require.NoError(t, validate.Self(clusterversion.TestingClusterVersion, fixed))
-		changes, err := GetPostDeserializationChanges(fixed)
-		require.NoError(t, err)
-		require.True(t, changes.Contains(catalog.RemovedDefaultExprFromComputedColumn))
-		require.False(t, fixed.PublicColumns()[1].HasDefault())
-	}
 }
 
 func TestLogicalColumnID(t *testing.T) {

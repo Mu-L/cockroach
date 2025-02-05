@@ -1,19 +1,15 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package cli is the command-line library used by the cockroach binary and
+// other utilities. See README.md.
 package cli
 
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -26,18 +22,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
+	"github.com/cockroachdb/cockroach/pkg/testutils/bazelcodecover"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	// intentionally not all the workloads in pkg/ccl/workloadccl/allccl
 	_ "github.com/cockroachdb/cockroach/pkg/workload/bank"       // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/bulkingest" // registers workloads
 	workloadcli "github.com/cockroachdb/cockroach/pkg/workload/cli"
+	_ "github.com/cockroachdb/cockroach/pkg/workload/debug"     // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/examples"  // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/insights"  // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/kv"        // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/movr"      // registers workloads
+	_ "github.com/cockroachdb/cockroach/pkg/workload/sqlstats"  // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpcc"      // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpch"      // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/ttlbench"  // registers workloads
@@ -51,9 +49,7 @@ import (
 // to be the body of an action package main `main` func elsewhere. It is
 // abstracted for reuse by duplicated `main` funcs in different distributions.
 func Main() {
-	// Seed the math/rand RNG from crypto/rand.
-	rand.Seed(randutil.NewPseudoSeed())
-
+	bazelcodecover.MaybeInitCodeCoverage()
 	if len(os.Args) == 1 {
 		os.Args = append(os.Args, "help")
 	}
@@ -229,6 +225,11 @@ var cockroachCmd = &cobra.Command{
 	},
 }
 
+// CockroachCmd returns the root cockroach Command object.
+func CockroachCmd() *cobra.Command {
+	return cockroachCmd
+}
+
 var workloadCmd = workloadcli.WorkloadCmd(true /* userFacing */)
 
 func init() {
@@ -246,7 +247,6 @@ func init() {
 	cockroachCmd.AddCommand(
 		startCmd,
 		startSingleNodeCmd,
-		connectCmd,
 		initCmd,
 		certCmd,
 
@@ -262,11 +262,12 @@ func init() {
 		// TODO(pmattis): stats
 		demoCmd,
 		convertURLCmd,
-		genCmd,
+		GenCmd,
 		versionCmd,
 		DebugCmd,
 		sqlfmtCmd,
 		workloadCmd,
+		encodeURICmd,
 	)
 }
 

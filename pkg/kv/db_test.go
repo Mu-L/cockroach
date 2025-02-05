@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv_test
 
@@ -111,13 +106,44 @@ func TestDB_GetForUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	s, db := setup(t)
-	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
 
-	result, err := db.GetForUpdate(context.Background(), "aa")
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkResult(t, []byte(""), result.ValueBytes())
+	testutils.RunTrueAndFalse(t, "durability-guaranteed", func(t *testing.T, durabilityGuaranteed bool) {
+		var result kv.KeyValue
+		var err error
+		if durabilityGuaranteed {
+			result, err = db.GetForUpdate(ctx, "aa", kvpb.GuaranteedDurability)
+		} else {
+			result, err = db.GetForUpdate(ctx, "aa", kvpb.BestEffort)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkResult(t, []byte(""), result.ValueBytes())
+	})
+}
+
+func TestDB_GetForShare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	testutils.RunTrueAndFalse(t, "durability-guaranteed", func(t *testing.T, durabilityGuaranteed bool) {
+		var result kv.KeyValue
+		var err error
+		if durabilityGuaranteed {
+			result, err = db.GetForShare(ctx, "aa", kvpb.GuaranteedDurability)
+		} else {
+			result, err = db.GetForShare(ctx, "aa", kvpb.BestEffort)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkResult(t, []byte(""), result.ValueBytes())
+	})
 }
 
 func TestDB_Put(t *testing.T) {
@@ -242,38 +268,6 @@ func TestDB_CPutInline(t *testing.T) {
 	}
 }
 
-func TestDB_InitPut(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	s, db := setup(t)
-	defer s.Stopper().Stop(context.Background())
-	ctx := context.Background()
-
-	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.InitPut(ctx, "aa", "2", false); err == nil {
-		t.Fatal("expected error from init put")
-	}
-	if _, err := db.Del(ctx, "aa"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.InitPut(ctx, "aa", "2", true); err == nil {
-		t.Fatal("expected error from init put")
-	}
-	if err := db.InitPut(ctx, "aa", "1", false); err != nil {
-		t.Fatal(err)
-	}
-	result, err := db.Get(ctx, "aa")
-	if err != nil {
-		t.Fatal(err)
-	}
-	checkResult(t, []byte("1"), result.ValueBytes())
-}
-
 func TestDB_Inc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -350,26 +344,70 @@ func TestDB_ScanForUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	s, db := setup(t)
-	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
 
-	b := &kv.Batch{}
-	b.Put("aa", "1")
-	b.Put("ab", "2")
-	b.Put("bb", "3")
-	if err := db.Run(context.Background(), b); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := db.ScanForUpdate(context.Background(), "a", "b", 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected := map[string][]byte{
-		"aa": []byte("1"),
-		"ab": []byte("2"),
-	}
+	testutils.RunTrueAndFalse(t, "durability-guaranteed", func(t *testing.T, durabilityGuaranteed bool) {
+		b := &kv.Batch{}
+		b.Put("aa", "1")
+		b.Put("ab", "2")
+		b.Put("bb", "3")
+		if err := db.Run(context.Background(), b); err != nil {
+			t.Fatal(err)
+		}
+		var rows []kv.KeyValue
+		var err error
+		if durabilityGuaranteed {
+			rows, err = db.ScanForUpdate(ctx, "a", "b", 100, kvpb.GuaranteedDurability)
+		} else {
+			rows, err = db.ScanForUpdate(ctx, "a", "b", 100, kvpb.BestEffort)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := map[string][]byte{
+			"aa": []byte("1"),
+			"ab": []byte("2"),
+		}
 
-	checkRows(t, expected, rows)
-	checkLen(t, len(expected), len(rows))
+		checkRows(t, expected, rows)
+		checkLen(t, len(expected), len(rows))
+	})
+}
+
+func TestDB_ScanForShare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	testutils.RunTrueAndFalse(t, "durability-guaranteed", func(t *testing.T, durabilityGuaranteed bool) {
+		b := &kv.Batch{}
+		b.Put("aa", "1")
+		b.Put("ab", "2")
+		b.Put("bb", "3")
+		if err := db.Run(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		var rows []kv.KeyValue
+		var err error
+		if durabilityGuaranteed {
+			rows, err = db.ScanForShare(ctx, "a", "b", 100, kvpb.GuaranteedDurability)
+		} else {
+			rows, err = db.ScanForShare(ctx, "a", "b", 100, kvpb.BestEffort)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := map[string][]byte{
+			"aa": []byte("1"),
+			"ab": []byte("2"),
+		}
+
+		checkRows(t, expected, rows)
+		checkLen(t, len(expected), len(rows))
+	})
 }
 
 func TestDB_ReverseScan(t *testing.T) {
@@ -402,26 +440,72 @@ func TestDB_ReverseScanForUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	s, db := setup(t)
-	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
 
-	b := &kv.Batch{}
-	b.Put("aa", "1")
-	b.Put("ab", "2")
-	b.Put("bb", "3")
-	if err := db.Run(context.Background(), b); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := db.ReverseScanForUpdate(context.Background(), "ab", "c", 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	expected := map[string][]byte{
-		"bb": []byte("3"),
-		"ab": []byte("2"),
-	}
+	testutils.RunTrueAndFalse(t, "durability-guaranteed", func(t *testing.T, durabilityGuaranteed bool) {
+		b := &kv.Batch{}
+		b.Put("aa", "1")
+		b.Put("ab", "2")
+		b.Put("bb", "3")
+		if err := db.Run(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		var rows []kv.KeyValue
+		var err error
 
-	checkRows(t, expected, rows)
-	checkLen(t, len(expected), len(rows))
+		if durabilityGuaranteed {
+			rows, err = db.ReverseScanForUpdate(ctx, "ab", "c", 100, kvpb.GuaranteedDurability)
+		} else {
+			rows, err = db.ReverseScanForUpdate(ctx, "ab", "c", 100, kvpb.BestEffort)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := map[string][]byte{
+			"bb": []byte("3"),
+			"ab": []byte("2"),
+		}
+
+		checkRows(t, expected, rows)
+		checkLen(t, len(expected), len(rows))
+	})
+}
+
+func TestDB_ReverseScanForShare(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, db := setup(t)
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	testutils.RunTrueAndFalse(t, "durability-guaranteed", func(t *testing.T, durabilityGuaranteed bool) {
+		b := &kv.Batch{}
+		b.Put("aa", "1")
+		b.Put("ab", "2")
+		b.Put("bb", "3")
+		if err := db.Run(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		var rows []kv.KeyValue
+		var err error
+
+		if durabilityGuaranteed {
+			rows, err = db.ReverseScanForShare(ctx, "ab", "c", 100, kvpb.GuaranteedDurability)
+		} else {
+			rows, err = db.ReverseScanForShare(ctx, "ab", "c", 100, kvpb.BestEffort)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := map[string][]byte{
+			"bb": []byte("3"),
+			"ab": []byte("2"),
+		}
+
+		checkRows(t, expected, rows)
+		checkLen(t, len(expected), len(rows))
+	})
 }
 
 func TestDB_TxnIterate(t *testing.T) {
@@ -697,7 +781,7 @@ func TestDBDecommissionedOperations(t *testing.T) {
 			return err
 		}},
 		{"GetForUpdate", func() error {
-			_, err := db.GetForUpdate(ctx, key)
+			_, err := db.GetForUpdate(ctx, key, kvpb.BestEffort)
 			return err
 		}},
 		{"Put", func() error {
@@ -850,6 +934,51 @@ func testDBTxnRetry(t *testing.T, isoLevel isolation.Level, returnNil bool) {
 	require.NoError(t, err1)
 }
 
+// TestDB_TxnRetryLimit tests kv.transaction.internal.max_auto_retries.
+func TestDB_TxnRetryLimit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+		testDBTxnRetryLimit(t, isoLevel)
+	})
+}
+
+func testDBTxnRetryLimit(t *testing.T, isoLevel isolation.Level) {
+	ctx := context.Background()
+	s, db := setup(t)
+	defer s.Stopper().Stop(ctx)
+
+	// Configure a low retry limit.
+	const maxRetries = 7
+	const maxAttempts = maxRetries + 1
+	kv.MaxInternalTxnAutoRetries.Override(ctx, &s.ClusterSettings().SV, maxRetries)
+
+	// Run the txn, aborting it on each attempt.
+	attempts := 0
+	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		attempts++
+		require.NoError(t, txn.SetIsoLevel(isoLevel))
+		require.NoError(t, txn.Put(ctx, "a", "1"))
+
+		{
+			// High priority txn - will abort the other txn each attempt.
+			hpTxn := kv.NewTxn(ctx, db, 0)
+			require.NoError(t, hpTxn.SetUserPriority(roachpb.MaxUserPriority))
+			require.NoError(t, hpTxn.Put(ctx, "a", "hp txn"))
+			require.NoError(t, hpTxn.Commit(ctx))
+		}
+
+		// Read, so that we'll get a retryable error.
+		_, err := txn.Get(ctx, "a")
+		require.Error(t, err)
+		require.IsType(t, &kvpb.TransactionRetryWithProtoRefreshError{}, err)
+		return err
+	})
+	require.Error(t, err)
+	require.Regexp(t, "Terminating retry loop and returning error", err)
+	require.Equal(t, maxAttempts, attempts)
+}
+
 func TestPreservingSteppingOnSenderReplacement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -977,8 +1106,7 @@ func TestBulkBatchAPI(t *testing.T) {
 
 	testF(func(b *kv.Batch) { b.PutBytes(&byteSliceBulkSource[[]byte]{kys, vals}) })
 	testF(func(b *kv.Batch) { b.PutTuples(&byteSliceBulkSource[[]byte]{kys, vals}) })
-	testF(func(b *kv.Batch) { b.InitPutBytes(&byteSliceBulkSource[[]byte]{kys, vals}) })
-	testF(func(b *kv.Batch) { b.InitPutTuples(&byteSliceBulkSource[[]byte]{kys, vals}) })
+	testF(func(b *kv.Batch) { b.CPutBytesEmpty(&byteSliceBulkSource[[]byte]{kys, vals}) })
 	testF(func(b *kv.Batch) { b.CPutTuplesEmpty(&byteSliceBulkSource[[]byte]{kys, vals}) })
 
 	values := make([]roachpb.Value, len(kys))
@@ -991,7 +1119,7 @@ func TestBulkBatchAPI(t *testing.T) {
 	testF(func(b *kv.Batch) { b.CPutValuesEmpty(&byteSliceBulkSource[roachpb.Value]{kys, values}) })
 }
 
-func TestGetResults(t *testing.T) {
+func TestGetResult(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	s, db := setup(t)
@@ -1005,6 +1133,8 @@ func TestGetResults(t *testing.T) {
 	b := txn.NewBatch()
 	b.PutBytes(&byteSliceBulkSource[[]byte]{kys1, vals})
 	b.PutBytes(&byteSliceBulkSource[[]byte]{kys2, vals})
+	keyToDel := roachpb.Key("b")
+	b.Del(keyToDel)
 	err := txn.CommitInBatch(ctx, b)
 	require.NoError(t, err)
 	for i := 0; i < len(kys1)+len(kys2); i++ {
@@ -1013,12 +1143,17 @@ func TestGetResults(t *testing.T) {
 		require.Equal(t, row, b.Results[i/3].Rows[i%3])
 		require.NoError(t, err)
 	}
+	// test Del request (it uses Result.Keys rather than Result.Rows)
+	_, kv, err := b.GetResult(len(kys1) + len(kys2))
+	require.NoError(t, err)
+	require.Equal(t, keyToDel, kv.Key)
+	require.Nil(t, kv.Value)
 	// test EndTxn result
-	_, _, err = b.GetResult(len(kys1) + len(kys2))
+	_, _, err = b.GetResult(len(kys1) + len(kys2) + 1)
 	require.NoError(t, err)
 
 	// test out of bounds
-	_, _, err = b.GetResult(len(kys1) + len(kys2) + 1)
+	_, _, err = b.GetResult(len(kys1) + len(kys2) + 2)
 	require.Error(t, err)
 }
 

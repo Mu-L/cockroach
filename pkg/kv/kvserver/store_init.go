@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -205,7 +200,7 @@ func WriteInitialClusterData(
 		for _, kv := range rangeInitialValues {
 			// Initialize the checksums.
 			kv.Value.InitChecksum(kv.Key)
-			if err := storage.MVCCPut(
+			if _, err := storage.MVCCPut(
 				ctx, batch, kv.Key, now, kv.Value, storage.MVCCWriteOptions{},
 			); err != nil {
 				return err
@@ -216,7 +211,7 @@ func WriteInitialClusterData(
 			ctx, batch, *desc, firstReplicaID, initialReplicaVersion); err != nil {
 			return err
 		}
-		computedStats, err := rditer.ComputeStatsForRange(desc, batch, now.WallTime)
+		computedStats, err := rditer.ComputeStatsForRange(ctx, desc, batch, now.WallTime)
 		if err != nil {
 			return err
 		}

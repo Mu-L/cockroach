@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -31,21 +26,28 @@ const (
 var provisionalReleasePrefixRE = regexp.MustCompile(`^provisional_[0-9]{12}_`)
 
 func main() {
+	var platforms release.Platforms
 	var gcsBucket string
 	var outputDirectory string
 	var buildTagOverride string
+	var thirdPartyNoticesFileOverride string
 	var doProvisional bool
 	var isRelease bool
 	var doBless bool
+	flag.Var(&platforms, "platform", "platforms to build")
 	flag.BoolVar(&isRelease, "release", false, "build in release mode instead of bleeding-edge mode")
 	flag.StringVar(&gcsBucket, "gcs-bucket", "", "GCS bucket")
 	flag.StringVar(&outputDirectory, "output-directory", "",
 		"Save local copies of uploaded release archives in this directory")
 	flag.StringVar(&buildTagOverride, "build-tag-override", "", "override the version from version.txt")
+	flag.StringVar(&thirdPartyNoticesFileOverride, "third-party-notices-file", "", "override the file with third party notices")
 	flag.BoolVar(&doProvisional, "provisional", false, "publish provisional binaries")
 	flag.BoolVar(&doBless, "bless", false, "bless provisional binaries")
 
 	flag.Parse()
+	if len(platforms) == 0 {
+		platforms = release.DefaultPlatforms()
+	}
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	// GCS bucket is required now
@@ -83,30 +85,37 @@ func main() {
 		log.Fatalf("%s: out=%q err=%s", cmd.Args, shaOut, err)
 	}
 
-	run(providers, runFlags{
-		doProvisional:    doProvisional,
-		doBless:          doBless,
-		isRelease:        isRelease,
-		buildTagOverride: buildTagOverride,
-		branch:           branch,
-		pkgDir:           pkg,
-		sha:              string(bytes.TrimSpace(shaOut)),
-		outputDirectory:  outputDirectory,
+	run(providers, platforms, runFlags{
+		doProvisional:                 doProvisional,
+		doBless:                       doBless,
+		isRelease:                     isRelease,
+		buildTagOverride:              buildTagOverride,
+		branch:                        branch,
+		pkgDir:                        pkg,
+		sha:                           string(bytes.TrimSpace(shaOut)),
+		outputDirectory:               outputDirectory,
+		thirdPartyNoticesFileOverride: thirdPartyNoticesFileOverride,
 	}, release.ExecFn{})
 }
 
 type runFlags struct {
-	doProvisional    bool
-	doBless          bool
-	isRelease        bool
-	buildTagOverride string
-	branch           string
-	sha              string
-	pkgDir           string
-	outputDirectory  string
+	doProvisional                 bool
+	doBless                       bool
+	isRelease                     bool
+	buildTagOverride              string
+	branch                        string
+	sha                           string
+	pkgDir                        string
+	outputDirectory               string
+	thirdPartyNoticesFileOverride string
 }
 
-func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.ExecFn) {
+func run(
+	providers []release.ObjectPutGetter,
+	platforms release.Platforms,
+	flags runFlags,
+	execFn release.ExecFn,
+) {
 	// TODO(dan): non-release builds currently aren't broken into the two
 	// phases. Instead, the provisional phase does them both.
 	if !flags.isRelease {
@@ -143,15 +152,6 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 		versionStr = flags.sha
 		updateLatest = true
 	}
-
-	platforms := []release.Platform{
-		release.PlatformLinux,
-		release.PlatformLinuxFIPS,
-		release.PlatformMacOS,
-		release.PlatformMacOSArm,
-		release.PlatformWindows,
-		release.PlatformLinuxArm,
-	}
 	var cockroachBuildOpts []opts
 	for _, platform := range platforms {
 		var o opts
@@ -186,17 +186,33 @@ func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.Exe
 					)
 				}
 			} else {
+				thirdPartyNoticesFile := filepath.Join(o.PkgDir, "licenses", "THIRD-PARTY-NOTICES.txt")
+				if flags.thirdPartyNoticesFileOverride != "" {
+					thirdPartyNoticesFile = flags.thirdPartyNoticesFileOverride
+				}
+				licenseFiles := []release.ArchiveFile{
+					{
+						LocalAbsolutePath: filepath.Join(o.PkgDir, "LICENSE"),
+						ArchiveFilePath:   "LICENSE",
+					},
+					{
+						LocalAbsolutePath: thirdPartyNoticesFile,
+						ArchiveFilePath:   "THIRD-PARTY-NOTICES.txt",
+					},
+				}
 				for _, provider := range providers {
 					crdbFiles := append(
 						[]release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.AbsolutePath, "cockroach")},
 						release.MakeCRDBLibraryArchiveFiles(o.PkgDir, o.Platform)...,
 					)
+					crdbFiles = append(crdbFiles, licenseFiles...)
 					crdbBody, err := release.CreateArchive(o.Platform, o.VersionStr, "cockroach", crdbFiles)
 					if err != nil {
 						log.Fatalf("cannot create crdb release archive %s", err)
 					}
 
 					sqlFiles := []release.ArchiveFile{release.MakeCRDBBinaryArchiveFile(o.CockroachSQLAbsolutePath, "cockroach-sql")}
+					sqlFiles = append(sqlFiles, licenseFiles...)
 					sqlBody, err := release.CreateArchive(o.Platform, o.VersionStr, "cockroach-sql", sqlFiles)
 					if err != nil {
 						log.Fatalf("cannot create sql release archive %s", err)

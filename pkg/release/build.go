@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package release
 
@@ -138,7 +133,7 @@ func MakeWorkload(platform Platform, opts BuildOptions, pkgDir string) error {
 	}
 	crossConfig := CrossConfigFromPlatform(platform)
 	configArg := fmt.Sprintf("--config=%s", crossConfig)
-	cmd := exec.Command("bazel", "build", "//pkg/cmd/workload", "-c", "opt", configArg, "--config=ci")
+	cmd := exec.Command("bazel", "build", "//pkg/cmd/workload", "-c", "opt", configArg, "--norun_validations")
 	cmd.Dir = pkgDir
 	cmd.Stderr = os.Stderr
 	log.Printf("%s", cmd.Args)
@@ -147,7 +142,7 @@ func MakeWorkload(platform Platform, opts BuildOptions, pkgDir string) error {
 		return errors.Wrapf(err, "failed to run %s: %s", cmd.Args, string(stdoutBytes))
 	}
 
-	bazelBin, err := getPathToBazelBin(opts.ExecFn, pkgDir, []string{"-c", "opt", configArg, "--config=ci"})
+	bazelBin, err := getPathToBazelBin(opts.ExecFn, pkgDir, []string{"-c", "opt", configArg})
 	if err != nil {
 		return err
 	}
@@ -181,8 +176,9 @@ func MakeRelease(platform Platform, opts BuildOptions, pkgDir string) error {
 		stampCommand = fmt.Sprintf("--workspace_status_command=./build/bazelutil/stamp.sh %s %s", targetTriple, opts.Channel)
 	}
 	buildArgs = append(buildArgs, stampCommand)
-	configs := []string{"-c", "opt", "--config=ci", "--config=force_build_cdeps", fmt.Sprintf("--config=%s", CrossConfigFromPlatform(platform))}
+	configs := []string{"-c", "opt", "--config=force_build_cdeps", fmt.Sprintf("--config=%s", CrossConfigFromPlatform(platform))}
 	buildArgs = append(buildArgs, configs...)
+	buildArgs = append(buildArgs, "--norun_validations")
 	cmd := exec.Command("bazel", buildArgs...)
 	cmd.Dir = pkgDir
 	cmd.Stderr = os.Stderr
@@ -280,22 +276,62 @@ var (
 )
 
 // Platform is an enumeration of the supported platforms for release.
-type Platform int
+type Platform string
 
 const (
 	// PlatformLinux is the Linux x86_64 target.
-	PlatformLinux Platform = iota
+	PlatformLinux Platform = "linux-amd64"
 	// PlatformLinuxFIPS is the Linux FIPS target.
-	PlatformLinuxFIPS
+	PlatformLinuxFIPS Platform = "linux-amd64-fips"
 	// PlatformLinuxArm is the Linux aarch64 target.
-	PlatformLinuxArm
+	PlatformLinuxArm Platform = "linux-arm64"
 	// PlatformMacOS is the Darwin x86_64 target.
-	PlatformMacOS
+	PlatformMacOS Platform = "darwin-amd64"
 	// PlatformMacOSArm is the Darwin aarch6 target.
-	PlatformMacOSArm
+	PlatformMacOSArm Platform = "darwin-arm64"
 	// PlatformWindows is the Windows (mingw) x86_64 target.
-	PlatformWindows
+	PlatformWindows Platform = "win-amd64"
 )
+
+type Platforms []Platform
+
+// String implements flag.Value interface
+func (p Platforms) String() string {
+	if len(p) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, platform := range p {
+		sb.WriteString(string(platform))
+		if i < len(p)-1 {
+			sb.WriteString(", ")
+		}
+	}
+	return sb.String()
+}
+
+// Set implements flag.Value interface
+func (p *Platforms) Set(v string) error {
+	switch Platform(v) {
+	case PlatformLinux, PlatformLinuxArm, PlatformLinuxFIPS, PlatformMacOS, PlatformMacOSArm, PlatformWindows:
+		*p = append(*p, Platform(v))
+		return nil
+	default:
+		return fmt.Errorf("unsupported platform `%s`", v)
+	}
+}
+
+// DefaultPlatforms returns a list of platforms supported by default.
+func DefaultPlatforms() Platforms {
+	return Platforms{
+		PlatformLinux,
+		PlatformLinuxFIPS,
+		PlatformLinuxArm,
+		PlatformMacOS,
+		PlatformMacOSArm,
+		PlatformWindows,
+	}
+}
 
 func getPathToBazelBin(execFn ExecFn, pkgDir string, configArgs []string) (string, error) {
 	args := []string{"info", "bazel-bin"}

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"hash/fnv"
 	"strconv"
 	"strings"
 	"time"
@@ -21,15 +17,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/multitenant"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
@@ -37,14 +33,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -59,6 +53,7 @@ import (
 
 // setClusterSettingNode represents a SET CLUSTER SETTING statement.
 type setClusterSettingNode struct {
+	zeroInputPlanNode
 	name    settings.SettingName
 	st      *cluster.Settings
 	setting settings.NonMaskedSetting
@@ -69,62 +64,30 @@ type setClusterSettingNode struct {
 func checkPrivilegesForSetting(
 	ctx context.Context, p *planner, name settings.SettingName, action string,
 ) error {
-	// First check system privileges.
-	hasModify := false
-	hasSqlModify := false
-	hasView := false
-	if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User()); err != nil {
+	// If the user has modify privileges, then they can set or show any setting.
+	hasModify, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYCLUSTERSETTING)
+	if err != nil {
 		return err
-	} else if ok {
-		hasModify = true
-		hasSqlModify = true
-		hasView = true
 	}
-	if !hasSqlModify {
-		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING, p.User()); err != nil {
-			return err
-		} else if ok {
-			hasSqlModify = true
-		}
-	}
-	if !hasView {
-		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING, p.User()); err != nil {
-			return err
-		} else if ok {
-			hasView = true
-		}
-	}
-
-	// Fallback to role option if the user doesn't have the privilege.
-	if !hasModify {
-		ok, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
-		if err != nil {
-			return err
-		}
-		hasModify = hasModify || ok
-		hasView = hasView || ok
-	}
-	if !hasView {
-		ok, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING)
-		if err != nil {
-			return err
-		}
-		hasView = hasView || ok
-	}
-
-	isSqlSetting := strings.HasPrefix(string(name), "sql.defaults")
-	// If the user has modify they can do either action to any setting regardless of
-	// whether they have the other 2 settings.
 	if hasModify {
 		return nil
 	}
-	// If the user has sql modify they can do either action as long as its a sql.defaults
-	// setting.
-	if hasSqlModify && isSqlSetting {
-		return nil
+
+	// If the user only has sql modify privileges, then they can only set or show
+	// any sql.defaults setting.
+	isSqlSetting := strings.HasPrefix(string(name), "sql.defaults")
+	if isSqlSetting {
+		hasSqlModify, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYSQLCLUSTERSETTING)
+		if err != nil {
+			return err
+		}
+		if hasSqlModify {
+			return nil
+		}
 	}
-	// From this point, the user does not have modify or has sql modify but it is not a
-	// sql.defaults setting so we can expect an error if the user wants to edit.
+
+	// If the user does not have modify or sql modify privileges, then they
+	// cannot set any settings.
 	if action == "set" {
 		if !isSqlSetting {
 			return pgerror.Newf(pgcode.InsufficientPrivilege,
@@ -136,18 +99,25 @@ func checkPrivilegesForSetting(
 			privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, action, name)
 	}
 
-	// From this point, if the user does not have view then we can expect an error.
-	if action == "show" && !hasView {
-		if !isSqlSetting {
-			return pgerror.Newf(pgcode.InsufficientPrivilege,
-				"only users with %s or %s privileges are allowed to %s cluster setting '%s'",
-				privilege.MODIFYCLUSTERSETTING, privilege.VIEWCLUSTERSETTING, action, name)
-		}
-		return pgerror.Newf(pgcode.InsufficientPrivilege,
-			"only users with %s, %s or %s privileges are allowed to %s cluster setting '%s'",
-			privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, privilege.VIEWCLUSTERSETTING, action, name)
+	// If the user has view privileges, then they can show any setting.
+	hasView, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWCLUSTERSETTING)
+	if err != nil {
+		return err
 	}
-	return nil
+	if action == "show" && hasView {
+		return nil
+	}
+
+	// If the user does not have modify, sql modify, or view privileges,
+	// then they cannot show any setting.
+	if !isSqlSetting {
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"only users with %s or %s privileges are allowed to %s cluster setting '%s'",
+			privilege.MODIFYCLUSTERSETTING, privilege.VIEWCLUSTERSETTING, action, name)
+	}
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"only users with %s, %s or %s privileges are allowed to %s cluster setting '%s'",
+		privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, privilege.VIEWCLUSTERSETTING, action, name)
 }
 
 // SetClusterSetting sets cluster settings.
@@ -155,14 +125,69 @@ func checkPrivilegesForSetting(
 func (p *planner) SetClusterSetting(
 	ctx context.Context, n *tree.SetClusterSetting,
 ) (planNode, error) {
+	forSystemTenant := p.ExecCfg().Codec.ForSystemTenant()
+	tipSystemInterface := !forSystemTenant && TipUserAboutSystemInterface.Get(&p.ExecCfg().Settings.SV)
 	name := settings.SettingName(strings.ToLower(n.Name))
-	st := p.EvalContext().Settings
-	setting, ok, nameStatus := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
-	if !ok {
-		return nil, errors.Errorf("unknown cluster setting '%s'", name)
+
+	friendlyIgnore := func() {
+		p.BufferClientNotice(ctx, errors.WithHintf(pgnotice.Newf("ignoring attempt to modify %q", name),
+			"The setting is only modifiable by the operator.\n"+
+				"Normally, an error would be reported, but the operation is silently accepted here as configured by %q.",
+			TipUserAboutSystemInterface.Name()))
 	}
+
+	st := p.EvalContext().Settings
+	setting, ok, nameStatus := settings.LookupForLocalAccess(name, forSystemTenant)
+	if !ok {
+		// Uh-oh.
+		unknownSettingError := pgerror.Newf(pgcode.UndefinedParameter, "unknown cluster setting '%s'", name)
+
+		// There's 3 cases here.
+		//
+		// - the setting does not exist. We'll fall back to a "unknown
+		//   setting" error below.
+		//
+		// - the setting exists and was previously application. In this case,
+		//   either report "unknown setting" in the common case, or, if
+		//   the "tip" flag is enabled, _make the operation succeed
+		//   as a no-op_ with a simple NOTICE.
+		//
+		// - the setting exists and has always been non-application. Either
+		//   tell the user "unknown setting" in the common case, or, if the
+		//   "tip" flag is enabled, tell the user "nope, connect to system
+		//   interface instead".
+		//
+		//
+
+		// Check if the setting exists at all, perhaps as a system setting.
+		actualSetting, settingExists, _ := settings.LookupForLocalAccess(name, true /* forSystemTenant */)
+		if !settingExists {
+			return nil, unknownSettingError
+		}
+
+		// Did the setting previously have ApplicationLevel?
+		if settings.SettingPreviouslyHadApplicationClass(actualSetting.InternalKey()) {
+			if !tipSystemInterface {
+				return nil, unknownSettingError
+			}
+
+			friendlyIgnore()
+			return &zeroNode{}, nil
+		}
+
+		// This is a system setting.
+
+		if !tipSystemInterface {
+			return nil, unknownSettingError
+		}
+
+		return nil, p.maybeAddSystemInterfaceHint(
+			pgerror.Newf(pgcode.InsufficientPrivilege, "cannot modify storage-level setting from virtual cluster"),
+			"modify the cluster setting")
+	}
+
 	if nameStatus != settings.NameActive {
-		p.BufferClientNotice(ctx, settingNameDeprecationNotice(name, setting.Name()))
+		p.BufferClientNotice(ctx, settingAlternateNameNotice(name, setting.Name()))
 		name = setting.Name()
 	}
 
@@ -170,14 +195,32 @@ func (p *planner) SetClusterSetting(
 		return nil, err
 	}
 
-	if !p.execCfg.Codec.ForSystemTenant() {
+	if !forSystemTenant {
 		switch setting.Class() {
 		case settings.SystemOnly:
 			// The Lookup call above should never return SystemOnly settings if this
 			// is a tenant.
 			return nil, errors.AssertionFailedf("looked up system-only setting")
-		case settings.TenantReadOnly:
-			return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "setting %s is only settable by the operator", name)
+
+		case settings.SystemVisible:
+			// Did the setting previously have ApplicationLevel?
+			if settings.SettingPreviouslyHadApplicationClass(setting.InternalKey()) && tipSystemInterface {
+				friendlyIgnore()
+				return &zeroNode{}, nil
+			}
+
+			return nil, p.maybeAddSystemInterfaceHint(
+				pgerror.Newf(pgcode.InsufficientPrivilege, "setting %s is only settable by the operator", name),
+				"modify the cluster setting")
+		}
+	} else {
+		switch setting.Class() {
+		case settings.ApplicationLevel:
+			if err := p.shouldRestrictAccessToSystemInterface(ctx,
+				"update to application-level cluster setting", /* operation */
+				"changing the setting" /* alternate action */); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -220,7 +263,8 @@ func (p *planner) getAndValidateTypedClusterSetting(
 				requiredType = types.Int
 			case *settings.FloatSetting:
 				requiredType = types.Float
-			case *settings.EnumSetting:
+			case settings.AnyEnumSetting:
+				// EnumSettings can be set with either strings or integers.
 				requiredType = types.Any
 			case *settings.DurationSetting:
 				requiredType = types.Interval
@@ -228,7 +272,7 @@ func (p *planner) getAndValidateTypedClusterSetting(
 				requiredType = types.Interval
 				// Ensure that the expression contains a unit (i.e can't be a float)
 				_, err := p.analyzeExpr(
-					ctx, expr, nil, dummyHelper, types.Float, false, "SET CLUSTER SETTING "+string(name),
+					ctx, expr, dummyHelper, types.Float, false, "SET CLUSTER SETTING "+string(name),
 				)
 				// An interval with a unit (valid) will return an
 				// "InvalidTextRepresentation" error when trying to parse it as a float.
@@ -244,7 +288,7 @@ func (p *planner) getAndValidateTypedClusterSetting(
 			}
 
 			typed, err := p.analyzeExpr(
-				ctx, expr, nil, dummyHelper, requiredType, true, "SET CLUSTER SETTING "+string(name))
+				ctx, expr, dummyHelper, requiredType, true, "SET CLUSTER SETTING "+string(name))
 			if err != nil {
 				hasHint, hint := setting.ErrorHint()
 				if hasHint {
@@ -285,9 +329,9 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 		n.st,
 		n.value,
 		params.p.EvalContext(),
-		params.extendedEvalCtx.Codec.ForSystemTenant(),
 		params.p.logEvent,
 		params.p.descCollection.ReleaseLeases,
+		params.p.makeUnsafeSettingInterlockInfo(),
 	)
 	if err != nil {
 		return err
@@ -309,17 +353,6 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 	// Report tracked cluster settings via telemetry.
 	// TODO(justin): implement a more general mechanism for tracking these.
 	switch n.name {
-	case multitenant.DefaultClusterSelectSettingName:
-		if multitenant.VerifyTenantService.Get(&n.st.SV) && expectedEncodedValue != "" {
-			tr, err := GetTenantRecordByName(params.ctx, n.st, params.p.InternalSQLTxn(), roachpb.TenantName(expectedEncodedValue))
-			if err != nil {
-				return errors.Wrapf(err, "failed to lookup tenant %q", expectedEncodedValue)
-			}
-			if tr.ServiceMode != mtinfopb.ServiceModeShared {
-				return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-					"shared service not enabled for tenant %q", expectedEncodedValue)
-			}
-		}
 	case catpb.AutoStatsEnabledSettingName:
 		switch expectedEncodedValue {
 		case "true":
@@ -380,9 +413,9 @@ func writeSettingInternal(
 	st *cluster.Settings,
 	value tree.TypedExpr,
 	evalCtx *eval.Context,
-	forSystemTenant bool,
 	logFn func(context.Context, descpb.ID, logpb.EventPayload) error,
 	releaseLeases func(context.Context),
+	interlockInfo unsafeSettingInterlockInfo,
 ) (expectedEncodedValue string, err error) {
 	if err := func() error {
 		var reportedValue string
@@ -394,21 +427,24 @@ func writeSettingInternal(
 				return err
 			}
 		} else {
-
 			// Setting a non-DEFAULT value.
 			value, err := eval.Expr(ctx, evalCtx, value)
 			if err != nil {
 				return err
 			}
 			reportedValue, expectedEncodedValue, err = writeNonDefaultSettingValue(
-				ctx, hook, db,
-				setting, user, st, value, forSystemTenant,
-				releaseLeases,
+				ctx, hook, db, setting, user, st, value, releaseLeases, interlockInfo,
 			)
 			if err != nil {
 				return err
 			}
 		}
+
+		if setting.IsUnsafe() {
+			// Also mention the change in the non-structured DEV log.
+			log.Warningf(ctx, "unsafe setting changed: %q -> %v", name, reportedValue)
+		}
+
 		return logFn(ctx,
 			0, /* no target */
 			&eventpb.SetClusterSetting{
@@ -432,7 +468,7 @@ func writeDefaultSettingValue(
 	expectedEncodedValue = setting.EncodedDefault()
 	_, err = db.Executor().ExecEx(
 		ctx, "reset-setting", nil,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		"DELETE FROM system.settings WHERE name = $1", setting.InternalKey(),
 	)
 	return reportedValue, expectedEncodedValue, err
@@ -448,8 +484,8 @@ func writeNonDefaultSettingValue(
 	user username.SQLUsername,
 	st *cluster.Settings,
 	value tree.Datum,
-	forSystemTenant bool,
 	releaseLeases func(context.Context),
+	interlockInfo unsafeSettingInterlockInfo,
 ) (reportedValue string, expectedEncodedValue string, err error) {
 	// Stringify the value set by the statement for reporting in errors, logs etc.
 	reportedValue = tree.AsStringWithFlags(value, tree.FmtBareStrings)
@@ -464,16 +500,21 @@ func writeNonDefaultSettingValue(
 	verSetting, isSetVersion := setting.(*settings.VersionSetting)
 	if isSetVersion {
 		if err := setVersionSetting(
-			ctx, hook, verSetting, db, user, st, value, encoded,
-			forSystemTenant, releaseLeases,
+			ctx, hook, verSetting, db, user, st, value, encoded, releaseLeases,
 		); err != nil {
 			return reportedValue, expectedEncodedValue, err
 		}
 	} else {
 		// Modifying another setting than the version.
+		if setting.IsUnsafe() {
+			if err := unsafeSettingInterlock(ctx, st, setting, encoded, interlockInfo); err != nil {
+				return reportedValue, expectedEncodedValue, err
+			}
+		}
+
 		if _, err = db.Executor().ExecEx(
 			ctx, "update-setting", nil,
-			sessiondata.RootUserSessionDataOverride,
+			sessiondata.NodeUserSessionDataOverride,
 			`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
 			setting.InternalKey(), encoded, setting.Typ(),
 		); err != nil {
@@ -495,7 +536,6 @@ func setVersionSetting(
 	st *cluster.Settings,
 	value tree.Datum,
 	encoded string,
-	forSystemTenant bool,
 	releaseLeases func(context.Context),
 ) error {
 	// In the special case of the 'version' cluster setting,
@@ -503,7 +543,7 @@ func setVersionSetting(
 	// value change is valid.
 	datums, err := db.Executor().QueryRowEx(
 		ctx, "retrieve-prev-setting", nil,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		"SELECT value FROM system.settings WHERE name = $1", setting.InternalKey(),
 	)
 	if err != nil {
@@ -515,23 +555,7 @@ func setVersionSetting(
 		// hasn't run yet, we can't update the version as we don't
 		// have good enough information about the current cluster
 		// version.
-		if forSystemTenant {
-			return errors.New("no persisted cluster version found, please retry later")
-		}
-		// The tenant cluster in 20.2 did not ever initialize this value and
-		// utilized this hard-coded value instead. In 21.1, the builtin
-		// which creates tenants sets up the cluster version state. It also
-		// is set when the version is upgraded.
-		tenantDefaultVersion := clusterversion.ClusterVersion{
-			Version: roachpb.Version{Major: 20, Minor: 2},
-		}
-		// Pretend that the expected value was already there to allow us to
-		// run migrations.
-		prevEncoded, err := protoutil.Marshal(&tenantDefaultVersion)
-		if err != nil {
-			return errors.WithAssertionFailure(err)
-		}
-		prev = tree.NewDString(string(prevEncoded))
+		return errors.New("no persisted cluster version found, please retry later")
 	} else {
 		prev = datums[0]
 	}
@@ -553,22 +577,49 @@ func setVersionSetting(
 		if err != nil {
 			return err
 		}
-		return db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-			// Confirm if the version has actually changed on us.
-			datums, err := txn.QueryRowEx(
-				ctx, "retrieve-prev-setting", txn.KV(),
-				sessiondata.RootUserSessionDataOverride,
-				"SELECT value FROM system.settings WHERE name = $1", setting.InternalKey(),
-			)
+		return db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			// On complex clusters with a large number of descriptors (> 500) and
+			// multi-region nodes (> 9), normal priority transactions reading/updating
+			// the version row can be starved. This is due to the lease manager reading
+			// the version row at high priority, when refreshing leases (#95227), with
+			// a complex cluster this traffic will continuous.
+			// Run the version bump inside the upgrade as high priority, since
+			// lease manager ends up reading the version row (with high priority)
+			// inside the settings table when refreshing leases. On complex clusters
+			// (multi-region with high latency) or with a large number of descriptors
+			// ( >500) it's possible for normal transactions to be starved by continuous
+			// lease traffic.
+			// This is safe from deadlocks / starvation because we expected this
+			// transaction only do the following:
+			// 1) We expect this transaction to only read and write to the
+			//    version key in the system.settings table. To achieve the smallest
+			//    possible txn and avoid extra operations on other keys, we are going to
+			//	  use KV call with EncodeSettingKey/EncodeSettingValue functions
+			//	  instead of using the internal executor.
+			// 2) Reads from the system.sql_instances table to confirm all SQL servers
+			//    have been upgraded in multi-tenant environments.
+			// 3) Other transactions will use a normal priority and get pushed out by
+			//    this one, if they involve schema changes on the system database
+			//    descriptor (highly unlikely).
+			if err := txn.SetUserPriority(roachpb.MaxUserPriority); err != nil {
+				return err
+			}
+
+			// Fetch the existing version setting and see if its
+			// been modified.
+			codec := db.(*InternalDB).server.cfg.Codec
+			decoder := settingswatcher.MakeRowDecoder(codec)
+			key := settingswatcher.EncodeSettingKey(codec, "version")
+			row, err := txn.Get(ctx, key)
 			if err != nil {
 				return err
 			}
-			if len(datums) > 0 {
-				dStr, ok := datums[0].(*tree.DString)
-				if !ok {
-					return errors.AssertionFailedf("existing version value is not a string, got %T", datums[0])
+			if row.Value != nil {
+				_, val, _, err := decoder.DecodeRow(roachpb.KeyValue{Key: row.Key, Value: *row.Value}, nil /* alloc */)
+				if err != nil {
+					return err
 				}
-				oldRawValue := []byte(string(*dStr))
+				oldRawValue := []byte(val.Value)
 				if bytes.Equal(oldRawValue, rawValue) {
 					return nil
 				}
@@ -582,22 +633,22 @@ func setVersionSetting(
 					return nil
 				}
 			}
-			// Only if the version has increased, alter the setting.
-			if _, err = txn.ExecEx(
-				ctx, "update-setting", txn.KV(),
-				sessiondata.RootUserSessionDataOverride,
-				`UPSERT INTO system.settings (name, value, "lastUpdated", "valueType") VALUES ($1, $2, now(), $3)`,
-				setting.InternalKey(), string(rawValue), setting.Typ(),
-			); err != nil {
+			// Encode the setting value to write out the updated version.
+			var tuple []byte
+			if tuple, err = settingswatcher.EncodeSettingValue(rawValue, setting.Typ()); err != nil {
 				return err
 			}
-
+			newValue := &roachpb.Value{}
+			newValue.SetTuple(tuple)
+			if err := txn.Put(ctx, row.Key, newValue); err != nil {
+				return err
+			}
 			// Perform any necessary post-setting validation. This is used in
 			// the tenant upgrade interlock to ensure that the set of sql
 			// servers present at the time of the settings update, matches the
 			// set that was present when the fence bump occurred (see comment in
 			// upgrademanager.Migrate() for more details).
-			if err = postSettingValidate(ctx, txn.KV()); err != nil {
+			if err = postSettingValidate(ctx, txn); err != nil {
 				return err
 			}
 			return err
@@ -727,6 +778,9 @@ func toSettingString(
 		return "", errors.Errorf("cannot use %s %T value for string setting", d.ResolvedType(), d)
 	case *settings.BoolSetting:
 		if b, ok := d.(*tree.DBool); ok {
+			if err := setting.Validate(&st.SV, bool(*b)); err != nil {
+				return "", err
+			}
 			return settings.EncodeBool(bool(*b)), nil
 		}
 		return "", errors.Errorf("cannot use %s %T value for bool setting", d.ResolvedType(), d)
@@ -746,20 +800,20 @@ func toSettingString(
 			return settings.EncodeFloat(float64(*f)), nil
 		}
 		return "", errors.Errorf("cannot use %s %T value for float setting", d.ResolvedType(), d)
-	case *settings.EnumSetting:
+	case settings.AnyEnumSetting:
 		if i, intOK := d.(*tree.DInt); intOK {
 			v, ok := setting.ParseEnum(settings.EncodeInt(int64(*i)))
 			if ok {
 				return settings.EncodeInt(v), nil
 			}
-			return "", errors.WithHintf(errors.Errorf("invalid integer value '%d' for enum setting", *i), setting.GetAvailableValuesAsHint())
+			return "", errors.WithHint(errors.Errorf("invalid integer value '%d' for enum setting", *i), setting.GetAvailableValuesAsHint())
 		} else if s, ok := d.(*tree.DString); ok {
 			str := string(*s)
 			v, ok := setting.ParseEnum(str)
 			if ok {
 				return settings.EncodeInt(v), nil
 			}
-			return "", errors.WithHintf(errors.Errorf("invalid string value '%s' for enum setting", str), setting.GetAvailableValuesAsHint())
+			return "", errors.WithHint(errors.Errorf("invalid string value '%s' for enum setting", str), setting.GetAvailableValuesAsHint())
 		}
 		return "", errors.Errorf("cannot use %s %T value for enum setting, must be int or string", d.ResolvedType(), d)
 	case *settings.ByteSizeSetting:
@@ -801,4 +855,53 @@ func toSettingString(
 	default:
 		return "", errors.Errorf("unsupported setting type %T", setting)
 	}
+}
+
+// unsafeSettingInterlockInfo contains information about the current
+// session that is used by the unsafe setting interlock system.
+type unsafeSettingInterlockInfo struct {
+	sessionID    clusterunique.ID
+	interlockKey string
+}
+
+func (p *planner) makeUnsafeSettingInterlockInfo() unsafeSettingInterlockInfo {
+	return unsafeSettingInterlockInfo{
+		sessionID:    p.ExtendedEvalContext().SessionID,
+		interlockKey: p.SessionData().UnsafeSettingInterlockKey,
+	}
+}
+
+const interlockKeySessionVarName = "unsafe_setting_interlock_key"
+
+// unsafeSettingInterlock ensures that changes to unsafe settings are
+// doubly confirmed by the operator by a special value in a session
+// variable.
+func unsafeSettingInterlock(
+	ctx context.Context,
+	st *cluster.Settings,
+	setting settings.Setting,
+	encodedValue string,
+	info unsafeSettingInterlockInfo,
+) error {
+	// The interlock key is a combination of:
+	// - the session ID, so that different sessions need different keys.
+	// - the setting key, so that different settings need different
+	//   interlock keys.
+	h := fnv.New32()
+	h.Write([]byte(info.sessionID.String()))
+	h.Write([]byte(setting.InternalKey()))
+	pastableKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	if info.interlockKey != pastableKey {
+		return errors.WithDetailf(
+			pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+				"changing cluster setting %q may cause cluster instability or data corruption.\n"+
+					"To confirm the change, run the following command before trying again:\n\n"+
+					"   SET %s = '%s';\n\n",
+				setting.Name(), interlockKeySessionVarName, pastableKey,
+			),
+			"key: %s", pastableKey,
+		)
+	}
+	return nil
 }

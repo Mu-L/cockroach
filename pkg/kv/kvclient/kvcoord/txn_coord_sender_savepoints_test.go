@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
@@ -174,7 +169,7 @@ func TestSavepoints(t *testing.T) {
 			case "get":
 				b := txn.NewBatch()
 				if td.HasArg("locking") {
-					b.GetForUpdate(td.CmdArgs[0].Key)
+					b.GetForUpdate(td.CmdArgs[0].Key, kvpb.BestEffort)
 				} else {
 					b.Get(td.CmdArgs[0].Key)
 				}
@@ -218,6 +213,15 @@ func TestSavepoints(t *testing.T) {
 					fmt.Fprintf(&buf, "(%T) %v\n", err, err)
 				} else {
 					ptxn()
+				}
+
+			case "can-use":
+				spn := td.CmdArgs[0].Key
+				spt := sp[spn]
+				if txn.CanUseSavepoint(ctx, spt) {
+					fmt.Fprintf(&buf, "true\n")
+				} else {
+					fmt.Fprintf(&buf, "false\n")
 				}
 
 			default:

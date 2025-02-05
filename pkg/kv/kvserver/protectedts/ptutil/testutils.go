@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ptutil
 
@@ -27,17 +22,17 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// TestingVerifyProtectionTimestampExistsOnSpans refreshes the PTS state in KV and
-// ensures a protection at the given protectionTimestamp exists for all the
-// supplied spans.
-func TestingVerifyProtectionTimestampExistsOnSpans(
+// TestingWaitForProtectedTimestampToExistOnSpans waits
+// testutils.SucceedsSoonDuration for the supplied protected timestamp to exist
+// on all the supplied spans. It fatals if this doesn't happen in time.
+func TestingWaitForProtectedTimestampToExistOnSpans(
 	ctx context.Context,
 	t *testing.T,
 	srv serverutils.TestServerInterface,
 	ptsReader spanconfig.ProtectedTSReader,
-	protectionTimestamp hlc.Timestamp,
+	protectedTimestamp hlc.Timestamp,
 	spans roachpb.Spans,
-) error {
+) {
 	testutils.SucceedsSoon(t, func() error {
 		if err := spanconfigptsreader.TestingRefreshPTSState(
 			ctx, t, ptsReader, srv.Clock().Now(),
@@ -51,18 +46,17 @@ func TestingVerifyProtectionTimestampExistsOnSpans(
 			}
 			found := false
 			for _, ts := range timestamps {
-				if ts.Equal(protectionTimestamp) {
+				if ts.Equal(protectedTimestamp) {
 					found = true
 					break
 				}
 			}
 			if !found {
-				return errors.Newf("protection timestamp %s does not exist on span %s", protectionTimestamp, sp)
+				return errors.Newf("protection timestamp %s does not exist on span %s", protectedTimestamp, sp)
 			}
 		}
 		return nil
 	})
-	return nil
 }
 
 func GetPTSTarget(t *testing.T, db *sqlutils.SQLRunner, ptsID *uuid.UUID) *ptpb.Target {

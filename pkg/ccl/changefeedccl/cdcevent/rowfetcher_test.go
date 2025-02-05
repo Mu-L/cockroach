@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdcevent
 
@@ -30,8 +27,11 @@ func TestRowFetcherCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+
+	s := srv.ApplicationLayer()
+
 	serverCfg := s.DistSQLServer().(*distsql.ServerImpl).ServerConfig
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
@@ -71,6 +71,7 @@ func TestRowFetcherCache(t *testing.T) {
 		serverCfg.LeaseManager.(*lease.Manager),
 		serverCfg.CollectionFactory,
 		serverCfg.DB.KV(),
+		serverCfg.Settings,
 		targets)
 	if err != nil {
 		t.Fatal(err)

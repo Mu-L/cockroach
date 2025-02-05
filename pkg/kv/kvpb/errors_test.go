@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvpb
 
@@ -15,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -55,7 +51,7 @@ func TestNewErrorNil(t *testing.T) {
 // TestSetTxn verifies that SetTxn updates the error message.
 func TestSetTxn(t *testing.T) {
 	e := NewError(NewTransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND))
-	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), isolation.Serializable, 1, hlc.Timestamp{}, 0, 99)
+	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), isolation.Serializable, 1, hlc.Timestamp{}, 0, 99, 0, false /* omitInRangefeeds */)
 	e.SetTxn(&txn)
 	if !strings.HasPrefix(
 		e.String(), "TransactionAbortedError(ABORT_REASON_ABORTED_RECORD_FOUND): \"test\"") {
@@ -74,7 +70,7 @@ func TestErrPriority(t *testing.T) {
 	require.Equal(t, ErrorScoreTxnAbort, ErrPriority(unhandledAbort))
 	require.Equal(t, ErrorScoreTxnRestart, ErrPriority(unhandledRetry))
 	{
-		id1 := uuid.Must(uuid.NewV4())
+		id1 := uuid.NewV4()
 		require.Equal(t, ErrorScoreTxnRestart, ErrPriority(&TransactionRetryWithProtoRefreshError{
 			PrevTxnID:       id1,
 			NextTransaction: roachpb.Transaction{TxnMeta: enginepb.TxnMeta{ID: id1}},
@@ -174,7 +170,7 @@ func TestErrorRedaction(t *testing.T) {
 			hlc.Timestamp{WallTime: 2},
 			hlc.ClockTimestamp{WallTime: 1, Logical: 2},
 		))
-		txn := roachpb.MakeTransaction("foo", roachpb.Key("bar"), isolation.Serializable, 1, hlc.Timestamp{WallTime: 1}, 1, 99)
+		txn := roachpb.MakeTransaction("foo", roachpb.Key("bar"), isolation.Serializable, 1, hlc.Timestamp{WallTime: 1}, 1, 99, 0, false /* omitInRangefeeds */)
 		txn.ID = uuid.Nil
 		txn.Priority = 1234
 		wrappedPErr.UnexposedTxn = &txn
@@ -232,6 +228,10 @@ func TestErrorRedaction(t *testing.T) {
 			expect: "conflicting locks on ",
 		},
 		{
+			err:    &WriteIntentError{},
+			expect: "conflicting locks on ",
+		},
+		{
 			err:    &WriteTooOldError{},
 			expect: "WriteTooOldError: write at timestamp 0,0 too old; must write at or above 0,0",
 		},
@@ -282,7 +282,7 @@ func TestErrorRedaction(t *testing.T) {
 		},
 		{
 			err:    &BatchTimestampBeforeGCError{},
-			expect: "batch timestamp 0,0 must be after replica GC threshold 0,0",
+			expect: "batch timestamp 0,0 must be after replica GC threshold 0,0 (r0: ‹/Min›)",
 		},
 		{
 			err:    &TxnAlreadyEncounteredErrorError{},
@@ -380,22 +380,17 @@ func TestNotLeaseholderError(t *testing.T) {
 		err *NotLeaseHolderError
 	}{
 		{
-			exp: `[NotLeaseHolderError] r1: replica not lease holder; replica (n1,s1):1 is`,
-			err: &NotLeaseHolderError{
-				RangeID:               1,
-				DeprecatedLeaseHolder: rd,
-			},
-		},
-		{
-			exp: `[NotLeaseHolderError] r1: replica not lease holder; current lease is repl=(n1,s1):1 seq=2 start=0.000000001,0 epo=1`,
+			exp: `[NotLeaseHolderError] r1: replica not lease holder; current lease is repl=(n1,s1):1 seq=2 start=0.000000002,0 epo=1 min-exp=0.000000003,0 pro=0.000000001,0 acq=Transfer`,
 			err: &NotLeaseHolderError{
 				RangeID: 1,
 				Lease: &roachpb.Lease{
-					Start:           hlc.ClockTimestamp{WallTime: 1},
+					Start:           hlc.ClockTimestamp{WallTime: 2},
+					ProposedTS:      hlc.ClockTimestamp{WallTime: 1},
 					Replica:         *rd,
 					Epoch:           1,
 					Sequence:        2,
 					AcquisitionType: roachpb.LeaseAcquisitionType_Transfer,
+					MinExpiration:   hlc.Timestamp{WallTime: 3},
 				},
 			},
 		},
@@ -410,4 +405,42 @@ func TestNotLeaseholderError(t *testing.T) {
 			require.Equal(t, tc.exp, tc.err.Error())
 		})
 	}
+}
+
+func TestDescNotFoundError(t *testing.T) {
+	t.Run("store not found", func(t *testing.T) {
+		err := NewStoreDescNotFoundError(42)
+		require.Equal(t, `store descriptor with store ID 42 was not found`, err.Error())
+		require.True(t, errors.HasType(err, &DescNotFoundError{}))
+	})
+	t.Run("node not found", func(t *testing.T) {
+		err := NewNodeDescNotFoundError(42)
+		require.Equal(t, `node descriptor with node ID 42 was not found`, err.Error())
+		require.True(t, errors.HasType(err, &DescNotFoundError{}))
+	})
+}
+
+// TestProxyFailedError validates that ProxyFailedErrors can be cleanly encoded
+// and decoded with an internal error.
+func TestProxyFailedError(t *testing.T) {
+	ctx := context.Background()
+	fooErr := errors.New("foo")
+	err := NewProxyFailedError(fooErr)
+	require.Equal(t, `proxy failed with send error`, err.Error())
+	require.True(t, errors.HasType(err, &ProxyFailedError{}))
+	decodedErr := errors.DecodeError(ctx, errors.EncodeError(ctx, err))
+
+	require.Truef(t, errors.HasType(decodedErr, &ProxyFailedError{}), "wrong error %v %v", decodedErr, reflect.TypeOf(decodedErr))
+	require.True(t, errors.Is(decodedErr, fooErr))
+	require.Equal(t, `proxy failed with send error`, decodedErr.Error())
+
+	var rue *ProxyFailedError
+	require.True(t, errors.As(decodedErr, &rue))
+
+	internalErr := errors.DecodeError(context.Background(), rue.Cause)
+	require.True(t, rue.Cause.IsSet())
+	require.ErrorContains(t, internalErr, "foo")
+	require.True(t, errors.Is(internalErr, fooErr))
+
+	require.Equal(t, `foo`, string(redact.Sprint(internalErr).Redact()))
 }

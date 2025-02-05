@@ -1,32 +1,32 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React, { ReactNode, useContext } from "react";
-import { Col, Row, Tabs } from "antd";
-import "antd/lib/col/style";
-import "antd/lib/row/style";
-import "antd/lib/tabs/style";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { InlineAlert, Text } from "@cockroachlabs/ui-components";
-import { Anchor } from "src/anchor";
 import { ArrowLeft } from "@cockroachlabs/icons";
-import { isNil } from "lodash";
+import { InlineAlert, Text } from "@cockroachlabs/ui-components";
+import { Col, Row, Tabs } from "antd";
+import classNames from "classnames/bind";
+import isNil from "lodash/isNil";
 import Long from "long";
+import moment from "moment-timezone";
+import React, { ReactNode, useContext } from "react";
 import { Helmet } from "react-helmet";
 import { Link, RouteComponentProps } from "react-router-dom";
-import classNames from "classnames/bind";
-import { PageConfig, PageConfigItem } from "src/pageConfig";
-import { BarGraphTimeSeries } from "../graphs/bargraph";
-import { AxisUnits } from "../graphs";
 import { AlignedData, Options } from "uplot";
 
+import { Anchor } from "src/anchor";
+import { StatementDetailsRequest } from "src/api/statementsApi";
+import { Button } from "src/button";
+import { commonStyles } from "src/common";
+import { getValidErrorsList, Loading } from "src/loading";
+import { PageConfig, PageConfigItem } from "src/pageConfig";
+import { SqlBox, SqlBoxSize } from "src/sql";
+import { SummaryCard, SummaryCardItem } from "src/summaryCard";
+import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
+import timeScaleStyles from "src/timeScaleDropdown/timeScale.module.scss";
+import { TimeScaleLabel } from "src/timeScaleDropdown/timeScaleLabel";
 import {
   appAttr,
   appNamesAttr,
@@ -43,48 +43,17 @@ import {
   Count,
   longToInt,
 } from "src/util";
-import { getValidErrorsList, Loading } from "src/loading";
-import { Button } from "src/button";
-import { SqlBox, SqlBoxSize } from "src/sql";
-import { PlanDetails } from "./planDetails";
-import { SummaryCard, SummaryCardItem } from "src/summaryCard";
-import { DiagnosticsView } from "./diagnostics/diagnosticsView";
-import insightTableStyles from "../insightsTable/insightsTable.module.scss";
-import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
-import timeScaleStyles from "src/timeScaleDropdown/timeScale.module.scss";
-import styles from "./statementDetails.module.scss";
-import { commonStyles } from "src/common";
-import { UIConfigState } from "../store";
-import { StatementDetailsRequest } from "src/api/statementsApi";
-import {
-  getValidOption,
-  TimeScale,
-  timeScale1hMinOptions,
-  TimeScaleDropdown,
-  toRoundedDateRange,
-} from "../timeScaleDropdown";
-import LoadingError from "../sqlActivity/errorComponent";
-import {
-  ActivateDiagnosticsModalRef,
-  ActivateStatementDiagnosticsModal,
-} from "../statementsDiagnostics";
-import {
-  generateContentionTimeseries,
-  generateExecCountTimeseries,
-  generateExecRetriesTimeseries,
-  generateExecuteAndPlanningTimeseries,
-  generateRowsProcessedTimeseries,
-  generateCPUTimeseries,
-  generateClientWaitTimeseries,
-} from "./timeseriesUtils";
-import { Delayed } from "../delayed";
-import moment from "moment-timezone";
+
 import {
   InsertStmtDiagnosticRequest,
   InsightRecommendation,
   StatementDiagnosticsReport,
   StmtInsightsReq,
 } from "../api";
+import { CockroachCloudContext } from "../contexts";
+import { Delayed } from "../delayed";
+import { AxisUnits } from "../graphs";
+import { BarGraphTimeSeries, XScale } from "../graphs/bargraph";
 import {
   getStmtInsightRecommendations,
   InsightType,
@@ -94,10 +63,36 @@ import {
   InsightsSortedTable,
   makeInsightsColumns,
 } from "../insightsTable/insightsTable";
-import { CockroachCloudContext } from "../contexts";
-import { filterByTimeScale } from "./diagnostics/diagnosticsUtils";
+import insightTableStyles from "../insightsTable/insightsTable.module.scss";
+import LoadingError from "../sqlActivity/errorComponent";
+import {
+  ActivateDiagnosticsModalRef,
+  ActivateStatementDiagnosticsModal,
+} from "../statementsDiagnostics";
+import { UIConfigState } from "../store";
+import {
+  getValidOption,
+  TimeScale,
+  timeScale1hMinOptions,
+  TimeScaleDropdown,
+  toRoundedDateRange,
+} from "../timeScaleDropdown";
 import { FormattedTimescale } from "../timeScaleDropdown/formattedTimeScale";
 import { Timestamp } from "../timestamp";
+
+import { filterByTimeScale } from "./diagnostics/diagnosticsUtils";
+import { DiagnosticsView } from "./diagnostics/diagnosticsView";
+import { PlanDetails } from "./planDetails";
+import styles from "./statementDetails.module.scss";
+import {
+  generateContentionTimeseries,
+  generateExecCountTimeseries,
+  generateExecRetriesTimeseries,
+  generateExecuteAndPlanningTimeseries,
+  generateRowsProcessedTimeseries,
+  generateCPUTimeseries,
+  generateClientWaitTimeseries,
+} from "./timeseriesUtils";
 
 type StatementDetailsResponse =
   cockroach.server.serverpb.StatementDetailsResponse;
@@ -312,9 +307,9 @@ export class StatementDetails extends React.Component<
     if (!this.props.isTenant) {
       this.props.refreshNodes();
       this.props.refreshNodesLiveness();
-      if (!this.props.hasViewActivityRedactedRole) {
-        this.props.refreshStatementDiagnosticsRequests();
-      }
+    }
+    if (!this.props.hasViewActivityRedactedRole) {
+      this.props.refreshStatementDiagnosticsRequests();
     }
   }
 
@@ -331,9 +326,9 @@ export class StatementDetails extends React.Component<
     if (!this.props.isTenant) {
       this.props.refreshNodes();
       this.props.refreshNodesLiveness();
-      if (!this.props.hasViewActivityRedactedRole) {
-        this.props.refreshStatementDiagnosticsRequests();
-      }
+    }
+    if (!this.props.hasViewActivityRedactedRole) {
+      this.props.refreshStatementDiagnosticsRequests();
     }
 
     // If a new, non-empty-string query text is available
@@ -358,7 +353,9 @@ export class StatementDetails extends React.Component<
     // This is necessary for when the new statementFingerprintID does not have data for the given time frame.
     // The new query text and the formatted query text would be an empty string, and we need to invalidate the old
     // query text and formatted query text.
-    if (this.props.statementFingerprintID != prevProps.statementFingerprintID) {
+    if (
+      this.props.statementFingerprintID !== prevProps.statementFingerprintID
+    ) {
       this.setState({ query: null, formattedQuery: null });
     }
   }
@@ -471,7 +468,7 @@ export class StatementDetails extends React.Component<
         <TabPane tab="Explain Plans" key="explain-plan">
           {this.renderExplainPlanTabContent(hasTimeout, hasData)}
         </TabPane>
-        {!this.props.isTenant && !this.props.hasViewActivityRedactedRole && (
+        {!this.props.hasViewActivityRedactedRole && (
           <TabPane
             tab={`Diagnostics${
               this.hasDiagnosticReports()
@@ -528,7 +525,7 @@ export class StatementDetails extends React.Component<
             <Col className="gutter-row" span={24}>
               <SqlBox
                 value={this.state.formattedQuery}
-                size={SqlBoxSize.custom}
+                size={SqlBoxSize.CUSTOM}
                 format={true}
               />
             </Col>
@@ -564,21 +561,21 @@ export class StatementDetails extends React.Component<
     const { nodeRegions, isTenant, statementFingerprintInsights } = this.props;
     const { stats } = this.props.statementDetails.statement;
     const {
-      app_names,
+      app_names: appNames,
       databases,
-      fingerprint_id,
-      failed_count,
-      full_scan_count,
-      vec_count,
-      total_count,
-      implicit_txn,
+      fingerprint_id: fingerprintId,
+      full_scan_count: fullScanCount,
+      vec_count: vecCount,
+      total_count: totalCount,
+      implicit_txn: implicitTxn,
     } = this.props.statementDetails.statement.metadata;
-    const { statement_statistics_per_aggregated_ts } =
-      this.props.statementDetails;
+    const statementStatisticsPerAggregatedTs =
+      this.props.statementDetails.statement_statistics_per_aggregated_ts;
 
     const nodes: string[] = unique(
       (stats.nodes || []).map(node => node.toString()),
     ).sort();
+    // TODO(yuzefovich): use kv_node_ids to show KV regions.
     const regions = unique(
       isTenant
         ? stats.regions || []
@@ -593,6 +590,7 @@ export class StatementDetails extends React.Component<
     );
 
     const statementSampled = stats.exec_stats.count > Long.fromNumber(0);
+    const failureCount = stats.failure_count;
     const unavailableTooltip = !statementSampled && (
       <div>
         This metric is part of the statement execution and therefore will not be
@@ -607,13 +605,13 @@ export class StatementDetails extends React.Component<
       <Text className={cx("app-name", "app-name__unset")}>(unset)</Text>
     );
 
-    const statsPerAggregatedTs = statement_statistics_per_aggregated_ts.sort(
+    const statsPerAggregatedTs = statementStatisticsPerAggregatedTs.sort(
       (a, b) =>
         a.aggregated_ts.seconds < b.aggregated_ts.seconds
           ? -1
           : a.aggregated_ts.seconds > b.aggregated_ts.seconds
-          ? 1
-          : 0,
+            ? 1
+            : 0,
     );
 
     const executionAndPlanningTimeseries: AlignedData =
@@ -662,8 +660,8 @@ export class StatementDetails extends React.Component<
     const cpuTimeseries: AlignedData =
       generateCPUTimeseries(statsPerAggregatedTs);
     const cpuOps: Partial<Options> = {
-      axes: [{}, { label: "CPU Time" }],
-      series: [{}, { label: "CPU Time" }],
+      axes: [{}, { label: "SQL CPU Time" }],
+      series: [{}, { label: "SQL CPU Time" }],
       legend: { show: false },
       width: cardWidth,
     };
@@ -699,6 +697,11 @@ export class StatementDetails extends React.Component<
     }
 
     const duration = (v: number) => Duration(v * 1e9);
+    const [chartsStart, chartsEnd] = toRoundedDateRange(this.props.timeScale);
+    const xScale = {
+      graphTsStartMillis: chartsStart.valueOf(),
+      graphTsEndMillis: chartsEnd.valueOf(),
+    } as XScale;
 
     return (
       <>
@@ -712,20 +715,17 @@ export class StatementDetails extends React.Component<
           </PageConfigItem>
         </PageConfig>
         <p className={timeScaleStylesCx("time-label", "label-margin")}>
-          Showing aggregated stats from{" "}
-          <span className={timeScaleStylesCx("bold")}>
-            <FormattedTimescale
-              ts={this.props.timeScale}
-              requestTime={moment(this.props.requestTime)}
-            />
-          </span>
+          <TimeScaleLabel
+            timeScale={this.props.timeScale}
+            requestTime={moment(this.props.requestTime)}
+          />
         </p>
         <section className={cx("section")}>
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
               <SqlBox
                 value={this.state.formattedQuery}
-                size={SqlBoxSize.custom}
+                size={SqlBoxSize.CUSTOM}
                 format={true}
               />
             </Col>
@@ -750,33 +750,33 @@ export class StatementDetails extends React.Component<
                 <SummaryCardItem
                   label="Application Name"
                   value={intersperse<ReactNode>(
-                    app_names.map(a => <AppLink app={a} key={a} />),
+                    appNames.map(a => <AppLink app={a} key={a} />),
                     ", ",
                   )}
                 />
                 <SummaryCardItem
                   label="Fingerprint ID"
-                  value={FixFingerprintHexValue(fingerprint_id)}
+                  value={FixFingerprintHexValue(fingerprintId)}
                 />
               </SummaryCard>
             </Col>
             <Col className="gutter-row" span={12}>
               <SummaryCard className={cx("summary-card")}>
                 <SummaryCardItem
-                  label="Failed?"
-                  value={RenderCount(failed_count, total_count)}
+                  label="Failure Count"
+                  value={Count(failureCount.toNumber())}
                 />
                 <SummaryCardItem
                   label="Full scan?"
-                  value={RenderCount(full_scan_count, total_count)}
+                  value={RenderCount(fullScanCount, totalCount)}
                 />
                 <SummaryCardItem
                   label="Vectorized execution?"
-                  value={RenderCount(vec_count, total_count)}
+                  value={RenderCount(vecCount, totalCount)}
                 />
                 <SummaryCardItem
                   label="Transaction type"
-                  value={renderTransactionType(implicit_txn)}
+                  value={renderTransactionType(implicitTxn)}
                 />
                 <SummaryCardItem label="Last execution time" value={lastExec} />
               </SummaryCard>
@@ -831,7 +831,7 @@ export class StatementDetails extends React.Component<
                   )}
                 />
                 <SummaryCardItem
-                  label="CPU Time"
+                  label="SQL CPU Time"
                   value={formatNumberForDisplay(
                     stats?.exec_stats?.cpu_sql_nanos.mean,
                     Duration,
@@ -868,6 +868,7 @@ export class StatementDetails extends React.Component<
                 alignedData={executionAndPlanningTimeseries}
                 uPlotOptions={executionAndPlanningOps}
                 yAxisUnits={AxisUnits.Duration}
+                xScale={xScale}
               />
             </Col>
             <Col className="gutter-row" span={12}>
@@ -876,6 +877,7 @@ export class StatementDetails extends React.Component<
                 alignedData={rowsProcessedTimeseries}
                 uPlotOptions={rowsProcessedOps}
                 yAxisUnits={AxisUnits.Count}
+                xScale={xScale}
               />
             </Col>
           </Row>
@@ -886,6 +888,7 @@ export class StatementDetails extends React.Component<
                 alignedData={execRetriesTimeseries}
                 uPlotOptions={execRetriesOps}
                 yAxisUnits={AxisUnits.Count}
+                xScale={xScale}
               />
             </Col>
             <Col className="gutter-row" span={12}>
@@ -894,6 +897,7 @@ export class StatementDetails extends React.Component<
                 alignedData={execCountTimeseries}
                 uPlotOptions={execCountOps}
                 yAxisUnits={AxisUnits.Count}
+                xScale={xScale}
               />
             </Col>
           </Row>
@@ -905,15 +909,17 @@ export class StatementDetails extends React.Component<
                 uPlotOptions={contentionOps}
                 tooltip={unavailableTooltip}
                 yAxisUnits={AxisUnits.Duration}
+                xScale={xScale}
               />
             </Col>
             <Col className="gutter-row" span={12}>
               <BarGraphTimeSeries
-                title={`CPU Time${noSamples}`}
+                title={`SQL CPU Time${noSamples}`}
                 alignedData={cpuTimeseries}
                 uPlotOptions={cpuOps}
                 tooltip={unavailableTooltip}
                 yAxisUnits={AxisUnits.Duration}
+                xScale={xScale}
               />
             </Col>
           </Row>
@@ -939,6 +945,7 @@ export class StatementDetails extends React.Component<
                 alignedData={clientWaitTimeseries}
                 uPlotOptions={clientWaitOps}
                 yAxisUnits={AxisUnits.Duration}
+                xScale={xScale}
               />
             </Col>
           </Row>
@@ -954,8 +961,10 @@ export class StatementDetails extends React.Component<
     if (!hasData) {
       return this.renderNoDataWithTimeScaleAndSqlBoxTabContent(hasTimeout);
     }
-    const { statement_statistics_per_plan_hash } = this.props.statementDetails;
-    const { formatted_query } = this.props.statementDetails.statement.metadata;
+    const statementStatisticsPerPlanHash =
+      this.props.statementDetails.statement_statistics_per_plan_hash;
+    const formattedQuery =
+      this.props.statementDetails.statement.metadata.formatted_query;
     return (
       <>
         <PageConfig>
@@ -980,8 +989,8 @@ export class StatementDetails extends React.Component<
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
               <SqlBox
-                value={formatted_query}
-                size={SqlBoxSize.custom}
+                value={formattedQuery}
+                size={SqlBoxSize.CUSTOM}
                 format={true}
               />
             </Col>
@@ -989,7 +998,7 @@ export class StatementDetails extends React.Component<
           <p className={summaryCardStylesCx("summary--card__divider")} />
           <PlanDetails
             statementFingerprintID={this.props.statementFingerprintID}
-            plans={statement_statistics_per_plan_hash}
+            plans={statementStatisticsPerPlanHash}
             hasAdminRole={this.props.hasAdminRole}
           />
         </section>
@@ -1023,6 +1032,7 @@ export class StatementDetails extends React.Component<
         onSortingChange={this.props.onSortingChange}
         currentScale={this.props.timeScale}
         onChangeTimeScale={this.changeTimeScale}
+        planGists={this.props.statementDetails.statement.stats.plan_gists}
       />
     );
   };

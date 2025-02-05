@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package allocatorimpl
 
@@ -1064,18 +1059,15 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			var existing []roachpb.ReplicaDescriptor
+			var existing []roachpb.StoreID
 			for storeID := range tc.expected {
-				existing = append(existing, roachpb.ReplicaDescriptor{
-					NodeID:  roachpb.NodeID(storeID),
-					StoreID: storeID,
-				})
+				existing = append(existing, storeID)
 			}
 			conf := roachpb.SpanConfig{
 				Constraints: tc.constraints,
 				NumReplicas: tc.numReplicas,
 			}
-			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, existing, conf.NumReplicas, conf.Constraints)
+			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, testStoreReplicas(existing), conf.NumReplicas, conf.Constraints)
 			for storeID, expected := range tc.expected {
 				valid, necessary := removeConstraintsCheck(testStores[storeID], analyzed)
 				if e, a := expected.valid, valid; e != a {
@@ -1089,7 +1081,475 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 			}
 		})
 	}
+}
 
+func TestReplaceConstraintsCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		name              string
+		constraints       []roachpb.ConstraintsConjunction
+		numReplicas       int32
+		existing          []roachpb.StoreID
+		replacingStore    roachpb.StoreID
+		expectedValid     map[roachpb.StoreID]bool
+		expectedNecessary map[roachpb.StoreID]bool
+	}{
+		{
+			name: "required constraint",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+				},
+			},
+			existing:       []roachpb.StoreID{testStoreUSa15},
+			replacingStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				// NB: No stores are considered necessary replacements as the
+				// num_replicas is not specified for the constraint conjunction.
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "prohibited constraint",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "b", Type: roachpb.Constraint_PROHIBITED},
+					},
+				},
+			},
+			existing:       []roachpb.StoreID{testStoreUSa15},
+			replacingStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    true,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				// NB: No stores are considered necessary replacements as the
+				// num_replicas is not specified for the constraint conjunction.
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "single per-replica constraint existing=num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			existing:       []roachpb.StoreID{testStoreUSa15},
+			replacingStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "single per-replica constraint existing < num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "c", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			existing:       []roachpb.StoreID{testStoreEurope},
+			replacingStore: testStoreEurope,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15:     false,
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       true,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15:     false,
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       true,
+			},
+		},
+		{
+			name: "single per-replica constraint existing > num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			existing:       []roachpb.StoreID{testStoreUSa15, testStoreUSa15Dupe},
+			replacingStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				// NB: The constraint is over-satisfied, no store should be considered
+				// necessary as a replacement for testStoreUSa15.
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "multiple per-replica constraint existing < num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "b", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			numReplicas: 2,
+			// We are missing a replica which satisfies the "b" constraint here.
+			existing:       []roachpb.StoreID{testStoreUSa15, testStoreUSa15Dupe},
+			replacingStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "multiple per-replica constraint existing == num_replicas unconstrained",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "b", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			// One replica is unconstrained (sum(constraint_num_replicas) !=
+			// num_replicas).
+			numReplicas:    3,
+			existing:       []roachpb.StoreID{testStoreUSa1},
+			replacingStore: testStoreUSa1,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15:     false,
+				testStoreUSa15Dupe: false,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15:     false,
+				testStoreUSa15Dupe: false,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := roachpb.SpanConfig{
+				Constraints: tc.constraints,
+				NumReplicas: tc.numReplicas,
+			}
+			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, testStoreReplicas(tc.existing), conf.NumReplicas, conf.Constraints)
+			for storeID, s := range testStores {
+				if storeID == tc.replacingStore {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/candidate=s%d,replacing=s%d", tc.name, s.StoreID, tc.replacingStore), func(t *testing.T) {
+					valid, necessary := replaceConstraintsCheck(s, testStores[tc.replacingStore], analyzed)
+					require.Equal(t, tc.expectedValid[s.StoreID], valid,
+						"mismatch replaceConstraintsCheck(s%d,s%d).valid", s.StoreID, tc.replacingStore)
+					require.Equal(t, tc.expectedNecessary[s.StoreID], necessary,
+						"mismatch replaceConstraintsCheck(s%d,s%d).necessary", s.StoreID, tc.replacingStore)
+				})
+			}
+		})
+	}
+}
+
+func TestRebalanceFromConstraintsCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		name              string
+		constraints       []roachpb.ConstraintsConjunction
+		numReplicas       int32
+		existing          []roachpb.StoreID
+		fromStore         roachpb.StoreID
+		expectedValid     map[roachpb.StoreID]bool
+		expectedNecessary map[roachpb.StoreID]bool
+	}{
+		{
+			name: "required constraint",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+				},
+			},
+			existing:  []roachpb.StoreID{testStoreUSa15},
+			fromStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				// NB: No stores are considered necessary rebalance targets as the
+				// num_replicas is not specified for the constraint conjunction.
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "prohibited constraint",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "b", Type: roachpb.Constraint_PROHIBITED},
+					},
+				},
+			},
+			existing:  []roachpb.StoreID{testStoreUSa15},
+			fromStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    true,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				// NB: No stores are considered necessary rebalance targets as the
+				// num_replicas is not specified for the constraint conjunction.
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "single per-replica constraint existing=num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			existing:  []roachpb.StoreID{testStoreUSa15},
+			fromStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "single per-replica constraint existing < num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "c", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			existing:  []roachpb.StoreID{testStoreEurope},
+			fromStore: testStoreEurope,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15:     false,
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       true,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15:     false,
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       true,
+			},
+		},
+		{
+			name: "single per-replica constraint existing > num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			existing:  []roachpb.StoreID{testStoreUSa15, testStoreUSa15Dupe},
+			fromStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				// NB: The constraint is over-satisfied, no store should be considered
+				// necessary to rebalance from testStoreUSa15.
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "multiple per-replica constraint existing < num_replicas",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "b", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			numReplicas: 2,
+			// We are missing a replica which satisfies the "b" constraint here.
+			existing:  []roachpb.StoreID{testStoreUSa15, testStoreUSa15Dupe},
+			fromStore: testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    false,
+			},
+		},
+		{
+			name: "multiple per-replica constraint existing > num_replicas unconstrained",
+			constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "a", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "b", Type: roachpb.Constraint_REQUIRED},
+					},
+					NumReplicas: 1,
+				},
+			},
+			// One replica is unconstrained (sum(constraint_num_replicas) !=
+			// num_replicas). As a replica is unconstrained, every candidate replica
+			// is considered valid.
+			numReplicas: 3,
+			existing:    []roachpb.StoreID{testStoreUSa1, testStoreUSa15, testStoreEurope},
+			fromStore:   testStoreUSa15,
+			expectedValid: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: true,
+				testStoreUSa1:      true,
+				testStoreUSb:       true,
+				testStoreEurope:    true,
+			},
+			expectedNecessary: map[roachpb.StoreID]bool{
+				testStoreUSa15Dupe: false,
+				testStoreUSa1:      false,
+				testStoreUSb:       false,
+				testStoreEurope:    false,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			conf := roachpb.SpanConfig{
+				Constraints: tc.constraints,
+				NumReplicas: tc.numReplicas,
+			}
+			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, testStoreReplicas(tc.existing), conf.NumReplicas, conf.Constraints)
+			for storeID, s := range testStores {
+				if storeID == tc.fromStore {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/to=s%d,from=s%d", tc.name, s.StoreID, tc.fromStore), func(t *testing.T) {
+					valid, necessary := rebalanceFromConstraintsCheck(s, testStores[tc.fromStore], analyzed)
+					require.Equal(t, tc.expectedValid[s.StoreID], valid,
+						"mismatch rebalanceFromConstraintsCheck(s%d,s%d).valid", s.StoreID, tc.fromStore)
+					require.Equal(t, tc.expectedNecessary[s.StoreID], necessary,
+						"mismatch rebalanceFromConstraintsCheck(s%d,s%d).necessary", s.StoreID, tc.fromStore)
+				})
+			}
+		})
+	}
 }
 
 func TestShouldRebalanceDiversity(t *testing.T) {
@@ -1248,6 +1708,7 @@ func TestShouldRebalanceDiversity(t *testing.T) {
 			rebalanceConstraintsChecker,
 			replicas,
 			nil,
+			VoterTarget,
 			existingStoreLocalities,
 			func(context.Context, roachpb.StoreID) bool { return true },
 			options,
@@ -1661,4 +2122,37 @@ func TestMaxCapacity(t *testing.T) {
 			t.Errorf("store %d expected max capacity check: %t, actual %t", s.StoreID, e, a)
 		}
 	}
+}
+
+func TestCandidateListString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const numCandidates = 3
+
+	cl := candidateList{}
+	for i := 1; i <= numCandidates; i++ {
+		cl = append(cl, candidate{
+			store:           roachpb.StoreDescriptor{StoreID: roachpb.StoreID(i)},
+			valid:           i%2 == 0,
+			fullDisk:        i%2 == 0,
+			necessary:       i%2 == 0,
+			voterNecessary:  i%2 == 0,
+			diversityScore:  float64(i / numCandidates),
+			ioOverloaded:    i%2 == 0,
+			ioOverloadScore: float64(i / numCandidates),
+			convergesScore:  i%3 - 1,
+			balanceScore:    balanceStatus(i%3 - 1),
+			hasNonVoter:     i%2 == 0,
+			rangeCount:      i,
+			details:         fmt.Sprintf("mock detail %d", i),
+		})
+	}
+
+	require.Equal(t, "[]", candidateList{}.String())
+	require.Equal(t, "[\n"+
+		"s1, valid:false, fulldisk:false, necessary:false, voterNecessary:false, diversity:0.00, ioOverloaded: false, ioOverload: 0.00, converges:0, balance:0, hasNonVoter:false, rangeCount:1, queriesPerSecond:0.00, details:(mock detail 1)\n"+
+		"s2, valid:true, fulldisk:true, necessary:true, voterNecessary:true, diversity:0.00, ioOverloaded: true, ioOverload: 0.00, converges:1, balance:1, hasNonVoter:true, rangeCount:2, queriesPerSecond:0.00, details:(mock detail 2)\n"+
+		"s3, valid:false, fulldisk:false, necessary:false, voterNecessary:false, diversity:1.00, ioOverloaded: false, ioOverload: 1.00, converges:-1, balance:-1, hasNonVoter:false, rangeCount:3, queriesPerSecond:0.00, details:(mock detail 3)]",
+		cl.String())
 }

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opttester
 
@@ -57,10 +52,9 @@ type forcingOptimizer struct {
 
 // newForcingOptimizer creates a forcing optimizer that stops applying any rules
 // after <steps> rules are matched. If ignoreNormRules is true, normalization
-// rules don't count against this limit. If disableCheckExpr is true, expression
-// validation in CheckExpr will not run.
+// rules don't count against this limit.
 func newForcingOptimizer(
-	tester *OptTester, steps int, ignoreNormRules bool, disableCheckExpr bool,
+	tester *OptTester, steps int, ignoreNormRules bool,
 ) (*forcingOptimizer, error) {
 	fo := &forcingOptimizer{
 		remaining:   steps,
@@ -104,7 +98,7 @@ func newForcingOptimizer(
 		fo.groups.AddGroup(expr)
 	})
 
-	if disableCheckExpr {
+	if tester.Flags.DisableCheckExpr {
 		fo.o.Memo().DisableCheckExpr()
 	}
 
@@ -180,14 +174,25 @@ func (fc *forcingCoster) RestrictGroupToMember(loc memoLoc) {
 
 // ComputeCost is part of the xform.Coster interface.
 func (fc *forcingCoster) ComputeCost(e memo.RelExpr, required *physical.Required) memo.Cost {
+	// Always compute the cost even in the case that memo.MaxCost is returned
+	// below. This ensures that Memoize[Expr] functions in the statistics
+	// builder are still invoked even when a particular expression path is
+	// required via fc.restricted. Because groupIDs are assigned in
+	// Memoize[Expr] functions, invoking these functions in the same order and
+	// number is critical for expressions to be assigned the same groupID for
+	// each step of the forcing optimizer, and thus, allowing the restricted
+	// path mechanism to function properly. If some Memoize[Expr] functions are
+	// not called, then the groupIDs in the restricted path will not match the
+	// groupIDs of the expressions in the memo to restrict to.
+	cost := fc.inner.ComputeCost(e, required)
 	if fc.restricted != nil {
 		loc := fc.groups.MemoLoc(e)
 		if mIdx, ok := fc.restricted[loc.group]; ok && loc.member != mIdx {
-			return memo.MaxCost
+			cost = memo.MaxCost
 		}
 	}
 
-	return fc.inner.ComputeCost(e, required)
+	return cost
 }
 
 // MaybeGetBestCostRelation is part of the xform.Coster interface.

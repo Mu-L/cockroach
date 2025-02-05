@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,7 +12,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -42,12 +36,7 @@ func loadTPCHDataset(
 	m cluster.Monitor,
 	roachNodes option.NodeListOption,
 	disableMergeQueue bool,
-	secure bool,
 ) (retErr error) {
-	if c.Spec().Cloud != spec.GCE {
-		t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
-	}
-
 	_, err := db.Exec("SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;")
 	if retErr != nil {
 		return err
@@ -94,7 +83,7 @@ func loadTPCHDataset(
 		// If the scale factor was smaller than the required scale factor, wipe the
 		// cluster and restore.
 		m.ExpectDeaths(int32(c.Spec().NodeCount))
-		c.Wipe(ctx, secure, roachNodes)
+		c.Wipe(ctx, roachNodes)
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), roachNodes)
 		m.ResetDeaths()
 	} else if pqErr := (*pq.Error)(nil); !(errors.As(err, &pqErr) &&
@@ -109,11 +98,11 @@ func loadTPCHDataset(
 	if _, err := db.ExecContext(ctx, "SET CLUSTER SETTING backup.restore_span.target_size = '64MiB';"); err != nil {
 		return err
 	}
-	tpchURL := fmt.Sprintf("gs://cockroach-fixtures/workload/tpch/scalefactor=%d/backup?AUTH=implicit", sf)
+	tpchURL := fmt.Sprintf("gs://cockroach-fixtures-us-east1/workload/tpch/scalefactor=%d/backup?AUTH=implicit", sf)
 	if _, err := db.ExecContext(ctx, `CREATE DATABASE IF NOT EXISTS tpch;`); err != nil {
 		return err
 	}
-	query := fmt.Sprintf(`RESTORE tpch.* FROM '%s' WITH into_db = 'tpch', unsafe_restore_incompatible_version;`, tpchURL)
+	query := fmt.Sprintf(`RESTORE tpch.* FROM '/' IN '%s' WITH into_db = 'tpch', unsafe_restore_incompatible_version;`, tpchURL)
 	_, err = db.ExecContext(ctx, query)
 	return err
 }

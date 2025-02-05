@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package row
 
@@ -26,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -140,12 +136,10 @@ func (r *importRand) Int63(c *CellInfoAnnotation) int64 {
 // For some functions (specifically the volatile ones), we do
 // not want to use the provided builtin. Instead, we opt for
 // our own function definition, which produces deterministic results.
-func makeBuiltinOverride(
-	builtin *tree.FunctionDefinition, overloads ...tree.Overload,
-) *tree.ResolvedFunctionDefinition {
-	props := builtin.FunctionProperties
+func makeBuiltinOverride(name string, overloads ...tree.Overload) *tree.ResolvedFunctionDefinition {
+	props := builtins.GetBuiltinFunctionProperties(name)
 	override := tree.NewFunctionDefinition(
-		"import."+builtin.Name, &props, overloads)
+		"import."+name, props, overloads)
 	// Schema name is not really important here since it's already a resolved
 	// function definition, so it won't be actually resolved again.
 	return tree.QualifyBuiltinFunctionDefinition(override, "import")
@@ -279,7 +273,7 @@ func importGenUUID(
 		c.randSource = makeImportRand(c)
 	}
 	gen := c.randSource.Int63(c)
-	id := uuid.MakeV4()
+	id := uuid.UUID{}
 	id.DeterministicV4(uint64(gen), uint64(1<<63))
 	return tree.NewDUuid(tree.DUuid{UUID: id}), nil
 }
@@ -604,7 +598,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 			return nil
 		},
 		override: makeBuiltinOverride(
-			tree.FunDefs["unique_rowid"],
+			"unique_rowid",
 			tree.Overload{
 				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Int),
@@ -620,7 +614,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 			return nil
 		},
 		override: makeBuiltinOverride(
-			tree.FunDefs["random"],
+			"random",
 			tree.Overload{
 				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Float),
@@ -636,7 +630,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 			return nil
 		},
 		override: makeBuiltinOverride(
-			tree.FunDefs["gen_random_uuid"],
+			"gen_random_uuid",
 			tree.Overload{
 				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.Uuid),
@@ -671,7 +665,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 			return nil
 		},
 		override: makeBuiltinOverride(
-			tree.FunDefs["nextval"],
+			"nextval",
 			tree.Overload{
 				Types:      tree.ParamTypes{{Name: builtinconstants.SequenceNameArg, Typ: types.String}},
 				ReturnType: tree.FixedReturnType(types.Int),
@@ -688,7 +682,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 	},
 	"default_to_database_primary_region": {
 		override: makeBuiltinOverride(
-			tree.FunDefs["default_to_database_primary_region"],
+			"default_to_database_primary_region",
 			tree.Overload{
 				Types:      tree.ParamTypes{{Name: "val", Typ: types.String}},
 				ReturnType: tree.FixedReturnType(types.String),
@@ -699,7 +693,7 @@ var supportedImportFuncOverrides = map[string]*customFunc{
 	},
 	"gateway_region": {
 		override: makeBuiltinOverride(
-			tree.FunDefs["gateway_region"],
+			"gateway_region",
 			tree.Overload{
 				Types:      tree.ParamTypes{},
 				ReturnType: tree.FixedReturnType(types.String),
@@ -803,7 +797,7 @@ func (v *importDefaultExprVisitor) VisitPost(expr tree.Expr) (newExpr tree.Expr)
 func sanitizeExprsForImport(
 	ctx context.Context, evalCtx *eval.Context, expr tree.Expr, targetType *types.T,
 ) (tree.TypedExpr, overrideVolatility, error) {
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 
 	// If we have immutable expressions, then we can just return it right away.
 	typedExpr, err := schemaexpr.SanitizeVarFreeExpr(

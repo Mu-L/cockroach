@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -22,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -36,8 +32,8 @@ func declareKeysHeartbeatTransaction(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
-	declareKeysWriteTransaction(rs, header, req, latchSpans)
+) error {
+	return declareKeysWriteTransaction(rs, header, req, latchSpans)
 }
 
 // HeartbeatTxn updates the transaction status and heartbeat
@@ -50,7 +46,7 @@ func HeartbeatTxn(
 	h := cArgs.Header
 	reply := resp.(*kvpb.HeartbeatTxnResponse)
 
-	if err := VerifyTransaction(h, args, roachpb.PENDING, roachpb.STAGING); err != nil {
+	if err := VerifyTransaction(h, args, roachpb.PENDING, roachpb.PREPARED, roachpb.STAGING); err != nil {
 		return result.Result{}, err
 	}
 
@@ -62,7 +58,9 @@ func HeartbeatTxn(
 
 	var txn roachpb.Transaction
 	if ok, err := storage.MVCCGetProto(
-		ctx, readWriter, key, hlc.Timestamp{}, &txn, storage.MVCCGetOptions{},
+		ctx, readWriter, key, hlc.Timestamp{}, &txn, storage.MVCCGetOptions{
+			ReadCategory: fs.BatchEvalReadCategory,
+		},
 	); err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -93,7 +91,8 @@ func HeartbeatTxn(
 		// is up for debate.
 		txn.LastHeartbeat.Forward(args.Now)
 		txnRecord := txn.AsRecord()
-		if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord, storage.MVCCWriteOptions{Stats: cArgs.Stats}); err != nil {
+		if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord,
+			storage.MVCCWriteOptions{Stats: cArgs.Stats, Category: fs.BatchEvalReadCategory}); err != nil {
 			return result.Result{}, err
 		}
 	}

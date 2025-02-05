@@ -1,18 +1,14 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package hlc
 
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/stretchr/testify/assert"
@@ -21,10 +17,6 @@ import (
 
 func makeTS(walltime int64, logical int32) Timestamp {
 	return Timestamp{WallTime: walltime, Logical: logical}
-}
-
-func makeSynTS(walltime int64, logical int32) Timestamp {
-	return makeTS(walltime, logical).WithSynthetic(true)
 }
 
 func TestCompare(t *testing.T) {
@@ -59,26 +51,6 @@ func TestCompare(t *testing.T) {
 	}
 }
 
-func TestEqOrdering(t *testing.T) {
-	a := Timestamp{}
-	b := Timestamp{}
-	if !a.EqOrdering(b) {
-		t.Errorf("expected %+v == %+v", a, b)
-	}
-	b = makeTS(1, 0)
-	if a.EqOrdering(b) {
-		t.Errorf("expected %+v != %+v", a, b)
-	}
-	a = makeTS(1, 1)
-	if a.EqOrdering(b) {
-		t.Errorf("expected %+v != %+v", b, a)
-	}
-	b = makeSynTS(1, 1)
-	if !a.EqOrdering(b) {
-		t.Errorf("expected %+v == %+v", b, a)
-	}
-}
-
 func TestLess(t *testing.T) {
 	a := Timestamp{}
 	b := Timestamp{}
@@ -92,10 +64,6 @@ func TestLess(t *testing.T) {
 	a = makeTS(1, 1)
 	if !b.Less(a) {
 		t.Errorf("expected %+v < %+v", b, a)
-	}
-	b = makeSynTS(1, 1)
-	if a.Less(b) || b.Less(a) {
-		t.Errorf("expected %+v == %+v", a, b)
 	}
 }
 
@@ -113,10 +81,6 @@ func TestLessEq(t *testing.T) {
 	if !b.LessEq(a) || a.LessEq(b) {
 		t.Errorf("expected %+v < %+v", b, a)
 	}
-	b = makeSynTS(1, 1)
-	if !a.LessEq(b) || !b.LessEq(a) {
-		t.Errorf("expected %+v == %+v", a, b)
-	}
 }
 
 func TestIsEmpty(t *testing.T) {
@@ -126,12 +90,47 @@ func TestIsEmpty(t *testing.T) {
 	assert.False(t, a.IsEmpty())
 	a = makeTS(0, 1)
 	assert.False(t, a.IsEmpty())
-	a = makeSynTS(0, 0)
-	assert.False(t, a.IsEmpty())
 
 	nonZero := makeTS(1, 1)
-	nonZero.Synthetic = true
 	require.NoError(t, zerofields.NoZeroField(nonZero), "please update IsEmpty as well")
+}
+
+func TestTimestampAddDuration(t *testing.T) {
+	testCases := []struct {
+		ts        Timestamp
+		dur       time.Duration
+		expAddDur Timestamp
+	}{
+		{makeTS(1, 2), 0, makeTS(1, 2)},
+		{makeTS(1, 2), 1, makeTS(2, 2)},
+		{makeTS(1, 2), 2, makeTS(3, 2)},
+		{makeTS(1, 2), -1, makeTS(0, 2)},
+	}
+	for _, c := range testCases {
+		assert.Equal(t, c.expAddDur, c.ts.AddDuration(c.dur))
+	}
+}
+
+func TestTimestampAdd(t *testing.T) {
+	testCases := []struct {
+		ts       Timestamp
+		wallTime int64
+		logical  int32
+		expAdd   Timestamp
+	}{
+		{makeTS(1, 2), 0, 0, makeTS(1, 2)},
+		{makeTS(1, 2), 0, 1, makeTS(1, 3)},
+		{makeTS(1, 2), 0, -1, makeTS(1, 1)},
+		{makeTS(1, 2), 1, 0, makeTS(2, 2)},
+		{makeTS(1, 2), 1, 1, makeTS(2, 3)},
+		{makeTS(1, 2), 1, -1, makeTS(2, 1)},
+		{makeTS(1, 2), -1, 0, makeTS(0, 2)},
+		{makeTS(1, 2), -1, 1, makeTS(0, 3)},
+		{makeTS(1, 2), -1, -1, makeTS(0, 1)},
+	}
+	for _, c := range testCases {
+		assert.Equal(t, c.expAdd, c.ts.Add(c.wallTime, c.logical))
+	}
 }
 
 func TestTimestampNext(t *testing.T) {
@@ -142,10 +141,6 @@ func TestTimestampNext(t *testing.T) {
 		{makeTS(1, math.MaxInt32-1), makeTS(1, math.MaxInt32)},
 		{makeTS(1, math.MaxInt32), makeTS(2, 0)},
 		{makeTS(math.MaxInt32, math.MaxInt32), makeTS(math.MaxInt32+1, 0)},
-		{makeSynTS(1, 2), makeSynTS(1, 3)},
-		{makeSynTS(1, math.MaxInt32-1), makeSynTS(1, math.MaxInt32)},
-		{makeSynTS(1, math.MaxInt32), makeSynTS(2, 0)},
-		{makeSynTS(math.MaxInt32, math.MaxInt32), makeSynTS(math.MaxInt32+1, 0)},
 	}
 	for _, c := range testCases {
 		assert.Equal(t, c.expNext, c.ts.Next())
@@ -160,7 +155,6 @@ func TestTimestampWallNext(t *testing.T) {
 		{makeTS(1, 2), makeTS(2, 0)},
 		{makeTS(1, 1), makeTS(2, 0)},
 		{makeTS(1, 0), makeTS(2, 0)},
-		{makeSynTS(1, 2), makeSynTS(2, 0)},
 	}
 	for _, c := range testCases {
 		assert.Equal(t, c.expWallNext, c.ts.WallNext())
@@ -174,9 +168,6 @@ func TestTimestampPrev(t *testing.T) {
 		{makeTS(1, 2), makeTS(1, 1)},
 		{makeTS(1, 1), makeTS(1, 0)},
 		{makeTS(1, 0), makeTS(0, math.MaxInt32)},
-		{makeSynTS(1, 2), makeSynTS(1, 1)},
-		{makeSynTS(1, 1), makeSynTS(1, 0)},
-		{makeSynTS(1, 0), makeSynTS(0, math.MaxInt32)},
 	}
 	for _, c := range testCases {
 		assert.Equal(t, c.expPrev, c.ts.Prev())
@@ -191,10 +182,6 @@ func TestTimestampFloorPrevWallPrev(t *testing.T) {
 		{makeTS(1, 2), makeTS(1, 1), makeTS(0, 0)},
 		{makeTS(1, 1), makeTS(1, 0), makeTS(0, 0)},
 		{makeTS(1, 0), makeTS(0, 0), makeTS(0, 0)},
-		{makeSynTS(2, 0), makeSynTS(1, 0), makeSynTS(1, 0)},
-		{makeSynTS(1, 2), makeSynTS(1, 1), makeSynTS(0, 0)},
-		{makeSynTS(1, 1), makeSynTS(1, 0), makeSynTS(0, 0)},
-		{makeSynTS(1, 0), makeSynTS(0, 0), makeSynTS(0, 0)},
 	}
 	for _, c := range testCases {
 		assert.Equal(t, c.expPrev, c.ts.FloorPrev())
@@ -213,21 +200,6 @@ func TestTimestampForward(t *testing.T) {
 		{makeTS(2, 0), makeTS(2, 0), makeTS(2, 0), false},
 		{makeTS(2, 0), makeTS(2, 1), makeTS(2, 1), true},
 		{makeTS(2, 0), makeTS(3, 0), makeTS(3, 0), true},
-		{makeSynTS(2, 0), makeTS(1, 0), makeSynTS(2, 0), false},
-		{makeSynTS(2, 0), makeTS(1, 1), makeSynTS(2, 0), false},
-		{makeSynTS(2, 0), makeTS(2, 0), makeTS(2, 0), false},
-		{makeSynTS(2, 0), makeTS(2, 1), makeTS(2, 1), true},
-		{makeSynTS(2, 0), makeTS(3, 0), makeTS(3, 0), true},
-		{makeTS(2, 0), makeSynTS(1, 0), makeTS(2, 0), false},
-		{makeTS(2, 0), makeSynTS(1, 1), makeTS(2, 0), false},
-		{makeTS(2, 0), makeSynTS(2, 0), makeTS(2, 0), false},
-		{makeTS(2, 0), makeSynTS(2, 1), makeSynTS(2, 1), true},
-		{makeTS(2, 0), makeSynTS(3, 0), makeSynTS(3, 0), true},
-		{makeSynTS(2, 0), makeSynTS(1, 0), makeSynTS(2, 0), false},
-		{makeSynTS(2, 0), makeSynTS(1, 1), makeSynTS(2, 0), false},
-		{makeSynTS(2, 0), makeSynTS(2, 0), makeSynTS(2, 0), false},
-		{makeSynTS(2, 0), makeSynTS(2, 1), makeSynTS(2, 1), true},
-		{makeSynTS(2, 0), makeSynTS(3, 0), makeSynTS(3, 0), true},
 	}
 	for _, c := range testCases {
 		ts := c.ts
@@ -245,21 +217,6 @@ func TestTimestampBackward(t *testing.T) {
 		{makeTS(2, 0), makeTS(2, 0), makeTS(2, 0)},
 		{makeTS(2, 0), makeTS(2, 1), makeTS(2, 0)},
 		{makeTS(2, 0), makeTS(3, 0), makeTS(2, 0)},
-		{makeSynTS(2, 0), makeTS(1, 0), makeTS(1, 0)},
-		{makeSynTS(2, 0), makeTS(1, 1), makeTS(1, 1)},
-		{makeSynTS(2, 0), makeTS(2, 0), makeTS(2, 0)},
-		{makeSynTS(2, 0), makeTS(2, 1), makeTS(2, 0)},
-		{makeSynTS(2, 0), makeTS(3, 0), makeTS(2, 0)},
-		{makeTS(2, 0), makeSynTS(1, 0), makeTS(1, 0)},
-		{makeTS(2, 0), makeSynTS(1, 1), makeTS(1, 1)},
-		{makeTS(2, 0), makeSynTS(2, 0), makeTS(2, 0)},
-		{makeTS(2, 0), makeSynTS(2, 1), makeTS(2, 0)},
-		{makeTS(2, 0), makeSynTS(3, 0), makeTS(2, 0)},
-		{makeSynTS(2, 0), makeSynTS(1, 0), makeSynTS(1, 0)},
-		{makeSynTS(2, 0), makeSynTS(1, 1), makeSynTS(1, 1)},
-		{makeSynTS(2, 0), makeSynTS(2, 0), makeSynTS(2, 0)},
-		{makeSynTS(2, 0), makeSynTS(2, 1), makeSynTS(2, 0)},
-		{makeSynTS(2, 0), makeSynTS(3, 0), makeSynTS(2, 0)},
 	}
 	for _, c := range testCases {
 		ts := c.ts
@@ -276,9 +233,6 @@ func TestAsOfSystemTime(t *testing.T) {
 		{makeTS(145, 0), "145.0000000000"},
 		{makeTS(145, 123), "145.0000000123"},
 		{makeTS(145, 1123456789), "145.1123456789"},
-		{makeSynTS(145, 0), "145.0000000000?"},
-		{makeSynTS(145, 123), "145.0000000123?"},
-		{makeSynTS(145, 1123456789), "145.1123456789?"},
 	}
 	for _, c := range testCases {
 		assert.Equal(t, c.exp, c.ts.AsOfSystemTime())
@@ -305,9 +259,6 @@ func TestTimestampFormatParseRoundTrip(t *testing.T) {
 		{makeTS(-1234567890, 0), "-1.234567890,0"},
 		{makeTS(6661234567890, 0), "6661.234567890,0"},
 		{makeTS(-6661234567890, 0), "-6661.234567890,0"},
-		{makeSynTS(0, 123), "0,123?"},
-		{makeSynTS(1, 0), "0.000000001,0?"},
-		{makeSynTS(1, 123), "0.000000001,123?"},
 	}
 	for _, c := range testCases {
 		str := c.ts.String()
@@ -343,10 +294,6 @@ func TestTimestampParseFormatNonRoundTrip(t *testing.T) {
 		// Other cases.
 		{"0.000000001", makeTS(1, 0), "0.000000001,0"},
 		{"99.000000001", makeTS(99000000001, 0), "99.000000001,0"},
-		{"0?", makeSynTS(0, 0), "0,0?"},
-		{"99?", makeSynTS(99000000000, 0), "99.000000000,0?"},
-		{"0.000000001?", makeSynTS(1, 0), "0.000000001,0?"},
-		{"99.000000001?", makeSynTS(99000000001, 0), "99.000000001,0?"},
 	}
 	for _, c := range testCases {
 		parsed, err := ParseTimestamp(c.s)
@@ -403,19 +350,11 @@ func BenchmarkTimestampString(b *testing.B) {
 	}
 }
 
-func BenchmarkTimestampStringSynthetic(b *testing.B) {
-	ts := makeSynTS(-6661234567890, 0)
-
-	for i := 0; i < b.N; i++ {
-		_ = ts.String()
-	}
-}
-
 func BenchmarkTimestampIsEmpty(b *testing.B) {
 	cases := map[string]Timestamp{
 		"empty":    {},
 		"walltime": {WallTime: 1664364012528805328},
-		"all":      {WallTime: 1664364012528805328, Logical: 65535, Synthetic: true},
+		"all":      {WallTime: 1664364012528805328, Logical: 65535},
 	}
 
 	var result bool

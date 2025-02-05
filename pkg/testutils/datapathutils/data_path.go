@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package datapathutils
 
@@ -24,16 +19,19 @@ import (
 )
 
 // DebuggableTempDir returns a temporary directory that is appropriate for
-// retaining leftover artifacts in case the temp fails for debugging.
-// If the test is not executing remotely, or the test is not built with Bazel,
-// then os.TempDir() is returned (the person executing the test should set up
-// their $TMPDIR appropriately so they know where to find these leftover
-// artifacts). If the test is executing remotely, then we instead use
-// TEST_UNDECLARED_OUTPUTS_DIR, and if any files are left-over in this directory
-// after the test exits, then Bazel will package them up into outputs.zip.
-// This function is specifically for when we want to capture left-over artifacts
-// after the test completes; if you are always going to clean up the files you
-// create either way, testutils.TempDir() may be more convenient.
+// retaining leftover artifacts for debugging in case the test fails. That makes
+// it an appropriate replacement for os.TempDir() in the case where the test is
+// executing remotely. If the test is not executing remotely, or the test is not
+// built with Bazel, then os.TempDir() is returned (the person executing the
+// test should set up their $TMPDIR appropriately so they know where to find
+// these leftover artifacts). If the test is executing remotely, then we instead
+// use TEST_UNDECLARED_OUTPUTS_DIR, and if any files are left-over in this
+// directory after the test exits, then Bazel will package them up into
+// outputs.zip. If you are always going to clean up the files you create either
+// way, testutils.TempDir() may be more convenient.
+//
+// This also means that os.MkdirTemp(datapathutils.DebuggableTempDir(), ...)
+// is appropriate as a drop-in replacement for os.MkdirTemp("", ...)
 func DebuggableTempDir() string {
 	if bazel.BuiltWithBazel() {
 		isRemote := os.Getenv("REMOTE_EXEC")

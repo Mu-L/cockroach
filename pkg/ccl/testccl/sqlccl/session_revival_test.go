@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlccl
 
@@ -27,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	pbtypes "github.com/gogo/protobuf/types"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,7 +41,7 @@ func TestAuthenticateWithSessionRevivalToken(t *testing.T) {
 	tenant, tenantDB := serverutils.StartTenant(t, s, base.TestTenantArgs{
 		TenantID: serverutils.TestTenantID(),
 	})
-	defer tenant.Stopper().Stop(ctx)
+	defer tenant.AppStopper().Stop(ctx)
 	defer tenantDB.Close()
 
 	_, err := tenantDB.Exec("CREATE USER testuser WITH PASSWORD 'hunter2'")
@@ -53,7 +50,7 @@ func TestAuthenticateWithSessionRevivalToken(t *testing.T) {
 
 	var token string
 	t.Run("generate token", func(t *testing.T) {
-		conn := tenant.SQLConnForUser(t, username.TestUser, "")
+		conn := tenant.SQLConn(t, serverutils.User(username.TestUser))
 		err := conn.QueryRowContext(ctx, "SELECT encode(crdb_internal.create_session_revival_token(), 'base64')").Scan(&token)
 		require.NoError(t, err)
 	})

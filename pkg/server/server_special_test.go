@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -26,8 +21,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
-	pgx "github.com/jackc/pgx/v4"
+	pgx "github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,10 +35,12 @@ func TestPanicRecovery(t *testing.T) {
 
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.(*testServer)
+	ts := s.ApplicationLayer()
+
+	hs := ts.HTTPServer().(*httpServer)
 
 	// Enable a test-only endpoint that induces a panic.
-	ts.http.mux.Handle("/panic", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	hs.mux.Handle("/panic", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic("induced panic for testing")
 	}))
 
@@ -53,7 +51,7 @@ func TestPanicRecovery(t *testing.T) {
 	// Create a ResponseRecorder to record the response.
 	rr := httptest.NewRecorder()
 	require.NotPanics(t, func() {
-		ts.http.baseHandler(rr, req)
+		hs.baseHandler(rr, req)
 	})
 
 	// Check that the status code is correct.
@@ -109,7 +107,8 @@ func TestSocketAutoNumbering(t *testing.T) {
 	_, expectedPort, err := addr.SplitHostPort(s.SQLAddr(), "")
 	require.NoError(t, err)
 
-	if socketPath := s.(*testServer).Cfg.SocketFile; !strings.HasSuffix(socketPath, "."+expectedPort) {
+	srv := s.SystemLayer().(*testServer)
+	if socketPath := srv.Cfg.SocketFile; !strings.HasSuffix(socketPath, "."+expectedPort) {
 		t.Errorf("expected unix socket ending with port %q, got %q", expectedPort, socketPath)
 	}
 }
@@ -121,13 +120,14 @@ func TestInternalSQL(t *testing.T) {
 	ctx := context.Background()
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
+	ts := s.ApplicationLayer()
 
 	conf, err := pgx.ParseConfig("")
 	require.NoError(t, err)
 	conf.User = "root"
 	// Configure pgx to connect on the loopback listener.
 	conf.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return s.(*testServer).topLevelServer.loopbackPgL.Connect(ctx)
+		return ts.SQLLoopbackListener().(*netutil.LoopbackListener).Connect(ctx)
 	}
 	conn, err := pgx.ConnectConfig(ctx, conf)
 	require.NoError(t, err)

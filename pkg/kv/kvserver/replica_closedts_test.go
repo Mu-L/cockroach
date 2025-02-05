@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -513,13 +508,13 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 		}
 	}
 
-	blockTransfer := func(p *kvserver.ProposalData) {
+	blockTransfer := func(args kvserverbase.ProposalFilterArgs) {
 		blockedRID := roachpb.RangeID(atomic.LoadInt64(&blockedRangeID))
-		ba := p.Request
+		ba := args.Req
 		if ba.RangeID != blockedRID {
 			return
 		}
-		_, ok := p.Request.GetArg(kvpb.TransferLease)
+		_, ok := args.Req.GetArg(kvpb.TransferLease)
 		if !ok {
 			return
 		}
@@ -547,6 +542,10 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					DisableConsistencyQueue: true,
+					// We set AllowLeaseRequestProposalsWhenNotLeader to true so that the
+					// lease acquisition request (TestingAcquireLease) can be proposed
+					// regardless of the raft state.
+					AllowLeaseRequestProposalsWhenNotLeader: true,
 					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 						TestingPostEvalFilter: func(args kvserverbase.FilterArgs) *kvpb.Error {
 							blockWrites(args)
@@ -554,9 +553,9 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 							return nil
 						},
 					},
-					TestingProposalSubmitFilter: func(p *kvserver.ProposalData) (drop bool, _ error) {
-						blockTransfer(p)
-						return false, nil
+					TestingProposalSubmitFilter: func(args kvserverbase.ProposalFilterArgs) (bool, error) {
+						blockTransfer(args)
+						return false /* drop */, nil
 					},
 				},
 			},
@@ -772,14 +771,14 @@ func TestNonBlockingReadsAtResolvedTimestamp(t *testing.T) {
 
 			// Issue a transactional scan over the keys at the resolved timestamp on
 			// the same store. Use an error wait policy so that we'll hear an error
-			// (LockConflictError) under conditions that would otherwise cause us to
+			// (WriteIntentError) under conditions that would otherwise cause us to
 			// block on an intent. Send to a specific store instead of through a
 			// DistSender so that we'll hear an error (NotLeaseholderError) if the
 			// request would otherwise be redirected to the leaseholder.
 			scan := kvpb.ScanRequest{
 				RequestHeader: kvpb.RequestHeaderFromSpan(keySpan),
 			}
-			txn := roachpb.MakeTransaction("test", keySpan.Key, 0, 0, resTS, 0, 0)
+			txn := roachpb.MakeTransaction("test", keySpan.Key, 0, 0, resTS, 0, 0, 0, false /* omitInRangefeeds */)
 			scanHeader := kvpb.Header{
 				RangeID:         rangeID,
 				ReadConsistency: kvpb.CONSISTENT,
@@ -814,7 +813,7 @@ func TestNonBlockingReadsWithServerSideBoundedStalenessNegotiation(t *testing.T)
 		return func(ctx context.Context) error {
 			// Issue a bounded-staleness read (a read with a MinTimestampBound)
 			// over the keys. Use an error wait policy so that we'll hear an error
-			// (LockConflictError) under conditions that would otherwise cause us
+			// (WriteIntentError) under conditions that would otherwise cause us
 			// to block on an intent. Send to a specific store instead of through
 			// a DistSender so that we'll hear an error (NotLeaseholderError) if
 			// the request would otherwise be redirected to the leaseholder.

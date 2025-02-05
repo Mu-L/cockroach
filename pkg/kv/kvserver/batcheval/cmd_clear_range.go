@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -46,8 +42,11 @@ func declareKeysClearRange(
 	latchSpans *spanset.SpanSet,
 	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
-) {
-	DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+) error {
+	err := DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+	if err != nil {
+		return err
+	}
 	// We look up the range descriptor key to check whether the span
 	// is equal to the entire range for fast stats updating.
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
@@ -71,6 +70,7 @@ func declareKeysClearRange(
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{
 		Key: keys.MVCCRangeKeyGCKey(rs.GetRangeID()),
 	})
+	return nil
 }
 
 // ClearRange wipes all MVCC versions of keys covered by the specified
@@ -107,17 +107,18 @@ func ClearRange(
 		},
 	}
 
-	// Check for any intents, and return them for the caller to resolve. This
+	// Check for any locks, and return them for the caller to resolve. This
 	// prevents removal of intents belonging to implicitly committed STAGING
 	// txns. Otherwise, txn recovery would fail to find these intents and
 	// consider the txn incomplete, uncommitting it and its writes (even those
 	// outside of the cleared range).
-	maxIntents := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
-	intents, err := storage.ScanIntents(ctx, readWriter, from, to, maxIntents, 0)
+	maxLockConflicts := storage.MaxConflictsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+	targetLockConflictBytes := storage.TargetBytesPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+	locks, err := storage.ScanLocks(ctx, readWriter, from, to, maxLockConflicts, targetLockConflictBytes)
 	if err != nil {
 		return result.Result{}, err
-	} else if len(intents) > 0 {
-		return result.Result{}, &kvpb.LockConflictError{Locks: roachpb.AsLocks(intents)}
+	} else if len(locks) > 0 {
+		return result.Result{}, &kvpb.LockConflictError{Locks: locks}
 	}
 
 	// Before clearing, compute the delta in MVCCStats.
@@ -151,7 +152,7 @@ func ClearRange(
 	// range key span, since we expect range keys to be rare.
 	const pointKeyThreshold, rangeKeyThreshold = 2, 2
 	if err := storage.ClearRangeWithHeuristic(
-		readWriter, readWriter, from, to, pointKeyThreshold, rangeKeyThreshold,
+		ctx, readWriter, readWriter, from, to, pointKeyThreshold, rangeKeyThreshold,
 	); err != nil {
 		return result.Result{}, err
 	}
@@ -188,7 +189,7 @@ func computeStatsDelta(
 	// If we can't use the fast stats path, or race test is enabled, compute stats
 	// across the key span to be cleared.
 	if !entireRange || util.RaceEnabled {
-		computed, err := storage.ComputeStats(readWriter, from, to, delta.LastUpdateNanos)
+		computed, err := storage.ComputeStats(ctx, readWriter, from, to, delta.LastUpdateNanos)
 		if err != nil {
 			return enginepb.MVCCStats{}, err
 		}
@@ -213,10 +214,11 @@ func computeStatsDelta(
 		if !entireRange {
 			leftPeekBound, rightPeekBound := rangeTombstonePeekBounds(
 				from, to, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey())
-			rkIter, err := readWriter.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
-				KeyTypes:   storage.IterKeyTypeRangesOnly,
-				LowerBound: leftPeekBound,
-				UpperBound: rightPeekBound,
+			rkIter, err := readWriter.NewMVCCIterator(ctx, storage.MVCCKeyIterKind, storage.IterOptions{
+				KeyTypes:     storage.IterKeyTypeRangesOnly,
+				LowerBound:   leftPeekBound,
+				UpperBound:   rightPeekBound,
+				ReadCategory: fs.BatchEvalReadCategory,
 			})
 			if err != nil {
 				return enginepb.MVCCStats{}, err

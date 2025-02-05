@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -21,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -64,8 +60,10 @@ func TestJobSchedulerReschedulesRunning(t *testing.T) {
 		t.Run(wait.String(), func(t *testing.T) {
 			// Create job with the target wait behavior.
 			j := h.newScheduledJob(t, "j", "j sql")
-			j.SetScheduleDetails(jobspb.ScheduleDetails{Wait: wait})
-			require.NoError(t, j.SetSchedule("@hourly"))
+			details := j.ScheduleDetails()
+			details.Wait = wait
+			j.SetScheduleDetails(*details)
+			require.NoError(t, j.SetScheduleAndNextRun("@hourly"))
 
 			require.NoError(t,
 				h.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
@@ -121,8 +119,8 @@ func TestJobSchedulerExecutesAfterTerminal(t *testing.T) {
 		t.Run(wait.String(), func(t *testing.T) {
 			// Create job that waits for the previous runs to finish.
 			j := h.newScheduledJob(t, "j", "SELECT 42 AS meaning_of_life;")
-			j.SetScheduleDetails(jobspb.ScheduleDetails{Wait: wait})
-			require.NoError(t, j.SetSchedule("@hourly"))
+			j.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{Wait: wait}))
+			require.NoError(t, j.SetScheduleAndNextRun("@hourly"))
 
 			require.NoError(t,
 				h.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
@@ -166,7 +164,7 @@ func TestJobSchedulerExecutesAndSchedulesNextRun(t *testing.T) {
 
 	// Create job that waits for the previous runs to finish.
 	j := h.newScheduledJob(t, "j", "SELECT 42 AS meaning_of_life;")
-	require.NoError(t, j.SetSchedule("@hourly"))
+	require.NoError(t, j.SetScheduleAndNextRun("@hourly"))
 
 	require.NoError(t,
 		h.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
@@ -233,7 +231,7 @@ func TestJobSchedulerDaemonGetWaitPeriod(t *testing.T) {
 }
 
 type recordScheduleExecutor struct {
-	executed []int64
+	executed []jobspb.ScheduleID
 }
 
 func (n *recordScheduleExecutor) ExecuteJob(
@@ -335,7 +333,7 @@ func TestJobSchedulerCanBeDisabledWhileSleeping(t *testing.T) {
 
 // We expect the first 2 jobs to be executed.
 type expectedRun struct {
-	id      int64
+	id      jobspb.ScheduleID
 	nextRun interface{} // Interface to support nullable nextRun
 }
 
@@ -374,7 +372,7 @@ func TestJobSchedulerDaemonProcessesJobs(t *testing.T) {
 	// Create few, one-off schedules.
 	const numJobs = 5
 	scheduleRunTime := h.env.Now().Add(time.Hour)
-	var scheduleIDs []int64
+	var scheduleIDs []jobspb.ScheduleID
 	schedules := ScheduledJobDB(h.cfg.DB)
 	for i := 0; i < numJobs; i++ {
 		schedule := h.newScheduledJob(t, "test_job", "SELECT 42")
@@ -418,7 +416,7 @@ func TestJobSchedulerDaemonHonorsMaxJobsLimit(t *testing.T) {
 	// Create few, one-off schedules.
 	const numJobs = 5
 	scheduleRunTime := h.env.Now().Add(time.Hour)
-	var scheduleIDs []int64
+	var scheduleIDs []jobspb.ScheduleID
 	schedules := ScheduledJobDB(h.cfg.DB)
 	for i := 0; i < numJobs; i++ {
 		schedule := h.newScheduledJob(t, "test_job", "SELECT 42")
@@ -559,8 +557,8 @@ func TestJobSchedulerRetriesFailed(t *testing.T) {
 	} {
 		t.Run(tc.onError.String(), func(t *testing.T) {
 			h.env.SetTime(startTime)
-			schedule.SetScheduleDetails(jobspb.ScheduleDetails{OnError: tc.onError})
-			require.NoError(t, schedule.SetSchedule("@hourly"))
+			schedule.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{OnError: tc.onError}))
+			require.NoError(t, schedule.SetScheduleAndNextRun("@hourly"))
 			require.NoError(t, schedules.Update(ctx, schedule))
 
 			h.env.SetTime(execTime)
@@ -597,6 +595,7 @@ func TestJobSchedulerDaemonUsesSystemTables(t *testing.T) {
 	schedule.SetScheduleLabel("test schedule")
 	schedule.SetOwner(username.TestUserName())
 	schedule.SetNextRun(timeutil.Now())
+	schedule.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	any, err := types.MarshalAny(
 		&jobspb.SqlStatementExecutionArg{Statement: "INSERT INTO defaultdb.foo VALUES (1), (2), (3)"})
 	require.NoError(t, err)
@@ -699,6 +698,7 @@ INSERT INTO defaultdb.foo VALUES(1, 1)
 	nextRun := h.env.Now().Add(time.Hour)
 	schedule.SetNextRun(nextRun)
 	schedule.SetExecutionDetails(execName, jobspb.ExecutionArguments{})
+	schedule.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	require.NoError(t, schedules.Create(ctx, schedule))
 
 	// Execute schedule on another thread.
@@ -821,6 +821,7 @@ func TestDisablingSchedulerCancelsSchedules(t *testing.T) {
 	schedule.SetOwner(username.TestUserName())
 	schedule.SetNextRun(timeutil.Now())
 	schedule.SetExecutionDetails(executorName, jobspb.ExecutionArguments{})
+	schedule.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	require.NoError(t, schedules.Create(context.Background(), schedule))
 
 	readWithTimeout(t, ex.started)
@@ -859,6 +860,7 @@ func TestSchedulePlanningRespectsTimeout(t *testing.T) {
 	schedule.SetOwner(username.TestUserName())
 	schedule.SetNextRun(timeutil.Now())
 	schedule.SetExecutionDetails(executorName, jobspb.ExecutionArguments{})
+	schedule.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	require.NoError(t, schedules.Create(context.Background(), schedule))
 
 	readWithTimeout(t, ex.started)

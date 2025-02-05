@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -21,7 +18,9 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
@@ -50,12 +49,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -65,15 +68,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/cidr"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -83,8 +90,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randident"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
@@ -159,19 +168,16 @@ func TestChangefeedBasicQuery(t *testing.T) {
 		assertPayloads(t, foo, []string{
 			`foo: [0]->{"a": 0, "b": "updated", "cdc_prev": null, "op": "insert"}`,
 		})
-
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b')`)
 		assertPayloads(t, foo, []string{
 			`foo: [1]->{"a": 1, "b": "a", "cdc_prev": null, "op": "insert"}`,
 			`foo: [2]->{"a": 2, "b": "b", "cdc_prev": null, "op": "insert"}`,
 		})
-
 		sqlDB.Exec(t, `UPSERT INTO foo VALUES (2, 'c'), (3, 'd')`)
 		assertPayloads(t, foo, []string{
 			`foo: [2]->{"a": 2, "b": "c", "cdc_prev": {"a": 2, "b": "b"}, "op": "update"}`,
 			`foo: [3]->{"a": 3, "b": "d", "cdc_prev": null, "op": "insert"}`,
 		})
-
 		// Deleted rows with bare envelope are emitted with only
 		// the key columns set.
 		sqlDB.Exec(t, `DELETE FROM foo WHERE a = 1`)
@@ -181,6 +187,109 @@ func TestChangefeedBasicQuery(t *testing.T) {
 	}
 
 	cdcTest(t, testFn)
+}
+
+// TestChangefeedIdentifyDependentTablesForProtecting identifies (system) tables
+// that are accessed in the course of running a changefeed and ensures that they
+// are all in the list of tables we protect with PTS. It does this by running a
+// sinkless changefeed and capturing a trace of its execution. For completeness,
+// it includes a cdc query in the changefeed, under the assumption that doing so
+// will require more tables.
+func TestChangefeedIdentifyDependentTablesForProtecting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	cfCreated := atomic.Bool{}
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, 'initial')`)
+		foo := feed(t, f, `CREATE CHANGEFEED AS SELECT *, event_op() AS op, cdc_prev FROM foo`)
+		defer closeFeed(t, foo)
+		cfCreated.Store(true)
+
+		assertPayloads(t, foo, []string{
+			`foo: [0]->{"a": 0, "b": "initial", "cdc_prev": null, "op": "insert"}`,
+		})
+
+		// Do some operations so the changefeed does some scanning.
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b')`)
+		sqlDB.Exec(t, `UPSERT INTO foo VALUES (2, 'c'), (3, 'd')`)
+		sqlDB.Exec(t, `DELETE FROM foo WHERE a = 1`)
+
+		assertPayloads(t, foo, []string{
+			`foo: [1]->{"a": 1, "b": "a", "cdc_prev": null, "op": "insert"}`,
+			`foo: [2]->{"a": 2, "b": "b", "cdc_prev": null, "op": "insert"}`,
+			`foo: [2]->{"a": 2, "b": "c", "cdc_prev": {"a": 2, "b": "b"}, "op": "update"}`,
+			`foo: [3]->{"a": 3, "b": "d", "cdc_prev": null, "op": "insert"}`,
+			`foo: [1]->{"a": 1, "b": null, "cdc_prev": {"a": 1, "b": "a"}, "op": "delete"}`,
+		})
+	}
+
+	trimRx := regexp.MustCompile(`executing (.*), \[txn:.*`)
+	tableIdRx := regexp.MustCompile(`(/Tenant/[0-9]+)?/(Table|NamespaceTable)/([0-9]+)`)
+
+	tableIDsAccessed := map[catid.DescID]struct{}{}
+
+	// Parse trace logs of the following format into table ids and add them to our map:
+	// `executing Scan [/Tenant/10/Table/3/1,/Tenant/10/Table/3/2), Scan [/Tenant/10/NamespaceTable/30/1,/Tenant/10/NamespaceTable/30/2), ...`
+	// This seems a bit brittle, but it's the best we can do currently.
+	noteExecutingScansLog := func(msg string) {
+		trimmed := trimRx.FindStringSubmatch(msg)[1]
+		spanStmts := strings.Split(trimmed, ", ")
+		for _, spanStmt := range spanStmts {
+			spanStmt = strings.Replace(spanStmt, "Scan ", "", 1)
+			startEnd := strings.Split(strings.Trim(spanStmt, "[)"), ",")
+			require.Len(t, startEnd, 2)
+
+			start := startEnd[0]
+			matches := tableIdRx.FindStringSubmatch(start)
+			require.NotEmpty(t, matches)
+
+			tableID, err := strconv.ParseInt(matches[3], 10, 64)
+			require.NoError(t, err)
+			tableIDsAccessed[catid.DescID(tableID)] = struct{}{}
+		}
+	}
+
+	traceCb := func(trace tracingpb.Recording, stmt string) {
+		if !cfCreated.Load() {
+			return
+		}
+		if !strings.HasPrefix(stmt, "CREATE CHANGEFEED") {
+			return
+		}
+		for _, span := range trace {
+			for _, log := range span.Logs {
+				msg := log.Message.StripMarkers()
+				if !strings.Contains(msg, "executing Scan") {
+					continue
+				}
+				noteExecutingScansLog(msg)
+			}
+		}
+	}
+
+	cdcTest(t, testFn, withKnobsFn(func(knobs *base.TestingKnobs) {
+		knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
+		if knobs.SQLExecutor == nil {
+			knobs.SQLExecutor = &sql.ExecutorTestingKnobs{}
+		}
+		knobs.SQLExecutor.(*sql.ExecutorTestingKnobs).WithStatementTrace = traceCb
+	}), feedTestForceSink("sinkless"))
+
+	// NOTE: not all the required tables will necessarily show up in every run due to caching. However we should always see SOME tables.
+	require.NotEmpty(t, tableIDsAccessed)
+
+	var unexpectedTableIDs []catid.DescID
+	for id := range tableIDsAccessed {
+		if !slices.Contains(systemTablesToProtect, id) {
+			unexpectedTableIDs = append(unexpectedTableIDs, id)
+		}
+	}
+	require.Empty(t, unexpectedTableIDs)
 }
 
 // Same test as TestChangefeedBasicQuery, but using wrapped envelope with CDC query.
@@ -292,11 +401,182 @@ func TestToJSONAsChangefeed(t *testing.T) {
 			[][]string{{`{"__crdb__": {"updated": "0.0000000000"}, "a": 1, "b": "hello"}`}},
 		)
 
-		sqlDB.ExpectErr(t, `unknown envelope: lobster`,
+		sqlDB.ExpectErrWithTimeout(t, `unknown envelope: lobster`,
 			`SELECT crdb_internal.to_json_as_changefeed_with_flags(foo.*, 'updated', 'envelope=lobster') from foo`)
 	}
 
 	cdcTest(t, testFn)
+}
+
+// TestChangefeedProgressMetrics tests the changefeed.aggregator_progress and
+// changefeed.checkpoint_progress metrics.
+func TestChangefeedProgressMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Verify the aggmetric functional gauges work correctly
+	t.Run("aggregate functional gauge", func(t *testing.T) {
+		cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+			registry := s.Server.JobRegistry().(*jobs.Registry)
+			metrics := registry.MetricsStruct().Changefeed.(*Metrics)
+			defaultSLI, err := metrics.getSLIMetrics(defaultSLIScope)
+			require.NoError(t, err)
+			sliA, err := metrics.getSLIMetrics("scope_a")
+			require.NoError(t, err)
+			sliB, err := metrics.getSLIMetrics("scope_b")
+			require.NoError(t, err)
+
+			defaultSLI.mu.checkpoint[5] = hlc.Timestamp{WallTime: 1}
+
+			sliA.mu.checkpoint[1] = hlc.Timestamp{WallTime: 2}
+			sliA.mu.checkpoint[2] = hlc.Timestamp{WallTime: 5}
+			sliA.mu.checkpoint[3] = hlc.Timestamp{WallTime: 0} // Zero timestamp should be ignored.
+
+			sliB.mu.checkpoint[1] = hlc.Timestamp{WallTime: 4}
+			sliB.mu.checkpoint[2] = hlc.Timestamp{WallTime: 9}
+
+			// Ensure each scope gets the correct value
+			require.Equal(t, int64(1), defaultSLI.CheckpointProgress.Value())
+			require.Equal(t, int64(2), sliA.CheckpointProgress.Value())
+			require.Equal(t, int64(4), sliB.CheckpointProgress.Value())
+
+			// Ensure the value progresses upon changefeed progress
+			defaultSLI.mu.checkpoint[5] = hlc.Timestamp{WallTime: 20}
+			require.Equal(t, int64(20), defaultSLI.CheckpointProgress.Value())
+
+			// Ensure the value updates correctly upon changefeeds completing
+			delete(sliB.mu.checkpoint, 1)
+			require.Equal(t, int64(9), sliB.CheckpointProgress.Value())
+			delete(sliB.mu.checkpoint, 2)
+			require.Equal(t, int64(0), sliB.CheckpointProgress.Value())
+
+			// Ensure the aggregate value is correct after progress / completion
+			require.Equal(t, int64(2), metrics.AggMetrics.CheckpointProgress.Value())
+			sliA.mu.checkpoint[1] = hlc.Timestamp{WallTime: 30}
+			require.Equal(t, int64(5), metrics.AggMetrics.CheckpointProgress.Value())
+			delete(sliA.mu.checkpoint, 2)
+			require.Equal(t, int64(20), metrics.AggMetrics.CheckpointProgress.Value())
+			delete(defaultSLI.mu.checkpoint, 5)
+			require.Equal(t, int64(30), metrics.AggMetrics.CheckpointProgress.Value())
+			delete(sliA.mu.checkpoint, 1)
+			require.Equal(t, int64(0), metrics.AggMetrics.CheckpointProgress.Value())
+		})
+	})
+
+	// Verify that ids must be registered to have an effect.
+	t.Run("id registration", func(t *testing.T) {
+		cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+			registry := s.Server.JobRegistry().(*jobs.Registry)
+			metrics := registry.MetricsStruct().Changefeed.(*Metrics)
+			sliA, err := metrics.getSLIMetrics("scope_a")
+			require.NoError(t, err)
+
+			unregisteredID := int64(999)
+			id1 := sliA.claimId()
+			id2 := sliA.claimId()
+			id3 := sliA.claimId()
+			sliA.setResolved(unregisteredID, hlc.Timestamp{WallTime: 0})
+			sliA.setResolved(id1, hlc.Timestamp{WallTime: 1})
+			sliA.setResolved(id2, hlc.Timestamp{WallTime: 2})
+			sliA.setResolved(id3, hlc.Timestamp{WallTime: 3})
+
+			sliA.setCheckpoint(unregisteredID, hlc.Timestamp{WallTime: 0})
+			sliA.setCheckpoint(id1, hlc.Timestamp{WallTime: 1})
+			sliA.setCheckpoint(id2, hlc.Timestamp{WallTime: 2})
+			sliA.setCheckpoint(id3, hlc.Timestamp{WallTime: 3})
+
+			require.Equal(t, int64(1), metrics.AggMetrics.CheckpointProgress.Value())
+			require.Equal(t, int64(1), metrics.AggMetrics.AggregatorProgress.Value())
+
+			sliA.closeId(id1)
+
+			require.Equal(t, int64(2), metrics.AggMetrics.CheckpointProgress.Value())
+			require.Equal(t, int64(2), metrics.AggMetrics.AggregatorProgress.Value())
+
+		})
+	})
+
+	// Verify that a changefeed updates the timestamps as it progresses
+	t.Run("running changefeed", func(t *testing.T) {
+		cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+			sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
+			fooA := feed(t, f, `CREATE CHANGEFEED FOR foo WITH metrics_label='label_a', resolved='100ms'`)
+
+			registry := s.Server.JobRegistry().(*jobs.Registry)
+			metrics := registry.MetricsStruct().Changefeed.(*Metrics)
+			sliA, err := metrics.getSLIMetrics("label_a")
+			require.NoError(t, err)
+
+			// Verify that aggregator_progress has recurring updates
+			var lastTimestamp int64 = 0
+			for i := 0; i < 3; i++ {
+				testutils.SucceedsSoon(t, func() error {
+					progress := sliA.AggregatorProgress.Value()
+					if progress > lastTimestamp {
+						lastTimestamp = progress
+						return nil
+					}
+					return errors.Newf("waiting for aggregator_progress to advance from %d (value=%d)",
+						lastTimestamp, progress)
+				})
+			}
+
+			// Verify that checkpoint_progress has recurring updates
+			for i := 0; i < 3; i++ {
+				testutils.SucceedsSoon(t, func() error {
+					progress := sliA.CheckpointProgress.Value()
+					if progress > lastTimestamp {
+						lastTimestamp = progress
+						return nil
+					}
+					return errors.Newf("waiting for checkpoint_progress to advance from %d (value=%d)",
+						lastTimestamp, progress)
+				})
+			}
+
+			// Verify that max_behind_nanos has recurring updates
+			var lastValue int64 = 0
+			for i := 0; i < 3; i++ {
+				testutils.SucceedsSoon(t, func() error {
+					value := sliA.MaxBehindNanos.Value()
+					if value != lastValue {
+						lastValue = value
+						return nil
+					}
+					return errors.Newf("waiting for max_behind_nanos to update %d",
+						lastValue)
+				})
+			}
+
+			sliB, err := registry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics("label_b")
+			require.Equal(t, int64(0), sliB.AggregatorProgress.Value())
+			fooB := feed(t, f, `CREATE CHANGEFEED FOR foo WITH metrics_label='label_b', resolved='100ms'`)
+			defer closeFeed(t, fooB)
+			require.NoError(t, err)
+			// Verify that aggregator_progress has recurring updates
+			testutils.SucceedsSoon(t, func() error {
+				progress := sliB.AggregatorProgress.Value()
+				if progress > 0 {
+					return nil
+				}
+				return errors.Newf("waiting for second aggregator_progress to advance (value=%d)", progress)
+			})
+
+			closeFeed(t, fooA)
+			testutils.SucceedsSoon(t, func() error {
+				aggregatorProgress := sliA.AggregatorProgress.Value()
+				checkpointProgress := sliA.CheckpointProgress.Value()
+				maxBehindNanos := sliA.MaxBehindNanos.Value()
+				if aggregatorProgress == 0 && checkpointProgress == 0 && maxBehindNanos == 0 {
+					return nil
+				}
+				return errors.Newf("waiting for progress metrics to be 0 (ap=%d, cp=%d)",
+					aggregatorProgress, checkpointProgress)
+			})
+		})
+	})
 }
 
 func TestChangefeedIdleness(t *testing.T) {
@@ -310,13 +590,33 @@ func TestChangefeedIdleness(t *testing.T) {
 
 		registry := s.Server.JobRegistry().(*jobs.Registry)
 		currentlyIdle := registry.MetricsStruct().JobMetrics[jobspb.TypeChangefeed].CurrentlyIdle
+		// Use a wait group for cases when the number of idle changefeeds temporarily
+		// decreases, to avoid a race condition where the changefeed becomes idle
+		// before the idleness is checked.
+		var wg sync.WaitGroup
 		waitForIdleCount := func(numIdle int64) {
+			wg.Add(1)
 			testutils.SucceedsSoon(t, func() error {
 				if currentlyIdle.Value() != numIdle {
 					return fmt.Errorf("expected (%+v) idle changefeeds, found (%+v)", numIdle, currentlyIdle.Value())
 				}
 				return nil
 			})
+			wg.Done()
+		}
+		done := make(chan bool)
+		workload := func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					sqlDB.Exec(t, `INSERT INTO foo VALUES (0)`)
+					sqlDB.Exec(t, `DELETE FROM foo WHERE a = 0`)
+					sqlDB.Exec(t, `INSERT INTO bar VALUES (0)`)
+					sqlDB.Exec(t, `DELETE FROM bar WHERE b = 0`)
+				}
+			}
 		}
 
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
@@ -325,9 +625,10 @@ func TestChangefeedIdleness(t *testing.T) {
 		cf2 := feed(t, f, "CREATE CHANGEFEED FOR TABLE bar WITH resolved='10ms'")
 		defer closeFeed(t, cf1)
 
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (0)`)
-		sqlDB.Exec(t, `INSERT INTO bar VALUES (0)`)
-		waitForIdleCount(0)
+		go workload()
+		go waitForIdleCount(0)
+		wg.Wait()
+		done <- true
 		waitForIdleCount(2) // Both should eventually be considered idle
 
 		jobFeed := cf2.(cdctest.EnterpriseTestFeed)
@@ -340,14 +641,12 @@ func TestChangefeedIdleness(t *testing.T) {
 		closeFeed(t, cf2)
 		waitForIdleCount(1) // The cancelled changefeed isn't considered idle
 
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
-		waitForIdleCount(0)
+		go workload()
+		go waitForIdleCount(0)
+		wg.Wait()
+		done <- true
 		waitForIdleCount(1)
 
-		assertPayloads(t, cf1, []string{
-			`foo: [0]->{"after": {"a": 0}}`,
-			`foo: [1]->{"after": {"a": 1}}`,
-		})
 	}, feedTestEnterpriseSinks)
 }
 
@@ -552,7 +851,7 @@ func TestMissingTableErr(t *testing.T) {
 
 	t.Run("changefeed on non existing table fails", func(t *testing.T) {
 		kvSQL := sqlutils.MakeSQLRunner(s.DB)
-		kvSQL.ExpectErr(t, `^pq: failed to resolve targets in the CHANGEFEED stmt: table "foo" does not exist$`,
+		kvSQL.ExpectErr(t, `^pq: failed to resolve targets in the CHANGEFEED stmt: table "foo" does not exist`,
 			`CREATE CHANGEFEED FOR foo`,
 		)
 	})
@@ -616,6 +915,7 @@ func TestChangefeedEnvelope(t *testing.T) {
 			defer closeFeed(t, foo)
 			assertPayloads(t, foo, []string{`foo: [1]->{"after": {"a": 1, "b": "a"}, "key": [1]}`})
 		})
+		// TODO(#139660): add envelope=enriched here
 	}
 
 	// some sinks are incompatible with envelope
@@ -739,8 +1039,7 @@ func TestChangefeedCursor(t *testing.T) {
 		// statement timestamp, so only verify this for enterprise.
 		if e, ok := fooLogical.(cdctest.EnterpriseTestFeed); ok {
 			var bytes []byte
-			sqlDB.QueryRow(t, fmt.Sprintf(`SELECT payload FROM (%s)`,
-				jobutils.InternalSystemJobsBaseQuery), e.JobID()).Scan(&bytes)
+			sqlDB.QueryRow(t, jobutils.JobPayloadByIDQuery, e.JobID()).Scan(&bytes)
 			var payload jobspb.Payload
 			require.NoError(t, protoutil.Unmarshal(bytes, &payload))
 			require.Equal(t, tsLogical, payload.GetChangefeed().StatementTime)
@@ -838,6 +1137,34 @@ func TestChangefeedMVCCTimestamps(t *testing.T) {
 	cdcTest(t, testFn)
 }
 
+func TestChangefeedMVCCTimestampsAvro(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE mvcc_timestamp_test_table (id UUID PRIMARY KEY DEFAULT gen_random_uuid())`)
+
+		const rowCount = 5
+		expectedPayloads := make([]string, rowCount)
+		for i := 0; i < rowCount; i++ {
+			row := sqlDB.QueryRow(t, `INSERT INTO mvcc_timestamp_test_table VALUES (DEFAULT) RETURNING id, cluster_logical_timestamp()`)
+
+			var id string
+			var mvccTimestamp string
+			row.Scan(&id, &mvccTimestamp)
+			expectedPayloads[i] = fmt.Sprintf(`mvcc_timestamp_test_table: {"id":{"string":"%[1]s"}}->{"after":{"mvcc_timestamp_test_table":{"id":{"string":"%[1]s"}}},"mvcc_timestamp":{"string":"%[2]s"}}`,
+				id, mvccTimestamp)
+		}
+
+		changeFeed := feed(t, f, `CREATE CHANGEFEED FOR mvcc_timestamp_test_table WITH mvcc_timestamp, format='avro'`)
+		defer closeFeed(t, changeFeed)
+		assertPayloads(t, changeFeed, expectedPayloads)
+	}
+
+	cdcTest(t, testFn, feedTestForceSink(`kafka`))
+}
+
 func TestChangefeedResolvedFrequency(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -880,25 +1207,42 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 		tblName := "seed"
 		defer s.DB.Close()
 
-		sqlDB.ExecMultiple(t, sqlsmith.Setups[tblName](rng)...)
+		setup := sqlsmith.Setups[tblName](rng)
+		sqlDB.ExecMultiple(t, setup...)
 
 		// TODO: PopulateTableWithRandData doesn't work with enums
-		sqlDB.Exec(t, "ALTER TABLE seed DROP COLUMN _enum")
+		dropEnumQry := "ALTER TABLE seed DROP COLUMN _enum;"
+		sqlDB.Exec(t, dropEnumQry)
 
+		// Attempt to insert a few more than our target 100 values, since there's a
+		// small chance we may not succeed that many inserts.
+		numInserts := 110
+		inserts := make([]string, 0, numInserts)
 		for rows := 0; rows < 100; {
 			var err error
 			var newRows int
-			if newRows, err = randgen.PopulateTableWithRandData(rng, s.DB, tblName, 200); err != nil {
+			if newRows, err = randgen.PopulateTableWithRandData(rng, s.DB, tblName, numInserts, &inserts); err != nil {
 				t.Fatal(err)
 			}
 			rows += newRows
 		}
 
-		sqlDB.Exec(t, `DELETE FROM seed WHERE rowid NOT IN (SELECT rowid FROM seed LIMIT 100)`)
+		limitQry := "DELETE FROM seed WHERE rowid NOT IN (SELECT rowid FROM seed ORDER BY rowid LIMIT 100);"
+		sqlDB.Exec(t, limitQry)
 
 		// Put the enums back. enum_range('hi'::greeting)[rowid%7] will give nulls when rowid%7=0 or 6.
-		sqlDB.Exec(t, `ALTER TABLE seed ADD COLUMN _enum greeting`)
-		sqlDB.Exec(t, `UPDATE seed SET _enum = enum_range('hi'::greeting)[rowid%7]`)
+		addEnumQry := "ALTER TABLE seed ADD COLUMN _enum greeting;"
+		sqlDB.Exec(t, addEnumQry)
+		populateEnumQry := "UPDATE seed SET _enum = enum_range('hi'::greeting)[rowid%7];"
+		sqlDB.Exec(t, populateEnumQry)
+		// Get values to log setup.
+		t.Logf("setup:\n%s\n%s\n%s\n%s\n%s\n%s",
+			strings.Join(setup, "\n"),
+			dropEnumQry,
+			strings.Join(inserts, "\n"),
+			limitQry,
+			addEnumQry,
+			populateEnumQry)
 
 		queryGen, err := sqlsmith.NewSmither(s.DB, rng,
 			sqlsmith.DisableWith(),
@@ -953,20 +1297,52 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 				}
 				continue
 			}
-			numNonTrivialTestRuns++
 			assertedPayloads := make([]string, len(expectedRowIDs))
 			for i, id := range expectedRowIDs {
 				assertedPayloads[i] = fmt.Sprintf(`seed: [%s]->{"rowid": %s}`, id, id)
 			}
-			err = assertPayloadsBaseErr(context.Background(), seedFeed, assertedPayloads, false, false)
+			err = assertPayloadsBaseErr(context.Background(), seedFeed, assertedPayloads, false, false, changefeedbase.OptEnvelopeWrapped)
 			closeFeedIgnoreError(t, seedFeed)
 			if err != nil {
+				// Skip errors that may come up during SQL execution. If the SQL query
+				// didn't fail with these errors, it's likely because the query was built in
+				// a way that did not have to execute on the row that caused the error, but
+				// the CDC query did.
+				// Since we get the error that caused the changefeed job to
+				// fail from scraping the job status and creating a new
+				// error, we unfortunately don't have the pgcode and have to
+				// rely on known strings.
+				validPgErrs := []string{
+					"cannot subtract infinite dates",
+					"regexp compilation failed",
+					"invalid regular expression",
+					"error parsing GeoJSON",
+					"error parsing EWKT",
+					"geometry type is unsupported",
+					"should be of length",
+					"dwithin distance cannot be less than zero",
+					"parameter has to be of type Point",
+					"expected LineString",
+					"no locations to init GEOS",
+				}
+				containsKnownPgErr := func(e error) (interface{}, bool) {
+					for _, v := range validPgErrs {
+						if strings.Contains(e.Error(), v) {
+							return nil, true
+						}
+					}
+					return nil, false
+				}
+				if _, contains := errors.If(err, containsKnownPgErr); contains {
+					t.Logf("Skipping statement %s because it encountered pgerror %s", createStmt, err)
+					continue
+				}
+
 				t.Fatal(err)
 			}
+			numNonTrivialTestRuns++
 		}
-		if n > 100 {
-			require.Greater(t, numNonTrivialTestRuns, 1)
-		}
+		require.Greater(t, numNonTrivialTestRuns, 1)
 		t.Logf("%d predicates checked: all had the same result in SELECT and CHANGEFEED", numNonTrivialTestRuns)
 
 	}
@@ -1070,6 +1446,176 @@ func TestChangefeedInitialScan(t *testing.T) {
 	cdcTest(t, testFn)
 }
 
+// TestChangefeedLaggingRangesMetrics tests the behavior of the
+// changefeed.lagging_ranges metric.
+func TestChangefeedLaggingRangesMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		// Ensure a fast closed timestamp interval so ranges can catch up fast.
+		kvserver.RangeFeedRefreshInterval.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 20*time.Millisecond)
+		closedts.SideTransportCloseInterval.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 20*time.Millisecond)
+		closedts.TargetDuration.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 20*time.Millisecond)
+
+		skipMu := syncutil.Mutex{}
+		skippedRanges := map[string]struct{}{}
+		numRanges := 10
+		numRangesToSkip := int64(4)
+		var stopSkip atomic.Bool
+		// `shouldSkip` continuously skips checkpoints for the first `numRangesToSkip` ranges it sees.
+		// skipping is disabled by setting `stopSkip` to true.
+		shouldSkip := func(event *kvpb.RangeFeedEvent) bool {
+			if stopSkip.Load() {
+				return false
+			}
+			switch event.GetValue().(type) {
+			case *kvpb.RangeFeedCheckpoint:
+				sp := event.Checkpoint.Span
+				skipMu.Lock()
+				defer skipMu.Unlock()
+				if _, ok := skippedRanges[sp.String()]; ok || int64(len(skippedRanges)) < numRangesToSkip {
+					skippedRanges[sp.String()] = struct{}{}
+					return true
+				}
+			}
+			return false
+		}
+
+		knobs := s.TestingKnobs.DistSQL.(*execinfra.TestingKnobs).Changefeed.(*TestingKnobs)
+
+		knobs.FeedKnobs.RangefeedOptions = append(knobs.FeedKnobs.RangefeedOptions, kvcoord.TestingWithOnRangefeedEvent(
+			func(ctx context.Context, s roachpb.Span, _ int64, event *kvpb.RangeFeedEvent) (skip bool, _ error) {
+				return shouldSkip(event), nil
+			}),
+		)
+
+		registry := s.Server.JobRegistry().(*jobs.Registry)
+		sli1, err := registry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics("t1")
+		require.NoError(t, err)
+		laggingRangesTier1 := sli1.LaggingRanges
+		sli2, err := registry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics("t2")
+		require.NoError(t, err)
+		laggingRangesTier2 := sli2.LaggingRanges
+
+		assertLaggingRanges := func(tier string, expected int64) {
+			testutils.SucceedsWithin(t, func() error {
+				var laggingRangesObserved int64
+				if tier == "t1" {
+					laggingRangesObserved = laggingRangesTier1.Value()
+				} else {
+					laggingRangesObserved = laggingRangesTier2.Value()
+				}
+				if laggingRangesObserved != expected {
+					return fmt.Errorf("expected %d lagging ranges, but found %d", expected, laggingRangesObserved)
+				}
+				return nil
+			}, 10*time.Second)
+		}
+
+		sqlDB.Exec(t, fmt.Sprintf(`
+		  CREATE TABLE foo (key INT PRIMARY KEY);
+		  INSERT INTO foo (key) SELECT * FROM generate_series(1, %d);
+		  ALTER TABLE foo SPLIT AT (SELECT * FROM generate_series(1, %d, 1));
+  		`, numRanges, numRanges-1))
+		sqlDB.CheckQueryResults(t, `SELECT count(*) FROM [SHOW RANGES FROM TABLE foo]`,
+			[][]string{{fmt.Sprint(numRanges)}},
+		)
+
+		const laggingRangesOpts = `lagging_ranges_threshold="250ms", lagging_ranges_polling_interval="25ms"`
+		feed1Tier1 := feed(t, f,
+			fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH initial_scan='no', metrics_label="t1", %s`, laggingRangesOpts))
+		feed2Tier1 := feed(t, f,
+			fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH initial_scan='no', metrics_label="t1", %s`, laggingRangesOpts))
+		feed3Tier2 := feed(t, f,
+			fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH initial_scan='no', metrics_label="t2", %s`, laggingRangesOpts))
+
+		assertLaggingRanges("t1", numRangesToSkip*2)
+		assertLaggingRanges("t2", numRangesToSkip)
+
+		stopSkip.Store(true)
+		assertLaggingRanges("t1", 0)
+		assertLaggingRanges("t2", 0)
+
+		stopSkip.Store(false)
+		assertLaggingRanges("t1", numRangesToSkip*2)
+		assertLaggingRanges("t2", numRangesToSkip)
+
+		require.NoError(t, feed1Tier1.Close())
+		assertLaggingRanges("t1", numRangesToSkip)
+		assertLaggingRanges("t2", numRangesToSkip)
+
+		require.NoError(t, feed2Tier1.Close())
+		assertLaggingRanges("t1", 0)
+		assertLaggingRanges("t2", numRangesToSkip)
+
+		require.NoError(t, feed3Tier2.Close())
+		assertLaggingRanges("t1", 0)
+		assertLaggingRanges("t2", 0)
+	}
+	// Can't run on tenants due to lack of SPLIT AT support (#54254)
+	cdcTest(t, testFn, feedTestNoTenants, feedTestEnterpriseSinks)
+}
+
+func TestChangefeedTotalRangesMetric(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		registry := s.Server.JobRegistry().(*jobs.Registry)
+		metrics := registry.MetricsStruct().Changefeed.(*Metrics)
+		defaultSLI, err := metrics.getSLIMetrics(defaultSLIScope)
+		require.NoError(t, err)
+		totalRanges := defaultSLI.TotalRanges
+
+		// Total ranges should start at zero.
+		require.Zero(t, totalRanges.Value())
+
+		assertTotalRanges := func(expected int64) {
+			testutils.SucceedsSoon(t, func() error {
+				if actual := totalRanges.Value(); expected != actual {
+					return errors.Newf("expected total ranges to be %d, but got %d", expected, actual)
+				}
+				return nil
+			})
+		}
+
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, "CREATE TABLE foo (x int)")
+
+		// We expect one range after creating a changefeed on a single table.
+		fooFeed := feed(t, f, "CREATE CHANGEFEED FOR foo WITH lagging_ranges_polling_interval='1s'")
+		assertTotalRanges(1)
+
+		// We expect total ranges to be zero again after pausing the changefeed.
+		require.NoError(t, fooFeed.(cdctest.EnterpriseTestFeed).Pause())
+		assertTotalRanges(0)
+
+		// We once again expect one range after resuming the changefeed.
+		require.NoError(t, fooFeed.(cdctest.EnterpriseTestFeed).Resume())
+		assertTotalRanges(1)
+
+		// We expect two ranges after starting another changefeed on a single table.
+		barFeed := feed(t, f, "CREATE CHANGEFEED FOR foo WITH lagging_ranges_polling_interval='1s'")
+		assertTotalRanges(2)
+
+		// We expect there to still be one range after cancelling one of the changefeeds.
+		require.NoError(t, fooFeed.Close())
+		assertTotalRanges(1)
+
+		// We expect there to be no ranges left after cancelling the other changefeed.
+		require.NoError(t, barFeed.Close())
+		assertTotalRanges(0)
+	}
+
+	cdcTest(t, testFn, feedTestEnterpriseSinks)
+}
+
 func TestChangefeedBackfillObservability(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1141,6 +1687,8 @@ func TestChangefeedBackfillObservability(t *testing.T) {
 
 func TestChangefeedUserDefinedTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1204,6 +1752,10 @@ func TestChangefeedUserDefinedTypes(t *testing.T) {
 // targeted by the changefeed, it should not stop.
 func TestNoStopAfterNonTargetColumnDrop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1236,6 +1788,8 @@ func TestNoStopAfterNonTargetColumnDrop(t *testing.T) {
 
 func TestChangefeedProjectionDelete(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1257,6 +1811,8 @@ func TestChangefeedProjectionDelete(t *testing.T) {
 // cluster ID continue functioning.
 func TestChangefeedCanResumeWhenClusterIDMissing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1302,6 +1858,10 @@ func TestChangefeedCanResumeWhenClusterIDMissing(t *testing.T) {
 // If we drop columns which are not targeted by the changefeed, it should not backfill.
 func TestNoBackfillAfterNonTargetColumnDrop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1334,6 +1894,10 @@ func TestNoBackfillAfterNonTargetColumnDrop(t *testing.T) {
 
 func TestChangefeedColumnDropsWithFamilyAndNonFamilyTargets(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1379,6 +1943,10 @@ func TestChangefeedColumnDropsWithFamilyAndNonFamilyTargets(t *testing.T) {
 
 func TestChangefeedColumnDropsOnMultipleFamiliesWithTheSameName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1424,6 +1992,10 @@ func TestChangefeedColumnDropsOnMultipleFamiliesWithTheSameName(t *testing.T) {
 
 func TestChangefeedColumnDropsOnTheSameTableWithMultipleFamilies(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1456,6 +2028,10 @@ func TestChangefeedColumnDropsOnTheSameTableWithMultipleFamilies(t *testing.T) {
 
 func TestNoStopAfterNonTargetAddColumnWithBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -1522,7 +2098,7 @@ func TestChangefeedExternalIODisabled(t *testing.T) {
 		sqlDB.ExecMultiple(t, strings.Split(serverSetupStatements, ";")...)
 		sqlDB.Exec(t, "CREATE TABLE target_table (pk INT PRIMARY KEY)")
 		for _, proto := range disallowedSinkProtos {
-			sqlDB.ExpectErr(t, "Outbound IO is disabled by configuration, cannot create changefeed",
+			sqlDB.ExpectErrWithTimeout(t, "Outbound IO is disabled by configuration, cannot create changefeed",
 				"CREATE CHANGEFEED FOR target_table INTO $1",
 				fmt.Sprintf("%s://does-not-matter", proto),
 			)
@@ -1548,6 +2124,8 @@ func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	skip.UnderRace(t, "takes >1 min under race")
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -1725,7 +2303,7 @@ func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 
 	cdcTest(t, testFn)
 
-	log.Flush()
+	log.FlushFiles()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1, regexp.MustCompile("cdc ux violation"),
 		log.WithFlattenedSensitiveData)
 	if err != nil {
@@ -1760,11 +2338,11 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 
 	// Checkpoint progress frequently, allow a large enough checkpoint, and
 	// reduce the lag threshold to allow lag checkpointing to trigger
-	changefeedbase.FrontierCheckpointFrequency.Override(
+	changefeedbase.SpanCheckpointInterval.Override(
 		context.Background(), &s.ClusterSettings().SV, 10*time.Millisecond)
-	changefeedbase.FrontierCheckpointMaxBytes.Override(
+	changefeedbase.SpanCheckpointMaxBytes.Override(
 		context.Background(), &s.ClusterSettings().SV, 100<<20)
-	changefeedbase.FrontierHighwaterLagCheckpointThreshold.Override(
+	changefeedbase.SpanCheckpointLagThreshold.Override(
 		context.Background(), &s.ClusterSettings().SV, 10*time.Millisecond)
 
 	// We'll start changefeed with the cursor.
@@ -1817,7 +2395,7 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	// (this is mostly due to racy updates sent from aggregators to the frontier.
 	// However, the checkpoint timestamp should be at least at the cursor.
 	progress := loadProgress()
-	require.True(t, progress.GetHighWater().IsEmpty() || progress.GetHighWater().EqOrdering(cursor),
+	require.True(t, progress.GetHighWater().IsEmpty() || *progress.GetHighWater() == cursor,
 		"expected empty highwater or %s,  found %s", cursor, progress.GetHighWater())
 	require.NotNil(t, progress.GetChangefeed().Checkpoint)
 	require.Less(t, 0, len(progress.GetChangefeed().Checkpoint.Spans))
@@ -1894,18 +2472,18 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			Changefeed.(*TestingKnobs)
 
 		// Initialize table
-		sqlDB.Exec(t, `CREATE TABLE foo(key INT PRIMARY KEY DEFAULT unique_rowid(), val INT)`)
-		sqlDB.Exec(t, `INSERT INTO foo (val) SELECT * FROM generate_series(1, 1000)`)
+		sqlDB.Exec(t, `CREATE TABLE foo(key INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `INSERT INTO foo (key) SELECT * FROM generate_series(1, 1000)`)
 
 		// Ensure Scan Requests are always small enough that we receive multiple
 		// resolved events during a backfill
 		knobs.FeedKnobs.BeforeScanRequest = func(b *kv.Batch) error {
-			b.Header.MaxSpanRequestKeys = 10
+			b.Header.MaxSpanRequestKeys = 50
 			return nil
 		}
 
 		// Setup changefeed job details, avoid relying on initial scan functionality
-		baseFeed := feed(t, f, `CREATE CHANGEFEED FOR foo WITH resolved='100ms', no_initial_scan`)
+		baseFeed := feed(t, f, `CREATE CHANGEFEED FOR foo WITH resolved='100ms', min_checkpoint_frequency='100ms', no_initial_scan`)
 		jobFeed := baseFeed.(cdctest.EnterpriseTestFeed)
 		jobRegistry := s.Server.JobRegistry().(*jobs.Registry)
 
@@ -1936,6 +2514,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			prog := loadProgress()
 			if p := prog.GetHighWater(); p != nil && !p.IsEmpty() {
+				t.Logf("highwater: %s", p)
 				return nil
 			}
 			return errors.New("waiting for highwater")
@@ -1945,9 +2524,9 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 		require.NoError(t, jobFeed.Pause())
 
 		// Checkpoint progress frequently, and set the checkpoint size limit.
-		changefeedbase.FrontierCheckpointFrequency.Override(
-			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Millisecond)
-		changefeedbase.FrontierCheckpointMaxBytes.Override(
+		changefeedbase.SpanCheckpointInterval.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 1)
+		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, maxCheckpointSize)
 
 		var tableSpan roachpb.Span
@@ -1980,6 +2559,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 				// change due to a primary index swap.
 				refreshTableSpan()
 				backfillTimestamp = r.Timestamp
+				t.Logf("backfill timestamp: %s", backfillTimestamp)
 				return false, nil
 			}
 
@@ -1998,7 +2578,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			// Filter non-backfill-related spans
 			if !r.Timestamp.Equal(backfillTimestamp.Next()) {
 				// Only allow spans prior to a valid backfillTimestamp to avoid moving past the backfill
-				return !(backfillTimestamp.IsEmpty() || r.Timestamp.LessEq(backfillTimestamp.Next())), nil
+				return backfillTimestamp.IsSet() && !r.Timestamp.LessEq(backfillTimestamp.Next()), nil
 			}
 
 			// At the end of a backfill, kv feed will emit a resolved span for the whole table.
@@ -2026,6 +2606,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			}
 			return errors.New("waiting for checkpoint")
 		})
+		t.Logf("initial checkpoint: %s", initialCheckpoint.Slice())
 
 		require.NoError(t, jobFeed.Pause())
 
@@ -2064,7 +2645,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			// Filter non-backfill-related spans
 			if !r.Timestamp.Equal(backfillTimestamp.Next()) {
 				// Only allow spans prior to a valid backfillTimestamp to avoid moving past the backfill
-				return !(backfillTimestamp.IsEmpty() || r.Timestamp.LessEq(backfillTimestamp.Next())), nil
+				return backfillTimestamp.IsSet() && !r.Timestamp.LessEq(backfillTimestamp.Next()), nil
 			}
 
 			require.Falsef(t, initialCheckpoint.Encloses(r.Span), "second backfill should not resolve checkpointed span")
@@ -2090,6 +2671,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 			}
 			return errors.New("waiting for second checkpoint")
 		})
+		t.Logf("second checkpoint: %s", secondCheckpoint.Slice())
 
 		require.NoError(t, jobFeed.Pause())
 		for _, span := range initialCheckpoint.Slice() {
@@ -2109,10 +2691,11 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 		// checkpoint should eventually be gone once backfill completes.
 		testutils.SucceedsSoon(t, func() error {
 			progress := loadProgress()
-			if p := progress.GetChangefeed(); p == nil || p.Checkpoint == nil || len(p.Checkpoint.Spans) == 0 {
-				return nil
+			if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && len(p.Checkpoint.Spans) > 0 {
+				t.Logf("non-empty checkpoint: %s", progress.GetChangefeed().Checkpoint.Spans)
+				return errors.New("checkpoint still non-empty")
 			}
-			return errors.New("checkpoint still non-empty")
+			return nil
 		})
 
 		// Pause job to avoid race on the resolved array
@@ -2127,7 +2710,7 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 
 	cdcTestWithSystem(t, testFn, feedTestEnterpriseSinks)
 
-	log.Flush()
+	log.FlushFiles()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
 		regexp.MustCompile("cdc ux violation"), log.WithFlattenedSensitiveData)
 	if err != nil {
@@ -2145,6 +2728,8 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 func TestChangefeedSchemaChangeAllowBackfill_Legacy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
 
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2323,7 +2908,7 @@ func TestChangefeedSchemaChangeAllowBackfill_Legacy(t *testing.T) {
 
 	cdcTestWithSystem(t, testFn)
 
-	log.Flush()
+	log.FlushFiles()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
 		regexp.MustCompile("cdc ux violation"), log.WithFlattenedSensitiveData)
 	if err != nil {
@@ -2339,6 +2924,8 @@ func TestChangefeedSchemaChangeAllowBackfill_Legacy(t *testing.T) {
 func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
 
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2480,7 +3067,7 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 
 	cdcTestWithSystem(t, testFn)
 
-	log.Flush()
+	log.FlushFiles()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
 		regexp.MustCompile("cdc ux violation"), log.WithFlattenedSensitiveData)
 	if err != nil {
@@ -2496,6 +3083,8 @@ func TestChangefeedSchemaChangeAllowBackfill(t *testing.T) {
 func TestChangefeedSchemaChangeBackfillScope(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
 
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2543,7 +3132,7 @@ func TestChangefeedSchemaChangeBackfillScope(t *testing.T) {
 	}
 
 	cdcTestWithSystem(t, testFn)
-	log.Flush()
+	log.FlushFiles()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
 		regexp.MustCompile("cdc ux violation"), log.WithFlattenedSensitiveData)
 	if err != nil {
@@ -2558,6 +3147,8 @@ func TestChangefeedSchemaChangeBackfillScope(t *testing.T) {
 func TestChangefeedAfterSchemaChangeBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2574,7 +3165,7 @@ func TestChangefeedAfterSchemaChangeBackfill(t *testing.T) {
 	}
 
 	cdcTest(t, testFn)
-	log.Flush()
+	log.FlushFiles()
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
 		regexp.MustCompile("cdc ux violation"), log.WithFlattenedSensitiveData)
 	if err != nil {
@@ -2589,6 +3180,8 @@ func TestChangefeedEachColumnFamily(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2598,7 +3191,7 @@ func TestChangefeedEachColumnFamily(t *testing.T) {
 		sqlDB.Exec(t, `INSERT INTO foo values (0, 'dog', 'cat')`)
 
 		// Must specify WITH split_column_families
-		sqlDB.ExpectErr(t, `multiple column families`, `CREATE CHANGEFEED FOR foo`)
+		sqlDB.ExpectErrWithTimeout(t, `multiple column families`, `CREATE CHANGEFEED FOR foo`)
 
 		foo := feed(t, f, `CREATE CHANGEFEED FOR foo WITH split_column_families`)
 		defer closeFeed(t, foo)
@@ -2668,7 +3261,7 @@ func TestChangefeedSingleColumnFamily(t *testing.T) {
 		sqlDB.Exec(t, `INSERT INTO foo(a,b,c) values (0, 'dog', 'cat')`)
 		sqlDB.Exec(t, `INSERT INTO foo(a,b,c) values (1, 'dollar', 'cent')`)
 
-		sqlDB.ExpectErr(t, `nosuchfamily`, `CREATE CHANGEFEED FOR foo FAMILY nosuchfamily`)
+		sqlDB.ExpectErrWithTimeout(t, `nosuchfamily`, `CREATE CHANGEFEED FOR foo FAMILY nosuchfamily`)
 
 		fooMost := feed(t, f, `CREATE CHANGEFEED FOR foo FAMILY most`)
 		defer closeFeed(t, fooMost)
@@ -2706,6 +3299,8 @@ func TestChangefeedSingleColumnFamily(t *testing.T) {
 func TestChangefeedSingleColumnFamilySchemaChanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
 
 	// requireErrorSoon times out after 30 seconds
 	skip.UnderStress(t)
@@ -2750,6 +3345,8 @@ func TestChangefeedSingleColumnFamilySchemaChanges(t *testing.T) {
 func TestChangefeedEachColumnFamilySchemaChanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2877,7 +3474,7 @@ func TestChangefeedCreateAuthorizationWithChangefeedPriv(t *testing.T) {
 						if _, ok := s.(*externalConnectionKafkaSink); ok {
 							return s
 						}
-						return &externalConnectionKafkaSink{sink: s}
+						return &externalConnectionKafkaSink{sink: s, ignoreDialError: true}
 					},
 				},
 			},
@@ -3018,10 +3615,10 @@ func TestChangefeedJobControl(t *testing.T) {
 			waitForJobStatus(userDB, t, currentFeed.JobID(), "running")
 		})
 		asUser(t, f, `userWithSomeGrants`, func(userDB *sqlutils.SQLRunner) {
-			userDB.ExpectErr(t, "pq: user userwithsomegrants does not have CHANGEFEED privilege on relation table_b", "PAUSE job $1", currentFeed.JobID())
+			userDB.ExpectErr(t, "user userwithsomegrants does not have CHANGEFEED privilege on relation table_b", "PAUSE job $1", currentFeed.JobID())
 		})
 		asUser(t, f, `regularUser`, func(userDB *sqlutils.SQLRunner) {
-			userDB.ExpectErr(t, "pq: user regularuser does not have CHANGEFEED privilege on relation (table_a|table_b)", "PAUSE job $1", currentFeed.JobID())
+			userDB.ExpectErr(t, "user regularuser does not have CHANGEFEED privilege on relation (table_a|table_b)", "PAUSE job $1", currentFeed.JobID())
 		})
 		closeCf()
 
@@ -3035,10 +3632,10 @@ func TestChangefeedJobControl(t *testing.T) {
 			waitForJobStatus(userDB, t, currentFeed.JobID(), "paused")
 		})
 		asUser(t, f, `userWithAllGrants`, func(userDB *sqlutils.SQLRunner) {
-			userDB.ExpectErr(t, "pq: only admins can control jobs owned by other admins", "PAUSE job $1", currentFeed.JobID())
+			userDB.ExpectErr(t, "only admins can control jobs owned by other admins", "PAUSE job $1", currentFeed.JobID())
 		})
 		asUser(t, f, `jobController`, func(userDB *sqlutils.SQLRunner) {
-			userDB.ExpectErr(t, "pq: only admins can control jobs owned by other admins", "PAUSE job $1", currentFeed.JobID())
+			userDB.ExpectErr(t, "only admins can control jobs owned by other admins", "PAUSE job $1", currentFeed.JobID())
 		})
 		closeCf()
 	}
@@ -3069,6 +3666,130 @@ func TestChangefeedCustomKey(t *testing.T) {
 		requireErrorSoon(context.Background(), t, foo, regexp.MustCompile(`required column b not present`))
 	}
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
+}
+
+// Reproduce issue for #114196. This test verifies that changefeed with custom
+// key column works with CDC queries correctly.
+func TestChangefeedCustomKeyColumnWithCDCQuery(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := map[string]struct {
+		shouldSkip           bool
+		createTableStmt      string
+		createChangeFeedStmt string
+		stmts                []string
+		payloadsAfterStmts   []string
+	}{
+		`select_star`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog", "c": "cat"}`, `foo: ["dog1"]->{"a": 1, "b": "dog1", "c": "cat1"}`},
+		},
+		`select_with_filter`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo WHERE b='dog'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog", "c": "cat"}`},
+		},
+		`select_multiple_columns`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='c', unordered AS SELECT b, c FROM foo WHERE b='dog'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["cat"]->{"b": "dog", "c": "cat"}`},
+		},
+		`custom_key_with_created_column`: {
+			shouldSkip:           true,
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='double_b', unordered AS SELECT concat(b, c) AS double_b FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["cat"]->{"c": "cat"}`},
+		},
+		`select_star_with_builtin_funcs`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='c', unordered AS SELECT *, concat(b, c) FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["cat"]->{"a": 0, "b": "dog", "c": "cat", "concat": "dogcat"}`, `foo: ["cat1"]->{"a": 1, "b": "dog1", "c": "cat1", "concat": "dog1cat1"}`},
+		},
+		`select_stored_column`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING, d STRING AS (concat(b, c)) STORED)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='d', unordered AS SELECT * FROM foo WHERE d='dog1cat1'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog1cat1"]->{"a": 1, "b": "dog1", "c": "cat1", "d": "dog1cat1"}`},
+		},
+		`select_virtual_column`: {
+			shouldSkip:           true,
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, c STRING, d STRING AS (concat(b, c)) VIRTUAL)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='d', unordered AS SELECT d FROM foo WHERE d='dog1cat1'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog', 'cat')`, `INSERT INTO foo VALUES (1, 'dog1', 'cat1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog1cat1"]->{"a": 1, "b": "dog1", "c": "cat1", "d": "dog1cat1"}`},
+		},
+		`select_with_filter_IN`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo WHERE b IN ('dog', 'dog1')`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `INSERT INTO foo VALUES (1, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog"}`, `foo: ["dog1"]->{"a": 1, "b": "dog1"}`},
+		},
+		`select_with_delete`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT *, event_op() = 'delete' AS deleted FROM foo WHERE 'hello' != 'world'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `INSERT INTO foo VALUES (1, 'dog1')`, `DELETE FROM foo WHERE a=1`},
+			payloadsAfterStmts:   []string{`foo: [null]->{"a": 1, "b": null, "deleted": true}`, `foo: ["dog"]->{"a": 0, "b": "dog", "deleted": false}`, `foo: ["dog1"]->{"a": 1, "b": "dog1", "deleted": false}`},
+		},
+		`select_with_filter_delete`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT * FROM foo WHERE event_op() = 'delete'`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `INSERT INTO foo VALUES (1, 'dog1')`, `DELETE FROM foo WHERE a=1`},
+			payloadsAfterStmts:   []string{`foo: [null]->{"a": 1, "b": null}`},
+		},
+		`select_with_cdc_prev`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT *, (cdc_prev) FROM foo`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `UPSERT INTO foo VALUES (0,'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"a": 0, "b": "dog", "cdc_prev": null}`, `foo: ["dog1"]->{"a": 0, "b": "dog1", "cdc_prev": {"a": 0, "b": "dog"}}`},
+		},
+		`select_with_filter_cdc_prev`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT b FROM foo WHERE (cdc_prev).a = 0`,
+			stmts:                []string{`INSERT INTO foo VALUES (0, 'dog')`, `UPSERT INTO foo VALUES (0, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog1"]->{"b": "dog1"}`},
+		},
+		`select_with_hidden_column`: {
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING NOT VISIBLE)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='b', unordered AS SELECT b FROM foo`,
+			stmts:                []string{`INSERT INTO foo(a,b) VALUES (0, 'dog')`, `INSERT INTO foo(a,b) VALUES (1, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"b": "dog"}`, `foo: ["dog1"]->{"b": "dog1"}`},
+		},
+		`select_with_cdc_prev_column`: {
+			shouldSkip:           true,
+			createTableStmt:      `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`,
+			createChangeFeedStmt: `CREATE CHANGEFEED WITH key_column='cdc_prev.a', unordered AS SELECT * FROM foo`,
+			stmts:                []string{`INSERT INTO foo(a,b) VALUES (0, 'dog')`, `INSERT INTO foo(a,b) VALUES (1, 'dog1')`},
+			payloadsAfterStmts:   []string{`foo: ["dog"]->{"b": "dog"}`, `foo: ["dog1"]->{"b": "dog1"}`},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if test.shouldSkip {
+				t.Logf("skipping this test because %s is currently not supported; "+
+					"see #115267 for more details", name)
+				return
+			}
+			testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+				sqlDB := sqlutils.MakeSQLRunner(s.DB)
+				sqlDB.Exec(t, test.createTableStmt)
+				foo := feed(t, f, test.createChangeFeedStmt)
+				defer closeFeed(t, foo)
+				for _, stmt := range test.stmts {
+					sqlDB.Exec(t, stmt)
+				}
+				assertPayloads(t, foo, test.payloadsAfterStmts)
+			}
+			cdcTest(t, testFn, feedTestForceSink("kafka"))
+		})
+	}
 }
 
 func TestChangefeedCustomKeyAvro(t *testing.T) {
@@ -3122,6 +3843,51 @@ func TestChangefeedBareAvro(t *testing.T) {
 		assertPayloads(t, foo, []string{
 			`foo: {"a":{"long":0}}->{"record":{"foo":{"a":{"long":0},"b":{"string":"dog"}}}}`,
 		})
+	}
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
+}
+
+func TestChangefeedEnriched(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO foo values (0, 'dog')`)
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo WITH envelope=enriched`)
+		defer closeFeed(t, foo)
+		// TODO(#139660): the webhook sink forces topic_in_value, but
+		// this is not supported by the enriched envelope type. We should adapt
+		// the test framework to account for this.
+		topic := "foo"
+		if _, ok := foo.(*webhookFeed); ok {
+			topic = ""
+		}
+		assertPayloadsEnvelopeStripTs(t, foo, changefeedbase.OptEnvelopeEnriched, []string{
+			fmt.Sprintf(`%s: [0]->{"payload": {"after": {"a": 0, "b": "dog"}, "op": "c"}}`, topic),
+		})
+	}
+	supportedSinks := []string{"kafka", "pubsub", "sinkless", "webhook"}
+	for _, sink := range supportedSinks {
+		cdcTest(t, testFn, feedTestForceSink(sink))
+	}
+}
+
+func TestChangefeedEnrichedAvro(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO foo values (0, 'dog')`)
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo WITH envelope=enriched, format=avro, confluent_schema_registry='localhost:90909'`)
+		// The feed should allow this configuration.
+		defer closeFeed(t, foo)
+		// TODO(#139660): assert messages once this envelope type is integrated into the test suite.
 	}
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
@@ -3220,60 +3986,125 @@ func TestChangefeedAvroNotice(t *testing.T) {
 	expectNotice(t, s.Server, sql, `avro is no longer experimental, use format=avro`)
 }
 
+func TestChangefeedResolvedNotice(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	cluster, _, cleanup := startTestCluster(t)
+	defer cleanup()
+	s := cluster.Server(1)
+
+	pgURL, cleanup := sqlutils.PGUrl(t, s.SQLAddr(), t.Name(), url.User(username.RootUser))
+	defer cleanup()
+	pgBase, err := pq.NewConnector(pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actual string
+	connector := pq.ConnectorWithNoticeHandler(pgBase, func(n *pq.Error) {
+		actual = n.Message
+	})
+
+	dbWithHandler := gosql.OpenDB(connector)
+	defer dbWithHandler.Close()
+
+	sqlDB := sqlutils.MakeSQLRunner(dbWithHandler)
+
+	sqlDB.Exec(t, `CREATE TABLE ☃ (i INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `INSERT INTO ☃ VALUES (0)`)
+
+	t.Run("resolved<min_checkpoint_frequency", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='5s', min_checkpoint_frequency='10s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `resolved (5s) messages will not be emitted more frequently than the configured min_checkpoint_frequency (10s), but may be emitted less frequently`, actual)
+	})
+	t.Run("resolved<min_checkpoint_frequency default", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='20ms'`)
+		defer closeFeed(t, testFeed)
+		// Note: default min_checkpoint_frequency is set to 100ms in startTestCluster.
+		require.Equal(t, `resolved (20ms) messages will not be emitted more frequently than the configured min_checkpoint_frequency (100ms), but may be emitted less frequently`, actual)
+	})
+	t.Run("resolved=min_checkpoint_frequency", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='5s', min_checkpoint_frequency='5s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
+	})
+	t.Run("resolved>min_checkpoint_frequency", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='10s', min_checkpoint_frequency='5s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
+	})
+	t.Run("resolved default", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved, min_checkpoint_frequency='10s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `resolved (0s) messages will not be emitted more frequently than the configured min_checkpoint_frequency (10s), but may be emitted less frequently`, actual)
+	})
+}
+
 func TestChangefeedOutputTopics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
-		pgURL, cleanup := sqlutils.PGUrl(t, s.Server.SQLAddr(), t.Name(), url.User(username.RootUser))
-		defer cleanup()
-		pgBase, err := pq.NewConnector(pgURL.String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		actual := "(no notice)"
-		connector := pq.ConnectorWithNoticeHandler(pgBase, func(n *pq.Error) {
-			actual = n.Message
-		})
+	cluster, _, cleanup := startTestCluster(t)
+	defer cleanup()
+	s := cluster.Server(1)
 
-		dbWithHandler := gosql.OpenDB(connector)
-		defer dbWithHandler.Close()
+	// Only pubsub v2 emits notices.
+	PubsubV2Enabled.Override(context.Background(), &s.ClusterSettings().SV, true)
 
-		sqlDB := sqlutils.MakeSQLRunner(dbWithHandler)
-
-		sqlDB.Exec(t, `CREATE TABLE ☃ (i INT PRIMARY KEY)`)
-		sqlDB.Exec(t, `INSERT INTO ☃ VALUES (0)`)
-
-		tg := newTeeGroup()
-		feedCh := make(chan *sarama.ProducerMessage, 1024)
-		wrapSink := func(s Sink) Sink {
-			return &fakeKafkaSink{
-				Sink:   s,
-				tg:     tg,
-				feedCh: feedCh,
-			}
-		}
-
-		jobFeed := newJobFeed(dbWithHandler, wrapSink)
-		jobFeed.jobID = jobspb.InvalidJobID
-
-		c := &kafkaFeed{
-			jobFeed:        jobFeed,
-			seenTrackerMap: make(map[string]struct{}),
-			source:         feedCh,
-			tg:             tg,
-		}
-		defer func() {
-			err = c.Close()
-			require.NoError(t, err)
-		}()
-		kafkaFeed := mustBeKafkaFeedFactory(f)
-		kafkaFeed.di.prepareJob(c.jobFeed)
-
-		sqlDB.Exec(t, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/'`)
-		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
+	pgURL, cleanup := sqlutils.PGUrl(t, s.SQLAddr(), t.Name(), url.User(username.RootUser))
+	defer cleanup()
+	pgBase, err := pq.NewConnector(pgURL.String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	cdcTest(t, testFn, feedTestForceSink("kafka"))
+	var actual string
+	connector := pq.ConnectorWithNoticeHandler(pgBase, func(n *pq.Error) {
+		actual = n.Message
+	})
+
+	dbWithHandler := gosql.OpenDB(connector)
+	defer dbWithHandler.Close()
+
+	sqlDB := sqlutils.MakeSQLRunner(dbWithHandler)
+
+	sqlDB.Exec(t, `CREATE TABLE ☃ (i INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `INSERT INTO ☃ VALUES (0)`)
+
+	t.Run("kafka", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
+	})
+
+	t.Run("pubsub v2", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makePubsubFeedFactory(s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'gcpubsub://does.not.matter/'`)
+		defer closeFeed(t, testFeed)
+		// Pubsub doesn't sanitize the topic name.
+		require.Equal(t, `changefeed will emit to topic ☃`, actual)
+	})
+
+	t.Run("webhooks does not emit anything", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makePubsubFeedFactory(s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'webhook-https://does.not.matter/'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `(no notice)`, actual)
+	})
 }
 
 // requireErrorSoon polls for the test feed for an error and asserts that
@@ -3316,9 +4147,8 @@ func TestChangefeedFailOnTableOffline(t *testing.T) {
 
 	cdcTestNamedWithSystem(t, "import fails changefeed", func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t, ""))
+		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t))
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
 		sqlDB.Exec(t, `CREATE TABLE for_import (a INT PRIMARY KEY, b INT)`)
 		defer sqlDB.Exec(t, `DROP TABLE for_import`)
 		sqlDB.Exec(t, `INSERT INTO for_import VALUES (0, NULL)`)
@@ -3335,7 +4165,6 @@ func TestChangefeedFailOnTableOffline(t *testing.T) {
 	cdcTestNamedWithSystem(t, "reverted import fails changefeed with earlier cursor", func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sysSQLDB := sqlutils.MakeSQLRunner(s.SystemDB)
 		sysSQLDB.Exec(t, "SET CLUSTER SETTING kv.bulk_io_write.small_write_size = '1'")
-		sysSQLDB.Exec(t, "SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true")
 
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE for_import (a INT PRIMARY KEY, b INT)`)
@@ -3347,7 +4176,7 @@ func TestChangefeedFailOnTableOffline(t *testing.T) {
 		// Start an import job which will immediately pause after ingestion
 		sqlDB.Exec(t, "SET CLUSTER SETTING jobs.debug.pausepoints = 'import.after_ingest';")
 		go func() {
-			sqlDB.ExpectErr(t, `pause point`, `IMPORT INTO for_import CSV DATA ($1);`, dataSrv.URL)
+			sqlDB.ExpectErrWithTimeout(t, `pause point`, `IMPORT INTO for_import CSV DATA ($1);`, dataSrv.URL)
 		}()
 		sqlDB.CheckQueryResultsRetry(
 			t,
@@ -3397,7 +4226,7 @@ func TestChangefeedRestartMultiNode(t *testing.T) {
 	db = cluster.ServerConn(feedServerID)
 	sqlDB = sqlutils.MakeSQLRunner(db)
 
-	f := makeKafkaFeedFactory(cluster, db)
+	f := makeKafkaFeedFactory(t, cluster, db)
 	feed := feed(t, f, "CREATE CHANGEFEED FOR test_tab WITH updated")
 	defer closeFeed(t, feed)
 	assertPayloadsStripTs(t, feed, []string{
@@ -3455,7 +4284,7 @@ func TestChangefeedStopPolicyMultiNode(t *testing.T) {
 	db = cluster.ServerConn(feedServerID)
 	sqlDB = sqlutils.MakeSQLRunner(db)
 
-	f := makeKafkaFeedFactory(cluster, db)
+	f := makeKafkaFeedFactory(t, cluster, db)
 	feed := feed(t, f, "CREATE CHANGEFEED FOR test_tab WITH schema_change_policy='stop'")
 	defer closeFeed(t, feed)
 	sqlDB.Exec(t, `INSERT INTO test_tab VALUES (1)`)
@@ -3483,9 +4312,8 @@ func TestChangefeedWorksOnRBRChange(t *testing.T) {
 
 	testFnJSON := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t, ""))
+		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t))
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
 		t.Run("regional by row change works", func(t *testing.T) {
 			sqlDB.Exec(t, `CREATE TABLE rbr (a INT PRIMARY KEY, b INT)`)
 			defer sqlDB.Exec(t, `DROP TABLE rbr`)
@@ -3554,7 +4382,9 @@ func TestChangefeedWorksOnRBRChange(t *testing.T) {
 	//
 	// error executing 'ALTER DATABASE d PRIMARY REGION
 	// "us-east-1"': pq: get_live_cluster_regions: unimplemented:
-	// operation is unsupported in multi-tenancy mode
+	// operation is unsupported inside virtual clusters
+	//
+	// TODO(knz): This seems incorrect; see issue #109418.
 	opts := []feedTestOption{
 		feedTestNoTenants,
 		feedTestEnterpriseSinks,
@@ -3573,7 +4403,7 @@ func TestChangefeedRBRAvroAddRegion(t *testing.T) {
 	cluster, db, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	f := makeKafkaFeedFactory(cluster, db)
+	f := makeKafkaFeedFactory(t, cluster, db)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE TABLE rbr (a INT PRIMARY KEY)`)
 	waitForSchemaChange(t, sqlDB, `ALTER TABLE rbr SET LOCALITY REGIONAL BY ROW`)
@@ -3627,17 +4457,14 @@ func TestChangefeedStopOnSchemaChange(t *testing.T) {
 	}
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t, ""))
+		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t))
 		// Shorten the intervals so this test doesn't take so long. We need to wait
 		// for timestamps to get resolved.
 		sysDB.Exec(t, "SET CLUSTER SETTING changefeed.experimental_poll_interval = '200ms'")
 		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING changefeed.experimental_poll_interval = '200ms'")
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '50ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '50ms'")
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '50ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '50ms'")
 
 		t.Run("add column not null", func(t *testing.T) {
 			sqlDB.Exec(t, `CREATE TABLE add_column_not_null (a INT PRIMARY KEY)`)
@@ -3761,7 +4588,7 @@ func TestChangefeedNoBackfill(t *testing.T) {
 	skip.UnderShort(t)
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t, ""))
+		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t))
 
 		usingLegacySchemaChanger := maybeDisableDeclarativeSchemaChangesForTest(t, sqlDB)
 
@@ -3770,11 +4597,8 @@ func TestChangefeedNoBackfill(t *testing.T) {
 		sysDB.Exec(t, "SET CLUSTER SETTING changefeed.experimental_poll_interval = '200ms'")
 		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING changefeed.experimental_poll_interval = '200ms'")
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '50ms'")
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10ms'")
 		sysDB.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10ms'")
-		sysDB.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10ms'")
 
 		t.Run("add column not null", func(t *testing.T) {
 			sqlDB.Exec(t, `CREATE TABLE add_column_not_null (a INT PRIMARY KEY)`)
@@ -4073,7 +4897,13 @@ func TestChangefeedTruncateOrDrop(t *testing.T) {
 		defer closeFeed(t, drop)
 		assertPayloads(t, drop, []string{`drop: [1]->{"after": {"a": 1}}`})
 		sqlDB.Exec(t, `DROP TABLE drop`)
-		const dropOrOfflineRE = `"drop" was dropped|CHANGEFEED cannot target offline table: drop`
+		// Dropping the table should cause the schema feed to return an error.
+		// This error can either come from validateDescriptor (the first two)
+		// or the lease manager (catalog.ErrDescriptorDropped).
+		dropOrOfflineRE := fmt.Sprintf(
+			`"drop" was dropped|CHANGEFEED cannot target offline table: drop|%s`,
+			catalog.ErrDescriptorDropped,
+		)
 		if err := drainUntilErr(drop); !testutils.IsError(err, dropOrOfflineRE) {
 			t.Errorf(`expected %q error, instead got: %+v`, dropOrOfflineRE, err)
 		}
@@ -4090,7 +4920,7 @@ func TestChangefeedMonitoring(t *testing.T) {
 
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t, ""))
+		sysDB := sqlutils.MakeSQLRunner(s.SystemServer.SQLConn(t))
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
 
@@ -4162,7 +4992,6 @@ func TestChangefeedMonitoring(t *testing.T) {
 		// Check that two changefeeds add correctly.
 		// Set cluster settings back so we don't interfere with schema changes.
 		sysDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s'`)
-		sysDB.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s'`)
 		fooCopy := feed(t, f, `CREATE CHANGEFEED FOR foo`)
 		_, _ = fooCopy.Next()
 		_, _ = fooCopy.Next()
@@ -4199,7 +5028,6 @@ func TestChangefeedMonitoring(t *testing.T) {
 func TestChangefeedRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		knobs := s.TestingKnobs.
@@ -4561,7 +5389,7 @@ func TestChangefeedErrors(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Locality: roachpb.Locality{
 			Tiers: []roachpb.Tier{{
 				Key:   "region",
@@ -4569,117 +5397,120 @@ func TestChangefeedErrors(t *testing.T) {
 			}},
 		},
 	})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+
 	schemaReg := cdctest.StartTestSchemaRegistry()
 	defer schemaReg.Close()
 
-	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.SucceedsSoonDuration = 5 * time.Second
+
+	// Another SQLDB that has a longer "SucceedsSoonDuration", because some tests will take longer to fail due to DNS resolution retries.
+	longTimeoutSQLDB := sqlutils.MakeSQLRunner(db)
+	longTimeoutSQLDB.SucceedsSoonDuration = 30 * time.Second
+
 	sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 	sqlDB.Exec(t, `CREATE DATABASE d`)
 
 	// Changefeeds default to rangefeed, but for now, rangefeed defaults to off.
 	// Verify that this produces a useful error.
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = false`)
+	for _, l := range []serverutils.ApplicationLayerInterface{s, srv.SystemLayer()} {
+		kvserver.RangefeedEnabled.Override(ctx, &l.ClusterSettings().SV, false)
+	}
+
 	sqlDB.Exec(t, `CREATE TABLE rangefeed_off (a INT PRIMARY KEY)`)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `rangefeeds require the kv.rangefeed.enabled setting`,
 		`EXPERIMENTAL CHANGEFEED FOR rangefeed_off`,
 	)
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+
+	for _, l := range []serverutils.ApplicationLayerInterface{s, srv.SystemLayer()} {
+		kvserver.RangefeedEnabled.Override(ctx, &l.ClusterSettings().SV, true)
+	}
 
 	// Feature flag for changefeeds is off — test that CREATE CHANGEFEED and
 	// EXPERIMENTAL CHANGEFEED FOR surface error.
-	sqlDB.Exec(t, `SET CLUSTER SETTING feature.changefeed.enabled = false`)
-	sqlDB.ExpectErr(t, `feature CHANGEFEED was disabled by the database administrator`,
+	featureChangefeedEnabled.Override(ctx, &s.ClusterSettings().SV, false)
+	sqlDB.ExpectErrWithTimeout(t, `feature CHANGEFEED was disabled by the database administrator`,
 		`CREATE CHANGEFEED FOR foo`)
-	sqlDB.ExpectErr(t, `feature CHANGEFEED was disabled by the database administrator`,
+	sqlDB.ExpectErrWithTimeout(t, `feature CHANGEFEED was disabled by the database administrator`,
 		`EXPERIMENTAL CHANGEFEED FOR foo`)
+	featureChangefeedEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 
-	sqlDB.Exec(t, `SET CLUSTER SETTING feature.changefeed.enabled = true`)
-
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `unknown format: nope`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH format=nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `unknown envelope: nope`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH envelope=nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `time: invalid duration "bar"`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH resolved='bar'`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `negative durations are not accepted: resolved='-1s'`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH resolved='-1s'`,
 	)
 
-	sqlDB.ExpectErr(
-		t, `cannot specify timestamp in the future`,
+	sqlDB.ExpectErrWithTimeout(
+		t, `request timestamp .* too far in future`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH cursor=$1`, timeutil.Now().Add(time.Hour),
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `omit the SINK clause`,
 		`CREATE CHANGEFEED FOR foo INTO ''`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `omit the SINK clause`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, ``,
 	)
 
-	enableEnterprise := utilccl.TestingDisableEnterprise()
-	sqlDB.ExpectErr(
-		t, `CHANGEFEED requires an enterprise license`,
-		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope`,
-	)
-	sqlDB.ExpectErr(
-		t, `use of AS SELECT requires an enterprise license`,
-		`CREATE CHANGEFEED AS SELECT * FROM foo`,
-	)
-	enableEnterprise()
-
 	// Watching system.jobs would create a cycle, since the resolved timestamp
 	// high-water mark is saved in it.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `not supported on system tables`,
 		`EXPERIMENTAL CHANGEFEED FOR system.jobs`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `table "bar" does not exist`,
 		`EXPERIMENTAL CHANGEFEED FOR bar`,
 	)
 	sqlDB.Exec(t, `CREATE SEQUENCE seq`)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `CHANGEFEED cannot target sequences: seq`,
 		`EXPERIMENTAL CHANGEFEED FOR seq`,
 	)
 	sqlDB.Exec(t, `CREATE VIEW vw AS SELECT a, b FROM foo`)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `CHANGEFEED cannot target views: vw`,
 		`EXPERIMENTAL CHANGEFEED FOR vw`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `CHANGEFEED targets TABLE foo and TABLE foo are duplicates`,
 		`EXPERIMENTAL CHANGEFEED FOR foo, foo`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `CHANGEFEED targets TABLE foo and TABLE defaultdb.foo are duplicates`,
 		`EXPERIMENTAL CHANGEFEED FOR foo, defaultdb.foo`,
 	)
 	sqlDB.Exec(t,
 		`CREATE TABLE threefams (a int, b int, c int, family f_a(a), family f_b(b), family f_c(c))`)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `CHANGEFEED targets TABLE foo FAMILY f_a and TABLE foo FAMILY f_a are duplicates`,
 		`EXPERIMENTAL CHANGEFEED FOR foo family f_a, foo FAMILY f_b, foo FAMILY f_a`,
 	)
 
 	// Backup has the same bad error message #28170.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `"information_schema.tables" does not exist`,
 		`EXPERIMENTAL CHANGEFEED FOR information_schema.tables`,
 	)
@@ -4688,14 +5519,14 @@ func TestChangefeedErrors(t *testing.T) {
 	// to pass.
 	sqlDB.Exec(t, `CREATE TABLE dec (a DECIMAL PRIMARY KEY)`)
 	sqlDB.Exec(t, `INSERT INTO dec VALUES (1.0)`)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `.*column a: decimal with no precision`,
 		`EXPERIMENTAL CHANGEFEED FOR dec WITH format=$1, confluent_schema_registry=$2`,
 		changefeedbase.OptFormatAvro, schemaReg.URL(),
 	)
 	sqlDB.Exec(t, `CREATE TABLE "oid" (a OID PRIMARY KEY)`)
 	sqlDB.Exec(t, `INSERT INTO "oid" VALUES (3::OID)`)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `.*column a: type OID not yet supported with avro`,
 		`EXPERIMENTAL CHANGEFEED FOR "oid" WITH format=$1, confluent_schema_registry=$2`,
 		changefeedbase.OptFormatAvro, schemaReg.URL(),
@@ -4706,289 +5537,300 @@ func TestChangefeedErrors(t *testing.T) {
 	}
 
 	// Check that sink URLs have valid scheme
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `no scheme found for sink URL`,
 		`CREATE CHANGEFEED FOR foo INTO 'kafka%3A%2F%2Fnope%0A'`,
 	)
 
 	// Check that confluent_schema_registry is only accepted if format is avro.
 	// TODO: This should be testing it as a WITH option and check avro_schema_prefix too
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, unknownParams("SQL", "confluent_schema_registry", "weird"),
 		`CREATE CHANGEFEED FOR foo INTO $1`, `experimental-sql://d/?confluent_schema_registry=foo&weird=bar`,
 	)
 
-	// Check unavailable kafka.
-	sqlDB.ExpectErr(
-		t, `client has run out of available brokers`,
+	badHostErrRE := "client has run out of available brokers"
+	if KafkaV2Enabled.Get(&s.ClusterSettings().SV) {
+		badHostErrRE = "(unable to dial|unable to open connection to broker|lookup .* on .*: server misbehaving|connection refused)"
+	}
+
+	// Check unavailable kafka - bad dns.
+	longTimeoutSQLDB.ExpectErrWithTimeout(
+		t, badHostErrRE,
 		`CREATE CHANGEFEED FOR foo INTO 'kafka://nope'`,
 	)
 
+	// Check unavailable kafka - not running.
+	sqlDB.ExpectErrWithTimeout(
+		t, badHostErrRE,
+		`CREATE CHANGEFEED FOR foo INTO 'kafka://localhost:9999'`,
+	)
+
 	// Test that a well-formed URI gets as far as unavailable kafka error.
-	sqlDB.ExpectErr(
-		t, `client has run out of available brokers`,
+	longTimeoutSQLDB.ExpectErrWithTimeout(
+		t, badHostErrRE,
 		`CREATE CHANGEFEED FOR foo INTO 'kafka://nope/?tls_enabled=true&insecure_tls_skip_verify=true&topic_name=foo'`,
 	)
 
 	// kafka_topic_prefix was referenced by an old version of the RFC, it's
 	// "topic_prefix" now.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, unknownParams(`kafka`, `kafka_topic_prefix`),
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?kafka_topic_prefix=foo`,
 	)
 
 	// topic_name is only honored for kafka sinks
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, unknownParams("SQL", "topic_name"),
 		`CREATE CHANGEFEED FOR foo INTO $1`, `experimental-sql://d/?topic_name=foo`,
 	)
 
 	// schema_topic will be implemented but isn't yet.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `schema_topic is not yet supported`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?schema_topic=foo`,
 	)
 
 	// Sanity check kafka tls parameters.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param tls_enabled must be a bool`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?tls_enabled=foo`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param insecure_tls_skip_verify must be a bool`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?tls_enabled=true&insecure_tls_skip_verify=foo`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param ca_cert must be base 64 encoded`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?ca_cert=!`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `ca_cert requires tls_enabled=true`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?&ca_cert=Zm9v`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param client_cert must be base 64 encoded`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?client_cert=!`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param client_key must be base 64 encoded`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?client_key=!`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `client_cert requires tls_enabled=true`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?client_cert=Zm9v`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `client_cert requires client_key to be set`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?tls_enabled=true&client_cert=Zm9v`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `client_key requires client_cert to be set`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?tls_enabled=true&client_key=Zm9v`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `invalid client certificate`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?tls_enabled=true&client_cert=Zm9v&client_key=Zm9v`,
 	)
 
 	// Sanity check kafka sasl parameters.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param sasl_enabled must be a bool`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=maybe`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param sasl_handshake must be a bool`,
-		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_handshake=maybe`,
+		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_user=x&sasl_password=y&sasl_handshake=maybe`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_enabled must be enabled to configure SASL handshake behavior`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_handshake=false`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_user must be provided when SASL is enabled`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_password must be provided when SASL is enabled`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_user=a`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_user must be provided when SASL is enabled using mechanism SCRAM-SHA-256`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_mechanism=SCRAM-SHA-256`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_client_id must be provided when SASL is enabled using mechanism OAUTHBEARER`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_mechanism=OAUTHBEARER`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_enabled must be enabled if sasl_user is provided`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_user=a`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_enabled must be enabled if sasl_password is provided`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_password=a`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_client_id is only a valid parameter for sasl_mechanism=OAUTHBEARER`,
-		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_client_id=a`,
+		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_client_id=a`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_enabled must be enabled to configure SASL mechanism`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_mechanism=SCRAM-SHA-256`,
 	)
-	sqlDB.ExpectErr(
-		t, `param sasl_mechanism must be one of SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER, or PLAIN`,
+	sqlDB.ExpectErrWithTimeout(
+		t, `param sasl_mechanism must be one of AWS_MSK_IAM, OAUTHBEARER, PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_mechanism=unsuppported`,
 	)
-	sqlDB.ExpectErr(
-		t, `client has run out of available brokers`,
+	sqlDB.ExpectErrWithTimeout(
+		t, badHostErrRE,
 		`CREATE CHANGEFEED FOR foo INTO 'kafka://nope/' WITH kafka_sink_config='{"Flush": {"Messages": 100, "Frequency": "1s"}}'`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `this sink is incompatible with option webhook_client_timeout`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='1s'`,
 		`kafka://nope/`,
 	)
 	// The avro format doesn't support key_in_value or topic_in_value yet.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `key_in_value is not supported with format=avro`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH key_in_value, format='experimental_avro'`,
 		`kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `topic_in_value is not supported with format=avro`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH topic_in_value, format='experimental_avro'`,
 		`kafka://nope`,
 	)
 
 	// Unordered flag required for some options, disallowed for others.
-	sqlDB.ExpectErr(t, `resolved timestamps cannot be guaranteed to be correct in unordered mode`, `CREATE CHANGEFEED FOR foo WITH resolved, unordered`)
-	sqlDB.ExpectErr(t, `Use of gcpubsub without specifying a region requires the WITH unordered option.`, `CREATE CHANGEFEED FOR foo INTO "gcpubsub://foo"`)
-	sqlDB.ExpectErr(t, `key_column requires the unordered option`, `CREATE CHANGEFEED FOR foo WITH key_column='b'`)
+	sqlDB.ExpectErrWithTimeout(t, `resolved timestamps cannot be guaranteed to be correct in unordered mode`, `CREATE CHANGEFEED FOR foo WITH resolved, unordered`)
+	sqlDB.ExpectErrWithTimeout(t, `Use of gcpubsub without specifying a region requires the WITH unordered option.`, `CREATE CHANGEFEED FOR foo INTO "gcpubsub://foo"`)
+	sqlDB.ExpectErrWithTimeout(t, `key_column requires the unordered option`, `CREATE CHANGEFEED FOR foo WITH key_column='b'`)
 
 	// The topics option should not be exposed to users since it is used
 	// internally to display topics in the show changefeed jobs query
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `invalid option "topics"`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH topics='foo,bar'`,
 		`kafka://nope`,
 	)
 
 	// The cloudStorageSink is particular about the options it will work with.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `this sink is incompatible with option confluent_schema_registry`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH format='avro', confluent_schema_registry=$2`,
 		`experimental-nodelocal://1/bar`, schemaReg.URL(),
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `this sink is incompatible with envelope=key_only`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH envelope='key_only'`,
 		`experimental-nodelocal://1/bar`,
 	)
 
 	// WITH key_in_value requires envelope=wrapped
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `key_in_value is only usable with envelope=wrapped`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH key_in_value, envelope='key_only'`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `key_in_value is only usable with envelope=wrapped`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH key_in_value, envelope='row'`, `kafka://nope`,
 	)
 
 	// WITH topic_in_value requires envelope=wrapped
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `topic_in_value is only usable with envelope=wrapped`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH topic_in_value, envelope='key_only'`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `topic_in_value is only usable with envelope=wrapped`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH topic_in_value, envelope='row'`, `kafka://nope`,
 	)
 
 	// WITH initial_scan and no_initial_scan disallowed
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan and no_initial_scan`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan, no_initial_scan`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan and no_initial_scan`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH no_initial_scan, initial_scan`, `kafka://nope`,
 	)
 
 	// WITH only_initial_scan and no_initial_scan disallowed
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and no_initial_scan`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan_only, no_initial_scan`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and no_initial_scan`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH no_initial_scan, initial_scan_only`, `kafka://nope`,
 	)
 
 	// WITH initial_scan_only and initial_scan disallowed
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan and initial_scan_only`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan_only, initial_scan`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan and initial_scan_only`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan, initial_scan_only`, `kafka://nope`,
 	)
 
 	// WITH only_initial_scan and end_time disallowed
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan_only, end_time = '1'`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH end_time = '1', initial_scan_only`, `kafka://nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH end_time = '1', initial_scan = 'only'`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and end_time`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan = 'only', end_time = '1'`, `kafka://nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and resolved`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH resolved, initial_scan = 'only'`, `kafka://nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and diff`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH diff, initial_scan = 'only'`, `kafka://nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and mvcc_timestamp`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH mvcc_timestamp, initial_scan = 'only'`, `kafka://nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan='only' and updated`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH updated, initial_scan = 'only'`, `kafka://nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `unknown initial_scan: foo`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan = 'foo'`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan and no_initial_scan`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan = 'yes', no_initial_scan`, `kafka://nope`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `cannot specify both initial_scan and initial_scan_only`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH initial_scan = 'no', initial_scan_only`, `kafka://nope`,
 	)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `format=csv is only usable with initial_scan_only`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH format = csv`, `kafka://nope`,
 	)
@@ -4996,142 +5838,182 @@ func TestChangefeedErrors(t *testing.T) {
 	var tsCurrent string
 	sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&tsCurrent)
 
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t,
 		fmt.Sprintf(`specified end time 1.0000000000 cannot be less than statement time %s`, tsCurrent),
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH cursor = $2, end_time = '1.0000000000'`, `kafka://nope`, tsCurrent,
 	)
 
 	// Sanity check schema registry tls parameters.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param ca_cert must be base 64 encoded`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH format='experimental_avro', confluent_schema_registry=$2`,
 		`kafka://nope`, `https://schemareg-nope/?ca_cert=!`,
 	)
-	sqlDB.ExpectErr(
+	longTimeoutSQLDB.ExpectErrWithTimeout(
 		t, `failed to parse certificate data`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH format='experimental_avro', confluent_schema_registry=$2`,
 		`kafka://nope`, `https://schemareg-nope/?ca_cert=Zm9v`,
 	)
 
 	// Sanity check webhook sink options.
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param insecure_tls_skip_verify must be a bool`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `webhook-https://fake-host?insecure_tls_skip_verify=foo`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `param ca_cert must be base 64 encoded`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `webhook-https://fake-host?ca_cert=?`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `failed to parse certificate data`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `webhook-https://fake-host?ca_cert=Zm9v`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `sink requires webhook-https`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `webhook-http://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `this sink is incompatible with option confluent_schema_registry`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH format='avro', confluent_schema_registry=$2`,
 		`webhook-https://fake-host`, schemaReg.URL(),
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `problem parsing option webhook_client_timeout: time: invalid duration "not_an_integer"`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='not_an_integer'`, `webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `option webhook_client_timeout must be a duration greater than 0`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='0s'`, `webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `negative durations are not accepted: webhook_client_timeout='-500s'`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='-500s'`, `webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `problem parsing option webhook_client_timeout: time: missing unit in duration`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_client_timeout='0.5'`, `webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `this sink is incompatible with envelope=key_only`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH envelope='key_only'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `this sink is incompatible with envelope=row`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH envelope='row'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `invalid sink config, all values must be non-negative`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='{"Flush": {"Messages": -100, "Frequency": "1s"}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `invalid sink config, all values must be non-negative`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='{"Flush": {"Messages": 100, "Frequency": "-1s"}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `invalid sink config, Flush.Frequency is not set, messages may never be sent`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='{"Flush": {"Messages": 100}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `error unmarshalling json: time: invalid duration "Zm9v"`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='{"Flush": {"Frequency": "Zm9v"}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `error unmarshalling json: invalid character`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='not json'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `this sink is incompatible with option compression`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH compression='gzip'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `Retry.Max must be either a positive int or 'inf' for infinite retries.`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='{"Retry": {"Max": "not valid"}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `Retry.Max must be a positive integer. use 'inf' for infinite retries.`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='{"Retry": {"Max": 0}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `Retry.Max must be a positive integer. use 'inf' for infinite retries.`,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH webhook_sink_config='{"Retry": {"Max": -1}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, ``,
 		`CREATE CHANGEFEED FOR foo INTO $1 WITH updated, webhook_sink_config='{"Retry":{"Max":"inf"}}'`,
 		`webhook-https://fake-host`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `client_cert requires client_key to be set`,
 		`CREATE CHANGEFEED FOR foo INTO $1`,
 		`webhook-https://fake-host?client_cert=Zm9v`,
 	)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `client_key requires client_cert to be set`,
 		`CREATE CHANGEFEED FOR foo INTO $1`,
 		`webhook-https://fake-host?client_key=Zm9v`,
 	)
 
 	// Sanity check on_error option
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `option "on_error" requires a value`,
 		`CREATE CHANGEFEED FOR foo into $1 WITH on_error`,
 		`kafka://nope`)
-	sqlDB.ExpectErr(
+	sqlDB.ExpectErrWithTimeout(
 		t, `unknown on_error: not_valid, valid values are 'pause' and 'fail'`,
 		`CREATE CHANGEFEED FOR foo into $1 WITH on_error='not_valid'`,
 		`kafka://nope`)
+
+	sqlDB.ExpectErrWithTimeout(
+		t, `envelope=enriched is incompatible with SELECT statement`,
+		`CREATE CHANGEFEED INTO 'null://' WITH envelope=enriched AS SELECT * from foo`,
+	)
+	sqlDB.ExpectErrWithTimeout(
+		t, `envelope=enriched is only usable with format=json/avro`,
+		`CREATE CHANGEFEED FOR foo INTO 'null://' WITH envelope=enriched, format=csv, initial_scan='only'`,
+	)
+	sqlDB.ExpectErrWithTimeout(
+		// I also would have accepted "this sink is incompatible with envelope=enriched".
+		t, `envelope=enriched is only usable with format=json/avro`,
+		`CREATE CHANGEFEED FOR foo INTO 'nodelocal://.' WITH envelope=enriched, format=parquet`,
+	)
+	sqlDB.ExpectErrWithTimeout(
+		t, `this sink is incompatible with envelope=enriched`,
+		`CREATE CHANGEFEED FOR foo INTO 'nodelocal://.' WITH envelope=enriched`,
+	)
+
+	t.Run("sinkless enriched non-json", func(t *testing.T) {
+		skip.WithIssue(t, 130949, "sinkless feed validations are subpar")
+		sqlDB.ExpectErrWithTimeout(
+			t, `some error`,
+			`CREATE CHANGEFEED FOR foo WITH envelope=enriched, format=avro, confluent_schema_registry='http://localhost:8888'`,
+		)
+	})
+
+	t.Run("enriched alters", func(t *testing.T) {
+		res := sqlDB.QueryStr(t, `CREATE CHANGEFEED FOR FOO INTO 'null://' WITH envelope=enriched`)
+		jobIDStr := res[0][0]
+		jobID, err := strconv.Atoi(jobIDStr)
+		require.NoError(t, err)
+		sqlDB.Exec(t, `PAUSE JOB $1`, jobID)
+		waitForJobStatus(sqlDB, t, catpb.JobID(jobID), jobs.StatusPaused)
+		sqlDB.ExpectErrWithTimeout(
+			t, `envelope=enriched is only usable with format=json/avro`,
+			`ALTER CHANGEFEED $1 SET format=parquet`, jobIDStr,
+		)
+	})
+
 }
 
 func TestChangefeedDescription(t *testing.T) {
@@ -5174,17 +6056,17 @@ func TestChangefeedDescription(t *testing.T) {
 		{
 			// TODO(#85143): remove schema_change_policy='stop' from this test.
 			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2, schema_change_policy='stop' AS SELECT a FROM foo WHERE a % 2 = 0",
-			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', schema_change_policy = 'stop', updated AS SELECT a FROM foo WHERE (a % 2) = 0`,
+			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH OPTIONS (envelope = 'wrapped', schema_change_policy = 'stop', updated) AS SELECT a FROM foo WHERE (a % 2) = 0`,
 		},
 		{
 			// TODO(#85143): remove schema_change_policy='stop' from this test.
 			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2, schema_change_policy='stop' AS SELECT a FROM public.foo AS bar WHERE a % 2 = 0",
-			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', schema_change_policy = 'stop', updated AS SELECT a FROM public.foo AS bar WHERE (a % 2) = 0`,
+			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH OPTIONS (envelope = 'wrapped', schema_change_policy = 'stop', updated) AS SELECT a FROM public.foo AS bar WHERE (a % 2) = 0`,
 		},
 		{
 			// TODO(#85143): remove schema_change_policy='stop' from this test.
 			create: "CREATE CHANGEFEED INTO $1 WITH updated, envelope = $2, schema_change_policy='stop' AS SELECT a FROM foo WHERE status IN ('open', 'closed')",
-			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH envelope = 'wrapped', schema_change_policy = 'stop', updated AS SELECT a FROM foo WHERE status IN ('open', 'closed')`,
+			descr:  `CREATE CHANGEFEED INTO '` + redactedSink + `' WITH OPTIONS (envelope = 'wrapped', schema_change_policy = 'stop', updated) AS SELECT a FROM foo WHERE status IN ('open', 'closed')`,
 		},
 	} {
 		t.Run(tc.create, func(t *testing.T) {
@@ -5193,7 +6075,7 @@ func TestChangefeedDescription(t *testing.T) {
 
 			var description string
 			sqlDB.QueryRow(t,
-				`SELECT description FROM [SHOW JOBS] WHERE job_id = $1`, jobID,
+				`SELECT description FROM [SHOW JOB $1]`, jobID,
 			).Scan(&description)
 
 			require.Equal(t, tc.descr, description)
@@ -5213,42 +6095,51 @@ func TestChangefeedPanicRecovery(t *testing.T) {
 		sqlDB.Exec(t, `INSERT INTO foo(id, s) VALUES (0, 'hello'), (1, null)`)
 	}
 
+	waitForFeedErr := func(t *testing.T, feed cdctest.TestFeed, timeout time.Duration) error {
+		start := timeutil.Now()
+		for {
+			if time.Since(start) >= timeout {
+				t.Fatalf("feed did not return error before timeout of %s", timeout)
+			}
+			_, err := feed.Next()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		prep(t, sqlDB)
 		// Check that disallowed expressions have a good error message.
 		// Also regression test for https://github.com/cockroachdb/cockroach/issues/90416
-		sqlDB.ExpectErr(t, "sub-query expressions not supported by CDC",
+		sqlDB.ExpectErrWithTimeout(t, "sub-query expressions not supported by CDC",
 			`CREATE CHANGEFEED WITH schema_change_policy='stop' AS SELECT 1 FROM foo WHERE EXISTS (SELECT true)`)
 	})
 
 	// Check that all panics while evaluating the WHERE clause in an expression are recovered from.
+	// NB: REPAIRCLUSTER is required to use crdb_internal.force_panic.
 	cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		prep(t, sqlDB)
 		foo := feed(t, f,
 			`CREATE CHANGEFEED WITH schema_change_policy='stop' AS SELECT 1 FROM foo WHERE crdb_internal.force_panic('wat') IS NULL`)
 		defer closeFeed(t, foo)
-		var err error
-		for err == nil {
-			_, err = foo.Next()
-		}
-		require.Error(t, err, "error while evaluating WHERE clause")
-	})
+		err := waitForFeedErr(t, foo, 2*time.Minute)
+		require.ErrorContains(t, err, "error evaluating CDC expression", "expected panic recovery while evaluating WHERE clause")
+	}, feedTestAdditionalSystemPrivs("REPAIRCLUSTER"))
 
 	// Check that all panics while evaluating the SELECT clause in an expression are recovered from.
+	// NB: REPAIRCLUSTER is required to use crdb_internal.force_panic.
 	cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		prep(t, sqlDB)
 		foo := feed(t, f,
 			`CREATE CHANGEFEED WITH schema_change_policy='stop' AS SELECT crdb_internal.force_panic('wat') FROM foo`)
 		defer closeFeed(t, foo)
-		var err error
-		for err == nil {
-			_, err = foo.Next()
-		}
-		require.Error(t, err, "error while evaluating SELECT clause")
-	})
+		err := waitForFeedErr(t, foo, 2*time.Minute)
+		require.ErrorContains(t, err, "error evaluating CDC expression", "expected panic recovery while evaluating SELECT clause")
+	}, feedTestAdditionalSystemPrivs("REPAIRCLUSTER"))
 }
 
 func TestChangefeedPauseUnpause(t *testing.T) {
@@ -5502,24 +6393,41 @@ func TestChangefeedContinuousTelemetry(t *testing.T) {
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		// Hack: since setting a zero value disabled, set a negative value to ensure we always log.
 		interval := -10 * time.Millisecond
-		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+		continuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
 
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
+		// NB: In order for this test to work for sinkless feeds, we must
+		// have at least one row before creating the feed.
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (-1)`)
 
 		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
 		defer closeFeed(t, foo)
-		jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
+		var jobID jobspb.JobID
+		if foo, ok := foo.(cdctest.EnterpriseTestFeed); ok {
+			jobID = foo.JobID()
+		}
 
 		for i := 0; i < 5; i++ {
 			beforeCreate := timeutil.Now()
 			sqlDB.Exec(t, fmt.Sprintf(`INSERT INTO foo VALUES (%d) RETURNING cluster_logical_timestamp()`, i))
-			verifyLogsWithEmittedBytes(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
+			verifyLogsWithEmittedBytesAndMessages(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
 		}
 	}
 
-	// TODO(#89421): include pubsub once it supports metrics
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless", "pubsub"))
+	cdcTest(t, testFn)
+}
+
+type testTelemetryLogger struct {
+	telemetryLogger
+	afterIncEmittedCounters func(numMessages int, numBytes int)
+}
+
+var _ telemetryLogger = (*testTelemetryLogger)(nil)
+
+func (t *testTelemetryLogger) incEmittedCounters(numMessages int, numBytes int) {
+	t.telemetryLogger.incEmittedCounters(numMessages, numBytes)
+	t.afterIncEmittedCounters(numMessages, numBytes)
 }
 
 func TestChangefeedContinuousTelemetryOnTermination(t *testing.T) {
@@ -5528,19 +6436,49 @@ func TestChangefeedContinuousTelemetryOnTermination(t *testing.T) {
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		interval := 24 * time.Hour
-		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
-		beforeCreate := timeutil.Now()
+		continuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
+		// NB: In order for this test to work for sinkless feeds, we must
+		// have at least one row before creating the feed.
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
+
+		var seen atomic.Bool
+		waitForIncEmittedCounters := func() error {
+			if !seen.Load() {
+				return errors.Newf("emitted counters have not been incremented yet")
+			}
+			return nil
+		}
+		// Synchronization to prevent a race between the changefeed closing
+		// and the telemetry logger getting emitted counts after messages
+		// have been emitted to the sink.
+		s.TestingKnobs.DistSQL.(*execinfra.TestingKnobs).Changefeed.(*TestingKnobs).
+			WrapTelemetryLogger = func(logger telemetryLogger) telemetryLogger {
+			return &testTelemetryLogger{
+				telemetryLogger: logger,
+				afterIncEmittedCounters: func(numMessages int, _ int) {
+					if numMessages > 0 {
+						seen.Store(true)
+					}
+				},
+			}
+		}
 
 		// Insert a row and wait for logs to be created.
+		beforeFirstLog := timeutil.Now()
 		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
-		jobID := foo.(cdctest.EnterpriseTestFeed).JobID()
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
-		verifyLogsWithEmittedBytes(t, jobID, beforeCreate.UnixNano(), interval.Nanoseconds(), false)
+		var jobID jobspb.JobID
+		if foo, ok := foo.(cdctest.EnterpriseTestFeed); ok {
+			jobID = foo.JobID()
+		}
+		testutils.SucceedsSoon(t, waitForIncEmittedCounters)
+		verifyLogsWithEmittedBytesAndMessages(t, jobID, beforeFirstLog.UnixNano(), interval.Nanoseconds(), false /* closing */)
 
 		// Insert more rows. No logs should be created for these since we recently
 		// published them above and the interval is 24h.
+		afterFirstLog := timeutil.Now()
+		seen.Store(false)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (2)`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (3)`)
 		assertPayloads(t, foo, []string{
@@ -5548,15 +6486,14 @@ func TestChangefeedContinuousTelemetryOnTermination(t *testing.T) {
 			`foo: [2]->{"after": {"id": 2}}`,
 			`foo: [3]->{"after": {"id": 3}}`,
 		})
+		testutils.SucceedsSoon(t, waitForIncEmittedCounters)
 
 		// Close the changefeed and ensure logs were created after closing.
-		beforeClose := timeutil.Now()
 		require.NoError(t, foo.Close())
-		verifyLogsWithEmittedBytes(t, jobID, beforeClose.UnixNano(), interval.Nanoseconds(), true)
+		verifyLogsWithEmittedBytesAndMessages(t, jobID, afterFirstLog.UnixNano(), interval.Nanoseconds(), true /* closing */)
 	}
 
-	// TODO(#89421): include pubsub once it supports metrics
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless", "pubsub"))
+	cdcTest(t, testFn)
 }
 
 func TestChangefeedContinuousTelemetryDifferentJobs(t *testing.T) {
@@ -5566,7 +6503,7 @@ func TestChangefeedContinuousTelemetryDifferentJobs(t *testing.T) {
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		// Hack: since setting a zero value disabled, set a negative value to ensure we always log.
 		interval := -100 * time.Millisecond
-		ContinuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
+		continuousTelemetryInterval.Override(context.Background(), &s.Server.ClusterSettings().SV, interval)
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (id INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `CREATE TABLE foo2 (id INT PRIMARY KEY)`)
@@ -5579,18 +6516,17 @@ func TestChangefeedContinuousTelemetryDifferentJobs(t *testing.T) {
 		beforeInsert := timeutil.Now()
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
 		sqlDB.Exec(t, `INSERT INTO foo2 VALUES (1)`)
-		verifyLogsWithEmittedBytes(t, job1, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
-		verifyLogsWithEmittedBytes(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytesAndMessages(t, job1, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytesAndMessages(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
 		require.NoError(t, foo.Close())
 
 		beforeInsert = timeutil.Now()
 		sqlDB.Exec(t, `INSERT INTO foo2 VALUES (2)`)
-		verifyLogsWithEmittedBytes(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
+		verifyLogsWithEmittedBytesAndMessages(t, job2, beforeInsert.UnixNano(), interval.Nanoseconds(), false)
 		require.NoError(t, foo2.Close())
 	}
 
-	// TODO(#89421): include pubsub once it supports metrics
-	cdcTest(t, testFn, feedTestOmitSinks("sinkless", "pubsub"))
+	cdcTest(t, testFn, feedTestOmitSinks("sinkless"))
 }
 
 func TestChangefeedHandlesDrainingNodes(t *testing.T) {
@@ -5763,7 +6699,7 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 								t.Fatal("did not get signal to proceed")
 							}
 						},
-						// Handle tarnsient changefeed error.  We expect to see node drain error.
+						// Handle transient changefeed error.  We expect to see node drain error.
 						// When we do, notify drainNotification, and reset node drain channel.
 						HandleDistChangefeedError: func(err error) error {
 							errCh <- err
@@ -5796,10 +6732,15 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 
 	db := tc.ServerConn(1)
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	serverutils.SetClusterSetting(t, tc, "changefeed.shutdown_checkpoint.enabled", true)
 	serverutils.SetClusterSetting(t, tc, "kv.rangefeed.enabled", true)
 	serverutils.SetClusterSetting(t, tc, "kv.closed_timestamp.target_duration", 10*time.Millisecond)
 	serverutils.SetClusterSetting(t, tc, "changefeed.experimental_poll_interval", 10*time.Millisecond)
 	serverutils.SetClusterSetting(t, tc, "changefeed.aggregator.heartbeat", 10*time.Millisecond)
+	// Randomizing replica assignment can cause timeouts or other
+	// failures due to assumptions in the testing knobs about balanced
+	// assignments.
+	serverutils.SetClusterSetting(t, tc, "changefeed.random_replica_selection.enabled", false)
 
 	sqlutils.CreateTable(
 		t, db, "foo",
@@ -5888,6 +6829,120 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 		}
 		cancel()
 	}
+}
+
+// TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart verifies that
+// a changefeed over a large number of quiesced ranges is able to quickly
+// advance its resolved timestamp after a rolling restart. At the lowest level,
+// the test ensures that lease acquisitions required to advance the closed
+// timestamp of the constituent changefeed ranges is fast.
+func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Add verbose logging to help debug future failures.
+	require.NoError(t, log.SetVModule("changefeed_processors=1"))
+
+	// This test requires many range splits, which can be slow under certain test
+	// conditions. Skip potentially slow tests.
+	skip.UnderDeadlock(t)
+	skip.UnderRace(t)
+
+	opts := makeOptions()
+	defer addCloudStorageOptions(t, &opts)()
+	opts.forceRootUserConnection = true
+	defer changefeedbase.TestingSetDefaultMinCheckpointFrequency(testSinkFlushFrequency)()
+	defer testingUseFastRetry()()
+	const numNodes = 3
+
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	listenerReg := listenerutil.NewListenerRegistry()
+	defer listenerReg.Close()
+
+	perServerKnobs := make(map[int]base.TestServerArgs, numNodes)
+	for i := 0; i < numNodes; i++ {
+		perServerKnobs[i] = base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				DistSQL: &execinfra.TestingKnobs{
+					Changefeed: &TestingKnobs{},
+				},
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+				Server: &server.TestingKnobs{
+					StickyVFSRegistry: stickyVFSRegistry,
+				},
+			},
+			ExternalIODir: opts.externalIODir,
+			UseDatabase:   "d",
+		}
+	}
+
+	tc := serverutils.StartCluster(t, numNodes,
+		base.TestClusterArgs{
+			ServerArgsPerNode: perServerKnobs,
+			ServerArgs: base.TestServerArgs{
+				// Test uses SPLIT AT, which isn't currently supported for
+				// secondary tenants. Tracked with #76378.
+				DefaultTestTenant: base.TODOTestTenantDisabled,
+			},
+			ReusableListenerReg: listenerReg,
+		})
+	defer tc.Stopper().Stop(context.Background())
+
+	db := tc.ServerConn(1)
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	serverutils.SetClusterSetting(t, tc, "kv.rangefeed.enabled", true)
+
+	// Create a table with 1000 ranges.
+	sqlDB.ExecMultiple(t,
+		`CREATE DATABASE d;`,
+		`CREATE TABLE d.foo (k INT PRIMARY KEY);`,
+		`INSERT INTO d.foo (k) SELECT * FROM generate_series(1, 1000);`,
+		`ALTER TABLE d.foo SPLIT AT (SELECT * FROM generate_series(1, 1000));`,
+	)
+
+	// Wait for ranges to quiesce.
+	testutils.SucceedsSoon(t, func() error {
+		for i := range tc.NumServers() {
+			store, err := tc.Server(i).GetStores().(*kvserver.Stores).GetStore(tc.Server(i).GetFirstStoreID())
+			require.NoError(t, err)
+			numQuiescent := store.Metrics().QuiescentCount.Value()
+			numQualifyForQuiesence := store.Metrics().LeaseEpochCount.Value()
+			if numQuiescent < numQualifyForQuiesence {
+				return errors.Newf(
+					"waiting for ranges to quiesce on node %d; quiescent: %d; should quiesce: %d",
+					tc.Server(i).NodeID(), numQuiescent, numQualifyForQuiesence,
+				)
+			}
+		}
+		return nil
+	})
+
+	// Capture the pre-restart timestamp. We'll use this as the start time for the
+	// changefeed later.
+	var tsLogical string
+	sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&tsLogical)
+
+	// Perform the rolling restart.
+	require.NoError(t, tc.Restart())
+
+	// For validation, the test requires an enterprise feed.
+	feedTestEnterpriseSinks(&opts)
+	sinkType := randomSinkTypeWithOptions(opts)
+	f, closeSink := makeFeedFactoryWithOptions(t, sinkType, tc, tc.ServerConn(0), opts)
+	defer closeSink()
+	// The end time is captured post restart. The changefeed spans from before the
+	// restart to after.
+	endTime := tc.Server(0).Clock().Now().AddDuration(5 * time.Second)
+	testFeed := feed(t, f, `CREATE CHANGEFEED FOR d.foo WITH cursor=$1, end_time=$2`,
+		tsLogical, eval.TimestampToDecimalDatum(endTime).String())
+	defer closeFeed(t, testFeed)
+
+	defer DiscardMessages(testFeed)()
+
+	// Ensure the changefeed is able to complete in a reasonable amount of time.
+	require.NoError(t, testFeed.(cdctest.EnterpriseTestFeed).WaitDurationForStatus(5*time.Minute, func(s jobs.Status) bool {
+		return s == jobs.StatusSucceeded
+	}))
 }
 
 func TestChangefeedPropagatesTerminalError(t *testing.T) {
@@ -6033,7 +7088,7 @@ func TestChangefeedPrimaryKeyChangeWorks(t *testing.T) {
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING NOT NULL)`)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY USING HASH, b STRING NOT NULL)`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, 'initial')`)
 		sqlDB.Exec(t, `UPSERT INTO foo VALUES (0, 'updated')`)
 
@@ -6044,20 +7099,20 @@ func TestChangefeedPrimaryKeyChangeWorks(t *testing.T) {
 		// 'initial' is skipped because only the latest value ('updated') is
 		// emitted by the initial scan.
 		assertPayloads(t, foo, []string{
-			`foo: [0]->{"after": {"a": 0, "b": "updated"}}`,
+			`foo: [2, 0]->{"after": {"a": 0, "b": "updated"}}`,
 		})
 
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b')`)
 		assertPayloads(t, foo, []string{
-			`foo: [1]->{"after": {"a": 1, "b": "a"}}`,
-			`foo: [2]->{"after": {"a": 2, "b": "b"}}`,
+			`foo: [11, 1]->{"after": {"a": 1, "b": "a"}}`,
+			`foo: [6, 2]->{"after": {"a": 2, "b": "b"}}`,
 		})
 
-		sqlDB.Exec(t, `ALTER TABLE foo ALTER PRIMARY KEY USING COLUMNS (b)`)
+		sqlDB.Exec(t, `ALTER TABLE foo ALTER PRIMARY KEY USING COLUMNS (b) USING HASH`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (3, 'c'), (4, 'd')`)
 		assertPayloads(t, foo, []string{
-			`foo: ["c"]->{"after": {"a": 3, "b": "c"}}`,
-			`foo: ["d"]->{"after": {"a": 4, "b": "d"}}`,
+			`foo: [6, "c"]->{"after": {"a": 3, "b": "c"}}`,
+			`foo: [15, "d"]->{"after": {"a": 4, "b": "d"}}`,
 		})
 
 		// ALTER PRIMARY KEY should work and we should see the changed
@@ -6073,10 +7128,8 @@ INSERT INTO foo VALUES (1, 'f');
 		// Note that the primary key change is asynchronous and that only the
 		// subsequent write will be displayed using the new primary key.
 		assertPayloads(t, foo, []string{
-			`foo: ["a"]->{"after": {"a": 6, "b": "a"}}`,
-			`foo: ["e"]->{"after": {"a": 5, "b": "e"}}`,
-		})
-		assertPayloads(t, foo, []string{
+			`foo: [6, "a"]->{"after": {"a": 6, "b": "a"}}`,
+			`foo: [14, "e"]->{"after": {"a": 5, "b": "e"}}`,
 			`foo: [1]->{"after": {"a": 1, "b": "f"}}`,
 		})
 	}
@@ -6207,6 +7260,8 @@ func TestChangefeedCheckpointSchemaChange(t *testing.T) {
 			`bar: [0]->{"after": {"a": 0, "b": "initial"}}`,
 		})
 
+		_, err := s.DB.Exec("SET autocommit_before_ddl = false")
+		require.NoError(t, err)
 		require.NoError(t, crdb.ExecuteTx(context.Background(), s.DB, nil, func(tx *gosql.Tx) error {
 			for _, stmt := range []string{
 				`CREATE TABLE baz ()`,
@@ -6223,6 +7278,8 @@ func TestChangefeedCheckpointSchemaChange(t *testing.T) {
 			}
 			return nil
 		}))
+		_, err = s.DB.Exec("RESET autocommit_before_ddl")
+		require.NoError(t, err)
 
 		expected := []string{
 			`bar: [0]->{"after": {"a": 0, "b": "updated"}}`,
@@ -6375,9 +7432,9 @@ func TestChangefeedBackfillCheckpoint(t *testing.T) {
 		}
 
 		// Checkpoint progress frequently, and set the checkpoint size limit.
-		changefeedbase.FrontierCheckpointFrequency.Override(
+		changefeedbase.SpanCheckpointInterval.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 1)
-		changefeedbase.FrontierCheckpointMaxBytes.Override(
+		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, maxCheckpointSize)
 
 		registry := s.Server.JobRegistry().(*jobs.Registry)
@@ -6491,7 +7548,7 @@ func TestChangefeedBackfillCheckpoint(t *testing.T) {
 	// TODO(ssd): Tenant testing disabled because of use of DB()
 	for _, sz := range []int64{100 << 20, 100} {
 		maxCheckpointSize = sz
-		cdcTestNamedWithSystem(t, fmt.Sprintf("limit=%s", humanize.Bytes(uint64(sz))), testFn, feedTestForceSink("webhook"), feedTestNoForcedSyntheticTimestamps)
+		cdcTestNamedWithSystem(t, fmt.Sprintf("limit=%s", humanize.Bytes(uint64(sz))), testFn, feedTestForceSink("webhook"))
 	}
 }
 
@@ -6526,9 +7583,9 @@ func TestCoreChangefeedBackfillScanCheckpoint(t *testing.T) {
 			b.Header.MaxSpanRequestKeys = 1 + rnd.Int63n(25)
 			return nil
 		}
-		changefeedbase.FrontierCheckpointFrequency.Override(
+		changefeedbase.SpanCheckpointInterval.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 1)
-		changefeedbase.FrontierCheckpointMaxBytes.Override(
+		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 100<<20)
 
 		emittedCount := 0
@@ -6566,7 +7623,7 @@ func TestCheckpointFrequency(t *testing.T) {
 	ts := timeutil.NewManualTime(timeutil.Now())
 	js := newJobState(nil, /* job */
 		cluster.MakeTestingClusterSettings(),
-		MakeMetrics(time.Second).(*Metrics), ts,
+		MakeMetrics(time.Second, cidr.NewTestLookup()).(*Metrics), ts,
 	)
 
 	ctx := context.Background()
@@ -6590,7 +7647,7 @@ func TestCheckpointFrequency(t *testing.T) {
 	// If we also specify minimum amount of time between updates, we would skip updates
 	// until enough time has elapsed.
 	minAdvance := 10 * time.Minute
-	changefeedbase.MinHighWaterMarkCheckpointAdvance.Override(ctx, &js.settings.SV, minAdvance)
+	changefeedbase.ResolvedTimestampMinUpdateInterval.Override(ctx, &js.settings.SV, minAdvance)
 
 	require.False(t, js.canCheckpointHighWatermark(frontierAdvanced))
 	ts.Advance(minAdvance)
@@ -6602,6 +7659,125 @@ func TestCheckpointFrequency(t *testing.T) {
 	js.checkpointCompleted(ctx, 42*time.Second)
 	require.Equal(t, completionTime, js.lastProgressUpdate)
 	require.False(t, js.progressUpdatesSkipped)
+}
+
+func TestFlushJitter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Test the logic around applying jitter to the flush logic.
+	// The more involved test that would try to capture flush times would likely
+	// be pretty flaky due to the fact that flush times do not happen at exactly
+	// min_flush_frequency period, and thus it would be hard to tell if the
+	// difference is due to jitter or not.  Just verify nextFlushWithJitter function
+	// works as expected with controlled time source.
+
+	ts := timeutil.NewManualTime(timeutil.Now())
+	const numIters = 100
+
+	for _, tc := range []struct {
+		flushFrequency        time.Duration
+		jitter                float64
+		expectedFlushDuration time.Duration
+		expectedErr           bool
+	}{
+		// Negative jitter.
+		{
+			flushFrequency:        -1,
+			jitter:                -0.1,
+			expectedFlushDuration: 0,
+			expectedErr:           true,
+		},
+		{
+			flushFrequency:        0,
+			jitter:                -0.1,
+			expectedFlushDuration: 0,
+			expectedErr:           true,
+		},
+		{
+			flushFrequency:        10 * time.Millisecond,
+			jitter:                -0.1,
+			expectedFlushDuration: 0,
+			expectedErr:           true,
+		},
+		{
+			flushFrequency:        100 * time.Millisecond,
+			jitter:                -0.1,
+			expectedFlushDuration: 0,
+			expectedErr:           true,
+		},
+		// Disable Jitter.
+		{
+			flushFrequency:        -1,
+			jitter:                0,
+			expectedFlushDuration: 0,
+			expectedErr:           true,
+		},
+		{
+			flushFrequency:        0,
+			jitter:                0,
+			expectedFlushDuration: 0,
+			expectedErr:           false,
+		},
+		{
+			flushFrequency:        10 * time.Millisecond,
+			jitter:                0,
+			expectedFlushDuration: 10 * time.Millisecond,
+			expectedErr:           false,
+		},
+		{
+			flushFrequency:        100 * time.Millisecond,
+			jitter:                0,
+			expectedFlushDuration: 100 * time.Millisecond,
+			expectedErr:           false,
+		},
+		// Enable Jitter.
+		{
+			flushFrequency:        -1,
+			jitter:                0.1,
+			expectedFlushDuration: 0,
+			expectedErr:           true,
+		},
+		{
+			flushFrequency:        0,
+			jitter:                0.1,
+			expectedFlushDuration: 0,
+			expectedErr:           false,
+		},
+		{
+			flushFrequency:        10 * time.Millisecond,
+			jitter:                0.1,
+			expectedFlushDuration: 10 * time.Millisecond,
+			expectedErr:           false,
+		},
+		{
+			flushFrequency:        100 * time.Millisecond,
+			jitter:                0.1,
+			expectedFlushDuration: 100 * time.Millisecond,
+			expectedErr:           false,
+		},
+	} {
+		t.Run(fmt.Sprintf("flushfrequency=%sjitter=%f", tc.flushFrequency, tc.jitter), func(t *testing.T) {
+			for i := 0; i < numIters; i++ {
+				next, err := nextFlushWithJitter(ts, tc.flushFrequency, tc.jitter)
+				if tc.expectedErr {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+				if tc.jitter > 0 {
+					minBound := tc.expectedFlushDuration
+					maxBound := tc.expectedFlushDuration + time.Duration(float64(tc.expectedFlushDuration)*tc.jitter)
+					actualDuration := next.Sub(ts.Now())
+					require.LessOrEqual(t, minBound, actualDuration)
+					require.LessOrEqual(t, actualDuration, maxBound)
+				} else {
+					require.Equal(t, tc.expectedFlushDuration, next.Sub(ts.Now()))
+				}
+				ts.AdvanceTo(next)
+			}
+		})
+	}
 }
 
 func TestChangefeedOrderingWithErrors(t *testing.T) {
@@ -6865,47 +8041,69 @@ func TestChangefeedEndTimeWithCursor(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
-		knobs := s.TestingKnobs.
-			DistSQL.(*execinfra.TestingKnobs).
-			Changefeed.(*TestingKnobs)
-		endTimeReached := make(chan struct{})
-		knobs.FeedKnobs.EndTimeReached = func() bool {
-			select {
-			case <-endTimeReached:
-				return true
-			default:
-				return false
-			}
-		}
-
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
 		sqlDB.Exec(t, "CREATE TABLE foo (a INT PRIMARY KEY)")
-		sqlDB.Exec(t, "INSERT INTO foo VALUES (1), (2), (3)")
 
 		var tsCursor string
 		sqlDB.QueryRow(t, "SELECT (cluster_logical_timestamp())").Scan(&tsCursor)
-		sqlDB.Exec(t, "INSERT INTO foo VALUES (4), (5), (6)")
 
-		fakeEndTime := s.Server.Clock().Now().Add(int64(time.Hour), 0).AsOfSystemTime()
-		feed := feed(t, f, "CREATE CHANGEFEED FOR foo WITH cursor = $1, end_time = $2, no_initial_scan", tsCursor, fakeEndTime)
+		// Insert 1k rows -- using separate statements to get different MVCC timestamps.
+		for i := 0; i < 1024; i++ {
+			sqlDB.Exec(t, "INSERT INTO foo VALUES ($1)", i)
+		}
+
+		// Split table into multiple ranges to make things more interesting.
+		sqlDB.Exec(t, "ALTER TABLE foo SPLIT AT VALUES (100), (200), (400), (800)")
+
+		knobs := s.TestingKnobs.
+			DistSQL.(*execinfra.TestingKnobs).
+			Changefeed.(*TestingKnobs)
+		fooSpan := func() roachpb.Span {
+			fooDesc := desctestutils.TestingGetPublicTableDescriptor(
+				s.Server.DB(), s.Codec, "d", "foo")
+			return fooDesc.PrimaryIndexSpan(s.Codec)
+		}()
+
+		// Capture resolved events emitted during changefeed.  We expect
+		// every range to emit resolved event with end_time timestamp.
+		frontier, err := span.MakeFrontier(fooSpan)
+		require.NoError(t, err)
+		knobs.FilterSpanWithMutation = func(rs *jobspb.ResolvedSpan) (bool, error) {
+			_, err := frontier.Forward(rs.Span, rs.Timestamp)
+			return false, err
+		}
+
+		// endTime must be after creation time (5 seconds should be enough
+		// to reach create changefeed statement and process it).
+		endTime := s.Server.Clock().Now().AddDuration(5 * time.Second)
+		feed := feed(t, f, "CREATE CHANGEFEED FOR foo WITH cursor = $1, end_time = $2, no_initial_scan",
+			tsCursor, eval.TimestampToDecimalDatum(endTime).String())
 		defer closeFeed(t, feed)
 
-		assertPayloads(t, feed, []string{
-			`foo: [4]->{"after": {"a": 4}}`,
-			`foo: [5]->{"after": {"a": 5}}`,
-			`foo: [6]->{"after": {"a": 6}}`,
-		})
-		close(endTimeReached)
+		// Don't care much about the values emitted (tested elsewhere) -- all
+		// we want to make sure is that the feed terminates.  However, we do need
+		// to consume those values since some of the test sink implementations (kafka)
+		// will block.
+		defer DiscardMessages(feed)()
 
 		testFeed := feed.(cdctest.EnterpriseTestFeed)
 		require.NoError(t, testFeed.WaitForStatus(func(s jobs.Status) bool {
 			return s == jobs.StatusSucceeded
 		}))
+
+		// After changefeed completes, verify we have seen all ranges emit resolved
+		// event with end_time timestamp.  That is: verify frontier.Frontier() is at end_time.
+		expectedFrontier := endTime.Prev()
+		testutils.SucceedsWithin(t, func() error {
+			if expectedFrontier == frontier.Frontier() {
+				return nil
+			}
+			return errors.Newf("still waiting for frontier to reach %s, current %s",
+				expectedFrontier, frontier.Frontier())
+		}, 5*time.Second)
 	}
 
-	// TODO: Fix sinkless feeds not providing pre-close events if Next is called
-	// after the feed was closed
 	cdcTest(t, testFn, feedTestEnterpriseSinks)
 }
 
@@ -7025,6 +8223,9 @@ func TestChangefeedOnlyInitialScanCSV(t *testing.T) {
 						if err != nil {
 							return err
 						}
+						if len(m.Resolved) > 0 {
+							continue
+						}
 						actualMessages = append(actualMessages, string(m.Value))
 					}
 				})
@@ -7049,7 +8250,8 @@ func TestChangefeedOnlyInitialScanCSV(t *testing.T) {
 		}
 	}
 
-	cdcTest(t, testFn, feedTestEnterpriseSinks)
+	// TODO(#119289): re-enable pulsar
+	cdcTest(t, testFn, feedTestEnterpriseSinks, feedTestOmitSinks("pulsar"))
 }
 
 func TestChangefeedOnlyInitialScanCSVSinkless(t *testing.T) {
@@ -7117,10 +8319,10 @@ func TestChangefeedPredicates(t *testing.T) {
 			sqlDB.Exec(t, `CREATE TYPE status AS ENUM ('open', 'closed', 'inactive')`)
 			sqlDB.Exec(t, `
 CREATE TABLE foo (
-  a INT, 
-  b STRING, 
+  a INT,
+  b STRING,
   c STRING,
-  d STRING AS (concat(b, c)) VIRTUAL, 
+  d STRING AS (concat(b, c)) VIRTUAL,
   e status DEFAULT 'inactive',
   PRIMARY KEY (a, b)
 )`)
@@ -7135,9 +8337,9 @@ INSERT INTO foo (a, b, e) VALUES (2, 'two', 'closed');
 				topic, fromClause = "foo", "foo AS "+alias
 			}
 			feed := feed(t, f, `
-CREATE CHANGEFEED 
+CREATE CHANGEFEED
 WITH schema_change_policy='stop'
-AS SELECT * FROM `+fromClause+` 
+AS SELECT * FROM `+fromClause+`
 WHERE e IN ('open', 'closed') AND event_op() != 'delete'`)
 			defer closeFeed(t, feed)
 
@@ -7183,10 +8385,10 @@ func TestChangefeedInvalidPredicate(t *testing.T) {
 	sqlDB.Exec(t, `CREATE TYPE status AS ENUM ('open', 'closed', 'inactive')`)
 	sqlDB.Exec(t, `
 CREATE TABLE foo (
-  a INT, 
-  b STRING, 
+  a INT,
+  b STRING,
   c STRING,
-  d STRING AS (concat(b, c)) VIRTUAL, 
+  d STRING AS (concat(b, c)) VIRTUAL,
   e status DEFAULT 'inactive',
   PRIMARY KEY (a, b)
 )`)
@@ -7228,7 +8430,7 @@ CREATE TABLE foo (
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sqlDB.ExpectErr(t, tc.err, tc.create)
+			sqlDB.ExpectErrWithTimeout(t, tc.err, tc.create)
 		})
 	}
 }
@@ -7244,8 +8446,8 @@ func TestChangefeedPredicateWithSchemaChange(t *testing.T) {
 		`CREATE SCHEMA alt`,
 		`CREATE TYPE alt.status AS ENUM ('alt_open', 'alt_closed')`,
 		`CREATE TABLE foo (
-  a INT, 
-  b STRING, 
+  a INT,
+  b STRING,
   c STRING,
   e status DEFAULT 'inactive',
   PRIMARY KEY (a, b)
@@ -7453,11 +8655,12 @@ func TestChangefeedPredicateWithSchemaChange(t *testing.T) {
 }
 
 func startMonitorWithBudget(budget int64) *mon.BytesMonitor {
-	mm := mon.NewMonitorWithLimit(
-		"test-mm", mon.MemoryResource, budget,
-		nil, nil,
-		128 /* small allocation increment */, 100,
-		cluster.MakeTestingClusterSettings())
+	mm := mon.NewMonitor(mon.Options{
+		Name:      mon.MakeMonitorName("test-mm"),
+		Limit:     budget,
+		Increment: 128, /* small allocation increment */
+		Settings:  cluster.MakeTestingClusterSettings(),
+	})
 	mm.Start(context.Background(), nil, mon.NewStandaloneBudget(budget))
 	return mm
 }
@@ -7881,7 +9084,7 @@ func TestChangefeedTestTimesOut(t *testing.T) {
 					nada, expectTimeout,
 					func(ctx context.Context) error {
 						return assertPayloadsBaseErr(
-							ctx, nada, []string{`nada: [2]->{"after": {}}`}, false, false)
+							ctx, nada, []string{`nada: [2]->{"after": {}}`}, false, false, changefeedbase.OptEnvelopeWrapped)
 					})
 				return nil
 			}, 20*expectTimeout))
@@ -7895,6 +9098,10 @@ func TestChangefeedTestTimesOut(t *testing.T) {
 // Regression for #85008.
 func TestSchemachangeDoesNotBreakSinklessFeed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("kv_feed=2,changefeed_processors=2"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
@@ -7924,9 +9131,13 @@ func TestSchemachangeDoesNotBreakSinklessFeed(t *testing.T) {
 func TestChangefeedKafkaMessageTooLarge(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		if KafkaV2Enabled.Get(&s.Server.ClusterSettings().SV) {
+			// This is already covered for the v2 sink in another test: TestKafkaSinkClientV2_Resize
+			return
+		}
+
 		changefeedbase.BatchReductionRetryEnabled.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, true)
 
@@ -8072,6 +9283,8 @@ func TestChangefeedKafkaMessageTooLarge(t *testing.T) {
 // Regression for #85902.
 func TestRedactedSchemaRegistry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE test_table (id INT PRIMARY KEY, i int, j int)`)
@@ -8096,89 +9309,9 @@ func TestRedactedSchemaRegistry(t *testing.T) {
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
-type echoResolver struct {
-	result []roachpb.Spans
-	pos    int
-}
-
-func (r *echoResolver) getRangesForSpans(
-	_ context.Context, _ []roachpb.Span,
-) (spans []roachpb.Span, _ error) {
-	spans = r.result[r.pos]
-	r.pos++
-	return spans, nil
-}
-
-func TestPartitionSpans(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	partitions := func(p ...sql.SpanPartition) []sql.SpanPartition {
-		return p
-	}
-	mkPart := func(n base.SQLInstanceID, spans ...roachpb.Span) sql.SpanPartition {
-		return sql.SpanPartition{SQLInstanceID: n, Spans: spans}
-	}
-	mkSpan := func(start, end string) roachpb.Span {
-		return roachpb.Span{Key: []byte(start), EndKey: []byte(end)}
-	}
-	spans := func(s ...roachpb.Span) roachpb.Spans {
-		return s
-	}
-	const sensitivity = 0.01
-
-	for i, tc := range []struct {
-		input   []sql.SpanPartition
-		resolve []roachpb.Spans
-		expect  []sql.SpanPartition
-	}{
-		{
-			input: partitions(
-				mkPart(1, mkSpan("a", "j")),
-				mkPart(2, mkSpan("j", "q")),
-				mkPart(3, mkSpan("q", "z")),
-			),
-			// 6 total ranges, 2 per node.
-			resolve: []roachpb.Spans{
-				spans(mkSpan("a", "c"), mkSpan("c", "e"), mkSpan("e", "j")),
-				spans(mkSpan("j", "q")),
-				spans(mkSpan("q", "y"), mkSpan("y", "z")),
-			},
-			expect: partitions(
-				mkPart(1, mkSpan("a", "e")),
-				mkPart(2, mkSpan("e", "q")),
-				mkPart(3, mkSpan("q", "z")),
-			),
-		},
-		{
-			input: partitions(
-				mkPart(1, mkSpan("a", "c"), mkSpan("e", "p"), mkSpan("r", "z")),
-				mkPart(2),
-				mkPart(3, mkSpan("c", "e"), mkSpan("p", "r")),
-			),
-			// 5 total ranges -- on 2 nodes; target should be 1 per node.
-			resolve: []roachpb.Spans{
-				spans(mkSpan("a", "c"), mkSpan("e", "p"), mkSpan("r", "z")),
-				spans(),
-				spans(mkSpan("c", "e"), mkSpan("p", "r")),
-			},
-			expect: partitions(
-				mkPart(1, mkSpan("a", "c"), mkSpan("e", "p")),
-				mkPart(2, mkSpan("r", "z")),
-				mkPart(3, mkSpan("c", "e"), mkSpan("p", "r")),
-			),
-		},
-	} {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			sp, err := rebalanceSpanPartitions(context.Background(),
-				&echoResolver{result: tc.resolve}, sensitivity, tc.input)
-			require.NoError(t, err)
-			require.Equal(t, tc.expect, sp)
-		})
-	}
-}
-
 func TestChangefeedMetricsScopeNotice(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, stopServer := makeServer(t)
 	defer stopServer()
@@ -8205,6 +9338,7 @@ func TestChangefeedMetricsScopeNotice(t *testing.T) {
 // TestPubsubValidationErrors tests error messages during pubsub sink URI validations.
 func TestPubsubValidationErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	s, stopServer := makeServer(t)
 	defer stopServer()
@@ -8247,7 +9381,7 @@ func TestPubsubValidationErrors(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sqlDB.ExpectErr(t, tc.expectedError, fmt.Sprintf("CREATE CHANGEFEED FOR foo INTO '%s'", tc.uri))
+			sqlDB.ExpectErrWithTimeout(t, tc.expectedError, fmt.Sprintf("CREATE CHANGEFEED FOR foo INTO '%s'", tc.uri))
 		})
 	}
 }
@@ -8334,6 +9468,8 @@ func TestChangefeedExecLocality(t *testing.T) {
 
 func TestChangefeedTopicNames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		rand, _ := randutil.NewTestRand()
 		cfg := randident.DefaultNameGeneratorConfig()
@@ -8513,4 +9649,451 @@ func TestHighwaterDoesNotRegressOnRetry(t *testing.T) {
 		}
 	}
 	cdcTest(t, testFn, feedTestEnterpriseSinks)
+}
+
+// TestChangefeedPubsubResolvedMessages tests that the pubsub sink emits
+// resolved messages to each topic.
+func TestChangefeedPubsubResolvedMessages(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		ctx := context.Background()
+		PubsubV2Enabled.Override(ctx, &s.Server.ClusterSettings().SV, true)
+
+		db := sqlutils.MakeSQLRunner(s.DB)
+		db.Exec(t, "CREATE TABLE one (i int)")
+		db.Exec(t, "CREATE TABLE two (i int)")
+		db.Exec(t, "CREATE TABLE three (i int)")
+
+		foo, err := f.Feed("CREATE CHANGEFEED FOR TABLE one, TABLE two, TABLE three with resolved = '10ms'")
+		require.NoError(t, err)
+
+		seenTopics := make(map[string]struct{})
+		expectedTopics := map[string]struct{}{
+			"projects/testfeed/topics/one":   {},
+			"projects/testfeed/topics/two":   {},
+			"projects/testfeed/topics/three": {},
+		}
+
+		// There may be retries, so we could get the same resolved message for a topic more than once.
+		testutils.SucceedsSoon(t, func() error {
+			for i := 0; i < 3; i++ {
+				// We should only see resolved messages since there is no data in the table.
+				msg, err := foo.Next()
+				require.NoError(t, err)
+				seenTopics[msg.Topic] = struct{}{}
+			}
+			if !reflect.DeepEqual(seenTopics, expectedTopics) {
+				return errors.Newf("failed to see expected resolved messages on each topic. seen: %v, expected: %v",
+					seenTopics, expectedTopics)
+			}
+			return nil
+		})
+
+		require.NoError(t, foo.Close())
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("pubsub"))
+}
+
+// TestCloudstorageBufferedBytesMetric tests the metric which tracks the number
+// of buffered bytes in the cloudstorage sink.
+func TestCloudstorageBufferedBytesMetric(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	rng, _ := randutil.NewTestRand()
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		registry := s.Server.JobRegistry().(*jobs.Registry)
+		metrics := registry.MetricsStruct().Changefeed.(*Metrics)
+		defaultSLI, err := metrics.getSLIMetrics(defaultSLIScope)
+		require.NoError(t, err)
+
+		knobs := s.TestingKnobs.
+			DistSQL.(*execinfra.TestingKnobs).
+			Changefeed.(*TestingKnobs)
+
+		var shouldEmit atomic.Bool
+		knobs.FilterSpanWithMutation = func(r *jobspb.ResolvedSpan) (bool, error) {
+			return !shouldEmit.Load(), nil
+		}
+		db := sqlutils.MakeSQLRunner(s.DB)
+		db.Exec(t, `
+		  CREATE TABLE foo (key INT PRIMARY KEY);
+		  INSERT INTO foo (key) SELECT * FROM generate_series(1, 1000);
+  		`)
+
+		require.Equal(t, int64(0), defaultSLI.CloudstorageBufferedBytes.Value())
+
+		format := "json"
+		if rng.Float32() < 0.5 {
+			format = "parquet"
+		}
+		foo, err := f.Feed(fmt.Sprintf("CREATE CHANGEFEED FOR TABLE foo WITH format='%s'", format))
+		require.NoError(t, err)
+
+		// Because checkpoints are disabled, we should have some bytes build up
+		// in the sink.
+		targetBytes := int64(40000)
+		if format == "parquet" {
+			// Parquet is a much more efficient format, so the buffered files will
+			// be much smaller.
+			targetBytes = 2000
+		}
+		testutils.SucceedsSoon(t, func() error {
+			numBytes := defaultSLI.CloudstorageBufferedBytes.Value()
+			if defaultSLI.CloudstorageBufferedBytes.Value() < targetBytes {
+				return errors.Newf("expected at least %d buffered bytes but found %d", targetBytes, numBytes)
+			}
+			return nil
+		})
+
+		// Allow checkpoints to pass through and flush the sink. We should see
+		// zero bytes buffered after that.
+		shouldEmit.Store(true)
+		testutils.SucceedsSoon(t, func() error {
+			numBytes := defaultSLI.CloudstorageBufferedBytes.Value()
+			if defaultSLI.CloudstorageBufferedBytes.Value() != 0 {
+				return errors.Newf("expected at least %d buffered bytes but found %d", 0, numBytes)
+			}
+			return nil
+		})
+
+		require.NoError(t, foo.Close())
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("cloudstorage"))
+}
+
+// TestBatchSizeMetric the emitted batch size histogram metric.
+func TestBatchSizeMetric(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		registry := s.Server.JobRegistry().(*jobs.Registry)
+		batchSizeHist := registry.MetricsStruct().Changefeed.(*Metrics).AggMetrics.EmittedBatchSizes
+
+		db := sqlutils.MakeSQLRunner(s.DB)
+		db.Exec(t, `
+		  CREATE TABLE foo (key INT PRIMARY KEY);
+		  INSERT INTO foo (key) VALUES (1), (2), (3);
+		`)
+
+		numSamples, sum := batchSizeHist.WindowedSnapshot().Total()
+		require.Equal(t, int64(0), numSamples)
+		require.Equal(t, 0.0, sum)
+
+		foo, err := f.Feed("CREATE CHANGEFEED FOR TABLE foo")
+		require.NoError(t, err)
+
+		testutils.SucceedsSoon(t, func() error {
+			numSamples, sum = batchSizeHist.WindowedSnapshot().Total()
+			if numSamples <= 0 && sum <= 0.0 {
+				return errors.Newf("waiting for metric %d %d", numSamples, sum)
+			}
+			return nil
+		})
+		require.NoError(t, foo.Close())
+	}
+	cdcTest(t, testFn)
+}
+
+// TestParallelIOMetrics tests parallel io metrics.
+func TestParallelIOMetrics(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test relies on messing with timings to see pending rows build up,
+	//  so skip it when the system is loaded.
+	skip.UnderDuress(t)
+
+	// Add delay so queuing occurs, which results in the below metrics being
+	// nonzero.
+	defer testingEnableQueuingDelay()()
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		registry := s.Server.JobRegistry().(*jobs.Registry)
+		metrics := registry.MetricsStruct().Changefeed.(*Metrics).AggMetrics
+
+		db := sqlutils.MakeSQLRunner(s.DB)
+		db.Exec(t, `SET CLUSTER SETTING changefeed.new_pubsub_sink_enabled = true`)
+		db.Exec(t, `SET CLUSTER SETTING changefeed.sink_io_workers = 1`)
+		db.Exec(t, `
+		  CREATE TABLE foo (a INT PRIMARY KEY);
+		`)
+
+		// Keep writing data to the same key to ensure contention.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		g := ctxgroup.WithContext(ctx)
+		done := make(chan struct{})
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-done:
+					return nil
+				default:
+					_, err := s.DB.Exec(`UPSERT INTO foo (a)  SELECT * FROM generate_series(1, 10)`)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		})
+		// Set the frequency to 1s. The default frequency at the time of writing is
+		foo, err := f.Feed("CREATE CHANGEFEED FOR TABLE foo WITH pubsub_sink_config=" +
+			"'{\"Flush\": {\"Frequency\": \"100ms\"}}'")
+		require.NoError(t, err)
+
+		testutils.SucceedsSoon(t, func() error {
+			numSamples, sum := metrics.ParallelIOPendingQueueNanos.WindowedSnapshot().Total()
+			if numSamples <= 0 && sum <= 0.0 {
+				return errors.Newf("waiting for queue nanos: %d %f", numSamples, sum)
+			}
+			return nil
+		})
+		testutils.SucceedsSoon(t, func() error {
+			pendingKeys := metrics.ParallelIOPendingRows.Value()
+			if pendingKeys <= 0 {
+				return errors.Newf("waiting for pending keys: %d", pendingKeys)
+			}
+			return nil
+		})
+		testutils.SucceedsSoon(t, func() error {
+			for i := 0; i < 50; i++ {
+				inFlightKeys := metrics.ParallelIOInFlightKeys.Value()
+				if inFlightKeys > 0 {
+					return nil
+				}
+			}
+			return errors.New("waiting for in-flight keys")
+		})
+		testutils.SucceedsSoon(t, func() error {
+			numSamples, sum := metrics.ParallelIOResultQueueNanos.WindowedSnapshot().Total()
+			if numSamples <= 0 && sum <= 0.0 {
+				return errors.Newf("waiting for result queue nanos: %d %f", numSamples, sum)
+			}
+			return nil
+		})
+		close(done)
+		require.NoError(t, g.Wait())
+		require.NoError(t, foo.Close())
+	}
+	cdcTest(t, testFn, feedTestForceSink("pubsub"))
+}
+
+// TestPubsubAttributes tests that the "attributes" field in the
+// `pubsub_sink_config` behaves as expected.
+func TestPubsubAttributes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		ctx := context.Background()
+		PubsubV2Enabled.Override(ctx, &s.Server.ClusterSettings().SV, true)
+		db := sqlutils.MakeSQLRunner(s.DB)
+
+		// asserts the next message has these attributes and is sent to each of the supplied topics.
+		expectAttributes := func(feed cdctest.TestFeed, attributes map[string]string, allowedTopics ...string) {
+			// Keep popping messages until we see all the expected topics.
+			seenTopics := make(map[string]struct{})
+			for len(seenTopics) < len(allowedTopics) {
+				msg, err := feed.(*pubsubFeed).Next()
+				require.NoError(t, err)
+
+				raw := msg.RawMessage.(*mockPubsubMessage)
+
+				require.Contains(t, allowedTopics, msg.Topic)
+				if attributes == nil {
+					require.Nil(t, raw.attributes)
+				} else {
+					require.True(t, reflect.DeepEqual(attributes, raw.attributes),
+						"%#v=%#v", attributes, raw.attributes)
+				}
+				seenTopics[msg.Topic] = struct{}{}
+				t.Logf("message %s: %s -> %s, %v", msg.Key, msg.Value, msg.Topic, raw.attributes)
+			}
+		}
+
+		t.Run("separate tables", func(t *testing.T) {
+			db.Exec(t, "CREATE TABLE one (i int)")
+			db.Exec(t, "CREATE TABLE two (i int)")
+
+			foo, err := f.Feed(`CREATE CHANGEFEED FOR TABLE one, TABLE two ` +
+				`INTO 'gcpubsub://testfeed?with_table_name_attribute=true' `)
+			require.NoError(t, err)
+
+			db.Exec(t, "INSERT INTO one VALUES (1)")
+			expectAttributes(foo, map[string]string{"TABLE_NAME": "one"}, "one")
+
+			db.Exec(t, "INSERT INTO two VALUES (1)")
+			expectAttributes(foo, map[string]string{"TABLE_NAME": "two"}, "two")
+
+			require.NoError(t, foo.Close())
+		})
+
+		t.Run("same table different families", func(t *testing.T) {
+			db.Exec(t, "CREATE TABLE withFams (i int, j int, k int, FAMILY ifam(i), FAMILY jfam(j))")
+			db.Exec(t, "CREATE TABLE withoutFams (i int)")
+
+			foo, err := f.Feed(`CREATE CHANGEFEED FOR TABLE withFams FAMILY ifam, TABLE withFams FAMILY jfam, ` +
+				`TABLE withoutFams INTO 'gcpubsub://testfeed?with_table_name_attribute=true'`)
+			require.NoError(t, err)
+
+			// We get two messages because the changefeed is targeting two familes.
+			// Each message should reference the same table.
+			db.Exec(t, "INSERT INTO withFams VALUES (1, 2, 3)")
+			expectAttributes(foo, map[string]string{"TABLE_NAME": "withfams"}, "withfams.jfam", "withfams.ifam")
+
+			db.Exec(t, "INSERT INTO withoutFams VALUES (1)")
+			expectAttributes(foo, map[string]string{"TABLE_NAME": "withoutfams"}, "withoutfams")
+
+			require.NoError(t, foo.Close())
+		})
+
+		t.Run("different tables with one topic", func(t *testing.T) {
+			db.Exec(t, "CREATE TABLE a (i int)")
+			db.Exec(t, "CREATE TABLE b (i int)")
+			db.Exec(t, "CREATE TABLE c (i int)")
+			foo, err := f.Feed(`CREATE CHANGEFEED FOR TABLE a, TABLE b, TABLE c ` +
+				`INTO 'gcpubsub://testfeed?topic_name=mytopicname&with_table_name_attribute=true'`)
+			require.NoError(t, err)
+
+			// Ensure each message goes in a different batch with its own
+			// attributes. Ie. ensure batching is not per-topic only, but also
+			// per-table when we enable the table name attribute.
+			db.Exec(t, "INSERT INTO a VALUES (1)")
+			expectAttributes(foo, map[string]string{"TABLE_NAME": "a"}, "mytopicname")
+			db.Exec(t, "INSERT INTO b VALUES (1)")
+			expectAttributes(foo, map[string]string{"TABLE_NAME": "b"}, "mytopicname")
+			db.Exec(t, "INSERT INTO c VALUES (1)")
+			expectAttributes(foo, map[string]string{"TABLE_NAME": "c"}, "mytopicname")
+
+			require.NoError(t, foo.Close())
+		})
+
+		t.Run("no attributes", func(t *testing.T) {
+			db.Exec(t, "CREATE TABLE non (i int)")
+			foo, err := f.Feed(`CREATE CHANGEFEED FOR TABLE non`)
+			require.NoError(t, err)
+
+			db.Exec(t, "INSERT INTO non VALUES (1)")
+			expectAttributes(foo, nil, "non")
+
+			require.NoError(t, foo.Close())
+		})
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("pubsub"))
+}
+
+// TestChangefeedAvroDecimalColumnWithDiff is a regression test for
+// https://github.com/cockroachdb/cockroach/issues/118647.
+func TestChangefeedAvroDecimalColumnWithDiff(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE test1 (c1 INT PRIMARY KEY, c2 INT, c3 DECIMAL(19, 0))`)
+		sqlDB.Exec(t, `INSERT INTO test1 VALUES (1, 2, 3);`)
+
+		schemaReg := cdctest.StartTestSchemaRegistry()
+		defer schemaReg.Close()
+		str := fmt.Sprintf(`CREATE CHANGEFEED FOR TABLE test1 WITH OPTIONS (avro_schema_prefix = 'crdb_cdc_', diff, confluent_schema_registry ="%s", format = 'avro', on_error = 'pause', updated);`, schemaReg.URL())
+		testFeed := feed(t, f, str)
+		defer closeFeed(t, testFeed)
+
+		_, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
+}
+
+func TestChangefeedProtectedTimestampUpdate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	verifyFunc := func() {}
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		defer verifyFunc()
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		// Checkpoint and trigger potential protected timestamp updates frequently.
+		// Make the protected timestamp lag long enough that it shouldn't be
+		// immediately updated after a restart.
+		changefeedbase.SpanCheckpointInterval.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Millisecond)
+		changefeedbase.ProtectTimestampInterval.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Millisecond)
+		changefeedbase.ProtectTimestampLag.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Hour)
+
+		sqlDB.Exec(t, `CREATE TABLE foo (id INT)`)
+
+		createStmt := `CREATE CHANGEFEED FOR foo WITH resolved='10ms', no_initial_scan`
+		testFeed := feed(t, f, createStmt)
+		defer closeFeed(t, testFeed)
+
+		eFeed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		// Wait for the changefeed to checkpoint.
+		var lastHWM hlc.Timestamp
+		checkHWM := func() error {
+			hwm, err := eFeed.HighWaterMark()
+			if err == nil && !hwm.IsEmpty() && lastHWM.Less(hwm) {
+				lastHWM = hwm
+				return nil
+			}
+			return errors.New("waiting for high watermark to advance")
+		}
+		testutils.SucceedsSoon(t, checkHWM)
+
+		// Get the PTS of this feed.
+		p, err := eFeed.Progress()
+		require.NoError(t, err)
+
+		ptsQry := fmt.Sprintf(`SELECT ts FROM system.protected_ts_records WHERE id = '%s'`, p.ProtectedTimestampRecord)
+		var ts, ts2 string
+		sqlDB.QueryRow(t, ptsQry).Scan(&ts)
+		require.NoError(t, err)
+
+		// Force the changefeed to restart.
+		require.NoError(t, eFeed.Pause())
+		require.NoError(t, eFeed.Resume())
+
+		// Wait for a new checkpoint.
+		testutils.SucceedsSoon(t, checkHWM)
+
+		// Check that the PTS was not updated after the resume.
+		sqlDB.QueryRow(t, ptsQry).Scan(&ts2)
+		require.NoError(t, err)
+		require.Equal(t, ts, ts2)
+
+		// Lower the PTS lag and check that it has been updated.
+		changefeedbase.ProtectTimestampLag.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Millisecond)
+
+		testutils.SucceedsSoon(t, checkHWM)
+
+		sqlDB.QueryRow(t, ptsQry).Scan(&ts2)
+		require.NoError(t, err)
+		require.Less(t, ts, ts2)
+	}
+
+	withTxnRetries := withArgsFn(func(args *base.TestServerArgs) {
+		requestFilter, vf := testutils.TestingRequestFilterRetryTxnWithPrefix(t, changefeedJobProgressTxnName, 1)
+		args.Knobs.Store = &kvserver.StoreTestingKnobs{
+			TestingRequestFilter: requestFilter,
+		}
+		verifyFunc = vf
+	})
+
+	cdcTest(t, testFn, feedTestForceSink("kafka"), withTxnRetries)
 }

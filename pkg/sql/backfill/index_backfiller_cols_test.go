@@ -1,18 +1,14 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package backfill
 
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -416,7 +412,7 @@ func TestInitIndexesAllowList(t *testing.T) {
 	t.Run("nil allowList", func(t *testing.T) {
 		// A nil allowList means no filtering.
 		ib := &IndexBackfiller{}
-		ib.initIndexes(desc, nil /* allowList */)
+		ib.initIndexes(keys.SystemSQLCodec, desc, nil /* allowList */)
 		require.Equal(t, 2, len(ib.added))
 		require.Equal(t, catid.IndexID(2), ib.added[0].GetID())
 		require.Equal(t, catid.IndexID(3), ib.added[1].GetID())
@@ -424,7 +420,7 @@ func TestInitIndexesAllowList(t *testing.T) {
 
 	t.Run("non-nil allowList", func(t *testing.T) {
 		ib := &IndexBackfiller{}
-		ib.initIndexes(desc, []catid.IndexID{3} /* allowList */)
+		ib.initIndexes(keys.SystemSQLCodec, desc, []catid.IndexID{3} /* allowList */)
 		require.Equal(t, 1, len(ib.added))
 		require.Equal(t, catid.IndexID(3), ib.added[0].GetID())
 	})

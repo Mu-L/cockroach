@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -367,8 +362,9 @@ func makeConstraintConformanceVisitor(
 	v := constraintConformanceVisitor{
 		cfg:           cfg,
 		storeResolver: storeResolver,
+		report:        make(ConstraintReport),
 	}
-	v.reset(ctx)
+	v.init(ctx)
 	return v
 }
 
@@ -383,14 +379,7 @@ func (v *constraintConformanceVisitor) Report() ConstraintReport {
 	return v.report
 }
 
-// reset is part of the rangeVisitor interface.
-func (v *constraintConformanceVisitor) reset(ctx context.Context) {
-	*v = constraintConformanceVisitor{
-		cfg:           v.cfg,
-		storeResolver: v.storeResolver,
-		report:        make(ConstraintReport, len(v.report)),
-	}
-
+func (v *constraintConformanceVisitor) init(ctx context.Context) {
 	// Iterate through all the zone configs to create report entries for all the
 	// zones that have constraints. Otherwise, just iterating through the ranges
 	// wouldn't create entries for constraints that aren't violated, and

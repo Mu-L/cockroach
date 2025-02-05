@@ -1,10 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package serverccl
 
@@ -30,17 +27,26 @@ import (
 func TestServerStartupGuardrails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	// We need to conditionally apply the DevOffset for the version
-	// returned by this function to work both on master (where the dev
-	// offset applies) and on release branches (where it doesn't).
-	v := func(major, minor int32) roachpb.Version {
-		binaryVersion := clusterversion.ByKey(clusterversion.BinaryVersionKey)
-		var offset int32
-		if binaryVersion.Major > clusterversion.DevOffset {
-			offset = clusterversion.DevOffset
+	// The tests below will use the minimum supported version as the logical
+	// version.
+	logicalVersionKey := clusterversion.MinSupported
+	logicalVersion := logicalVersionKey.Version()
+
+	prev := func(v roachpb.Version) roachpb.Version {
+		t.Helper()
+		if v.Minor < 1 || v.Minor > 4 || v.Patch != 0 || v.Internal != 0 {
+			t.Fatalf("invalid version %v", v)
 		}
-		return roachpb.Version{Major: offset + major, Minor: minor}
+		if v.Minor > 1 {
+			v.Minor--
+		} else {
+			v.Major--
+			v.Minor = 2
+		}
+		return v
 	}
+	minusOne := prev(logicalVersion)
+	minusTwo := prev(minusOne)
 
 	tests := []struct {
 		storageBinaryVersion             roachpb.Version
@@ -53,23 +59,23 @@ func TestServerStartupGuardrails(t *testing.T) {
 		// First test case ensures that a tenant server can start if the server binary
 		// version is not too low for the tenant logical version.
 		{
-			storageBinaryVersion:             v(22, 2),
-			storageBinaryMinSupportedVersion: v(22, 1),
-			tenantBinaryVersion:              v(22, 2),
-			tenantBinaryMinSupportedVersion:  v(22, 2),
-			TenantLogicalVersionKey:          clusterversion.V22_2,
+			storageBinaryVersion:             logicalVersion,
+			storageBinaryMinSupportedVersion: minusOne,
+			tenantBinaryVersion:              logicalVersion,
+			tenantBinaryMinSupportedVersion:  logicalVersion,
+			TenantLogicalVersionKey:          logicalVersionKey,
 			expErrMatch:                      "",
 		},
 		// Second test case ensures that a tenant server is prevented from starting if
 		// its binary version is too low for the current tenant logical version.
 		{
-			storageBinaryVersion:             v(22, 2),
-			storageBinaryMinSupportedVersion: v(22, 1),
-			tenantBinaryVersion:              v(22, 1),
-			tenantBinaryMinSupportedVersion:  v(21, 2),
-			TenantLogicalVersionKey:          clusterversion.V22_2,
+			storageBinaryVersion:             logicalVersion,
+			storageBinaryMinSupportedVersion: minusOne,
+			tenantBinaryVersion:              minusOne,
+			tenantBinaryMinSupportedVersion:  minusTwo,
+			TenantLogicalVersionKey:          logicalVersionKey,
 			expErrMatch: fmt.Sprintf("preventing SQL server from starting because its binary version is too low for the tenant active version: "+
-				"server binary version = %v, tenant active version = %v", v(22, 1), v(22, 2)),
+				"server binary version = %v, tenant active version = %v", minusOne, logicalVersion),
 		},
 	}
 
@@ -88,8 +94,7 @@ func TestServerStartupGuardrails(t *testing.T) {
 				Settings:          storageSettings,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						BinaryVersionOverride:          test.storageBinaryVersion,
-						BootstrapVersionKeyOverride:    clusterversion.V22_2,
+						ClusterVersionOverride:         test.storageBinaryVersion,
 						DisableAutomaticVersionUpgrade: make(chan struct{}),
 					},
 					SQLEvalContext: &eval.TestingKnobs{
@@ -110,13 +115,13 @@ func TestServerStartupGuardrails(t *testing.T) {
 			// to succeed for all test cases but server creation is expected to succeed
 			// only if tenantBinaryVersion is at least equal to the version corresponding
 			// to TenantLogicalVersionKey.
-			_, err := s.StartTenant(context.Background(),
+			_, err := s.TenantController().StartTenant(context.Background(),
 				base.TestTenantArgs{
 					Settings: tenantSettings,
 					TenantID: serverutils.TestTenantID(),
 					TestingKnobs: base.TestingKnobs{
 						Server: &server.TestingKnobs{
-							BinaryVersionOverride:          test.tenantBinaryVersion,
+							ClusterVersionOverride:         test.tenantBinaryVersion,
 							DisableAutomaticVersionUpgrade: make(chan struct{}),
 						},
 					},

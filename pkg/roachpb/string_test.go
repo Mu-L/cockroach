@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachpb_test
 
 import (
+	"fmt"
 	"testing"
 
 	// Hook up the pretty printer.
@@ -42,10 +38,10 @@ func TestTransactionString(t *testing.T) {
 		Status:                 roachpb.COMMITTED,
 		LastHeartbeat:          hlc.Timestamp{WallTime: 10, Logical: 11},
 		ReadTimestamp:          hlc.Timestamp{WallTime: 30, Logical: 31},
-		GlobalUncertaintyLimit: hlc.Timestamp{WallTime: 40, Logical: 41, Synthetic: true},
+		GlobalUncertaintyLimit: hlc.Timestamp{WallTime: 40, Logical: 41},
 	}
 	expStr := `"name" meta={id=d7aa0f5e key="foo" iso=Serializable pri=44.58039917 epo=2 ts=0.000000020,21 min=0.000000010,11 seq=15}` +
-		` lock=true stat=COMMITTED rts=0.000000030,31 wto=false gul=0.000000040,41?`
+		` lock=true stat=COMMITTED rts=0.000000030,31 wto=false gul=0.000000040,41`
 
 	if str := txn.String(); str != expStr {
 		t.Errorf(
@@ -98,5 +94,56 @@ func TestSpansString(t *testing.T) {
 		},
 	} {
 		require.Equal(t, tc.expected, tc.spans.String())
+	}
+}
+
+func TestSpansBoundedString(t *testing.T) {
+	getSpans := func(numSpans int) roachpb.Spans {
+		var spans roachpb.Spans
+		for i := 1; i <= numSpans; i++ {
+			spans = append(spans, roachpb.Span{
+				Key: roachpb.Key(fmt.Sprintf("a%d", i)),
+			})
+		}
+		return spans
+	}
+	for _, tc := range []struct {
+		spans     roachpb.Spans
+		bytesHint int
+		expected  string
+	}{
+		{
+			spans:     getSpans(6),
+			bytesHint: 0,
+			// At most 6 spans are always included.
+			expected: "a1, a2, a3, a4, a5, a6",
+		},
+		{
+			spans:     getSpans(7),
+			bytesHint: 0,
+			// 3 at the head and 3 at the tail are always included.
+			expected: "a1, a2, a3 ... a5, a6, a7",
+		},
+		{
+			spans:     getSpans(7),
+			bytesHint: 10,
+			// First 3 spans use up the bytes hint.
+			expected: "a1, a2, a3 ... a5, a6, a7",
+		},
+		{
+			spans:     getSpans(7),
+			bytesHint: 11,
+			// Bytes hint is exceeded after printing 4 spans, at which point
+			// only the guaranteed 3 tail spans are left, which are always
+			// included.
+			expected: "a1, a2, a3, a4, a5, a6, a7",
+		},
+		{
+			spans:     getSpans(15),
+			bytesHint: 20,
+			expected:  "a1, a2, a3, a4, a5, a6 ... a13, a14, a15",
+		},
+	} {
+		require.Equal(t, tc.expected, tc.spans.BoundedString(tc.bytesHint))
 	}
 }

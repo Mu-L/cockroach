@@ -1,17 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -178,8 +174,10 @@ func (rec SpanSetReplicaEvalContext) GetGCThreshold() hlc.Timestamp {
 
 // ExcludeDataFromBackup returns whether the replica is to be excluded from a
 // backup.
-func (rec SpanSetReplicaEvalContext) ExcludeDataFromBackup() bool {
-	return rec.i.ExcludeDataFromBackup()
+func (rec SpanSetReplicaEvalContext) ExcludeDataFromBackup(
+	ctx context.Context, sp roachpb.Span,
+) (bool, error) {
+	return rec.i.ExcludeDataFromBackup(ctx, sp)
 }
 
 // String implements Stringer.
@@ -202,10 +200,12 @@ func (rec SpanSetReplicaEvalContext) GetLastReplicaGCTimestamp(
 
 // GetLease returns the Replica's current and next lease (if any).
 func (rec SpanSetReplicaEvalContext) GetLease() (roachpb.Lease, roachpb.Lease) {
-	rec.ss.AssertAllowed(spanset.SpanReadOnly,
-		roachpb.Span{Key: keys.RangeLeaseKey(rec.GetRangeID())},
-	)
 	return rec.i.GetLease()
+}
+
+// GetRangeLeaseDuration is part of the EvalContext interface.
+func (rec SpanSetReplicaEvalContext) GetRangeLeaseDuration() time.Duration {
+	return rec.i.GetRangeLeaseDuration()
 }
 
 // GetRangeInfo is part of the EvalContext interface.
@@ -261,8 +261,8 @@ func (rec *SpanSetReplicaEvalContext) GetResponseMemoryAccount() *mon.BoundAccou
 }
 
 // GetMaxBytes implements the batcheval.EvalContext interface.
-func (rec *SpanSetReplicaEvalContext) GetMaxBytes() int64 {
-	return rec.i.GetMaxBytes()
+func (rec *SpanSetReplicaEvalContext) GetMaxBytes(ctx context.Context) int64 {
+	return rec.i.GetMaxBytes(ctx)
 }
 
 // GetEngineCapacity implements the batcheval.EvalContext interface.
@@ -275,6 +275,11 @@ func (rec *SpanSetReplicaEvalContext) GetApproximateDiskBytes(
 	from, to roachpb.Key,
 ) (uint64, error) {
 	return rec.i.GetApproximateDiskBytes(from, to)
+}
+
+// AdmissionHeader implements the batcheval.EvalContext interface.
+func (rec *SpanSetReplicaEvalContext) AdmissionHeader() kvpb.AdmissionHeader {
+	return rec.i.AdmissionHeader()
 }
 
 // Release implements the batcheval.EvalContext interface.

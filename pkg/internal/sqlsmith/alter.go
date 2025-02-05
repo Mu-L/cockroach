@@ -1,22 +1,19 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
 import (
+	"context"
 	gosql "database/sql"
-	"math/rand"
+	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -24,7 +21,13 @@ import (
 )
 
 var (
-	alters               = append(append(append(altersTableExistence, altersExistingTable...), altersTypeExistence...), altersExistingTypes...)
+	alters = append(append(append(append(append(
+		altersTableExistence,
+		altersExistingTable...),
+		altersTypeExistence...),
+		altersExistingTypes...),
+		altersFunctionExistence...),
+		altersSequenceExistence...)
 	altersTableExistence = []statementWeight{
 		{10, makeCreateTable},
 		{2, makeCreateSchema},
@@ -46,12 +49,21 @@ var (
 	}
 	altersTypeExistence = []statementWeight{
 		{5, makeCreateType},
+		{1, makeDropType},
 	}
 	altersExistingTypes = []statementWeight{
 		{5, makeAlterTypeDropValue},
 		{5, makeAlterTypeAddValue},
 		{1, makeAlterTypeRenameValue},
 		{1, makeAlterTypeRenameType},
+	}
+	altersFunctionExistence = []statementWeight{
+		{10, makeCreateFunc},
+		{1, makeDropFunc},
+	}
+	altersSequenceExistence = []statementWeight{
+		{10, makeCreateSequence},
+		{1, makeDropSequence},
 	}
 	alterTableMultiregion = []statementWeight{
 		{10, makeAlterLocality},
@@ -102,7 +114,7 @@ func makeCreateSchema(s *Smither) (tree.Statement, bool) {
 }
 
 func makeCreateTable(s *Smither) (tree.Statement, bool) {
-	table := randgen.RandCreateTable(s.rnd, "", 0, false /* isMultiRegion */)
+	table := randgen.RandCreateTable(context.Background(), s.rnd, "", 0, randgen.TableOptNone)
 	schemaOrd := s.rnd.Intn(len(s.schemas))
 	schema := s.schemas[schemaOrd]
 	table.Table = tree.MakeTableNameWithSchema(tree.Name(s.dbName), schema.SchemaName, s.name("tab"))
@@ -329,7 +341,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 	}
 	var cols tree.IndexElemList
 	seen := map[tree.Name]bool{}
-	inverted := false
+	indexType := idxtype.FORWARD
 	unique := s.coin()
 	for len(cols) < 1 || s.coin() {
 		col := tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
@@ -340,7 +352,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		// If this is the first column and it's invertible (i.e., JSONB), make an inverted index.
 		if len(cols) == 0 &&
 			colinfo.ColumnTypeIsOnlyInvertedIndexable(tree.MustBeStaticallyKnownType(col.Type)) {
-			inverted = true
+			indexType = idxtype.INVERTED
 			unique = false
 			cols = append(cols, tree.IndexElem{
 				Column: col.Name,
@@ -355,7 +367,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		}
 	}
 	var storing tree.NameList
-	for !inverted && s.coin() {
+	for indexType.SupportsStoring() && s.coin() {
 		col := tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
 		if seen[col.Name] {
 			continue
@@ -364,11 +376,12 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		storing = append(storing, col.Name)
 	}
 
-	visibility := 1.0
+	invisibility := tree.IndexInvisibility{Value: 0.0}
 	if notvisible := s.d6() == 1; notvisible {
-		visibility = 0.0
+		invisibility.Value = 1.0
 		if s.coin() {
-			visibility = s.rnd.Float64() // [0.0, 1.0)
+			invisibility.Value = s.rnd.Float64() // [0.0, 1.0)
+			invisibility.FloatProvided = true
 		}
 	}
 
@@ -378,9 +391,9 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		Unique:       unique,
 		Columns:      cols,
 		Storing:      storing,
-		Inverted:     inverted,
+		Type:         indexType,
 		Concurrently: s.coin(),
-		Invisibility: 1 - visibility,
+		Invisibility: invisibility,
 	}, true
 }
 
@@ -403,7 +416,34 @@ func makeRenameIndex(s *Smither) (tree.Statement, bool) {
 
 func makeCreateType(s *Smither) (tree.Statement, bool) {
 	name := s.name("typ")
-	return randgen.RandCreateType(s.rnd, string(name), letters), true
+
+	if s.coin() {
+		return randgen.RandCreateEnumType(s.rnd, string(name), letters), true
+	}
+
+	return randgen.RandCreateCompositeType(s.rnd, string(name), letters), true
+}
+
+func makeDropType(s *Smither) (tree.Statement, bool) {
+	var typNames []*tree.UnresolvedObjectName
+	for len(typNames) < 1 || s.coin() {
+		// It's ok if the same type is chosen multiple times.
+		_, typName, ok := s.getRandUserDefinedType()
+		if !ok {
+			if len(typNames) == 0 {
+				return nil, false
+			}
+			break
+		}
+		typNames = append(typNames, typName.ToUnresolvedObjectName())
+	}
+	return &tree.DropType{
+		Names:    typNames,
+		IfExists: s.d6() < 3,
+		// TODO(#51480): use s.randDropBehavior() once DROP TYPE CASCADE is
+		// implemented.
+		DropBehavior: s.randDropBehaviorNoCascade(),
+	}, true
 }
 
 func rowsToRegionList(rows *gosql.Rows) ([]string, error) {
@@ -421,6 +461,9 @@ func rowsToRegionList(rows *gosql.Rows) ([]string, error) {
 	for region := range regionsSet {
 		regions = append(regions, region)
 	}
+	// Make deterministic. Note that we don't need to shuffle the regions since
+	// the caller will be picking random ones from the slice.
+	sort.Strings(regions)
 	return regions, nil
 }
 
@@ -455,7 +498,7 @@ func makeAlterLocality(s *Smither) (tree.Statement, bool) {
 	}
 	regions := getClusterRegions(s)
 
-	localityLevel := tree.LocalityLevel(rand.Intn(3))
+	localityLevel := tree.LocalityLevel(s.rnd.Intn(3))
 	ast := &tree.AlterTableLocality{
 		Name: tableRef.TableName.ToUnresolvedObjectName(),
 		Locality: &tree.Locality{
@@ -466,7 +509,7 @@ func makeAlterLocality(s *Smither) (tree.Statement, bool) {
 		if len(regions) == 0 {
 			return &tree.AlterDatabaseAddRegion{}, false
 		}
-		ast.Locality.TableRegion = tree.Name(regions[rand.Intn(len(regions))])
+		ast.Locality.TableRegion = tree.Name(regions[s.rnd.Intn(len(regions))])
 	}
 	return ast, ok
 }
@@ -479,7 +522,7 @@ func makeAlterDatabaseAddRegion(s *Smither) (tree.Statement, bool) {
 	}
 
 	ast := &tree.AlterDatabaseAddRegion{
-		Region: tree.Name(regions[rand.Intn(len(regions))]),
+		Region: tree.Name(regions[s.rnd.Intn(len(regions))]),
 		Name:   tree.Name("defaultdb"),
 	}
 
@@ -494,7 +537,7 @@ func makeAlterDatabaseDropRegion(s *Smither) (tree.Statement, bool) {
 	}
 
 	ast := &tree.AlterDatabaseDropRegion{
-		Region: tree.Name(regions[rand.Intn(len(regions))]),
+		Region: tree.Name(regions[s.rnd.Intn(len(regions))]),
 		Name:   tree.Name("defaultdb"),
 	}
 
@@ -509,7 +552,7 @@ func makeAlterSurvivalGoal(s *Smither) (tree.Statement, bool) {
 		tree.SurvivalGoalRegionFailure,
 		tree.SurvivalGoalZoneFailure,
 	}
-	survivalGoal := survivalGoals[rand.Intn(len(survivalGoals))]
+	survivalGoal := survivalGoals[s.rnd.Intn(len(survivalGoals))]
 
 	ast := &tree.AlterDatabaseSurvivalGoal{
 		Name:         tree.Name("defaultdb"),
@@ -526,7 +569,7 @@ func makeAlterDatabasePlacement(s *Smither) (tree.Statement, bool) {
 		tree.DataPlacementDefault,
 		tree.DataPlacementRestricted,
 	}
-	dataPlacement := dataPlacements[rand.Intn(len(dataPlacements))]
+	dataPlacement := dataPlacements[s.rnd.Intn(len(dataPlacements))]
 
 	ast := &tree.AlterDatabasePlacement{
 		Name:      tree.Name("defaultdb"),
@@ -587,5 +630,32 @@ func makeAlterTypeRenameType(s *Smither) (tree.Statement, bool) {
 		Cmd: &tree.AlterTypeRename{
 			NewName: s.name("typ"),
 		},
+	}, true
+}
+
+func makeCreateSequence(s *Smither) (tree.Statement, bool) {
+	schema := s.schemas[s.rnd.Intn(len(s.schemas))]
+	name := tree.MakeTableNameWithSchema(tree.Name(s.dbName), schema.SchemaName, s.name("seq"))
+	return &tree.CreateSequence{
+		IfNotExists: s.d6() < 3,
+		Name:        name,
+	}, true
+}
+
+func makeDropSequence(s *Smither) (tree.Statement, bool) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	if len(s.sequences) == 0 {
+		return nil, false
+	}
+	var names tree.TableNames
+	for len(names) < 1 || s.coin() {
+		// It's ok if the same sequence is chosen multiple times.
+		names = append(names, s.sequences[s.rnd.Intn(len(s.sequences))].SequenceName)
+	}
+	return &tree.DropSequence{
+		Names:        names,
+		IfExists:     s.coin(),
+		DropBehavior: s.randDropBehavior(),
 	}, true
 }

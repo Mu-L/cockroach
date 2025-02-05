@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -25,6 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -240,7 +240,7 @@ func TestEncoders(t *testing.T) {
 				return
 			}
 			require.NoError(t, o.Validate())
-			e, err := getEncoder(o, targets, false, nil, nil)
+			e, err := getEncoder(context.Background(), o, targets, false, nil, nil)
 			require.NoError(t, err)
 
 			rowInsert := cdcevent.TestingMakeEventRow(tableDesc, 0, row, false)
@@ -386,7 +386,7 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 				StatementTimeName: changefeedbase.StatementTimeName(tableDesc.GetName()),
 			})
 
-			e, err := getEncoder(opts, targets, false, nil, nil)
+			e, err := getEncoder(context.Background(), opts, targets, false, nil, nil)
 			require.NoError(t, err)
 
 			rowInsert := cdcevent.TestingMakeEventRow(tableDesc, 0, row, false)
@@ -418,7 +418,7 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 			defer noCertReg.Close()
 			opts.SchemaRegistryURI = noCertReg.URL()
 
-			enc, err := getEncoder(opts, targets, false, nil, nil)
+			enc, err := getEncoder(context.Background(), opts, targets, false, nil, nil)
 			require.NoError(t, err)
 			_, err = enc.EncodeKey(context.Background(), rowInsert)
 			require.Regexp(t, "x509", err)
@@ -431,7 +431,7 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 			defer wrongCertReg.Close()
 			opts.SchemaRegistryURI = wrongCertReg.URL()
 
-			enc, err = getEncoder(opts, targets, false, nil, nil)
+			enc, err = getEncoder(context.Background(), opts, targets, false, nil, nil)
 			require.NoError(t, err)
 			_, err = enc.EncodeKey(context.Background(), rowInsert)
 			require.Regexp(t, `contacting confluent schema registry.*: x509`, err)
@@ -522,25 +522,41 @@ func TestAvroArrayCap(t *testing.T) {
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
-func TestAvroCollatedString(t *testing.T) {
+func TestCollatedString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b string collate "fr-CA")`)
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'désolée' collate "fr-CA")`)
+	for _, tc := range []struct {
+		format   changefeedbase.FormatType
+		expected string
+	}{
+		{
+			format:   changefeedbase.OptFormatAvro,
+			expected: `foo: {"a":{"long":1}}->{"after":{"foo":{"a":{"long":1},"b":{"string":"désolée"}}}}`,
+		},
+		{
+			format:   changefeedbase.OptFormatJSON,
+			expected: `foo: [1]->{"after": {"a": 1, "b": "désolée"}}`,
+		},
+		{
+			format:   changefeedbase.OptFormatCSV,
+			expected: `foo: ->1,désolée`,
+		},
+	} {
+		testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+			sqlDB := sqlutils.MakeSQLRunner(s.DB)
+			sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b string collate "fr-CA")`)
+			sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'désolée' collate "fr-CA")`)
 
-		foo := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR foo `+
-			`WITH format=%s`,
-			changefeedbase.OptFormatAvro))
-		defer closeFeed(t, foo)
-		assertPayloads(t, foo, []string{
-			`foo: {"a":{"long":1}}->{"after":{"foo":{"a":{"long":1},"b":{"string":"désolée"}}}}`,
-		})
+			foo := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR foo `+
+				`WITH format=%s, initial_scan_only`, tc.format))
+			defer closeFeed(t, foo)
+			assertPayloads(t, foo, []string{
+				tc.expected,
+			})
+		}
+		cdcTest(t, testFn, feedTestForceSink("kafka"))
 	}
-
-	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroEnum(t *testing.T) {
@@ -801,7 +817,7 @@ func TestTableNameCollision(t *testing.T) {
 		})
 	}
 
-	cdcTest(t, testFn, feedTestForceSink("kafka"), feedTestUseRootUserConnection)
+	cdcTest(t, testFn, feedTestForceSink("kafka"), feedTestUseRootUserConnection, withDebugUseAfterFinish)
 }
 
 func TestAvroMigrateToUnsupportedColumn(t *testing.T) {
@@ -921,7 +937,7 @@ func BenchmarkEncoders(b *testing.B) {
 		b.ReportAllocs()
 		b.StopTimer()
 
-		encoder, err := getEncoder(opts, targets, false, nil, nil)
+		encoder, err := getEncoder(context.Background(), opts, targets, false, nil, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1087,22 +1103,22 @@ func TestParquetEncoder(t *testing.T) {
 		for _, test := range tests {
 			t.Run(test.name, func(t *testing.T) {
 				sqlDB := sqlutils.MakeSQLRunner(s.DB)
-				sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY, x STRING, y INT, z FLOAT NOT NULL, a BOOL, c INT[])`)
+				sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY, x STRING, y INT, z FLOAT NOT NULL, a BOOL, c INT[], d REFCURSOR)`)
 				defer sqlDB.Exec(t, `DROP TABLE FOO`)
-				sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'Alice', 3, 0.5032135844230652, true,  ARRAY[]), (2, 'Bob',
-	2, CAST('nan' AS FLOAT),false, NULL),(3, NULL, NULL, 4.5, NULL,  ARRAY[1,NULL,3])`)
+				sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'Alice', 3, 0.5032135844230652, true,  ARRAY[], 'foo'), (2, 'Bob',
+	2, CAST('nan' AS FLOAT),false, NULL, 'bar'),(3, NULL, NULL, 4.5, NULL,  ARRAY[1,NULL,3], NULL)`)
 				foo := feed(t, f, test.changefeedStmt)
 				defer closeFeed(t, foo)
 
 				assertPayloads(t, foo, []string{
-					`foo: [1]->{"after": {"a": true, "c": [], "i": 1, "x": "Alice", "y": 3, "z": 0.5032135844230652}}`,
-					`foo: [2]->{"after": {"a": false, "c": null, "i": 2, "x": "Bob", "y": 2, "z": "NaN"}}`,
-					`foo: [3]->{"after": {"a": null, "c": [1, null, 3], "i": 3, "x": null, "y": null, "z": 4.5}}`,
+					`foo: [1]->{"after": {"a": true, "c": [], "d": "foo", "i": 1, "x": "Alice", "y": 3, "z": 0.5032135844230652}}`,
+					`foo: [2]->{"after": {"a": false, "c": null, "d": "bar", "i": 2, "x": "Bob", "y": 2, "z": "NaN"}}`,
+					`foo: [3]->{"after": {"a": null, "c": [1, null, 3], "d": null, "i": 3, "x": null, "y": null, "z": 4.5}}`,
 				})
 
 				sqlDB.Exec(t, `UPDATE foo SET x='wonderland' where i=1`)
 				assertPayloads(t, foo, []string{
-					`foo: [1]->{"after": {"a": true, "c": [], "i": 1, "x": "wonderland", "y": 3, "z": 0.5032135844230652}}`,
+					`foo: [1]->{"after": {"a": true, "c": [], "d": "foo", "i": 1, "x": "wonderland", "y": 3, "z": 0.5032135844230652}}`,
 				})
 
 				sqlDB.Exec(t, `DELETE from foo where i=1`)
@@ -1121,7 +1137,7 @@ func TestJsonRountrip(t *testing.T) {
 	rng, _ := randutil.NewTestRand()
 
 	isFloatOrDecimal := func(typ *types.T) bool {
-		return typ == types.Float4 || typ == types.Float || typ == types.Decimal
+		return typ.Identical(types.Float4) || typ.Identical(types.Float) || typ.Identical(types.Decimal)
 	}
 
 	type test struct {
@@ -1151,7 +1167,7 @@ func TestJsonRountrip(t *testing.T) {
 			switch typ {
 			case types.Jsonb:
 				// Unsupported by sql/catalog/colinfo
-			case types.TSQuery, types.TSVector, types.PGLSN:
+			case types.TSQuery, types.TSVector, types.PGVector:
 				// Unsupported by pkg/sql/parser
 			default:
 				if arrayTyp.InternalType.ArrayContents == typ {
@@ -1193,7 +1209,9 @@ func TestJsonRountrip(t *testing.T) {
 			dRow := rowenc.EncDatumRow{rowenc.EncDatum{Datum: tree.NewDInt(1)}, rowenc.EncDatum{Datum: test.datum}}
 			cdcRow := cdcevent.TestingMakeEventRow(tableDesc, 0, dRow, false)
 
-			encoder, err := makeJSONEncoder(jsonEncoderOptions{})
+			// TODO(#139660): test this with other envelopes.
+			opts := jsonEncoderOptions{EncodingOptions: changefeedbase.EncodingOptions{Envelope: changefeedbase.OptEnvelopeBare}}
+			encoder, err := makeJSONEncoder(context.Background(), opts)
 			require.NoError(t, err)
 
 			// Encode the value to a string and parse it. Assert that the parsed json matches the
@@ -1223,4 +1241,110 @@ func TestJsonRountrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAvroWithRegionalTable tests how the avro encoder works with regional
+// tables and with different envelope formats. This is a regression test for
+// #119428.
+func TestAvroWithRegionalTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := []struct {
+		envelope string
+		payload  []string
+	}{
+		{
+			envelope: "wrapped",
+			payload: []string{
+				`table1: {"a":{"long":1},"crdb_region":{"string":"us-east1"}}->{"after":{"table1":{"a":{"long":1},"crdb_region":{"string":"us-east1"}}}}`,
+				`table1: {"a":{"long":2},"crdb_region":{"string":"us-east1"}}->{"after":{"table1":{"a":{"long":2},"crdb_region":{"string":"us-east1"}}}}`,
+				`table1: {"a":{"long":3},"crdb_region":{"string":"us-east1"}}->{"after":{"table1":{"a":{"long":3},"crdb_region":{"string":"us-east1"}}}}`,
+			},
+		},
+		{
+			envelope: "bare",
+			payload: []string{
+				`table1: {"a":{"long":1},"crdb_region":{"string":"us-east1"}}->{"record":{"table1":{"a":{"long":1},"crdb_region":{"string":"us-east1"}}}}`,
+				`table1: {"a":{"long":2},"crdb_region":{"string":"us-east1"}}->{"record":{"table1":{"a":{"long":2},"crdb_region":{"string":"us-east1"}}}}`,
+				`table1: {"a":{"long":3},"crdb_region":{"string":"us-east1"}}->{"record":{"table1":{"a":{"long":3},"crdb_region":{"string":"us-east1"}}}}`,
+			},
+		},
+		{
+			envelope: "key_only",
+			payload: []string{
+				`table1: {"a":{"long":1},"crdb_region":{"string":"us-east1"}}->`,
+				`table1: {"a":{"long":2},"crdb_region":{"string":"us-east1"}}->`,
+				`table1: {"a":{"long":3},"crdb_region":{"string":"us-east1"}}->`,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.envelope, func(t *testing.T) {
+			// Run the test with one and three(default) workers to test both the
+			// default behaviour and the behaviour when
+			// confluentAvroEncoder.keyCache and confluentAvroEncoder.valueCache
+			// are used. With one worker, the cache is forced to be used during
+			// encoding for the second row.
+			testutils.RunTrueAndFalse(t, "overrideWithSingleWorker", func(t *testing.T, overrideWithSingleWorker bool) {
+				// Clear the singleton cache to avoid pollution from other tests.
+				// This needs to be done here since this test doesn't use the
+				// cdcTest helper function.
+				TestingClearSchemaRegistrySingleton()
+				cluster, db, cleanup := startTestCluster(t)
+				defer cleanup()
+				if overrideWithSingleWorker {
+					t.Logf("overriding number of parallel workers to one")
+					changefeedbase.EventConsumerWorkers.Override(
+						context.Background(), &cluster.ApplicationLayer(0).ClusterSettings().SV, 1)
+				}
+
+				sqlDB := sqlutils.MakeSQLRunner(db)
+				sqlDB.Exec(t, `CREATE TABLE table1 (a INT PRIMARY KEY) LOCALITY REGIONAL BY ROW`)
+				schemaReg := cdctest.StartTestSchemaRegistry()
+				defer schemaReg.Close()
+				stmt := fmt.Sprintf(`CREATE CHANGEFEED FOR TABLE table1 WITH format = avro, envelope = %s,
+	confluent_schema_registry = "%s", schema_change_events = column_changes, schema_change_policy = nobackfill`,
+					test.envelope, schemaReg.URL())
+
+				f := makeKafkaFeedFactory(t, cluster, db)
+				testFeed := feed(t, f, stmt)
+				defer closeFeed(t, testFeed)
+
+				sqlDB.Exec(t, `INSERT INTO table1(a) values(1), (2), (3)`)
+				assertPayloads(t, testFeed, test.payload)
+			})
+		})
+	}
+}
+
+// Create a thin, in-memory user-defined enum type
+func createEnum(enumLabels tree.EnumValueList, typeName tree.TypeName) *types.T {
+
+	members := make([]descpb.TypeDescriptor_EnumMember, len(enumLabels))
+	physReps := enum.GenerateNEvenlySpacedBytes(len(enumLabels))
+	for i := range enumLabels {
+		members[i] = descpb.TypeDescriptor_EnumMember{
+			LogicalRepresentation:  string(enumLabels[i]),
+			PhysicalRepresentation: physReps[i],
+			Capability:             descpb.TypeDescriptor_EnumMember_ALL,
+		}
+	}
+
+	enumKind := descpb.TypeDescriptor_ENUM
+
+	typeDesc := typedesc.NewBuilder(&descpb.TypeDescriptor{
+		Name:        typeName.Type(),
+		ID:          0,
+		Kind:        enumKind,
+		EnumMembers: members,
+		Version:     1,
+	}).BuildCreatedMutableType()
+
+	typ, _ := typedesc.HydratedTFromDesc(context.Background(), &typeName, typeDesc, nil /* res */)
+
+	testTypes[typeName.SQLString()] = typ
+
+	return typ
+
 }

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -49,7 +44,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -64,6 +63,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -86,13 +86,14 @@ import (
 func TestSchemaChangeProcess(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	// The descriptor changes made must have an immediate effect
-	// so disable leases on tables.
-	defer lease.TestingDisableTableLeases()()
 
 	params, _ := createTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
+
+	// The descriptor changes made must have an immediate effect
+	// so disable leases on tables.
+	defer lease.TestingDisableTableLeases()()
 
 	var instance = base.SQLInstanceID(2)
 	stopper := stop.NewStopper()
@@ -106,6 +107,7 @@ func TestSchemaChangeProcess(t *testing.T) {
 		execCfg.Clock,
 		execCfg.Settings,
 		s.SettingsWatcher().(*settingswatcher.SettingsWatcher),
+		execCfg.SQLLiveness,
 		execCfg.Codec,
 		lease.ManagerTestingKnobs{},
 		stopper,
@@ -213,9 +215,6 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 func TestAsyncSchemaChanger(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	// The descriptor changes made must have an immediate effect
-	// so disable leases on tables.
-	defer lease.TestingDisableTableLeases()()
 	// Disable synchronous schema change execution so the asynchronous schema
 	// changer executes all schema changes.
 	params, _ := createTestServerParams()
@@ -230,6 +229,10 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 `); err != nil {
 		t.Fatal(err)
 	}
+
+	// The descriptor changes made must have an immediate effect
+	// so disable leases on tables.
+	defer lease.TestingDisableTableLeases()()
 
 	// Read table descriptor for version.
 	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
@@ -470,6 +473,7 @@ CREATE TABLE d.t1 (val INT DEFAULT nextval('d.sq1'), animal d.animals);
 	// This view creation will fail and eventually rollback.
 	_, err = sqlDB.Exec(
 		`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 CREATE MATERIALIZED VIEW d.v AS SELECT val FROM d.t1;
 CREATE VIEW d.v1 AS SELECT A.val AS  val2, B.val AS val1, 'cat':::d.animals AS ANIMAL, c.last_value FROM d.v AS A, d.t1 AS B, d.sq1 as C;
 COMMIT;`)
@@ -561,6 +565,10 @@ INSERT INTO t.test VALUES (1,1), (2,2), (3,3)
 func TestRaceWithBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderDeadlock(t, "very long-running test under deadlock")
+	skip.UnderRace(t, "can cause flakes due to queries failing because of aggressive GC TTL")
+
 	// protects backfillNotification
 	var mu syncutil.Mutex
 	var backfillNotification chan struct{}
@@ -602,6 +610,11 @@ func TestRaceWithBackfill(t *testing.T) {
 				return nil
 			},
 		},
+		SQLEvalContext: &eval.TestingKnobs{
+			// This prevents using a small kv-batch-size, which is suspected
+			// of causing the test to time out when run with race detection enabled.
+			ForceProductionValues: true,
+		},
 	}
 
 	tc := serverutils.StartCluster(t, numNodes,
@@ -622,10 +635,11 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 		t.Fatal(err)
 	}
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	// Disable strict GC TTL enforcement so that we can use AddImmediateGCZoneConfig.
+	// We are reducing the GC TTL to a low value and, as a precaution, disabling
+	// strict GC TTL enforcement. Previously, we made it immediate but occasionally
+	// encountered errors where the batch timestamp was before the replica GC threshold.
 	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
-	// Add a zone config for the table so that garbage collection happens rapidly.
-	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
+	if _, err := sqltestutils.UpdateGCZoneConfig(sqlDB, tableDesc.GetID(), 1); err != nil {
 		t.Fatal(err)
 	}
 	// Bulk insert.
@@ -640,14 +654,17 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 
 	ctx := context.Background()
 
-	// number of keys == 2 * number of rows; 1 column family and 1 index entry
-	// for each row.
-	if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, codec, 2, maxValue); err != nil {
-		t.Fatal(err)
-	}
-	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
-		t.Fatal(err)
-	}
+	testutils.SucceedsSoon(t, func() error {
+		// number of keys == 2 * number of rows; 1 column family and 1 index entry
+		// for each row.
+		if err := sqltestutils.CheckTableKeyCount(ctx, kvDB, codec, 2, maxValue); err != nil {
+			return err
+		}
+		if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
+			return err
+		}
+		return nil
+	})
 
 	// Run some schema changes with operations.
 
@@ -806,6 +823,17 @@ func TestDropWhileBackfill(t *testing.T) {
 `); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := sqlDB.Exec(`
+	ALTER ROLE ALL SET autocommit_before_ddl = 'false';
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`
+	SET autocommit_before_ddl = 'false';
+`); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := sqlDB.Exec(`
 SET use_declarative_schema_changer = 'off';
 CREATE DATABASE t;
@@ -1326,6 +1354,9 @@ CREATE TABLE t.test (
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := txn.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := txn.Exec(`ALTER TABLE t.test ADD CONSTRAINT check_bk CHECK (b >= k)`); err != nil {
 		t.Fatal(err)
 	}
@@ -1581,116 +1612,6 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	dropColumnSchemaChange(t, sqlDB, kvDB, codec, maxValue, 2)
 	if num := atomic.SwapUint32(&numBackfills, 0); num != 2 {
 		t.Fatalf("expected %d backfills, but saw %d", 2, num)
-	}
-}
-
-// Test schema change purge failure doesn't leave DB in a bad state.
-func TestSchemaChangePurgeFailure(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	for _, schemaChangerSetup := range []string{
-		"SET use_declarative_schema_changer='off'",
-		"SET use_declarative_schema_changer='on'",
-	} {
-		params, _ := createTestServerParams()
-		const chunkSize = 200
-
-		var getKeyCount func() (int, error)
-		countBeforeRollback := 0
-		params.Knobs = base.TestingKnobs{
-			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				RunBeforeOnFailOrCancel: func(jobID jobspb.JobID) error {
-					cnt, err := getKeyCount()
-					if err != nil {
-						return err
-					}
-					countBeforeRollback = cnt
-					return nil
-				},
-			},
-			DistSQL: &execinfra.TestingKnobs{
-				BulkAdderFlushesEveryBatch: true,
-			},
-			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
-				RunBeforeMakingPostCommitPlan: func(inRollback bool) error {
-					if inRollback {
-						cnt, err := getKeyCount()
-						if err != nil {
-							return err
-						}
-						countBeforeRollback = cnt
-					}
-					return nil
-				},
-			},
-		}
-		server, sqlDB, kvDB := serverutils.StartServer(t, params)
-		defer server.Stopper().Stop(context.Background())
-		codec := server.ApplicationLayer().Codec()
-
-		_, err := sqlDB.Exec(fmt.Sprintf("SET CLUSTER SETTING bulkio.index_backfill.batch_size = %d", chunkSize))
-		require.NoError(t, err)
-
-		getKeyCount = func() (int, error) {
-			return sqltestutils.GetTableKeyCount(ctx, kvDB, codec)
-		}
-		// Disable strict GC TTL enforcement because we're going to shove a zero-value
-		// TTL into the system with AddImmediateGCZoneConfig.
-		defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
-
-		_, err = sqlDB.Exec(schemaChangerSetup)
-		require.NoError(t, err)
-
-		if _, err := sqlDB.Exec(`
-CREATE DATABASE t;
-CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
-`); err != nil {
-			t.Fatal(err)
-		}
-
-		// Bulk insert.
-		const maxValue = chunkSize + 1
-		if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
-			t.Fatal(err)
-		}
-
-		// Add a row with a duplicate value=0 which is the same
-		// value as for the key maxValue.
-		if _, err := sqlDB.Exec(
-			`INSERT INTO t.test VALUES ($1, $2)`, maxValue+1, 0,
-		); err != nil {
-			t.Fatal(err)
-		}
-
-		// A schema change that violates integrity constraints.
-		if _, err := sqlDB.Exec(
-			"CREATE UNIQUE INDEX foo ON t.test (v)",
-		); !testutils.IsError(err, `violates unique constraint "foo"`) {
-			t.Fatal(err)
-		}
-
-		// The index doesn't exist
-		if _, err := sqlDB.Query(
-			`SELECT v from t.test@foo`,
-		); !testutils.IsError(err, "index .* not found") {
-			t.Fatal(err)
-		}
-
-		// countBeforeRollback is assigned in the rollback testing knob which is
-		// called before rollback starts so that the first chunk (200 keys) written
-		// is still visible. The first chunk is visible because there is no
-		// duplicate keys within it. The duplicate keys only exist in the second
-		// chunk. Also note that we wrote maxValue+1 rows, and there is 1 extra key
-		// from kv.
-		require.Equal(t, countBeforeRollback, maxValue+2+chunkSize)
-
-		// No garbage left behind after rollback. This check should succeed pretty
-		// fast since we use `DelRange` in GC and `CheckTableKeyCount` cannot see
-		// tombstones.
-		testutils.SucceedsSoon(t, func() error {
-			return sqltestutils.CheckTableKeyCount(ctx, kvDB, codec, 1, maxValue+1)
-		})
 	}
 }
 
@@ -2109,6 +2030,8 @@ INSERT INTO t VALUES (1, 1, 1), (2, 2, 1);
 
 	txn, err := sqlDB.Begin()
 	require.NoError(t, err)
+	_, err = txn.Exec("SET LOCAL autocommit_before_ddl = false")
+	require.NoError(t, err)
 
 	_, err = txn.Exec("DROP INDEX index_to_drop")
 	require.NoError(t, err)
@@ -2257,8 +2180,8 @@ INSERT INTO t.test VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3);
 	y INT8 NOT NULL,
 	z INT8 NULL,
 	CONSTRAINT test_pkey PRIMARY KEY (y ASC),
-	UNIQUE INDEX test_x_key (x ASC),
-	INDEX i (z ASC)
+	INDEX i (z ASC),
+	UNIQUE INDEX test_x_key (x ASC)
 )`
 	if create != expected {
 		t.Fatalf("expected %s, found %s", expected, create)
@@ -3058,8 +2981,8 @@ func TestPrimaryKeyDropIndexNotCancelable(t *testing.T) {
 
 	ctx := context.Background()
 	var db *gosql.DB
-	var shouldAttemptCancel syncutil.AtomicBool
-	shouldAttemptCancel.Set(true)
+	var shouldAttemptCancel atomic.Bool
+	shouldAttemptCancel.Store(true)
 	hasAttemptedCancel := make(chan struct{})
 	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
@@ -3663,6 +3586,9 @@ INSERT INTO t.kv VALUES ('a', 'b');
 		t.Run(testCase.name, func(t *testing.T) {
 			tx, err := sqlDB.Begin()
 			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
 				t.Fatal(err)
 			}
 
@@ -4314,8 +4240,8 @@ SET CLUSTER SETTING kv.closed_timestamp.target_duration = '20s'
 	// A large enough value that the backfills run as part of the
 	// schema change run in many chunks.
 	var maxValue = 4001
-	if util.RaceEnabled {
-		// Race builds are a lot slower, so use a smaller number of rows.
+	if util.RaceEnabled || syncutil.DeadlockEnabled {
+		// Race and deadlock builds are a lot slower, so use a smaller number of rows.
 		maxValue = 200
 	}
 
@@ -4327,6 +4253,10 @@ CREATE DATABASE t;
 
 	tx, err := sqlDB.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tx.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4591,65 +4521,6 @@ func TestCancelSchemaChange(t *testing.T) {
 	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if checks := tableDesc.CheckConstraints(); len(checks) != 1 {
 		t.Fatalf("expected 1 check, found %+v", checks)
-	}
-}
-
-// This test checks that when a transaction containing schema changes
-// needs to be retried it gets retried internal to cockroach. This test
-// currently fails because a schema change transaction is not retried.
-func TestSchemaChangeRetryError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	const numNodes = 3
-
-	params, _ := createTestServerParams()
-
-	tc := serverutils.StartCluster(t, numNodes,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs:      params,
-		})
-	defer tc.Stopper().Stop(context.Background())
-	sqlDB := tc.ServerConn(0)
-
-	if _, err := sqlDB.Exec(`
- CREATE DATABASE t;
- CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
- `); err != nil {
-		t.Fatal(err)
-	}
-
-	tx, err := sqlDB.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The timestamp of the transaction is guaranteed to be fixed after
-	// this statement.
-	if _, err := tx.Exec(`
-		CREATE TABLE t.another (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
-		`); err != nil {
-		t.Fatal(err)
-	}
-
-	otherSQLDB := tc.ServerConn(1)
-
-	// Read schema on another node that picks a later timestamp.
-	rows, err := otherSQLDB.Query("SELECT * FROM t.test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows.Close()
-
-	if _, err := tx.Exec(`
-		CREATE UNIQUE INDEX vidx ON t.test (v);
-		`); err != nil {
-		t.Fatal(err)
-	}
-
-	// The transaction should get pushed and commit without an error.
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -4978,10 +4849,10 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v JSON);
 
 	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
-	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng, _ := randutil.NewTestRand()
 	// Insert enough rows to exceed the chunk size.
 	for i := 0; i < maxValue+1; i++ {
-		jsonVal, err := json.Random(20, r)
+		jsonVal, err := json.Random(20, rng)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -5025,14 +4896,14 @@ CREATE TABLE t.test (a INT, b INT, c JSON, d JSON);
 		t.Fatal(err)
 	}
 
-	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng, _ := randutil.NewTestRand()
 	// Insert enough rows to exceed the chunk size.
 	for i := 0; i < maxValue+1; i++ {
-		jsonVal1, err := json.Random(20, r)
+		jsonVal1, err := json.Random(20, rng)
 		if err != nil {
 			t.Fatal(err)
 		}
-		jsonVal2, err := json.Random(20, r)
+		jsonVal2, err := json.Random(20, rng)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -5044,6 +4915,9 @@ CREATE TABLE t.test (a INT, b INT, c JSON, d JSON);
 	// Start schema changes.
 	tx, err := sqlDB.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(`CREATE INDEX idx_a ON t.test (a)`); err != nil {
@@ -5066,7 +4940,8 @@ CREATE TABLE t.test (a INT, b INT, c JSON, d JSON);
 func TestCreateStatsAfterSchemaChange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderRace(t, "sometimes the timer in stats.Refresher doesn't fire fast enough under race")
+
+	skip.UnderDuress(t, "sometimes the timer in stats.Refresher doesn't fire fast enough under custom configs")
 
 	defer func(oldRefreshInterval, oldAsOf time.Duration) {
 		stats.DefaultRefreshInterval = oldRefreshInterval
@@ -5839,7 +5714,7 @@ CREATE UNIQUE INDEX i ON t.test(v);
 		require.NoError(t, sqlDB.QueryRow(`
 SELECT value
   FROM crdb_internal.node_metrics
- WHERE name = 'sql.schema_changer.permanent_errors';
+ WHERE name = 'jobs.schema_change.resume_failed';
 `).Scan(&permanentErrors))
 		require.Equal(t, 1, permanentErrors)
 		var userErrors int
@@ -6395,12 +6270,9 @@ func TestRollbackForeignKeyAddition(t *testing.T) {
 
 	var jobID jobspb.JobID
 
-	// We filter by descriptor_ids because there's a bug where we create an extra
+	// We filter by running because there's a bug where we create an extra
 	// no-op job for the referenced table (#57624).
-	require.NoError(t, sqlDB.QueryRow(`
-SELECT job_id FROM crdb_internal.jobs WHERE description LIKE '%ALTER TABLE%'
-AND descriptor_ids[1] = 'db.t2'::regclass::int`,
-	).Scan(&jobID))
+	require.NoError(t, sqlDB.QueryRow(`SELECT job_id FROM crdb_internal.jobs WHERE description LIKE '%ALTER TABLE%' AND status = 'running'`).Scan(&jobID))
 	tdb.Exec(t, "CANCEL JOB $1", jobID)
 
 	close(continueNotification)
@@ -6438,12 +6310,6 @@ func TestRevertingJobsOnDatabasesAndSchemas(t *testing.T) {
 			setupStmts: `CREATE DATABASE db_rename_schema; CREATE SCHEMA db_rename_schema.sc;`,
 			scStmt:     `ALTER SCHEMA db_rename_schema.sc RENAME TO new_name`,
 			jobRegex:   `^ALTER SCHEMA db_rename_schema.sc RENAME TO new_name$`,
-		},
-		{
-			name:       "grant on schema",
-			setupStmts: `CREATE DATABASE db_grant_on_schema; CREATE SCHEMA db_grant_on_schema.sc;`,
-			scStmt:     `GRANT ALL ON SCHEMA db_grant_on_schema.sc TO PUBLIC`,
-			jobRegex:   `updating privileges for schema`,
 		},
 		{
 			name:       "rename database",
@@ -6513,7 +6379,7 @@ func TestRevertingJobsOnDatabasesAndSchemas(t *testing.T) {
 					_, _ = db.Exec(`SET use_declarative_schema_changer = 'off'; ` + scStmt)
 				}(tc.scStmt)
 				// Verify that the job is in retry state while reverting.
-				const query = `SELECT num_runs > 3 FROM crdb_internal.jobs WHERE status = '` + string(jobs.StatusReverting) + `' AND description ~ '%s'`
+				const query = `SELECT true FROM crdb_internal.jobs WHERE status = '` + string(jobs.StatusReverting) + `' AND description ~ '%s'`
 				sqlDB.CheckQueryResultsRetry(t, fmt.Sprintf(query, tc.jobRegex), [][]string{{"true"}})
 			})
 		}
@@ -6718,31 +6584,30 @@ func TestClockSyncErrorsAreNotPermanent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	var tc serverutils.TestClusterInterface
+	var s serverutils.TestServerInterface
+	var conn *gosql.DB
 	ctx := context.Background()
 	var updatedClock int64 // updated with atomics
-	tc = testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				DistSQL: &execinfra.TestingKnobs{
-					RunBeforeBackfillChunk: func(sp roachpb.Span) error {
-						if atomic.AddInt64(&updatedClock, 1) > 1 {
-							return nil
-						}
-						clock := tc.Server(0).Clock()
-						now := clock.Now()
-						farInTheFuture := now.Add(time.Hour.Nanoseconds(), 0)
+	s, conn, _ = serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			DistSQL: &execinfra.TestingKnobs{
+				RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+					if atomic.AddInt64(&updatedClock, 1) > 1 {
+						return nil
+					}
+					clock := s.ApplicationLayer().Clock()
+					now := clock.Now()
+					farInTheFuture := now.Add(time.Hour.Nanoseconds(), 0)
 
-						return clock.UpdateAndCheckMaxOffset(ctx, farInTheFuture.UnsafeToClockTimestamp())
-					},
+					return clock.UpdateAndCheckMaxOffset(ctx, farInTheFuture.UnsafeToClockTimestamp())
 				},
-				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
 	})
-	defer tc.Stopper().Stop(ctx)
+	defer s.Stopper().Stop(ctx)
 
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(conn)
 	tdb.Exec(t, `CREATE TABLE t (i INT PRIMARY KEY)`)
 	// Before the commit which added this test, the below command would fail
 	// due to a permanent error.
@@ -6941,7 +6806,7 @@ CREATE TABLE t.test (id TEXT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expir
 	expire_at TIMESTAMPTZ NULL,
 	crdb_internal_expiration TIMESTAMPTZ NOT VISIBLE NOT NULL DEFAULT current_timestamp():::TIMESTAMPTZ + '10:00:00':::INTERVAL ON UPDATE current_timestamp():::TIMESTAMPTZ + '10:00:00':::INTERVAL,
 	CONSTRAINT test_pkey PRIMARY KEY (id ASC)
-) WITH (ttl = 'on', ttl_expire_after = '10:00:00':::INTERVAL, ttl_job_cron = '@hourly')`
+) WITH (ttl = 'on', ttl_expire_after = '10:00:00':::INTERVAL)`
 
 		createTTLExpirationExpressionTable = `CREATE DATABASE t;
 CREATE TABLE t.test (id TEXT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expiration_expression = 'expire_at');`
@@ -6949,7 +6814,7 @@ CREATE TABLE t.test (id TEXT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expir
 	id STRING NOT NULL,
 	expire_at TIMESTAMPTZ NULL,
 	CONSTRAINT test_pkey PRIMARY KEY (id ASC)
-) WITH (ttl = 'on', ttl_expiration_expression = 'expire_at', ttl_job_cron = '@hourly')`
+) WITH (ttl = 'on', ttl_expiration_expression = 'expire_at')`
 
 		createTTLExpireAfterTTLExpirationExpressionTable = `CREATE DATABASE t;
 CREATE TABLE t.test (id TEXT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expire_after = '10 hours', ttl_expiration_expression = 'crdb_internal_expiration');`
@@ -6958,7 +6823,7 @@ CREATE TABLE t.test (id TEXT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expir
 	expire_at TIMESTAMPTZ NULL,
 	crdb_internal_expiration TIMESTAMPTZ NOT VISIBLE NOT NULL DEFAULT current_timestamp():::TIMESTAMPTZ + '10:00:00':::INTERVAL ON UPDATE current_timestamp():::TIMESTAMPTZ + '10:00:00':::INTERVAL,
 	CONSTRAINT test_pkey PRIMARY KEY (id ASC)
-) WITH (ttl = 'on', ttl_expire_after = '10:00:00':::INTERVAL, ttl_expiration_expression = 'crdb_internal_expiration', ttl_job_cron = '@hourly')`
+) WITH (ttl = 'on', ttl_expire_after = '10:00:00':::INTERVAL, ttl_expiration_expression = 'crdb_internal_expiration')`
 	)
 
 	testCases := []struct {
@@ -7418,9 +7283,9 @@ func TestOperationAtRandomStateTransition(t *testing.T) {
 				},
 			},
 		}
-		s, sqlDB, _ := serverutils.StartServer(t, params)
+		srv, sqlDB, _ := serverutils.StartServer(t, params)
+		defer srv.Stopper().Stop(ctx)
 		sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
-		defer s.Stopper().Stop(ctx)
 
 		sqlRunner.Exec(t, tc.setupSQL)
 		atomic.StoreInt32(&shouldCount, 1)
@@ -7433,7 +7298,7 @@ func TestOperationAtRandomStateTransition(t *testing.T) {
 			count     int32 // accessed atomically
 			shouldRun int32 // accessed atomically
 
-			s     serverutils.ApplicationLayerInterface
+			srv   serverutils.TestServerInterface
 			sqlDB *gosql.DB
 			kvDB  *kv.DB
 		)
@@ -7455,8 +7320,8 @@ func TestOperationAtRandomStateTransition(t *testing.T) {
 				},
 			},
 		}
-		s, sqlDB, kvDB = serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(ctx)
+		srv, sqlDB, kvDB = serverutils.StartServer(t, params)
+		defer srv.Stopper().Stop(ctx)
 		_, err := sqlDB.Exec(tc.setupSQL)
 		require.NoError(t, err)
 		atomic.StoreInt32(&shouldRun, 1)
@@ -7622,12 +7487,8 @@ func TestConcurrentSchemaChangesDoNotDeadlock(t *testing.T) {
 		}
 		for i := 0; i < runs; i++ {
 			// We don't really care whether we use the declarative schema changer or
-			// not here. It's not currently supported for CREATE VIEW, so set it to
-			// on and let the system decide
-			if !runStmt(`
-SET use_declarative_schema_changer = on;
-CREATE VIEW IF NOT EXISTS v AS SELECT i FROM t
-`) {
+			// not here.
+			if !runStmt(`CREATE VIEW IF NOT EXISTS v AS SELECT i FROM t`) {
 				return
 			}
 			rows, err := conn.QueryContext(ctx, `SELECT * FROM v`)
@@ -7647,12 +7508,8 @@ CREATE VIEW IF NOT EXISTS v AS SELECT i FROM t
 				return
 			}
 			// Note that this is primarily about testing the behavior of this drop
-			// with the declarative schema changer, so we make that explicit. It
-			// would be used anyway, but no reason to leave it to policy.
-			if !runStmt(`
-SET use_declarative_schema_changer = unsafe;
-DROP VIEW IF EXISTS v
-`) {
+			// with the declarative schema changer.
+			if !runStmt(`DROP VIEW IF EXISTS v`) {
 				return
 			}
 		}
@@ -7762,4 +7619,179 @@ func TestLegacySchemaChangerWaitsForOtherSchemaChanges(t *testing.T) {
 		}
 		return errors.New("")
 	})
+}
+
+// TestMemoryMonitorErrorsDuringBackfillAreRetried tests that we properly classify memory
+// monitor errors as retriable. It's a regression test to ensure that we don't end up
+// trying to revert schema changes which encounter such errors. Prior to the commit which
+// added this test, these errors would result in failures which looked like:
+//
+//	reversing schema change \d+ due to irrecoverable error: memory budget exceeded: 1 bytes requested, 2 currently allocated, 2 bytes in budget
+func TestMemoryMonitorErrorsDuringBackfillAreRetried(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	// Run across both nodes to make sure that the error makes it across distsql
+	// boundaries.
+	testutils.RunTrueAndFalse(t, "local", func(t *testing.T, local bool) {
+		var shouldFail atomic.Int64
+		knobs := &execinfra.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				switch shouldFail.Add(1) {
+				case 1:
+					return mon.NewMemoryBudgetExceededError(1, 2, 2)
+				default:
+					return nil
+				}
+			},
+		}
+
+		var dataNode, otherNode int
+		if local {
+			dataNode, otherNode = 0, 1
+		} else {
+			dataNode, otherNode = 1, 0
+		}
+		tca := base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgsPerNode: map[int]base.TestServerArgs{
+				otherNode: {},
+				dataNode: {Knobs: base.TestingKnobs{
+					DistSQL:          knobs,
+					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+				}},
+			},
+		}
+		tc := testcluster.StartTestCluster(t, 2, tca)
+		defer tc.Stopper().Stop(ctx)
+		tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+		tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
+		tdb.Exec(t, "INSERT INTO foo VALUES (1)")
+		tdb.Exec(t, `ALTER TABLE foo EXPERIMENTAL_RELOCATE SELECT ARRAY[$1], 1`,
+			tc.Server(dataNode).GetFirstStoreID())
+		tdb.Exec(t, `ALTER TABLE foo ADD COLUMN j INT NOT NULL DEFAULT 42`)
+		require.GreaterOrEqualf(t, shouldFail.Load(), int64(2), "not all failure conditions were hit %d", shouldFail.Load())
+	})
+}
+
+// TestLeaseTimeoutWithConcurrentTransactions tests two concurrent transactions
+// on tables, we verify that the second transaction waits for the first
+// transaction to commit or for the lease to expire.
+func TestLeaseTimeoutWithConcurrentTransactions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t, "slow test")
+	ctx := context.Background()
+
+	settings := cluster.MakeTestingClusterSettings()
+	lease.LeaseDuration.Override(ctx, &settings.SV, 15*time.Second)
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{Settings: settings})
+	defer s.Stopper().Stop(ctx)
+
+	sqlRunner := sqlutils.MakeSQLRunner(sqlDB)
+
+	sqlRunner.Exec(t, `CREATE USER ROACHMIN;`)
+	sqlRunner.Exec(t, `GRANT ADMIN TO ROACHMIN;`)
+	sqlRunner.Exec(t, `CREATE TABLE PROMO_CODES (my_int INT);`)
+	sqlRunner.Exec(t, `CREATE TABLE RIDES (my_int INT);`)
+
+	txn1 := sqlRunner.Begin(t)
+	_, err := txn1.Exec(`SET LOCAL autocommit_before_ddl = false;`)
+	require.NoError(t, err)
+	_, err = txn1.Exec(`SELECT * FROM PROMO_CODES;`)
+	require.NoError(t, err)
+
+	txn2 := sqlRunner.Begin(t)
+	_, err = txn2.Exec(`SET LOCAL autocommit_before_ddl = false;`)
+	require.NoError(t, err)
+	_, err = txn2.Exec(`GRANT ALL ON TABLE PROMO_CODES TO ROACHMIN;`)
+	require.NoError(t, err)
+	_, err = txn2.Exec(`GRANT ALL ON TABLE RIDES TO ROACHMIN;`)
+	require.NoError(t, err)
+
+	blocker := make(chan struct{})
+	group := ctxgroup.WithContext(ctx)
+
+	group.GoCtx(func(ctx context.Context) error {
+		err := txn2.Commit()
+		close(blocker)
+		return err
+	})
+
+	<-blocker
+	_, err = txn1.Exec("INSERT INTO promo_codes values (1)")
+	require.NoError(t, err)
+
+	// txn1.commit() completes with an error due to lease timeout on txn2.commit().
+	err = txn1.Commit()
+	require.ErrorContains(t, err, "RETRY_COMMIT_DEADLINE_EXCEEDED")
+
+	err = group.Wait()
+	require.NoError(t, err)
+}
+
+func TestConcurrentDropAndCreateTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t, "slow test")
+	ctx := context.Background()
+
+	var blockDropHook atomic.Bool
+	executeCreateTable := make(chan struct{})
+	createComplete := make(chan struct{})
+	var waitedDetected atomic.Bool
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
+				BeforeStage: func(p scplan.Plan, stageIdx int) error {
+					// Pause at each post commit phase once the hook is enabled.
+					if !blockDropHook.Load() || p.Params.ExecutionPhase <= scop.PreCommitPhase {
+						return nil
+					}
+					// Execute a create table concurrently.
+					executeCreateTable <- struct{}{}
+					<-createComplete
+					return nil
+				},
+				BeforeWaitingForConcurrentSchemaChanges: func(stmts []string) error {
+					waitedDetected.Swap(true)
+					// Note: The error returned here will drop the connection, since
+					// it can't be bubbled back to the client.
+					return pgerror.New(pgcode.Internal, "concurrent wait detected")
+				},
+			},
+			SQLLeaseManager: &lease.ManagerTestingKnobs{},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+	runner := sqlutils.MakeSQLRunner(sqlDB)
+	runner.Exec(t, "CREATE SCHEMA sc1")
+	runner.Exec(t, "CREATE TABLE sc1.tbl1(n int PRIMARY KEY)")
+	runner.Exec(t, "CREATE TABLE tbl1(n int PRIMARY KEY REFERENCES sc1.tbl1(n))")
+	grp := ctxgroup.WithContext(ctx)
+
+	// Start a thread to drop the schema.
+	grp.GoCtx(func(ctx context.Context) error {
+		defer close(executeCreateTable)
+		blockDropHook.Swap(true)
+		_, err := sqlDB.Exec("DROP SCHEMA sc1 CASCADE")
+		return err
+	})
+
+	defer close(createComplete)
+	for range executeCreateTable {
+		_, err := sqlDB.Exec("CREATE TABLE sc1.t(n int)")
+		// Confirm that either a concurrent wait will occur or the schema will not be visible.
+		// Note: When the concurrent wait hook is hit the connection will be dropped, so the
+		// atomic will tell us if a wait occurred.
+		if !(testutils.IsError(err, "driver: bad connection") && waitedDetected.Swap(false)) &&
+			!testutils.IsError(err, `cannot create "sc1.t" because the target database or schema does not exist`) {
+			require.NoError(t, err, "unexpected error detected")
+		}
+		createComplete <- struct{}{}
+	}
+	require.NoError(t, grp.Wait())
 }

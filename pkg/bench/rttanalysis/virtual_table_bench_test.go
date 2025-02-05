@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysis
 
@@ -41,6 +36,7 @@ CREATE TABLE t2 (i INT PRIMARY KEY, j INT REFERENCES t1(i));
 		{
 			Name: "virtual table cache with schema change",
 			Setup: `
+SET autocommit_before_ddl = false;
 CREATE TABLE t1 (i INT PRIMARY KEY);
 CREATE TABLE t2 (i INT PRIMARY KEY, j INT);`,
 			Stmt: `
@@ -49,6 +45,7 @@ ALTER TABLE t1 ADD COLUMN j INT;
 SELECT * FROM crdb_internal.table_columns;
 CREATE INDEX idx ON t2 (j);
 SELECT * FROM crdb_internal.index_columns;`,
+			Reset: "RESET autocommit_before_ddl;",
 		},
 		// This checks that catalog point lookups following a virtual table scan
 		// access cached descriptors.

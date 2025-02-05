@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package dbdesc contains the concrete implementations of
 // catalog.DatabaseDescriptor.
@@ -15,7 +10,9 @@ package dbdesc
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
@@ -253,6 +250,8 @@ func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	if desc.IsMultiRegion() {
 		desc.validateMultiRegion(vea)
 	}
+
+	desc.maybeValidateSystemDatabaseSchemaVersion(vea)
 }
 
 // validateMultiRegion performs checks specific to multi-region DBs.
@@ -267,9 +266,61 @@ func (desc *immutable) validateMultiRegion(vea catalog.ValidationErrorAccumulato
 	}
 }
 
+// Prior to 24.2, the SystemDatabaseSchemaBootstrapVersion for each release does
+// not match the final cluster version for that release; instead it matches the
+// internal version for the last upgrade which modified the system schema. This
+// constant holds the schema version for the clusterversion.MinSupported
+// release; it is the value of SystemDatabaseSchemaBootstrapVersion in the
+// corresponding branch.
+//
+// Note that the version here should never have a dev offset.
+//
+// TODO(radu): when we no longer support 24.1, this mechanism should not be
+// necessary anymore (in 24.2+ we do a final bump to the release version).
+var minSupportedDatabaseSchemaVersion = roachpb.Version{
+	Major: 23, Minor: 2, Internal: 14, // V24_1_SessionBasedLeasingUpgradeDescriptor
+}
+
+func (desc *immutable) maybeValidateSystemDatabaseSchemaVersion(
+	vea catalog.ValidationErrorAccumulator,
+) {
+	maybeSV := desc.GetSystemDatabaseSchemaVersion()
+	if maybeSV == nil {
+		return
+	}
+	sv := clusterversion.RemoveDevOffset(*maybeSV)
+
+	if id := desc.GetID(); id != keys.SystemDatabaseID {
+		vea.Report(errors.AssertionFailedf(
+			`attempting to set system database schema version for non-system database descriptor (%d)`,
+			id,
+		))
+	}
+
+	if sv.Less(minSupportedDatabaseSchemaVersion) {
+		vea.Report(errors.AssertionFailedf(
+			`attempting to set system database schema version to version lower than the minimum supported version (%#v): %#v`,
+			minSupportedDatabaseSchemaVersion,
+			sv,
+		))
+	}
+
+	// TODO(radu): this should really be SystemDatabaseSchemaBootstrapVersion.
+	latestVersion := clusterversion.RemoveDevOffset(clusterversion.Latest.Version())
+	if latestVersion.Less(sv) && !clusterversion.TestingExtraVersions {
+		vea.Report(errors.AssertionFailedf(
+			`attempting to set system database schema version to version higher than the latest version (%#v): %#v`,
+			latestVersion,
+			sv,
+		))
+	}
+}
+
 // GetReferencedDescIDs returns the IDs of all descriptors referenced by
 // this descriptor, including itself.
-func (desc *immutable) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
+func (desc *immutable) GetReferencedDescIDs(
+	catalog.ValidationLevel,
+) (catalog.DescriptorIDSet, error) {
 	ids := catalog.MakeDescriptorIDSet(desc.GetID())
 	if desc.IsMultiRegion() {
 		id, err := desc.MultiRegionEnumID()
@@ -532,6 +583,11 @@ func (desc *immutable) GetObjectType() privilege.ObjectType {
 	return privilege.Database
 }
 
+// GetObjectTypeString implements the Object interface.
+func (desc *immutable) GetObjectTypeString() string {
+	return string(privilege.Database)
+}
+
 // SkipNamespace implements the descriptor interface.
 func (desc *immutable) SkipNamespace() bool {
 	return false
@@ -545,6 +601,14 @@ func (desc *immutable) GetRawBytesInStorage() []byte {
 // ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
 func (desc *immutable) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
 	return nil
+}
+
+// MaybeRequiresTypeHydration implements the catalog.Descriptor interface.
+func (desc *immutable) MaybeRequiresTypeHydration() bool { return false }
+
+// GetReplicatedPCRVersion is a part of the catalog.Descriptor
+func (desc *immutable) GetReplicatedPCRVersion() descpb.DescriptorVersion {
+	return desc.ReplicatedPCRVersion
 }
 
 // maybeRemoveDroppedSelfEntryFromSchemas removes an entry in the Schemas map corresponding to the

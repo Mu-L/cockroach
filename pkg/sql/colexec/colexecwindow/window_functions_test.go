@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecwindow
 
@@ -29,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/marusama/semaphore"
 	"github.com/stretchr/testify/require"
@@ -47,6 +43,9 @@ func (tc *windowFnTestCase) init() {
 }
 
 func TestWindowFunctions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.MakeTestingEvalContext(st)
@@ -59,11 +58,13 @@ func TestWindowFunctions(t *testing.T) {
 		},
 		DiskMonitor: testDiskMonitor,
 	}
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	defer closerRegistry.Close(ctx)
 
 	dec := func(val string) apd.Decimal {
 		res, _, err := apd.NewFromString(val)
@@ -90,7 +91,7 @@ func TestWindowFunctions(t *testing.T) {
 	avgFn := execinfrapb.AggregatorSpec_AVG
 	maxFn := execinfrapb.AggregatorSpec_MAX
 
-	for _, spillForced := range []bool{true} {
+	for _, spillForced := range []bool{false, true} {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
 		for _, tc := range []windowFnTestCase{
 			// With PARTITION BY, no ORDER BY.
@@ -1034,7 +1035,6 @@ func TestWindowFunctions(t *testing.T) {
 			},
 		} {
 			log.Infof(ctx, "spillForced=%t/%s", spillForced, tc.windowerSpec.WindowFns[0].Func.String())
-			var toClose []colexecop.Closers
 			var semsToCheck []semaphore.Semaphore
 			colexectestutils.RunTests(t, testAllocator, []colexectestutils.Tuples{tc.tuples}, tc.expected, colexectestutils.UnorderedVerifier, func(sources []colexecop.Operator) (colexecop.Operator, error) {
 				tc.init()
@@ -1070,23 +1070,21 @@ func TestWindowFunctions(t *testing.T) {
 				// FDs.
 				sem := colexecop.NewTestingSemaphore(relativeRankNumRequiredFDs)
 				args := &colexecargs.NewColOperatorArgs{
-					Spec:                spec,
-					Inputs:              colexectestutils.MakeInputs(sources),
-					StreamingMemAccount: testMemAcc,
-					DiskQueueCfg:        queueCfg,
-					FDSemaphore:         sem,
-					MonitorRegistry:     &monitorRegistry,
+					Spec:            spec,
+					Inputs:          colexectestutils.MakeInputs(sources),
+					DiskQueueCfg:    queueCfg,
+					FDSemaphore:     sem,
+					MonitorRegistry: &monitorRegistry,
+					CloserRegistry:  &closerRegistry,
 				}
 				semsToCheck = append(semsToCheck, sem)
 				result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
-				toClose = append(toClose, result.ToClose)
 				return result.Root, err
 			})
 			// Close all closers manually (in production this is done on the
 			// flow cleanup).
-			for _, c := range toClose {
-				require.NoError(t, c.Close(ctx))
-			}
+			closerRegistry.Close(ctx)
+			closerRegistry.Reset()
 			for i, sem := range semsToCheck {
 				require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
 			}
@@ -1098,7 +1096,7 @@ func BenchmarkWindowFunctions(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 
 	const (
 		memLimit        = 64 << 20
@@ -1160,7 +1158,7 @@ func BenchmarkWindowFunctions(b *testing.B) {
 			QueueCfg:        queueCfg,
 			FdSemaphore:     colexecop.NewTestingSemaphore(fdLimit),
 			DiskAcc:         testDiskAcc,
-			ConverterMemAcc: testMemAcc,
+			DiskQueueMemAcc: testMemAcc,
 			Input:           source,
 			InputTypes:      sourceTypes,
 			OutputColIdx:    outputIdx,
@@ -1223,7 +1221,8 @@ func BenchmarkWindowFunctions(b *testing.B) {
 				colexecagg.ProcessAggregations(ctx, &evalCtx, &semaCtx, aggregations, sourceTypes)
 			require.NoError(b, err)
 			aggFnsAlloc, _, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-				ctx, &aggArgs, aggregations, 1 /* allocSize */, colexecagg.WindowAggKind,
+				ctx, &aggArgs, aggregations, 1, /* initialAllocSize */
+				1 /* maxAllocSize */, colexecagg.WindowAggKind,
 			)
 			require.NoError(b, err)
 			op = NewWindowAggregatorOperator(
@@ -1239,11 +1238,11 @@ func BenchmarkWindowFunctions(b *testing.B) {
 		return op
 	}
 
-	inputCreator := func(length int) []coldata.Vec {
+	inputCreator := func(length int) []*coldata.Vec {
 		const arg1Offset, arg1Range = 5, 10
-		vecs := make([]coldata.Vec, len(sourceTypes))
+		vecs := make([]*coldata.Vec, len(sourceTypes))
 		for i := range vecs {
-			vecs[i] = testAllocator.NewMemColumn(sourceTypes[i], length)
+			vecs[i] = testAllocator.NewVec(sourceTypes[i], length)
 		}
 		argCol1 := vecs[arg1ColIdx].Int64()
 		argCol2 := vecs[arg2ColIdx].Int64()

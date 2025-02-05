@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -67,17 +62,24 @@ func (l *fluentSink) exitCode() exit.Code {
 func (l *fluentSink) output(b []byte, opts sinkOutputOptions) (err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	logging.metrics.IncrementCounter(FluentSinkWriteAttempt, 1)
+
 	// Try to write and reconnect immediately if the first write fails.
 	_ = l.tryWriteLocked(b)
 	if l.mu.good {
 		return nil
 	}
 
+	logging.metrics.IncrementCounter(FluentSinkConnectionAttempt, 1)
 	if err := l.ensureConnLocked(b); err != nil {
 		logging.metrics.IncrementCounter(FluentSinkConnectionError, 1)
 		return err
 	}
-	return l.tryWriteLocked(b)
+	if err := l.tryWriteLocked(b); err != nil {
+		logging.metrics.IncrementCounter(FluentSinkWriteError, 1)
+		return err
+	}
+	return nil
 }
 
 func (l *fluentSink) closeLocked() {

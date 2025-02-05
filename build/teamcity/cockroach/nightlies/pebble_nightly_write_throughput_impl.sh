@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2022 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -eo pipefail
 
 _dir="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -25,7 +31,8 @@ timeout -s INT 12h bin/roachtest run \
   --parallelism 2 \
   --teamcity \
   --cpu-quota=384 \
-  pebble tag:pebble_nightly_write
+  --suite pebble_nightly_write \
+  pebble
 
 exit_status=$?
 

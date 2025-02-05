@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parser
 
@@ -356,6 +351,9 @@ func TestScanError(t *testing.T) {
 		{`$0`, "placeholder index must be between 1 and 65536"},
 		{`$9223372036854775809`, "placeholder index must be between 1 and 65536"},
 		{`B'123'`, `"2" is not a valid binary digit`},
+		{`123foo`, "trailing junk after numeric literal at or near \"123f\""},
+		{`1.23foo`, "trailing junk after numeric literal at or near \"1.23f\""},
+		{`0x0afoo`, "trailing junk after numeric literal at or near \"0x0afo\""},
 	}
 	for _, d := range testData {
 		s := makeSQLScanner(d.sql)

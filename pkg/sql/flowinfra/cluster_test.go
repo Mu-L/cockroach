@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra_test
 
@@ -25,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -33,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
@@ -98,6 +95,8 @@ func runTestClusterFlow(
 		now.ToTimestamp(),
 		0, // maxOffsetNs
 		int32(servers[0].SQLInstanceID()),
+		0,
+		false, // omitInRangefeeds
 	)
 	txn := kv.NewTxnFromProto(ctx, kvDB, roachpb.NodeID(servers[0].SQLInstanceID()), now, kv.RootTxn, &txnProto)
 	leafInputState, err := txn.GetLeafTxnInputState(ctx)
@@ -126,7 +125,7 @@ func runTestClusterFlow(
 	fid := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 
 	req1 := &execinfrapb.SetupFlowRequest{
-		Version:           execinfra.Version,
+		Version:           execversion.Latest,
 		LeafTxnInputState: leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: fid,
@@ -145,7 +144,7 @@ func runTestClusterFlow(
 	}
 
 	req2 := &execinfrapb.SetupFlowRequest{
-		Version:           execinfra.Version,
+		Version:           execversion.Latest,
 		LeafTxnInputState: leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: fid,
@@ -171,7 +170,7 @@ func runTestClusterFlow(
 	}
 
 	req3 := &execinfrapb.SetupFlowRequest{
-		Version:           execinfra.Version,
+		Version:           execversion.Latest,
 		LeafTxnInputState: leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: fid,
@@ -268,7 +267,7 @@ func TestClusterFlow(t *testing.T) {
 	for i := 0; i < numNodes; i++ {
 		s := tc.Server(i).ApplicationLayer()
 		servers[i] = s
-		conns[i] = s.SQLConn(t, "")
+		conns[i] = s.SQLConn(t)
 		conn := s.RPCClientConn(t, username.RootUserName())
 		clients[i] = execinfrapb.NewDistSQLClient(conn)
 	}
@@ -301,7 +300,7 @@ func TestTenantClusterFlow(t *testing.T) {
 		})
 		defer podConns[i].Close()
 		pod := pods[i]
-		conn, err := pod.RPCContext().GRPCDialPod(pod.RPCAddr(), pod.SQLInstanceID(), rpc.DefaultClass).Connect(ctx)
+		conn, err := pod.RPCContext().GRPCDialPod(pod.RPCAddr(), pod.SQLInstanceID(), pod.Locality(), rpc.DefaultClass).Connect(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -410,6 +409,8 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 		now.ToTimestamp(),
 		0, // maxOffsetNs
 		int32(tc.Server(0).SQLInstanceID()),
+		0,
+		false, // omitInRangefeeds
 	)
 	txn := kv.NewTxnFromProto(
 		context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
@@ -418,7 +419,7 @@ func TestLimitedBufferingDeadlock(t *testing.T) {
 	require.NoError(t, err)
 
 	req := execinfrapb.SetupFlowRequest{
-		Version:           execinfra.Version,
+		Version:           execversion.Latest,
 		LeafTxnInputState: leafInputState,
 		Flow: execinfrapb.FlowSpec{
 			FlowID: execinfrapb.FlowID{UUID: uuid.MakeV4()},
@@ -521,7 +522,8 @@ func TestDistSQLReadsFillGatewayID(t *testing.T) {
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				UseDatabase: "test",
+				UseDatabase:       "test",
+				DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(109392),
 				Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 						TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
@@ -591,6 +593,15 @@ func TestEvalCtxTxnOnRemoteNodes(t *testing.T) {
 			},
 		})
 	defer tc.Stopper().Stop(ctx)
+
+	if srv := tc.Server(0); srv.TenantController().StartedDefaultTestTenant() {
+		systemSqlDB := srv.SystemLayer().SQLConn(t, serverutils.DBName("system"))
+		_, err := systemSqlDB.Exec(`ALTER TENANT [$1] GRANT CAPABILITY can_admin_relocate_range=true`, serverutils.TestTenantID().ToUint64())
+		require.NoError(t, err)
+		serverutils.WaitForTenantCapabilities(t, srv, serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
+			tenantcapabilities.CanAdminRelocateRange: "true",
+		}, "")
+	}
 
 	db := tc.ServerConn(0)
 	sqlutils.CreateTable(t, db, "t",
@@ -705,6 +716,8 @@ func BenchmarkInfrastructure(b *testing.B) {
 						now.ToTimestamp(),
 						0, // maxOffsetNs
 						int32(tc.Server(0).SQLInstanceID()),
+						0,
+						false, // omitInRangefeeds
 					)
 					txn := kv.NewTxnFromProto(
 						context.Background(), tc.Server(0).DB(), tc.Server(0).NodeID(),
@@ -713,7 +726,7 @@ func BenchmarkInfrastructure(b *testing.B) {
 					require.NoError(b, err)
 					for i := range reqs {
 						reqs[i] = execinfrapb.SetupFlowRequest{
-							Version:           execinfra.Version,
+							Version:           execversion.Latest,
 							LeafTxnInputState: leafInputState,
 							Flow: execinfrapb.FlowSpec{
 								Processors: []execinfrapb.ProcessorSpec{{

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -15,6 +10,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -114,7 +110,7 @@ func TestNoOpGrant(t *testing.T) {
 			}
 
 			// Grant privilege `privilege` on `objectType` `objectName` to user `roach`.
-			tdb.Exec(t, fmt.Sprintf("GRANT %v ON %v %v TO %v", priv, objectType, objectName, userRoach.Normalized()))
+			tdb.Exec(t, fmt.Sprintf("GRANT %v ON %v %v TO %v", priv.DisplayName(), objectType, objectName, userRoach.Normalized()))
 			desc := retrieveDescriptorByObjectType(objectType)
 			userPriv, ok := desc.GetPrivileges().FindUser(userRoach)
 			require.True(t, ok)
@@ -123,7 +119,7 @@ func TestNoOpGrant(t *testing.T) {
 
 			// Repeat and check we no-oped this GRANT by asserting that the privilege remains there and
 			// the table version remains the same.
-			tdb.Exec(t, fmt.Sprintf("GRANT %v ON %v %v TO %v", priv, objectType, objectName, userRoach.Normalized()))
+			tdb.Exec(t, fmt.Sprintf("GRANT %v ON %v %v TO %v", priv.DisplayName(), objectType, objectName, userRoach.Normalized()))
 			desc = retrieveDescriptorByObjectType(objectType)
 			userPriv, ok = desc.GetPrivileges().FindUser(userRoach)
 			require.True(t, ok)
@@ -233,9 +229,88 @@ func TestNoOpRevoke(t *testing.T) {
 		for _, priv := range testCase.allowedPrivs {
 			// Revoke privilege `privilege` on `objectType` `objectName` from user `roach`.
 			// Since `roach` has no privileges at all, those revokes should be treated as no-ops.
-			tdb.Exec(t, fmt.Sprintf("REVOKE %v ON %v %v FROM %v", priv, objectType, objectName, userRoach.Normalized()))
+			tdb.Exec(t, fmt.Sprintf("REVOKE %v ON %v %v FROM %v", priv.DisplayName(), objectType, objectName, userRoach.Normalized()))
 			desc := retrieveDescriptorByObjectType(objectType)
 			require.Equal(t, objectVersionBeforeRevoke, desc.GetVersion())
 		}
+	}
+}
+
+func BenchmarkGrantTables(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+	ctx := context.Background()
+
+	for _, numTables := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("numTables=%d", numTables), func(b *testing.B) {
+			srv, sqlDB, _ := serverutils.StartServer(b, base.TestServerArgs{})
+			defer srv.Stopper().Stop(ctx)
+
+			sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+			sqlRun.Exec(b, `CREATE DATABASE t;`)
+			sqlRun.Exec(b, `USE t;`)
+
+			sqlRun.Exec(b, `CREATE USER ROACH;`)
+
+			for i := 0; i < numTables; i++ {
+				sqlRun.Exec(b, fmt.Sprintf(`CREATE TABLE t.a%d (k INT PRIMARY KEY);`, i))
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				sqlRun.Exec(b, `GRANT ALL ON * TO ROACH;`)
+				sqlRun.Exec(b, `REVOKE ALL ON * FROM ROACH;`)
+			}
+		})
+	}
+}
+
+func BenchmarkGrantTypes(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+	ctx := context.Background()
+
+	for _, numTypes := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("numTypes=%d", numTypes), func(b *testing.B) {
+			srv, sqlDB, _ := serverutils.StartServer(b, base.TestServerArgs{})
+			defer srv.Stopper().Stop(ctx)
+
+			sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+			sqlRun.Exec(b, `CREATE DATABASE t;`)
+			sqlRun.Exec(b, `USE t;`)
+
+			sqlRun.Exec(b, `CREATE USER ROACH;`)
+
+			for i := 0; i < numTypes; i++ {
+				sqlRun.Exec(b, fmt.Sprintf(`CREATE TYPE a%d AS ENUM ('roach1', 'roach2', 'roach3');`, i))
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				txn := sqlRun.Begin(b)
+				for i := 0; i < numTypes; i++ {
+					_, err := txn.Exec(fmt.Sprintf(`GRANT ALL ON TYPE a%d TO ROACH;`, i))
+					if err != nil {
+						return
+					}
+				}
+				err := txn.Commit()
+				if err != nil {
+					return
+				}
+
+				txn = sqlRun.Begin(b)
+				for i := 0; i < numTypes; i++ {
+					_, err = txn.Exec(fmt.Sprintf(`REVOKE ALL ON TYPE a%d FROM ROACH;`, i))
+					if err != nil {
+						return
+					}
+				}
+				err = txn.Commit()
+				if err != nil {
+					return
+				}
+			}
+		})
 	}
 }

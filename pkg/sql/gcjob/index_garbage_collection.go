@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gcjob
 
@@ -22,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -42,7 +38,11 @@ func deleteIndexData(
 	// Before deleting any indexes, ensure that old versions of the table descriptor
 	// are no longer in use. This is necessary in the case of truncate, where we
 	// schedule a GC Job in the transaction that commits the truncation.
-	parentDesc, err := sql.WaitToUpdateLeases(ctx, execCfg.LeaseManager, parentID)
+	cachedRegions, err := regions.NewCachedDatabaseRegions(ctx, execCfg.DB, execCfg.LeaseManager)
+	if err != nil {
+		return err
+	}
+	parentDesc, err := sql.WaitToUpdateLeases(ctx, execCfg.LeaseManager, cachedRegions, parentID)
 	if isMissingDescriptorError(err) {
 		handleTableDescriptorDeleted(ctx, parentID, progress)
 		return nil
@@ -91,7 +91,11 @@ func gcIndexes(
 	// Before deleting any indexes, ensure that old versions of the table descriptor
 	// are no longer in use. This is necessary in the case of truncate, where we
 	// schedule a GC Job in the transaction that commits the truncation.
-	parentDesc, err := sql.WaitToUpdateLeases(ctx, execCfg.LeaseManager, parentID)
+	cachedRegions, err := regions.NewCachedDatabaseRegions(ctx, execCfg.DB, execCfg.LeaseManager)
+	if err != nil {
+		return err
+	}
+	parentDesc, err := sql.WaitToUpdateLeases(ctx, execCfg.LeaseManager, cachedRegions, parentID)
 	if isMissingDescriptorError(err) {
 		handleTableDescriptorDeleted(ctx, parentID, progress)
 		return nil

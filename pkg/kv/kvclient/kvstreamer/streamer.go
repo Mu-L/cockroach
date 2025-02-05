@@ -1,22 +1,19 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvstreamer
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -26,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitmap"
@@ -100,8 +99,8 @@ type Result struct {
 	}
 	// subRequestIdx allows us to order two Results that come for the same
 	// original Scan request but from different ranges. It is non-zero only in
-	// InOrder mode when Hints.SingleRowLookup is false, in all other cases it
-	// will remain zero. See singleRangeBatch.subRequestIdx for more details.
+	// InOrder mode, in all other cases it will remain zero. See
+	// singleRangeBatch.subRequestIdx for more details.
 	subRequestIdx int32
 	// subRequestDone is true if the current Result is the last one for the
 	// corresponding sub-request. For all Get requests and for Scan requests
@@ -109,8 +108,7 @@ type Result struct {
 	// have a single sub-request.
 	//
 	// Note that for correctness, it is only necessary that this value is set
-	// properly if this Result is a Scan response and Hints.SingleRowLookup is
-	// false.
+	// properly if this Result is a Scan response.
 	subRequestDone bool
 	// If the Result represents a scan result, scanComplete indicates whether
 	// this is the last response for the respective scan, or if there are more
@@ -131,9 +129,12 @@ type Hints struct {
 	// such, there's no point in de-duping them or caching results.
 	UniqueRequests bool
 	// SingleRowLookup tells the Streamer that each enqueued request will result
-	// in a single row lookup (in other words, the request contains a "key"). If
-	// true, then the Streamer knows that no request will be split across
-	// multiple ranges, so some internal state can be optimized away.
+	// in a single row lookup (in other words, the request contains a "key").
+	// TODO(yuzefovich): investigate using this hint to optimize the performance
+	// and / or allocations. In particular, whenever this hint is set, once one
+	// of the truncated single-range ScanRequests receives non-empty result,
+	// then we know for sure that the original cross-range ScanRequest has been
+	// fully satisfied (since we never split SQL rows across ranges).
 	SingleRowLookup bool
 }
 
@@ -216,13 +217,26 @@ func (r Result) Release(ctx context.Context) {
 // TODO(yuzefovich): support pipelining of Enqueue and GetResults calls.
 type Streamer struct {
 	distSender *kvcoord.DistSender
+	metrics    *Metrics
 	stopper    *stop.Stopper
+	// sd can be nil in tests.
+	sd *sessiondata.SessionData
 
 	mode          OperationMode
 	hints         Hints
 	maxKeysPerRow int32
-	budget        *budget
-	keyLocking    lock.Strength
+	// eagerMemUsageLimitBytes determines the maximum memory used from the
+	// budget at which point the streamer stops sending non-head-of-the-line
+	// requests eagerly.
+	eagerMemUsageLimitBytes int64
+	// headOfLineOnlyFraction controls the fraction of the available streamer's
+	// memory budget that will be used to set the TargetBytes limit on
+	// head-of-the-line request in case the "eager" memory usage limit has been
+	// exceeded. In such case, only head-of-the-line request will be sent.
+	headOfLineOnlyFraction float64
+	budget                 *budget
+	lockStrength           lock.Strength
+	lockDurability         lock.Durability
 
 	streamerStatistics
 
@@ -270,8 +284,8 @@ type Streamer struct {
 		// enqueued ScanRequest touches. In other words, it contains how many
 		// "sub-requests" the original Scan request was broken down into.
 		//
-		// It is allocated lazily if Hints.SingleRowLookup is false when the
-		// first ScanRequest is encountered in Enqueue.
+		// It is allocated lazily when the first ScanRequest is encountered in
+		// Enqueue.
 		numRangesPerScanRequest []int32
 
 		// numRequestsInFlight tracks the number of single-range batches that
@@ -288,8 +302,12 @@ type Streamer struct {
 
 type streamerStatistics struct {
 	atomics struct {
-		kvPairsRead         *int64
-		batchRequestsIssued *int64
+		kvPairsRead *int64
+		// batchRequestsIssued tracks the number of BatchRequests issued by the
+		// Streamer. Note that this number is only used for the logging done by
+		// the Streamer itself and is separate from any possible bookkeeping
+		// done by the caller.
+		batchRequestsIssued int64
 		// resumeBatchRequests tracks the number of BatchRequests created for
 		// the ResumeSpans throughout the lifetime of the Streamer.
 		resumeBatchRequests int64
@@ -318,28 +336,31 @@ type streamerStatistics struct {
 	enqueuedSingleRangeRequests int
 }
 
+const (
+	// The default scaling factor for the number of asynchronous requests per
+	// Streamer per vCPU. The value for this setting is chosen arbitrarily as
+	// 1/4th of the default value for the DefaultSenderStreamsPerVCPU.
+	defaultStreamerStreamsPerVCPU = kvcoord.DefaultSenderStreamsPerVCPU / 4
+)
+
 // streamerConcurrencyLimit is an upper bound on the number of asynchronous
-// requests that a single Streamer can have in flight. The default value for
-// this setting is chosen arbitrarily as 1/8th of the default value for the
-// senderConcurrencyLimit.
+// requests that a single Streamer can have in flight.
 var streamerConcurrencyLimit = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"kv.streamer.concurrency_limit",
 	"maximum number of asynchronous requests by a single streamer",
-	max(128, int64(8*runtime.GOMAXPROCS(0))),
+	defaultStreamerStreamsPerVCPU*max(kvcoord.MinViableProcs, int64(runtime.GOMAXPROCS(0))),
 	settings.PositiveInt,
 )
 
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
+type sendFn func(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, error)
 
 // NewStreamer creates a new Streamer.
 //
 // txn must be a LeafTxn that is not used by anything other than this Streamer.
+//
+// sendFn is a function that will be used for issuing BatchRequests. Normally,
+// it is txn.Send, possibly with some extra bookkeeping.
 //
 // limitBytes determines the maximum amount of memory this Streamer is allowed
 // to use (i.e. it'll be used lazily, as needed). The more memory it has, the
@@ -352,43 +373,60 @@ func max(a, b int64) int64 {
 // to interact with the account only after canceling the Streamer (because
 // memory accounts are not thread-safe).
 //
+// sd can be nil in tests in which case some reasonable defaults will be used.
+//
 // kvPairsRead should be incremented atomically with the sum of NumKeys
 // parameters of all received responses.
-//
-// batchRequestsIssued should be incremented atomically every time a new
-// BatchRequest is sent.
 func NewStreamer(
 	distSender *kvcoord.DistSender,
+	metrics *Metrics,
 	stopper *stop.Stopper,
 	txn *kv.Txn,
+	sendFn func(context.Context, *kvpb.BatchRequest) (*kvpb.BatchResponse, error),
 	st *cluster.Settings,
+	sd *sessiondata.SessionData,
 	lockWaitPolicy lock.WaitPolicy,
 	limitBytes int64,
 	acc *mon.BoundAccount,
 	kvPairsRead *int64,
-	batchRequestsIssued *int64,
-	keyLocking lock.Strength,
+	lockStrength lock.Strength,
+	lockDurability lock.Durability,
 ) *Streamer {
 	if txn.Type() != kv.LeafTxn {
 		panic(errors.AssertionFailedf("RootTxn is given to the Streamer"))
 	}
-	s := &Streamer{
-		distSender: distSender,
-		stopper:    stopper,
-		budget:     newBudget(acc, limitBytes),
-		keyLocking: keyLocking,
+	if lockDurability == lock.Replicated {
+		// Replicated lock durability is not supported by the Streamer. If we want
+		// to support it in the future, we'll need to make sure we're not re-using
+		// request memory after the request has been sent. This is because
+		// replicated lock pipelining retains references to requests even after
+		// their response has been returned.
+		panic(errors.AssertionFailedf("Replicated lock durability is given to the Streamer"))
 	}
+	// sd can be nil in tests.
+	headOfLineOnlyFraction := 0.8
+	if sd != nil {
+		headOfLineOnlyFraction = sd.StreamerHeadOfLineOnlyFraction
+	}
+	s := &Streamer{
+		distSender:             distSender,
+		metrics:                metrics,
+		stopper:                stopper,
+		sd:                     sd,
+		headOfLineOnlyFraction: headOfLineOnlyFraction,
+		budget:                 newBudget(acc, limitBytes),
+		lockStrength:           lockStrength,
+		lockDurability:         lockDurability,
+	}
+	s.metrics.OperatorsCount.Inc(1)
+
 	if kvPairsRead == nil {
 		kvPairsRead = new(int64)
 	}
-	if batchRequestsIssued == nil {
-		batchRequestsIssued = new(int64)
-	}
 	s.atomics.kvPairsRead = kvPairsRead
-	s.atomics.batchRequestsIssued = batchRequestsIssued
 	s.coordinator = workerCoordinator{
 		s:                      s,
-		txn:                    txn,
+		sendFn:                 sendFn,
 		lockWaitPolicy:         lockWaitPolicy,
 		requestAdmissionHeader: txn.AdmissionHeader(),
 		responseAdmissionQ:     txn.DB().SQLKVResponseAdmissionQ,
@@ -418,12 +456,29 @@ func (s *Streamer) Init(
 	mode OperationMode, hints Hints, maxKeysPerRow int, diskBuffer ResultDiskBuffer,
 ) {
 	s.mode = mode
+	// s.sd can be nil in tests, so use almost all the budget eagerly then.
+	eagerFraction := 0.9
 	if mode == OutOfOrder {
 		s.requestsToServe = newOutOfOrderRequestsProvider()
 		s.results = newOutOfOrderResultsBuffer(s.budget)
+		if s.sd != nil {
+			eagerFraction = s.sd.StreamerOutOfOrderEagerMemoryUsageFraction
+		}
 	} else {
 		s.requestsToServe = newInOrderRequestsProvider()
 		s.results = newInOrderResultsBuffer(s.budget, diskBuffer)
+		if s.sd != nil {
+			eagerFraction = s.sd.StreamerInOrderEagerMemoryUsageFraction
+		}
+	}
+	s.eagerMemUsageLimitBytes = int64(math.Ceil(float64(s.budget.limitBytes) * eagerFraction))
+	// Ensure some reasonable lower bound.
+	const minEagerMemUsage = 10 << 10 // 10KiB
+	if s.eagerMemUsageLimitBytes <= 0 {
+		// Protect from overflow.
+		s.eagerMemUsageLimitBytes = math.MaxInt64
+	} else if s.eagerMemUsageLimitBytes < minEagerMemUsage {
+		s.eagerMemUsageLimitBytes = minEagerMemUsage
 	}
 	if !hints.UniqueRequests {
 		panic(errors.AssertionFailedf("only unique requests are currently supported"))
@@ -454,6 +509,11 @@ func (s *Streamer) Init(
 // from the previous invocation is prohibited.
 // TODO(yuzefovich): lift this restriction and introduce the pipelining.
 func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retErr error) {
+	if log.ExpensiveLogEnabled(ctx, 2) {
+		log.VEventf(ctx, 2, "Enqueue %d original requests: %s", len(reqs),
+			kvpb.TruncatedRequestsString(reqs, 1024),
+		)
+	}
 	if !s.coordinatorStarted {
 		var coordinatorCtx context.Context
 		coordinatorCtx, s.coordinatorCtxCancel = s.stopper.WithCancelOnQuiesce(ctx)
@@ -527,9 +587,11 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retEr
 		// ranges.
 		if s.truncationHelper == nil {
 			// The streamer can process the responses in an arbitrary order, so
-			// we don't require the helper to preserve the order of requests and
-			// allow it to reorder the reqs slice too.
-			const mustPreserveOrder = false
+			// we don't require the helper to preserve the order of requests,
+			// unless we're in the InOrder mode when we must maintain increasing
+			// positions. We unconditionally allow reordering of the reqs slice
+			// though.
+			var mustPreserveOrder = s.mode == InOrder
 			const canReorderRequestsSlice = true
 			s.truncationHelper, err = kvcoord.NewBatchTruncationHelper(
 				scanDir, reqs, mustPreserveOrder, canReorderRequestsSlice,
@@ -576,36 +638,38 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retEr
 		for i, pos := range positions {
 			if _, isScan := reqs[pos].GetInner().(*kvpb.ScanRequest); isScan {
 				numScansInReqs++
-				if !s.hints.SingleRowLookup {
-					if firstScanRequest {
-						// We have some ScanRequests, and each might touch
-						// multiple ranges, so we have to set up
-						// numRangesPerScanRequest.
-						streamerLocked = true
-						s.mu.Lock()
-						if cap(s.mu.numRangesPerScanRequest) < len(reqs) {
-							s.mu.numRangesPerScanRequest = make([]int32, len(reqs))
-							newNumRangesPerScanRequestMemoryUsage = int64(cap(s.mu.numRangesPerScanRequest)) * int32Size
-						} else {
-							// We can reuse numRangesPerScanRequest allocated on
-							// the previous call to Enqueue after we zero it
-							// out.
-							s.mu.numRangesPerScanRequest = s.mu.numRangesPerScanRequest[:len(reqs)]
-							for n := 0; n < len(s.mu.numRangesPerScanRequest); {
-								n += copy(s.mu.numRangesPerScanRequest[n:], zeroInt32Slice)
-							}
+				// TODO(yuzefovich): we could avoid using / allocating
+				// numRangesPerScanRequest if allRequestsAreWithinSingleRange is
+				// true. We could also take this further and see whether any of
+				// the original ScanRequests are cross-range, and if not, then
+				// we could avoid using numRangesPerScanRequest even if all
+				// requests touch multiple ranges.
+				if firstScanRequest {
+					// We have some ScanRequests, so we have to set up
+					// numRangesPerScanRequest.
+					streamerLocked = true
+					s.mu.Lock()
+					if cap(s.mu.numRangesPerScanRequest) < len(reqs) {
+						s.mu.numRangesPerScanRequest = make([]int32, len(reqs))
+						newNumRangesPerScanRequestMemoryUsage = int64(cap(s.mu.numRangesPerScanRequest)) * int32Size
+					} else {
+						// We can reuse numRangesPerScanRequest allocated on the
+						// previous call to Enqueue after we zero it out.
+						s.mu.numRangesPerScanRequest = s.mu.numRangesPerScanRequest[:len(reqs)]
+						for n := 0; n < len(s.mu.numRangesPerScanRequest); {
+							n += copy(s.mu.numRangesPerScanRequest[n:], zeroInt32Slice)
 						}
 					}
-					if s.mode == InOrder {
-						if subRequestIdx == nil {
-							subRequestIdx = make([]int32, len(singleRangeReqs))
-							subRequestIdxOverhead = int32SliceOverhead + int32Size*int64(cap(subRequestIdx))
-						}
-						subRequestIdx[i] = s.mu.numRangesPerScanRequest[pos]
-					}
-					s.mu.numRangesPerScanRequest[pos]++
-					firstScanRequest = false
 				}
+				if s.mode == InOrder {
+					if subRequestIdx == nil {
+						subRequestIdx = make([]int32, len(singleRangeReqs))
+						subRequestIdxOverhead = int32SliceOverhead + int32Size*int64(cap(subRequestIdx))
+					}
+					subRequestIdx[i] = s.mu.numRangesPerScanRequest[pos]
+				}
+				s.mu.numRangesPerScanRequest[pos]++
+				firstScanRequest = false
 			}
 		}
 
@@ -711,6 +775,13 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retEr
 	}
 
 	// Memory reservation was approved, so the requests are good to go.
+	if log.ExpensiveLogEnabled(ctx, 2) {
+		reqStr := fmt.Sprintf("%v", requestsToServe)
+		if utf8.RuneCountInString(reqStr) > 1024 {
+			reqStr = util.TruncateString(reqStr, 1022) + "…]"
+		}
+		log.VEventf(ctx, 2, "enqueuing %d requests to serve: %s", len(requestsToServe), reqStr)
+	}
 	s.requestsToServe.enqueue(requestsToServe)
 	return nil
 }
@@ -722,16 +793,18 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retEr
 // returned once all enqueued requests have been responded to.
 //
 // Calling GetResults() invalidates the results returned on the previous call.
-func (s *Streamer) GetResults(ctx context.Context) ([]Result, error) {
+func (s *Streamer) GetResults(ctx context.Context) (retResults []Result, retErr error) {
+	log.VEvent(ctx, 2, "GetResults")
+	defer func() {
+		log.VEventf(ctx, 2, "exiting GetResults (%d results, err=%v)", len(retResults), retErr)
+	}()
 	for {
 		results, allComplete, err := s.results.get(ctx)
 		if len(results) > 0 || allComplete || err != nil {
 			return results, err
 		}
-		s.results.wait()
-		// Check whether the Streamer has been canceled or closed while we were
-		// waiting for the results.
-		if err = ctx.Err(); err != nil {
+		log.VEvent(ctx, 2, "waiting in GetResults")
+		if err = s.results.wait(ctx); err != nil {
 			s.results.setError(err)
 			return nil, err
 		}
@@ -758,6 +831,7 @@ func (s *Streamer) Close(ctx context.Context) {
 		// exited.
 		s.results.close(ctx)
 	}
+	s.metrics.OperatorsCount.Dec(1)
 	*s = Streamer{}
 }
 
@@ -797,7 +871,7 @@ func (s *Streamer) adjustNumRequestsInFlight(delta int) {
 
 type workerCoordinator struct {
 	s              *Streamer
-	txn            *kv.Txn
+	sendFn         sendFn
 	lockWaitPolicy lock.WaitPolicy
 
 	asyncSem *quotapool.IntPool
@@ -814,28 +888,34 @@ type workerCoordinator struct {
 // is insufficient. The function exits when an error is encountered by one of
 // the asynchronous requests.
 func (w *workerCoordinator) mainLoop(ctx context.Context) {
+	log.VEvent(ctx, 2, "starting coordinator main loop")
+	defer log.VEvent(ctx, 2, "exiting coordinator main loop")
 	defer w.s.waitGroup.Done()
 	for {
-		if err := w.waitForRequests(ctx); err != nil {
-			w.s.results.setError(err)
+		if shouldExit := w.waitForRequests(ctx); shouldExit {
 			return
 		}
 
-		var atLeastBytes int64
-		// The higher the value of priority is, the lower the actual priority of
-		// spilling. Use the maximum value by default.
-		spillingPriority := math.MaxInt64
-		w.s.requestsToServe.Lock()
-		if !w.s.requestsToServe.emptyLocked() {
-			// If we already have minTargetBytes set on the first request to be
-			// issued, then use that.
-			atLeastBytes = w.s.requestsToServe.nextLocked().minTargetBytes
-			// The first request has the highest urgency among all current
-			// requests to serve, so we use its priority to spill everything
-			// with less urgency when necessary to free up the budget.
-			spillingPriority = w.s.requestsToServe.nextLocked().priority()
-		}
-		w.s.requestsToServe.Unlock()
+		// The coordinator goroutine is the only one that removes requests from
+		// w.s.requestsToServe, so we can keep the reference to next request
+		// without holding the lock.
+		//
+		// Note that it's possible that by the time we get into
+		// issueRequestsForAsyncProcessing() another request with higher urgency
+		// is added; however, this is not a problem - we wait for available
+		// budget here on a best-effort basis.
+		nextReq := func() singleRangeBatch {
+			w.s.requestsToServe.Lock()
+			defer w.s.requestsToServe.Unlock()
+			return w.s.requestsToServe.nextLocked()
+		}()
+		// If we already have minTargetBytes set on the first request to be
+		// issued, then use that.
+		atLeastBytes := nextReq.minTargetBytes
+		// The first request has the highest urgency among all current requests
+		// to serve, so we use its priority to spill everything with less
+		// urgency when necessary to free up the budget.
+		spillingPriority := nextReq.priority()
 
 		avgResponseSize, shouldExit := w.getAvgResponseSize()
 		if shouldExit {
@@ -871,28 +951,31 @@ func (w *workerCoordinator) mainLoop(ctx context.Context) {
 // tracing span of the Streamer's user. Some time has been spent to figure it
 // out but led to no success. This should be cleaned up.
 func (w *workerCoordinator) logStatistics(ctx context.Context) {
-	avgResponseSize, _ := w.getAvgResponseSize()
-	log.VEventf(
-		ctx, 1,
-		"enqueueCalls=%d enqueuedRequests=%d enqueuedSingleRangeRequests=%d kvPairsRead=%d "+
-			"batchRequestsIssued=%d resumeBatchRequests=%d resumeSingleRangeRequests=%d "+
-			"numSpilledResults=%d emptyBatchResponses=%d droppedBatchResponses=%d avgResponseSize=%s",
-		w.s.enqueueCalls,
-		w.s.enqueuedRequests,
-		w.s.enqueuedSingleRangeRequests,
-		atomic.LoadInt64(w.s.atomics.kvPairsRead),
-		atomic.LoadInt64(w.s.atomics.batchRequestsIssued),
-		atomic.LoadInt64(&w.s.atomics.resumeBatchRequests),
-		atomic.LoadInt64(&w.s.atomics.resumeSingleRangeRequests),
-		w.s.results.numSpilledResults(),
-		atomic.LoadInt64(&w.s.atomics.emptyBatchResponses),
-		atomic.LoadInt64(&w.s.atomics.droppedBatchResponses),
-		humanizeutil.IBytes(avgResponseSize),
-	)
+	if log.ExpensiveLogEnabled(ctx, 1) {
+		avgResponseSize, _ := w.getAvgResponseSize()
+		log.Eventf(
+			ctx,
+			"enqueueCalls=%d enqueuedRequests=%d enqueuedSingleRangeRequests=%d kvPairsRead=%d "+
+				"batchRequestsIssued=%d resumeBatchRequests=%d resumeSingleRangeRequests=%d "+
+				"numSpilledResults=%d emptyBatchResponses=%d droppedBatchResponses=%d avgResponseSize=%s",
+			w.s.enqueueCalls,
+			w.s.enqueuedRequests,
+			w.s.enqueuedSingleRangeRequests,
+			atomic.LoadInt64(w.s.atomics.kvPairsRead),
+			atomic.LoadInt64(&w.s.atomics.batchRequestsIssued),
+			atomic.LoadInt64(&w.s.atomics.resumeBatchRequests),
+			atomic.LoadInt64(&w.s.atomics.resumeSingleRangeRequests),
+			w.s.results.numSpilledResults(),
+			atomic.LoadInt64(&w.s.atomics.emptyBatchResponses),
+			atomic.LoadInt64(&w.s.atomics.droppedBatchResponses),
+			humanizeutil.IBytes(avgResponseSize),
+		)
+	}
 }
 
 // waitForRequests blocks until there is at least one request to be served.
-func (w *workerCoordinator) waitForRequests(ctx context.Context) error {
+// Boolean indicating whether the coordinator should exit is returned.
+func (w *workerCoordinator) waitForRequests(ctx context.Context) (shouldExit bool) {
 	w.s.requestsToServe.Lock()
 	defer w.s.requestsToServe.Unlock()
 	if w.s.requestsToServe.emptyLocked() {
@@ -900,21 +983,21 @@ func (w *workerCoordinator) waitForRequests(ctx context.Context) error {
 		// Check if the Streamer has been canceled or closed while we were
 		// waiting.
 		if ctx.Err() != nil {
-			return ctx.Err()
+			w.s.results.setError(ctx.Err())
+			return true
 		}
 		w.s.mu.Lock()
-		shouldExit := w.s.results.error() != nil || w.s.mu.done
+		shouldExit = w.s.results.error() != nil || w.s.mu.done
 		w.s.mu.Unlock()
 		if shouldExit {
-			return nil
+			return true
 		}
-		if buildutil.CrdbTestBuild {
-			if w.s.requestsToServe.emptyLocked() {
-				panic(errors.AssertionFailedf("unexpectedly zero requests to serve after waiting "))
-			}
+		if w.s.requestsToServe.emptyLocked() {
+			w.s.results.setError(errors.AssertionFailedf("unexpectedly zero requests to serve after waiting"))
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func (w *workerCoordinator) getAvgResponseSize() (avgResponseSize int64, shouldExit bool) {
@@ -993,6 +1076,13 @@ func (w *workerCoordinator) getMaxNumRequestsToIssue(ctx context.Context) (_ int
 	}
 	// The whole quota is currently used up, so we blockingly acquire a quota of
 	// 1.
+	numBatches := func() int64 {
+		w.s.requestsToServe.Lock()
+		defer w.s.requestsToServe.Unlock()
+		return int64(w.s.requestsToServe.lengthLocked())
+	}()
+	w.s.metrics.BatchesThrottled.Inc(numBatches)
+	defer w.s.metrics.BatchesThrottled.Dec(numBatches)
 	alloc, err := w.asyncSem.Acquire(ctx, 1)
 	if err != nil {
 		w.s.results.setError(err)
@@ -1022,8 +1112,36 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 	defer w.s.budget.mu.Unlock()
 
 	headOfLine := w.s.getNumRequestsInProgress() == 0
+	log.VEventf(
+		ctx, 2, "serving %d requests, max:%v head:%v",
+		w.s.requestsToServe.lengthLocked(), maxNumRequestsToIssue, headOfLine,
+	)
 	var budgetIsExhausted bool
 	for !w.s.requestsToServe.emptyLocked() && maxNumRequestsToIssue > 0 && !budgetIsExhausted {
+		if !headOfLine && w.s.budget.mu.acc.Used() > w.s.eagerMemUsageLimitBytes {
+			// The next batch is not head-of-the-line, and the budget has used
+			// up more than eagerMemUsageLimitBytes bytes. At this point, we
+			// stop issuing "eager" requests, so we just exit.
+			//
+			// This exit will not lead to the streamer deadlocking because we
+			// already have at least one batch to serve, and at some point we'll
+			// get into this loop with headOfLine=true, so we'll always be
+			// issuing at least one batch, eventually.
+			//
+			// This behavior is helpful to prevent pathological behavior
+			// observed in #113729. Namely, if we issue too many batches eagerly
+			// in the InOrder mode, the buffered responses might consume most of
+			// our memory budget, and at some point we might regress to
+			// processing requests one batch with a single Get / Scan request at
+			// a time. We don't want to just drop already received responses
+			// (we've already discarded the original singleRangeBatches anyway),
+			// so this mechanism allows us to preserve a fraction of the budget
+			// to processing head-of-the-line batches.
+			//
+			// Similar pattern can occur in the OutOfOrder mode too although the
+			// degradation is not as severe as in the InOrder mode.
+			return nil
+		}
 		singleRangeReqs := w.s.requestsToServe.nextLocked()
 		availableBudget := w.s.budget.limitBytes - w.s.budget.mu.acc.Used()
 		// minTargetBytes is the minimum TargetBytes limit with which it makes
@@ -1057,6 +1175,10 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 				// We don't have enough budget available to serve this request,
 				// and there are other requests in progress, so we'll wait for
 				// some of them to finish.
+				log.VEventf(ctx, 2,
+					"pausing serving requests, remaining:%d, available:%d < min:%d",
+					w.s.requestsToServe.lengthLocked(), availableBudget, minAcceptableBudget,
+				)
 				return nil
 			}
 			budgetIsExhausted = true
@@ -1084,6 +1206,18 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 		// significantly in size.
 		if targetBytes < singleRangeReqs.minTargetBytes {
 			targetBytes = singleRangeReqs.minTargetBytes
+		}
+		if headOfLine && w.s.budget.mu.acc.Used() > w.s.eagerMemUsageLimitBytes {
+			// Given that the eager memory usage limit has already been
+			// exceeded, we won't issue any more requests for now, so rather
+			// than use the estimate on the response size, this head-of-the-line
+			// batch will use most of the available budget, as controlled by the
+			// session variable.
+			if headOfLineOnly := int64(float64(availableBudget) * w.s.headOfLineOnlyFraction); headOfLineOnly > targetBytes {
+				targetBytes = headOfLineOnly
+				// Ensure that we won't issue any more requests for now.
+				budgetIsExhausted = true
+			}
 		}
 		if targetBytes+responsesOverhead > availableBudget {
 			// We don't have enough budget to account for both the TargetBytes
@@ -1116,6 +1250,10 @@ func (w *workerCoordinator) issueRequestsForAsyncProcessing(
 			// truncated targetBytes above to not exceed availableBudget, and
 			// we're holding the budget's mutex. Thus, the error indicates that
 			// the root memory pool has been exhausted.
+			log.VEventf(ctx, 2,
+				"pausing serving requests, remaining:%d, root memory pool exhausted (head:%v): %v",
+				w.s.requestsToServe.lengthLocked(), headOfLine, err,
+			)
 			if !headOfLine {
 				// There are some requests in progress, so we'll let them
 				// finish / be released.
@@ -1235,6 +1373,10 @@ func (w *workerCoordinator) performRequestAsync(
 		},
 		func(ctx context.Context) {
 			defer w.asyncRequestCleanup(false /* budgetMuAlreadyLocked */)
+			w.s.metrics.BatchesSent.Inc(1)
+			w.s.metrics.BatchesInProgress.Inc(1)
+			defer w.s.metrics.BatchesInProgress.Dec(1)
+
 			ba := &kvpb.BatchRequest{}
 			ba.Header.WaitPolicy = w.lockWaitPolicy
 			ba.Header.TargetBytes = targetBytes
@@ -1247,6 +1389,20 @@ func (w *workerCoordinator) performRequestAsync(
 			// regardless of the value of headOfLine.
 			ba.AdmissionHeader.NoMemoryReservedAtSource = false
 			ba.Requests = req.reqs
+
+			if buildutil.CrdbTestBuild {
+				if w.s.mode == InOrder {
+					for i := range req.positions[:len(req.positions)-1] {
+						if req.positions[i] >= req.positions[i+1] {
+							w.s.results.setError(errors.AssertionFailedf(
+								"positions aren't ascending: %d before %d at index %d",
+								req.positions[i], req.positions[i+1], i,
+							))
+							return
+						}
+					}
+				}
+			}
 
 			// TODO(yuzefovich): in Enqueue we split all requests into
 			// single-range batches, so ideally ba touches a single range in
@@ -1262,16 +1418,22 @@ func (w *workerCoordinator) performRequestAsync(
 			// unnecessary blocking (due to sequential evaluation of sub-batches
 			// by the DistSender). For the initial implementation it doesn't
 			// seem important though.
-			br, pErr := w.txn.Send(ctx, ba)
-			if pErr != nil {
+
+			// Note that we don't add a separate log.VEventf here before calling
+			// Send since we create a separate tracing span for each async
+			// request which is sufficient to highlight where the handoff from
+			// SQL occurred.
+			br, err := w.sendFn(ctx, ba)
+			if err != nil {
 				// TODO(yuzefovich): if err is
 				// ReadWithinUncertaintyIntervalError and there is only a single
 				// Streamer in a single local flow, attempt to transparently
 				// refresh.
-				w.s.results.setError(pErr.GoError())
+				log.VEventf(ctx, 2, "dropping response: error from kv: %v", err)
+				w.s.results.setError(err)
 				return
 			}
-			atomic.AddInt64(w.s.atomics.batchRequestsIssued, 1)
+			atomic.AddInt64(&w.s.atomics.batchRequestsIssued, 1)
 
 			// First, we have to reconcile the memory budget. We do it
 			// separately from processing the results because we want to know
@@ -1281,6 +1443,7 @@ func (w *workerCoordinator) performRequestAsync(
 			// doesn't allow mutability.
 			fp, err := calculateFootprint(req, br)
 			if err != nil {
+				log.VEventf(ctx, 2, "dropping response: error calculating footprint: %v", err)
 				w.s.results.setError(err)
 				return
 			}
@@ -1313,6 +1476,9 @@ func (w *workerCoordinator) performRequestAsync(
 				// but not enough for that large row).
 				toConsume := -overaccountedTotal
 				if err = w.s.budget.consume(ctx, toConsume, headOfLine /* allowDebt */); err != nil {
+					log.VEventf(ctx, 2,
+						"dropping response: root memory pool exhausted (head:%v): %v", headOfLine, err,
+					)
 					// TODO(yuzefovich): rather than dropping the response
 					// altogether, consider blocking to wait for the budget to
 					// open up, up to some limit.
@@ -1330,6 +1496,11 @@ func (w *workerCoordinator) performRequestAsync(
 						// TODO(yuzefovich): consider updating the
 						// avgResponseSize and/or storing the information about
 						// the returned bytes size in req.
+
+						// The KV layer doesn't allow evaluation of the same
+						// Gets and Scans multiple times, so we need to make
+						// fresh copies of them.
+						req.deepCopyRequests(w.s)
 						w.s.requestsToServe.add(req)
 						return
 					}
@@ -1352,6 +1523,7 @@ func (w *workerCoordinator) performRequestAsync(
 					CreateTime: w.requestAdmissionHeader.CreateTime,
 				}
 				if _, err = w.responseAdmissionQ.Admit(ctx, responseAdmission); err != nil {
+					log.VEventf(ctx, 2, "dropping response: admission control: %v", err)
 					w.s.results.setError(err)
 					return
 				}
@@ -1359,6 +1531,13 @@ func (w *workerCoordinator) performRequestAsync(
 
 			// Finally, process the results and add the ResumeSpans to be
 			// processed as well.
+			log.VEventf(ctx, 2,
+				"responses:%d targetBytes:%d {footprint:%v overhead:%v resumeMem:%v gets:%v scans:%v incpGets:%v "+
+					"incpScans:%v startedScans:%v kvs:%v}",
+				len(br.Responses), targetBytes, fp.memoryFootprintBytes, fp.responsesOverhead,
+				fp.resumeReqsMemUsage, fp.numGetResults, fp.numScanResults, fp.numIncompleteGets,
+				fp.numIncompleteScans, fp.numStartedScans, fp.kvPairsRead,
+			)
 			processSingleRangeResponse(ctx, w.s, req, br, fp)
 		}); err != nil {
 		// The new goroutine for the request wasn't spun up, so we have to
@@ -1427,7 +1606,7 @@ func calculateFootprint(
 			}
 			if get.ResumeSpan != nil {
 				// This Get wasn't completed.
-				fp.resumeReqsMemUsage += requestSize(get.ResumeSpan.Key, get.ResumeSpan.EndKey)
+				fp.resumeReqsMemUsage += getRequestSize(get.ResumeSpan.Key)
 				fp.numIncompleteGets++
 			} else {
 				// This Get was completed.
@@ -1462,7 +1641,7 @@ func calculateFootprint(
 			}
 			if scan.ResumeSpan != nil {
 				// This Scan wasn't completed.
-				fp.resumeReqsMemUsage += requestSize(scan.ResumeSpan.Key, scan.ResumeSpan.EndKey)
+				fp.resumeReqsMemUsage += scanRequestSize(scan.ResumeSpan.Key, scan.ResumeSpan.EndKey)
 				fp.numIncompleteScans++
 			}
 		}
@@ -1488,6 +1667,7 @@ func processSingleRangeResponse(
 	processSingleRangeResults(ctx, s, req, br, fp)
 	if fp.hasIncomplete() {
 		resumeReq := buildResumeSingleRangeBatch(s, req, br, fp)
+		log.VEventf(ctx, 2, "adding resume batch %v", resumeReq)
 		s.requestsToServe.add(resumeReq)
 	}
 }
@@ -1505,6 +1685,7 @@ func processSingleRangeResults(
 ) {
 	// If there are no results, this function has nothing to do.
 	if !fp.hasResults() {
+		log.VEvent(ctx, 2, "no results")
 		return
 	}
 
@@ -1524,12 +1705,11 @@ func processSingleRangeResults(
 	numRequestsStarted := fp.numGetResults + fp.numStartedScans
 	s.mu.avgResponseEstimator.update(fp.memoryFootprintBytes, numRequestsStarted)
 
-	// If we have any Scan results to create and the Scan requests can return
-	// multiple rows, we'll need to consult s.mu.numRangesPerScanRequest, so
-	// we'll defer unlocking the streamer's mutex. However, if only Get results
-	// or Scan results of single rows will be created, we can unlock the
+	// If we have any Scan results to create, we'll need to consult
+	// s.mu.numRangesPerScanRequest, so we'll defer unlocking the streamer's
+	// mutex. However, if only Get results will be created, we can unlock the
 	// streamer's mutex right away.
-	if fp.numScanResults > 0 && !s.hints.SingleRowLookup {
+	if fp.numScanResults > 0 {
 		defer s.mu.Unlock()
 	} else {
 		s.mu.Unlock()
@@ -1539,7 +1719,10 @@ func processSingleRangeResults(
 	// the Streamer's one.
 	s.results.Lock()
 	defer s.results.Unlock()
-	defer s.results.doneAddingLocked(ctx)
+	defer func() {
+		numResults, signalled := s.results.doneAddingLocked(ctx)
+		log.VEventf(ctx, 2, "done adding results, buffered:%d signalled:%v", numResults, signalled)
+	}()
 
 	// memoryTokensBytes accumulates all reservations that are made for all
 	// Results created below. The accounting for these reservations has already
@@ -1601,9 +1784,7 @@ func processSingleRangeResults(
 			result.memoryTok.streamer = s
 			result.memoryTok.toRelease = scanResponseSize(scan) + scanResponseOverhead
 			memoryTokensBytes += result.memoryTok.toRelease
-			if s.hints.SingleRowLookup {
-				result.scanComplete = true
-			} else if scan.ResumeSpan == nil {
+			if scan.ResumeSpan == nil {
 				// The scan within the range is complete.
 				if s.mode == OutOfOrder {
 					s.mu.numRangesPerScanRequest[position]--
@@ -1663,6 +1844,9 @@ func buildResumeSingleRangeBatch(
 	// We've already reconciled the budget with the actual reservation for the
 	// requests with the ResumeSpans.
 	resumeReq.reqsReservedBytes = fp.resumeReqsMemUsage
+	// TODO(yuzefovich): add heuristic for making fresh allocation of slices
+	// whenever only a fraction of them will be used by the resume batch. This
+	// will allow us to return most of overheadAccountedFor to the budget.
 	resumeReq.overheadAccountedFor = req.overheadAccountedFor
 	// Note that due to limitations of the KV layer (#75452) we cannot reuse
 	// original requests because the KV doesn't allow mutability (and all
@@ -1691,7 +1875,8 @@ func buildResumeSingleRangeBatch(
 			newGet := gets[0]
 			gets = gets[1:]
 			newGet.req.SetSpan(*get.ResumeSpan)
-			newGet.req.KeyLocking = s.keyLocking
+			newGet.req.KeyLockingStrength = s.lockStrength
+			newGet.req.KeyLockingDurability = s.lockDurability
 			newGet.union.Get = &newGet.req
 			resumeReq.reqs[resumeReqIdx].Value = &newGet.union
 			resumeReq.positions = append(resumeReq.positions, position)
@@ -1719,7 +1904,8 @@ func buildResumeSingleRangeBatch(
 			scans = scans[1:]
 			newScan.req.SetSpan(*scan.ResumeSpan)
 			newScan.req.ScanFormat = kvpb.BATCH_RESPONSE
-			newScan.req.KeyLocking = s.keyLocking
+			newScan.req.KeyLockingStrength = s.lockStrength
+			newScan.req.KeyLockingDurability = s.lockDurability
 			newScan.union.Scan = &newScan.req
 			resumeReq.reqs[resumeReqIdx].Value = &newScan.union
 			resumeReq.positions = append(resumeReq.positions, position)

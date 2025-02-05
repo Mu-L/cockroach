@@ -1,20 +1,15 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -22,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -68,7 +62,7 @@ func Validate(steps []Step, kvs *Engine, dt *SeqTracker) []error {
 	// by `After` timestamp is sufficient to get us the necessary ordering. This
 	// is because txns cannot be used concurrently, so none of the (Begin,After)
 	// timespans for a given transaction can overlap.
-	sort.Slice(steps, func(i, j int) bool { return steps[i].After.Less(steps[j].After) })
+	slices.SortFunc(steps, func(a, b Step) int { return a.After.Compare(b.After) })
 	for _, s := range steps {
 		v.processOp(s.Op)
 	}
@@ -227,8 +221,25 @@ func (o *observedWrite) isDelete() bool {
 
 type observedRead struct {
 	Key        roachpb.Key
+	SkipLocked bool
 	Value      roachpb.Value
 	ValidTimes disjointTimeSpans
+	// AlwaysValid indicates whether a read should be considered valid in the
+	// entire interval [hlc.MinTimestamp, hlc.MaxTimestamp].
+	//
+	// A lock acquired by a locking read is kept until commit time, unless it's
+	// rolled back by a savepoint; in that case, the lock is not released eagerly,
+	// but it's also not guaranteed to be held (if the transaction is pushed, the
+	// lock may be released). Serializable transactions refresh all reads at
+	// commit time, so their reads should be validated even if they were rolled
+	// back. Weaker-isolation transaction don't refresh their reads at commit
+	// time, so if a locking read from such a transaction is rolled back, we
+	// don't need to validate the read; it's valid at all times.
+	AlwaysValid bool
+	// DoNotObserveOnSavepointRollback indicates whether a read should be skipped
+	// from validation if it's rolled back by a savepoint. It's set to true for
+	// all locking reads from weak-isolation transactions.
+	DoNotObserveOnSavepointRollback bool
 }
 
 func (*observedRead) observedMarker() {}
@@ -237,11 +248,27 @@ type observedScan struct {
 	Span          roachpb.Span
 	IsDeleteRange bool
 	Reverse       bool
+	SkipLocked    bool
 	KVs           []roachpb.KeyValue
 	Valid         multiKeyTimeSpan
 }
 
 func (*observedScan) observedMarker() {}
+
+type savepointType int
+
+const (
+	create savepointType = iota
+	release
+	rollback
+)
+
+type observedSavepoint struct {
+	ID   int
+	Type savepointType
+}
+
+func (*observedSavepoint) observedMarker() {}
 
 type validator struct {
 	kvs *Engine
@@ -249,8 +276,9 @@ type validator struct {
 	// Observations for the current atomic unit. This is reset between units, in
 	// checkAtomic, which then calls processOp (which might recurse owing to the
 	// existence of txn closures, batches, etc).
-	curObservations []observedOp
-	buffering       bufferingType
+	curObservations   []observedOp
+	observationFilter observationFilter
+	buffering         bufferingType
 
 	// NB: The Generator carefully ensures that each value written is unique
 	// globally over a run, so there's a 1:1 relationship between a value that was
@@ -344,6 +372,18 @@ func (v *validator) tryConsumeRangedWrite(
 	return consumed, len(consumed) > 0
 }
 
+// observationFilter describes which observations should be included in the
+// validator's observations.
+type observationFilter int
+
+const (
+	// observeAll includes all observations.
+	observeAll observationFilter = iota
+	// observeLocking includes only observations for operations that acquire locks
+	// (i.e. writes and locking reads).
+	observeLocking
+)
+
 type bufferingType byte
 
 const (
@@ -393,10 +433,28 @@ func (v *validator) processOp(op Operation) {
 			break
 		}
 		read := &observedRead{
-			Key:   t.Key,
-			Value: roachpb.Value{RawBytes: t.Result.Value},
+			Key:        t.Key,
+			SkipLocked: t.SkipLocked,
+			Value:      roachpb.Value{RawBytes: t.Result.Value},
 		}
-		v.curObservations = append(v.curObservations, read)
+		var observe bool
+		switch v.observationFilter {
+		case observeAll:
+			observe = true
+		case observeLocking:
+			// NOTE: even if t.ForUpdate || t.ForShare, we only consider the read to
+			// be locking if it has a guaranteed durability. Furthermore, we only
+			// consider the read as an observation if it found and returned a value,
+			// otherwise no lock would have been acquired on the non-existent key.
+			// Gets do not acquire gap locks.
+			observe = t.GuaranteedDurability && read.Value.IsPresent()
+			read.DoNotObserveOnSavepointRollback = true
+		default:
+			panic("unexpected")
+		}
+		if observe {
+			v.curObservations = append(v.curObservations, read)
+		}
 
 		if v.buffering == bufferingSingle {
 			v.checkAtomic(`get`, t.Result)
@@ -466,14 +524,22 @@ func (v *validator) processOp(op Operation) {
 		}
 		v.curObservations = append(v.curObservations, deleteOps...)
 		// The span ought to be empty right after the DeleteRange.
-		v.curObservations = append(v.curObservations, &observedScan{
-			Span: roachpb.Span{
-				Key:    t.Key,
-				EndKey: t.EndKey,
-			},
-			IsDeleteRange: true, // just for printing
-			KVs:           nil,
-		})
+		//
+		// However, we do not add this observation if the observation filter is
+		// observeLocking because the DeleteRange's read is not locking. This means
+		// that for isolation levels that permit write skew, the DeleteRange does
+		// not prevent new keys from being inserted in the deletion span between the
+		// transaction's read and write timestamps.
+		if v.observationFilter != observeLocking {
+			v.curObservations = append(v.curObservations, &observedScan{
+				Span: roachpb.Span{
+					Key:    t.Key,
+					EndKey: t.EndKey,
+				},
+				IsDeleteRange: true, // just for printing
+				KVs:           nil,
+			})
+		}
 
 		if v.buffering == bufferingSingle {
 			v.checkAtomic(`deleteRange`, t.Result)
@@ -544,12 +610,17 @@ func (v *validator) processOp(op Operation) {
 
 		// The span ought to be empty right after the DeleteRange, even if parts of
 		// the DeleteRange that didn't materialize due to a shadowing operation.
-		v.curObservations = append(v.curObservations, &observedScan{
-			Span: roachpb.Span{
-				Key:    t.Key,
-				EndKey: t.EndKey,
-			},
-		})
+		//
+		// See above for why we do not add this observation if the observation
+		// filter is observeLocking.
+		if v.observationFilter != observeLocking {
+			v.curObservations = append(v.curObservations, &observedScan{
+				Span: roachpb.Span{
+					Key:    t.Key,
+					EndKey: t.EndKey,
+				},
+			})
+		}
 
 		if v.buffering == bufferingSingle {
 			v.checkAtomic(`deleteRangeUsingTombstone`, t.Result)
@@ -649,25 +720,62 @@ func (v *validator) processOp(op Operation) {
 		if v.buffering == bufferingSingle {
 			v.checkAtomic(`addSSTable`, t.Result)
 		}
+	case *BarrierOperation:
+		execTimestampStrictlyOptional = true
+		if op.Barrier.WithLeaseAppliedIndex &&
+			resultHasErrorType(t.Result, &kvpb.RangeKeyMismatchError{}) {
+			// Barriers requesting LAIs can't span ranges. The generator will
+			// optimistically try to fit the barrier inside one of the current ranges,
+			// but this may race with a split, so we ignore the error in this case and
+			// try again later.
+		} else {
+			// Fail or retry on other errors, depending on type.
+			v.checkNonAmbError(op, t.Result, exceptUnhandledRetry)
+		}
+		// We don't yet actually check the barrier guarantees here, i.e. that all
+		// concurrent writes are applied by the time it completes. Maybe later.
 	case *ScanOperation:
 		if _, isErr := v.checkError(op, t.Result); isErr {
 			break
 		}
-		scan := &observedScan{
-			Span: roachpb.Span{
-				Key:    t.Key,
-				EndKey: t.EndKey,
-			},
-			KVs:     make([]roachpb.KeyValue, len(t.Result.Values)),
-			Reverse: t.Reverse,
-		}
-		for i, kv := range t.Result.Values {
-			scan.KVs[i] = roachpb.KeyValue{
-				Key:   kv.Key,
-				Value: roachpb.Value{RawBytes: kv.Value},
+		switch v.observationFilter {
+		case observeAll:
+			scan := &observedScan{
+				Span: roachpb.Span{
+					Key:    t.Key,
+					EndKey: t.EndKey,
+				},
+				Reverse:    t.Reverse,
+				SkipLocked: t.SkipLocked,
+				KVs:        make([]roachpb.KeyValue, len(t.Result.Values)),
 			}
+			for i, kv := range t.Result.Values {
+				scan.KVs[i] = roachpb.KeyValue{
+					Key:   kv.Key,
+					Value: roachpb.Value{RawBytes: kv.Value},
+				}
+			}
+			v.curObservations = append(v.curObservations, scan)
+		case observeLocking:
+			// If we are only observing locking operations then we only want to
+			// consider the scan to be locking if it has a guaranteed durability.
+			// Furthermore, we only consider the individual keys that were returned to
+			// be locked, not the entire span that was scanned. Scans do not acquire
+			// gap locks.
+			if t.GuaranteedDurability {
+				for _, kv := range t.Result.Values {
+					read := &observedRead{
+						Key:                             kv.Key,
+						SkipLocked:                      t.SkipLocked,
+						Value:                           roachpb.Value{RawBytes: kv.Value},
+						DoNotObserveOnSavepointRollback: true,
+					}
+					v.curObservations = append(v.curObservations, read)
+				}
+			}
+		default:
+			panic("unexpected")
 		}
-		v.curObservations = append(v.curObservations, scan)
 
 		if v.buffering == bufferingSingle {
 			atomicScanType := `scan`
@@ -707,19 +815,19 @@ func (v *validator) processOp(op Operation) {
 		if t.CommitInBatch != nil {
 			ops = append(ops, t.CommitInBatch.Ops...)
 		}
+		if t.IsoLevel.ToleratesWriteSkew() {
+			// If the transaction ran under an isolation level that permits write skew
+			// then we only validate the atomicity of locking operations (writes and
+			// locking reads). Non-locking reads may be inconsistent with the commit
+			// timestamp of the transaction.
+			v.observationFilter = observeLocking
+		}
 		v.buffering = bufferingBatchOrTxn
 		for _, op := range ops {
 			v.processOp(op)
 		}
-		prevFailures := v.failures
 		atomicTxnType := fmt.Sprintf(`%s txn`, t.IsoLevel.StringLower())
 		v.checkAtomic(atomicTxnType, t.Result)
-		if t.IsoLevel != isolation.Serializable {
-			// TODO(nvanbenschoten): for now, we run snapshot and read committed
-			// transactions in the mix but don't validate their results. Doing so
-			// is non-trivial. See #100169 and #100170
-			v.failures = prevFailures
-		}
 	case *SplitOperation:
 		execTimestampStrictlyOptional = true
 		v.failIfError(op, t.Result) // splits should never return *any* error
@@ -745,16 +853,14 @@ func (v *validator) processOp(op Operation) {
 			// However, I think the right thing to do is sniff this inside the
 			// AdminMerge code and retry so the client never sees it. In the meantime,
 			// no-op. #44377
-		} else if resultIsErrorStr(t.Result, `merge failed: cannot merge ranges when (rhs)|(lhs) is in a joint state or has learners`) {
+		} else if resultIsErrorStr(t.Result, `merge failed: cannot merge ranges when (lhs|rhs) is in a joint state or has learners`) {
 			// This operation executed concurrently with one that was changing
 			// replicas.
 		} else if resultIsErrorStr(t.Result, `merge failed: ranges not collocated`) {
 			// A merge requires that the two ranges have replicas on the same nodes,
 			// but Generator intentiontally does not try to avoid this so that this
 			// edge case is exercised.
-		} else if resultIsErrorStr(t.Result, `merge failed: waiting for all left-hand replicas to initialize`) {
-			// Probably should be transparently retried.
-		} else if resultIsErrorStr(t.Result, `merge failed: waiting for all right-hand replicas to catch up`) {
+		} else if resultIsErrorStr(t.Result, `merge failed: waiting for all (left|right)-hand replicas to (initialize|catch up)`) {
 			// Probably should be transparently retried.
 		} else if resultIsErrorStr(t.Result, `merge failed: non-deletion intent on local range descriptor`) {
 			// Probably should be transparently retried.
@@ -782,9 +888,35 @@ func (v *validator) processOp(op Operation) {
 		if !transferLeaseResultIsIgnorable(t.Result) {
 			v.failIfError(op, t.Result) // fail on all other errors
 		}
+	case *ChangeSettingOperation:
+		execTimestampStrictlyOptional = true
+		// It's possible that reading the modified setting times out. Ignore these
+		// errors for now, at least until we do some validation that depends on the
+		// cluster settings being fully propagated.
+		if !resultIsErrorStr(t.Result, `setting updated but timed out waiting to read new value`) {
+			v.failIfError(op, t.Result)
+		}
 	case *ChangeZoneOperation:
 		execTimestampStrictlyOptional = true
 		v.failIfError(op, t.Result) // fail on all errors
+	case *SavepointCreateOperation:
+		sp := &observedSavepoint{ID: int(t.ID), Type: create}
+		v.curObservations = append(v.curObservations, sp)
+		// Don't fail on all errors because savepoints can be labeled with
+		// errOmitted if a previous op in the txn failed.
+		v.checkError(op, t.Result)
+	case *SavepointReleaseOperation:
+		sp := &observedSavepoint{ID: int(t.ID), Type: release}
+		v.curObservations = append(v.curObservations, sp)
+		// Don't fail on all errors because savepoints can be labeled with
+		// errOmitted if a previous op in the txn failed.
+		v.checkError(op, t.Result)
+	case *SavepointRollbackOperation:
+		sp := &observedSavepoint{ID: int(t.ID), Type: rollback}
+		v.curObservations = append(v.curObservations, sp)
+		// Don't fail on all errors because savepoints can be labeled with
+		// errOmitted if a previous op in the txn failed.
+		v.checkError(op, t.Result)
 	default:
 		panic(errors.AssertionFailedf(`unknown operation type: %T %v`, t, t))
 	}
@@ -802,6 +934,7 @@ func (v *validator) processOp(op Operation) {
 func (v *validator) checkAtomic(atomicType string, result Result) {
 	observations := v.curObservations
 	v.curObservations = nil
+	v.observationFilter = observeAll
 	v.buffering = bufferingSingle
 
 	// Only known-uncommitted results may come without a timestamp. Whenever we
@@ -922,6 +1055,18 @@ func (v *validator) checkAtomicCommitted(
 	// unit tested.
 	lastWritesByIdx := map[int]struct{}{}
 	var lastWrites roachpb.SpanGroup
+	// We will iterate over the observations in reverse order to find the last
+	// write; so we will encounter a savepoint rollback before the corresponding
+	// savepoint create. Assuming a rollback is preceded by a matching create
+	// (guaranteed by the generator), to identify the last write we need to ignore
+	// all writes that occur between a savepoint rollback and a corresponding
+	// savepoint create.
+	// rollbackSp keeps track of the current active rollback.
+	// rollbackSp = nil if no savepoint rollback has been encountered yet or any
+	// encountered rollback has been matched by a rollback create.
+	// rollbackSp = observedSavepoint{...} when the observedSavepoint object
+	// contains a rollback for which we haven't encountered a matching create yet.
+	var rollbackSp *observedSavepoint = nil
 	for idx := len(txnObservations) - 1; idx >= 0; idx-- {
 		observation := txnObservations[idx]
 		switch o := observation.(type) {
@@ -953,19 +1098,10 @@ func (v *validator) checkAtomicCommitted(
 			{
 				var g roachpb.SpanGroup
 				g.Add(lastWrites.Slice()...)
-				lastWrite = !g.Sub(sp) // if subtracting did nothing, it's a most recent write
-				if !lastWrite {
-					// Otherwise, add it back in, which should restore the old set. If it
-					// didn't, there was partial overlap, which shouldn't be possible.
-					g.Add(sp)
-				}
-				if then, now := lastWrites.Slice(), g.Slice(); !reflect.DeepEqual(then, now) {
-					v.failures = append(v.failures,
-						errors.AssertionFailedf("%s has write %q partially overlapping %+v; subtracting and re-adding gave %+v", atomicType, sp, then, now))
-					return
-				}
+				// If subtracting did nothing and there are no active rollbacks, it's a
+				// most recent write.
+				lastWrite = !g.Sub(sp) && rollbackSp == nil
 			}
-
 			if lastWrite {
 				lastWritesByIdx[idx] = struct{}{}
 				lastWrites.Add(sp)
@@ -990,13 +1126,44 @@ func (v *validator) checkAtomicCommitted(
 					panic(err)
 				}
 			} else { // ranged write
+				key := storage.EngineKey{Key: o.Key}.Encode()
+				endKey := storage.EngineKey{Key: o.EndKey}.Encode()
 				suffix := storage.EncodeMVCCTimestampSuffix(o.Timestamp)
-				if err := batch.RangeKeyUnset(o.Key, o.EndKey, suffix, nil); err != nil {
+				if err := batch.RangeKeyUnset(key, endKey, suffix, nil); err != nil {
 					panic(err)
+				}
+			}
+		case *observedRead:
+			// If this read should not be observed on savepoint rollback, and there is
+			// a savepoint being rolled back, mark the read as valid at all times.
+			if rollbackSp != nil && o.DoNotObserveOnSavepointRollback {
+				o.AlwaysValid = true
+			}
+		case *observedSavepoint:
+			switch o.Type {
+			case create:
+				// Set rollbackSp to nil if this savepoint create matches the rolled
+				// back one recorded in rollbackSp.
+				if rollbackSp != nil && rollbackSp.ID == o.ID {
+					rollbackSp = nil
+				}
+			case release:
+				// Savepoint releases don't affect the last write.
+			case rollback:
+				// Update rollbackSp only if there is no active rollback (i.e. a
+				// rollback for which we haven't found a matching create). Otherwise,
+				// the active rollback recorded in rollbackSp subsumes the one we're
+				// seeing now.
+				if rollbackSp == nil {
+					rollbackSp = o
 				}
 			}
 		}
 	}
+
+	// A map from a savepoint id to a batch that represents the state of the
+	// txn at the time of the savepoint creation.
+	spIDToBatch := make(map[int]*pebble.Batch)
 
 	// Iterate through the observations, building up the snapshot visible at each
 	// point in the atomic unit and filling in the valid read times (validating
@@ -1014,14 +1181,15 @@ func (v *validator) checkAtomicCommitted(
 			// writeTS was populated above as the unique timestamp at which the writes became
 			// visible. We know the operation had writes (we're looking at one now) and so
 			// this operation has either materialized or is covered by a later one that did,
-			// and so we must have a timestamp here. We defer the failure to the next for
-			// loop, as we will have filled in the read timestamps at that time.
+			// and so we must have a timestamp here.
+			// The only exception is when all writes were rolled back by a savepoint
+			// rollback. In that case, we still need a writeTS to ensure reads within the txn
+			// can see those writes; the execTimestamp serves that purpose.
 			if writeTS.IsEmpty() {
-				continue
+				writeTS = execTimestamp
 			}
 
 			_, isLastWrite := lastWritesByIdx[idx]
-
 			if !isLastWrite && o.Timestamp.IsSet() {
 				failure = `committed txn overwritten key had write`
 				break
@@ -1035,13 +1203,19 @@ func (v *validator) checkAtomicCommitted(
 					panic(err)
 				}
 			} else {
+				key := storage.EngineKey{Key: o.Key}.Encode()
+				endKey := storage.EngineKey{Key: o.EndKey}.Encode()
 				suffix := storage.EncodeMVCCTimestampSuffix(writeTS)
-				if err := batch.RangeKeySet(o.Key, o.EndKey, suffix, o.Value.RawBytes, nil); err != nil {
+				if err := batch.RangeKeySet(key, endKey, suffix, o.Value.RawBytes, nil); err != nil {
 					panic(err)
 				}
 			}
 		case *observedRead:
-			o.ValidTimes = validReadTimes(batch, o.Key, o.Value.RawBytes)
+			if o.AlwaysValid {
+				o.ValidTimes = disjointTimeSpans{{Start: hlc.MinTimestamp, End: hlc.MaxTimestamp}}
+			} else {
+				o.ValidTimes = validReadTimes(batch, o.Key, o.Value.RawBytes, o.SkipLocked /* missingKeyValid */)
+			}
 		case *observedScan:
 			// All kvs should be within scan boundary.
 			for _, kv := range o.KVs {
@@ -1062,10 +1236,35 @@ func (v *validator) checkAtomicCommitted(
 			if !sort.IsSorted(orderedKVs) {
 				failure = `scan result not ordered correctly`
 			}
-			o.Valid = validScanTime(batch, o.Span, o.KVs)
+			o.Valid = validScanTime(batch, o.Span, o.KVs, o.SkipLocked /* missingKeysValid */)
+		case *observedSavepoint:
+			switch o.Type {
+			case create:
+				// Clone the existing batch by creating a new batch and applying the
+				// existing batch state to it.
+				newBatch := v.kvs.kvs.NewIndexedBatch()
+				_ = newBatch.Apply(batch, nil)
+				if _, ok := spIDToBatch[o.ID]; ok {
+					panic(errors.AssertionFailedf("validating a savepoint create op: ID %d already exists", o.ID))
+				}
+				spIDToBatch[o.ID] = newBatch
+			case release:
+				// Savepoint releases don't affect the validation.
+			case rollback:
+				if _, ok := spIDToBatch[o.ID]; !ok {
+					panic(errors.AssertionFailedf("validating a savepoint rollback op: ID %d does not exist", o.ID))
+				}
+				// The new batch to use for validation.
+				batch = spIDToBatch[o.ID]
+			}
 		default:
 			panic(errors.AssertionFailedf(`unknown observedOp: %T %s`, observation, observation))
 		}
+	}
+
+	// Close all batches in spIDToBatch.
+	for _, spBatch := range spIDToBatch {
+		_ = spBatch.Close()
 	}
 
 	validPossibilities := disjointTimeSpans{{Start: hlc.MinTimestamp, End: hlc.MaxTimestamp}}
@@ -1089,6 +1288,9 @@ func (v *validator) checkAtomicCommitted(
 			opValid = o.ValidTimes
 		case *observedScan:
 			opValid = o.Valid.Combined()
+		case *observedSavepoint:
+			// A savepoint is always valid.
+			opValid = disjointTimeSpans{{Start: hlc.MinTimestamp, End: hlc.MaxTimestamp}}
 		default:
 			panic(errors.AssertionFailedf(`unknown observedOp: %T %s`, observation, observation))
 		}
@@ -1168,6 +1370,7 @@ func (v *validator) checkAtomicUncommitted(atomicType string, txnObservations []
 		case *observedScan:
 			// TODO(dan): Figure out what we can assert about reads in an uncommitted
 			// transaction.
+		case *observedSavepoint:
 		default:
 			panic(errors.AssertionFailedf(`unknown observedOp: %T %s`, observed, observed))
 		}
@@ -1201,8 +1404,7 @@ func (v *validator) checkError(
 	op Operation, r Result, extraExceptions ...func(err error) bool,
 ) (ambiguous, hadError bool) {
 	sl := []func(error) bool{
-		exceptAmbiguous, exceptOmitted, exceptRetry,
-		exceptDelRangeUsingTombstoneStraddlesRangeBoundary,
+		exceptAmbiguous, exceptOmitted, exceptRetry, exceptDelRangeUsingTombstoneStraddlesRangeBoundary,
 	}
 	sl = append(sl, extraExceptions...)
 	return v.failIfError(op, r, sl...)
@@ -1304,7 +1506,15 @@ func mustGetStringValue(value []byte) string {
 	return string(b)
 }
 
-func validReadTimes(b *pebble.Batch, key roachpb.Key, value []byte) disjointTimeSpans {
+func validReadTimes(
+	b *pebble.Batch, key roachpb.Key, value []byte, missingKeyValid bool,
+) disjointTimeSpans {
+	if len(value) == 0 && missingKeyValid {
+		// If no value was returned for the key and this is allowed, all times are
+		// valid for this read.
+		return disjointTimeSpans{{Start: hlc.MinTimestamp, End: hlc.MaxTimestamp}}
+	}
+
 	var hist []storage.MVCCValue
 	lowerBound := storage.EncodeMVCCKey(storage.MVCCKey{Key: key})
 	upperBound := storage.EncodeMVCCKey(storage.MVCCKey{Key: key.Next()})
@@ -1364,6 +1574,7 @@ func validReadTimes(b *pebble.Batch, key roachpb.Key, value []byte) disjointTime
 
 		// Handle a point key - put it into `hist`.
 		valB, err := iter.ValueAndErr()
+		valB = append([]byte{}, valB...)
 		if err != nil {
 			panic(err)
 		}
@@ -1375,8 +1586,8 @@ func validReadTimes(b *pebble.Batch, key roachpb.Key, value []byte) disjointTime
 		hist = append(hist, v)
 	}
 	// The slice isn't sorted due to MVCC rangedels. Sort in descending order.
-	sort.Slice(hist, func(i, j int) bool {
-		return hist[j].Value.Timestamp.Less(hist[i].Value.Timestamp)
+	slices.SortFunc(hist, func(a, b storage.MVCCValue) int {
+		return -a.Value.Timestamp.Compare(b.Value.Timestamp)
 	})
 
 	sv := mustGetStringValue(value)
@@ -1397,7 +1608,9 @@ func validReadTimes(b *pebble.Batch, key roachpb.Key, value []byte) disjointTime
 	return validTimes
 }
 
-func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) multiKeyTimeSpan {
+func validScanTime(
+	b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue, missingKeysValid bool,
+) multiKeyTimeSpan {
 	valid := multiKeyTimeSpan{
 		Gaps: disjointTimeSpans{{Start: hlc.MinTimestamp, End: hlc.MaxTimestamp}},
 	}
@@ -1412,7 +1625,7 @@ func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) m
 		// NB: we use value uniqueness here, but we could also use seqnos, so this
 		// is only a left-over of past times rather than an actual reliance on
 		// unique values.
-		validTimes := validReadTimes(b, kv.Key, kv.Value.RawBytes)
+		validTimes := validReadTimes(b, kv.Key, kv.Value.RawBytes, missingKeysValid)
 		if len(validTimes) > 1 {
 			panic(errors.AssertionFailedf(
 				`invalid number of read time spans for a (key,non-nil-value) pair in scan results: %s->%s: %v`,
@@ -1463,7 +1676,7 @@ func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) m
 		if _, ok := missingKeys[string(mvccKey.Key)]; !ok {
 			// Key not in scan response. Only valid if scan was before key's time, or
 			// at a time when the key was deleted.
-			missingKeys[string(mvccKey.Key)] = validReadTimes(b, mvccKey.Key, nil)
+			missingKeys[string(mvccKey.Key)] = validReadTimes(b, mvccKey.Key, nil, missingKeysValid)
 		}
 	}
 
@@ -1506,7 +1719,11 @@ func printObserved(observedOps ...observedOp) string {
 					opCode, o.Key, o.EndKey, ts, mustGetStringValue(o.Value.RawBytes), o.Seq)
 			}
 		case *observedRead:
-			fmt.Fprintf(&buf, "[r]%s:", o.Key)
+			opCode := "r"
+			if o.SkipLocked {
+				opCode += "(skip-locked)"
+			}
+			fmt.Fprintf(&buf, "[%s]%s:", opCode, o.Key)
 			validTimes := o.ValidTimes
 			if len(validTimes) == 0 {
 				validTimes = append(validTimes, timeSpan{})
@@ -1526,6 +1743,9 @@ func printObserved(observedOps ...observedOp) string {
 			if o.Reverse {
 				opCode = "rs"
 			}
+			if o.SkipLocked {
+				opCode += "(skip-locked)"
+			}
 			var kvs strings.Builder
 			for i, kv := range o.KVs {
 				if i > 0 {
@@ -1539,6 +1759,16 @@ func printObserved(observedOps ...observedOp) string {
 			}
 			fmt.Fprintf(&buf, "[%s]%s:%s->[%s]",
 				opCode, o.Span, o.Valid, kvs.String())
+		case *observedSavepoint:
+			opCode := "sp"
+			if o.Type == create {
+				opCode += "(create)"
+			} else if o.Type == release {
+				opCode += "(release)"
+			} else if o.Type == rollback {
+				opCode += "(rollback)"
+			}
+			fmt.Fprintf(&buf, "[%s]id:%d", opCode, o.ID)
 		default:
 			panic(errors.AssertionFailedf(`unknown observedOp: %T %s`, observed, observed))
 		}

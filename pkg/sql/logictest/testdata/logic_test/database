@@ -62,11 +62,11 @@ query TT colnames,rowsort
 SHOW SCHEMAS FROM a
 ----
 schema_name         owner
-crdb_internal       NULL
-information_schema  NULL
-pg_catalog          NULL
-pg_extension        NULL
-public              admin
+crdb_internal       node
+information_schema  node
+pg_catalog          node
+pg_extension        node
+public              root
 s                   root
 
 statement ok
@@ -262,7 +262,7 @@ subtest missing-db-error-issue-68060
 statement ok
 CREATE DATABASE db1;
 
-statement ok;
+statement ok
 USE db1;
 
 statement ok
@@ -379,11 +379,11 @@ query TT colnames,rowsort
 SHOW SCHEMAS
 ----
 schema_name         owner
-crdb_internal       NULL
-information_schema  NULL
-pg_catalog          NULL
-pg_extension        NULL
-public              admin
+crdb_internal       node
+information_schema  node
+pg_catalog          node
+pg_extension        node
+public              root
 regression_105906   root
 
 # Note: regression_105906 should not appear in the list of schemas below
@@ -391,11 +391,11 @@ query TT colnames,rowsort
 SHOW SCHEMAS FROM regression_105906
 ----
 schema_name         owner
-crdb_internal       NULL
-information_schema  NULL
-pg_catalog          NULL
-pg_extension        NULL
-public              admin
+crdb_internal       node
+information_schema  node
+pg_catalog          node
+pg_extension        node
+public              root
 
 statement ok
 DROP DATABASE regression_105906

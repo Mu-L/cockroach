@@ -1,15 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-//go:build docker
-// +build docker
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package docker
 
@@ -21,16 +13,17 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/build/bazel"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -76,7 +69,14 @@ func TestSingleNodeDocker(t *testing.T) {
 		t.Fatal(errors.NewAssertionErrorWithWrappedErrf(err, "cannot get pwd"))
 	}
 
-	fsnotifyBinPath := filepath.Join(pwd, "docker-fsnotify/docker-fsnotify-bin")
+	if !bazel.BuiltWithBazel() {
+		skip.IgnoreLint(t)
+	}
+
+	fsnotifyBinPath, err := bazel.Runfile("pkg/testutils/docker/docker-fsnotify/docker-fsnotify-bin")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var dockerTests = []singleNodeDockerTest{
 		{
@@ -235,19 +235,15 @@ func TestSingleNodeDocker(t *testing.T) {
 
 				if err := timeutil.RunWithTimeout(
 					ctx,
-					fmt.Sprintf("execute command \"%s\"", query),
+					redact.Sprintf("execute command \"%s\"", query),
 					defaultTimeout,
 					func(ctx context.Context) error {
 						resp, err := dn.execSQLQuery(ctx, query, test.sqlOpts)
 						if err != nil {
 							return err
 						}
-						cleanedOutput, err := cleanQueryResult(resp.stdOut)
-						if err != nil {
+						if err := checkQueryResult(resp.stdOut, expected); err != nil {
 							return err
-						}
-						if cleanedOutput != expected {
-							return fmt.Errorf("executing %s, expect:\n%#v\n, got\n%#v", query, expected, cleanedOutput)
 						}
 						return nil
 					},
@@ -559,17 +555,10 @@ func (dn *dockerNode) rmContainer(ctx context.Context) error {
 	return nil
 }
 
-// cleanQueryResult is to parse the result from a sql query to a cleaner format.
-// e.g.
-// "id,name\r\n1,a\r\n2,b\r\n3,c\r\n\r\n\r\nTime: 11ms\r\n\r\n"
-// => "id,name\n1,a\n2,b\n3,c"
-func cleanQueryResult(queryRes string) (string, error) {
+func checkQueryResult(queryRes string, expected string) error {
 	formatted := strings.ReplaceAll(queryRes, "\r\n", "\n")
-	r := regexp.MustCompile(`([\s\S]+)\n{3}Time:.+`)
-	res := r.FindStringSubmatch(formatted)
-	if len(res) < 2 {
-		return "", errors.Errorf("cannot parse the query result: %s", queryRes)
+	if strings.Contains(formatted, expected) {
+		return nil
 	}
-	return res[1], nil
-
+	return errors.Errorf("queryRes %q doesn't contain the expected string %q", queryRes, expected)
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -16,7 +11,6 @@ import (
 	"runtime/pprof"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
@@ -141,12 +135,6 @@ func (r *Replica) SendWithWriteBytes(
 	// recorded regardless of errors that are encountered.
 	startCPU := grunning.Time()
 	defer r.MeasureReqCPUNanos(startCPU)
-	// Record summary throughput information about the batch request for
-	// accounting.
-	r.recordBatchRequestLoad(ctx, ba)
-
-	// If the internal Raft group is quiesced, wake it and the leader.
-	r.maybeUnquiesce(true /* wakeLeader */, true /* mayCampaign */)
 
 	isReadOnly := ba.IsReadOnly()
 	if err := r.checkBatchRequest(ba, isReadOnly); err != nil {
@@ -216,6 +204,9 @@ func (r *Replica) SendWithWriteBytes(
 		r.recordBatchForLoadBasedSplitting(ctx, ba, br, int(grunning.Difference(startCPU, grunning.Time())))
 	}
 
+	// Record summary throughput information about the batch request for
+	// accounting.
+	r.recordBatchRequestLoad(ctx, ba)
 	r.recordRequestWriteBytes(writeBytes)
 	r.recordImpactOnRateLimiter(ctx, br, isReadOnly)
 	return br, writeBytes, pErr
@@ -315,14 +306,8 @@ func (r *Replica) maybeAddRangeInfoToResponse(
 	// DistSender and never use ClientRangeInfo.
 	//
 	// From 23.2, all DistSenders ensure ExplicitlyRequested is set when otherwise
-	// empty. Fall back to check for lease requests, to avoid 23.1 regressions.
-	if r.ClusterSettings().Version.IsActive(ctx, clusterversion.V23_2) {
-		if ba.ClientRangeInfo == (roachpb.ClientRangeInfo{}) {
-			return
-		}
-	} else if ba.IsSingleRequestLeaseRequest() {
-		// TODO(erikgrinaker): Remove this branch when 23.1 support is dropped.
-		_ = clusterversion.V23_1
+	// empty.
+	if ba.ClientRangeInfo == (roachpb.ClientRangeInfo{}) {
 		return
 	}
 
@@ -431,7 +416,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 	defer func() {
 		// NB: wrapped to delay g evaluation to its value when returning.
 		if g != nil {
-			r.concMgr.FinishReq(g)
+			r.concMgr.FinishReq(ctx, g)
 		}
 	}()
 	pp := poison.Policy_Error
@@ -472,10 +457,13 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 			ReadConsistency: ba.ReadConsistency,
 			WaitPolicy:      ba.WaitPolicy,
 			LockTimeout:     ba.LockTimeout,
+			DeadlockTimeout: ba.DeadlockTimeout,
+			AdmissionHeader: ba.AdmissionHeader,
 			PoisonPolicy:    pp,
 			Requests:        ba.Requests,
 			LatchSpans:      latchSpans, // nil if g != nil
 			LockSpans:       lockSpans,  // nil if g != nil
+			BaFmt:           ba,
 		}, requestEvalKind)
 		if pErr != nil {
 			if poisonErr := (*poison.PoisonedError)(nil); errors.As(pErr.GoError(), &poisonErr) {
@@ -529,7 +517,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 				if reuseLatchAndLockSpans {
 					latchSpans, lockSpans = g.TakeSpanSets()
 				}
-				r.concMgr.FinishReq(g)
+				r.concMgr.FinishReq(ctx, g)
 				g = nil
 			}
 		}
@@ -773,7 +761,7 @@ func (r *Replica) handleTransactionPushError(
 	dontRetry := r.store.cfg.TestingKnobs.DontRetryPushTxnFailures
 	if !dontRetry && ba.IsSinglePushTxnRequest() {
 		pushReq := ba.Requests[0].GetInner().(*kvpb.PushTxnRequest)
-		dontRetry = txnwait.ShouldPushImmediately(pushReq, t.PusheeTxn.Status)
+		dontRetry = txnwait.ShouldPushImmediately(pushReq, t.PusheeTxn.Status, ba.WaitPolicy)
 	}
 	if dontRetry {
 		return g, pErr
@@ -814,7 +802,9 @@ func (r *Replica) handleReadWithinUncertaintyIntervalError(
 	// Attempt a server-side retry of the request. Note that we pass nil for
 	// latchSpans, because we have already released our latches and plan to
 	// re-acquire them if the retry is allowed.
-	if !canDoServersideRetry(ctx, pErr, ba, nil /* g */, hlc.Timestamp{} /* deadline */) {
+	var ok bool
+	ba, ok = canDoServersideRetry(ctx, pErr, ba, nil /* g */, hlc.Timestamp{} /* deadline */)
+	if !ok {
 		r.store.Metrics().ReadWithinUncertaintyIntervalErrorServerSideRetryFailure.Inc(1)
 		return nil, pErr
 	}
@@ -946,17 +936,17 @@ func (r *Replica) executeAdminBatch(
 	switch tArgs := args.(type) {
 	case *kvpb.AdminSplitRequest:
 		var reply kvpb.AdminSplitResponse
-		reply, pErr = r.AdminSplit(ctx, *tArgs, "manual")
+		reply, pErr = r.AdminSplit(ctx, *tArgs, manualAdminReason)
 		resp = &reply
 
 	case *kvpb.AdminUnsplitRequest:
 		var reply kvpb.AdminUnsplitResponse
-		reply, pErr = r.AdminUnsplit(ctx, *tArgs, "manual")
+		reply, pErr = r.AdminUnsplit(ctx, *tArgs, manualAdminReason)
 		resp = &reply
 
 	case *kvpb.AdminMergeRequest:
 		var reply kvpb.AdminMergeResponse
-		reply, pErr = r.AdminMerge(ctx, *tArgs, "manual")
+		reply, pErr = r.AdminMerge(ctx, *tArgs, manualAdminReason)
 		resp = &reply
 
 	case *kvpb.AdminTransferLeaseRequest:
@@ -965,7 +955,7 @@ func (r *Replica) executeAdminBatch(
 
 	case *kvpb.AdminChangeReplicasRequest:
 		chgs := tArgs.Changes()
-		desc, err := r.ChangeReplicas(ctx, &tArgs.ExpDesc, kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonAdminRequest, "", chgs)
+		desc, err := r.ChangeReplicas(ctx, &tArgs.ExpDesc, kvserverpb.ReasonAdminRequest, "", chgs)
 		pErr = kvpb.NewError(err)
 		if pErr != nil {
 			resp = &kvpb.AdminChangeReplicasResponse{}
@@ -1116,7 +1106,7 @@ func (r *Replica) collectSpans(
 	latchSpans, lockSpans = spanset.New(), lockspanset.New()
 	r.mu.RLock()
 	desc := r.descRLocked()
-	liveCount := r.mu.state.Stats.LiveCount
+	liveCount := r.shMu.state.Stats.LiveCount
 	r.mu.RUnlock()
 	// TODO(bdarnell): need to make this less global when local
 	// latches are used more heavily. For example, a split will
@@ -1184,11 +1174,17 @@ func (r *Replica) collectSpans(
 	// than the request timestamp, and may have to retry at a higher timestamp.
 	// This is still safe as we're only ever writing at timestamps higher than the
 	// timestamp any write latch would be declared at.
-	batcheval.DeclareKeysForBatch(desc, &ba.Header, latchSpans)
+	err := batcheval.DeclareKeysForBatch(desc, &ba.Header, latchSpans)
+	if err != nil {
+		return nil, nil, concurrency.PessimisticEval, err
+	}
 	for _, union := range ba.Requests {
 		inner := union.GetInner()
 		if cmd, ok := batcheval.LookupCommand(inner.Method()); ok {
-			cmd.DeclareKeys(desc, &ba.Header, inner, latchSpans, lockSpans, r.Clock().MaxOffset())
+			err := cmd.DeclareKeys(desc, &ba.Header, inner, latchSpans, lockSpans, r.Clock().MaxOffset())
+			if err != nil {
+				return nil, nil, concurrency.PessimisticEval, err
+			}
 			if considerOptEvalForLimit {
 				switch inner.(type) {
 				case *kvpb.ScanRequest, *kvpb.ReverseScanRequest:
@@ -1341,7 +1337,7 @@ func (ec *endCmds) done(
 	// do so if the request is consistent and was operating on the leaseholder
 	// under a valid range lease.
 	if ba.ReadConsistency == kvpb.CONSISTENT && ec.st.State == kvserverpb.LeaseState_VALID {
-		ec.repl.updateTimestampCache(ctx, &ec.st, ba, br, pErr)
+		ec.repl.updateTimestampCache(ctx, ba, br, pErr)
 	}
 
 	if ts := ec.replicatingSince; !ts.IsZero() {
@@ -1357,6 +1353,6 @@ func (ec *endCmds) done(
 	// this method is called and the Guard is not set. Consider removing this
 	// check and upgrading the previous observation to an invariant.
 	if ec.g != nil {
-		ec.repl.concMgr.FinishReq(ec.g)
+		ec.repl.concMgr.FinishReq(ctx, ec.g)
 	}
 }

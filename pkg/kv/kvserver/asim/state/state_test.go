@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package state
 
@@ -95,7 +90,7 @@ func TestRangeMap(t *testing.T) {
 	require.Equal(t, firstRange.startKey, MinKey)
 	require.Equal(t, firstRange.desc.StartKey, MinKey.ToRKey())
 	require.Equal(t, firstRange.desc.EndKey, MaxKey.ToRKey())
-	require.Equal(t, defaultSpanConfig, firstRange.SpanConfig())
+	require.Equal(t, defaultSpanConfig, *firstRange.SpanConfig())
 
 	k2 := Key(1)
 	k3 := Key(2)
@@ -611,7 +606,7 @@ func TestSetSpanConfig(t *testing.T) {
 				Key:    tc.start.ToRKey().AsRawKey(),
 				EndKey: tc.end.ToRKey().AsRawKey(),
 			}
-			s.SetSpanConfig(span, config)
+			s.SetSpanConfig(span, &config)
 			for _, rng := range s.Ranges() {
 				start, _, ok := s.RangeSpan(rng.RangeID())
 				require.True(t, ok)

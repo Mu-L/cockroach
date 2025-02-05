@@ -1,23 +1,18 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package application_api_test
 
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
@@ -35,52 +30,63 @@ func TestAdminAPIStatementDiagnosticsBundle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// To enable tenant servers until we can do this in main_test.go for
-	// all tests.
-	defer ccl.TestingEnableEnterprise()()
-
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-
 	ts := s.ApplicationLayer()
+	conn := sqlutils.MakeSQLRunner(ts.SQLConn(t))
 
 	query := "EXPLAIN ANALYZE (DEBUG) SELECT 'secret'"
-	_, err := db.Exec(query)
-	require.NoError(t, err)
+	conn.Exec(t, query)
 
 	query = "SELECT id FROM system.statement_diagnostics LIMIT 1"
-	idRow, err := db.Query(query)
-	require.NoError(t, err)
+	idRow := conn.Query(t, query)
 	var diagnosticRow string
 	if idRow.Next() {
-		err = idRow.Scan(&diagnosticRow)
+		err := idRow.Scan(&diagnosticRow)
 		require.NoError(t, err)
 	} else {
 		t.Fatal("no results")
 	}
 
-	client, err := ts.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
-	require.NoError(t, err)
-	resp, err := client.Get(ts.AdminURL().WithPath("/_admin/v1/stmtbundle/" + diagnosticRow).String())
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, 500, resp.StatusCode)
+	reqBundle := func(isAdmin bool, expectedStatusCode int) {
+		client, err := ts.GetAuthenticatedHTTPClient(isAdmin, serverutils.SingleTenantSession)
+		require.NoError(t, err)
+		resp, err := client.Get(ts.AdminURL().WithPath("/_admin/v1/stmtbundle/" + diagnosticRow).String())
+		require.NoError(t, err)
+		defer func() {
+			err := resp.Body.Close()
+			require.NoError(t, err)
+		}()
+		require.Equal(t, expectedStatusCode, resp.StatusCode)
+	}
 
-	adminClient, err := ts.GetAuthenticatedHTTPClient(true, serverutils.SingleTenantSession)
-	require.NoError(t, err)
-	adminResp, err := adminClient.Get(ts.AdminURL().WithPath("/_admin/v1/stmtbundle/" + diagnosticRow).String())
-	require.NoError(t, err)
-	defer adminResp.Body.Close()
-	require.Equal(t, 200, adminResp.StatusCode)
+	t.Run("with admin role", func(t *testing.T) {
+		reqBundle(true, http.StatusOK)
+	})
+
+	t.Run("no permissions", func(t *testing.T) {
+		reqBundle(false, http.StatusForbidden)
+	})
+
+	t.Run("with VIEWACTIVITYREDACTED role", func(t *testing.T) {
+		// VIEWACTIVITYREDACTED cannot download bundles due to PII.
+		// This will be revisited once we allow requesting and downloading redacted bundles.
+		conn.Exec(t, fmt.Sprintf("GRANT SYSTEM VIEWACTIVITYREDACTED TO %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
+		reqBundle(false, http.StatusForbidden)
+		conn.Exec(t, fmt.Sprintf("REVOKE SYSTEM VIEWACTIVITYREDACTED FROM %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
+	})
+
+	t.Run("with VIEWACTIVITY role", func(t *testing.T) {
+		// VIEWACTIVITY users can download bundles.
+		conn.Exec(t, fmt.Sprintf("GRANT SYSTEM VIEWACTIVITY TO %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
+		reqBundle(false, http.StatusOK)
+		conn.Exec(t, fmt.Sprintf("REVOKE SYSTEM VIEWACTIVITY FROM %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
+	})
 }
 
 func TestCreateStatementDiagnosticsReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	// To enable tenant servers until we can do this in main_test.go for
-	// all tests.
-	defer ccl.TestingEnableEnterprise()()
 
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -109,10 +115,6 @@ func TestCreateStatementDiagnosticsReportWithViewActivityOptions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// To enable tenant servers until we can do this in main_test.go for
-	// all tests.
-	defer ccl.TestingEnableEnterprise()()
-
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	db := sqlutils.MakeSQLRunner(sqlDB)
@@ -136,10 +138,10 @@ func TestCreateStatementDiagnosticsReportWithViewActivityOptions(t *testing.T) {
 		},
 		"SELECT crdb_internal.request_statement_bundle('SELECT _', 0::FLOAT, 0::INTERVAL, 0::INTERVAL)",
 	)
-	require.Contains(t, err.Error(), "requesting statement bundle requires VIEWACTIVITY or ADMIN role option")
+	require.Contains(t, err.Error(), "requesting statement bundle requires VIEWACTIVITY privilege")
 
 	// Grant VIEWACTIVITY and all test should work.
-	db.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", apiconstants.TestingUserNameNoAdmin().Normalized()))
+	db.Exec(t, fmt.Sprintf("GRANT SYSTEM VIEWACTIVITY TO %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
 	req := &serverpb.CreateStatementDiagnosticsReportRequest{
 		StatementFingerprint: "INSERT INTO test VALUES (_)",
 	}
@@ -172,7 +174,7 @@ func TestCreateStatementDiagnosticsReportWithViewActivityOptions(t *testing.T) {
 `, [][]string{{"1"}})
 
 	// Grant VIEWACTIVITYREDACTED and all test should get permission errors.
-	db.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", apiconstants.TestingUserNameNoAdmin().Normalized()))
+	db.Exec(t, fmt.Sprintf("GRANT SYSTEM VIEWACTIVITYREDACTED TO %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
 
 	if err := srvtestutils.PostStatusJSONProtoWithAdminOption(ts, "stmtdiagreports", req, &resp, false); err != nil {
 		if !testutils.IsError(err, "status: 403") {
@@ -194,16 +196,12 @@ func TestCreateStatementDiagnosticsReportWithViewActivityOptions(t *testing.T) {
 		},
 		"SELECT crdb_internal.request_statement_bundle('SELECT _', 0::FLOAT, 0::INTERVAL, 0::INTERVAL)",
 	)
-	require.Contains(t, err.Error(), "VIEWACTIVITYREDACTED role option cannot request statement bundle")
+	require.Contains(t, err.Error(), "users with VIEWACTIVITYREDACTED privilege can only request redacted statement bundles")
 }
 
 func TestStatementDiagnosticsCompleted(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	// To enable tenant servers until we can do this in main_test.go for
-	// all tests.
-	defer ccl.TestingEnableEnterprise()()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
@@ -247,10 +245,6 @@ func TestStatementDiagnosticsCompleted(t *testing.T) {
 func TestStatementDiagnosticsDoesNotReturnExpiredRequests(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	// To enable tenant servers until we can do this in main_test.go for
-	// all tests.
-	defer ccl.TestingEnableEnterprise()()
 
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())

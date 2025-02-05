@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -845,10 +840,14 @@ func (db *DB) readFromDatabase(
 	kd := diskResolution.SlabDuration()
 	for currentTimestamp := startTimestamp; currentTimestamp <= timespan.EndNanos; currentTimestamp += kd {
 		for _, source := range sources {
-			// If a TenantID is specified and is not the system tenant, only query
-			// data for that tenant source.
-			if tenantID.IsSet() && !tenantID.IsSystem() {
-				source = tsutil.MakeTenantSource(source, tenantID.String())
+			// If a TenantID is specified we may need to format the source in order to retrieve the correct data.
+			// e.g. if not system tenant we need the source to be of format nodeID-tenantID but if it is the
+			// system tenant we need the source to be of format nodeID. Otherwise we get all the data via the
+			// format nodeID-
+			if tenantID.IsSet() {
+				if !tenantID.IsSystem() {
+					source = tsutil.MakeTenantSource(source, tenantID.String())
+				}
 				key := MakeDataKey(seriesName, source, diskResolution, currentTimestamp)
 				b.Get(key)
 			} else {
@@ -905,7 +904,7 @@ func (db *DB) readAllSourcesFromDatabase(
 		return nil, err
 	}
 
-	if !tenantID.IsSet() || tenantID.IsSystem() {
+	if !tenantID.IsSet() {
 		return b.Results[0].Rows, nil
 	}
 
@@ -917,7 +916,7 @@ func (db *DB) readAllSourcesFromDatabase(
 			return nil, err
 		}
 		_, tenantSource := tsutil.DecodeSource(source)
-		if tenantSource == tenantID.String() {
+		if tenantID.IsSystem() && tenantSource == "" || tenantSource == tenantID.String() {
 			rows = append(rows, row)
 		}
 	}

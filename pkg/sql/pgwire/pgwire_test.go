@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire_test
 
@@ -31,13 +26,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -76,17 +69,8 @@ func TestPGWireDrainClient(t *testing.T) {
 	defer srv.Stopper().Stop(ctx)
 	tt := srv.ApplicationLayer()
 
-	host, port, err := net.SplitHostPort(tt.AdvSQLAddr())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pgBaseURL := url.URL{
-		Scheme:   "postgres",
-		Host:     net.JoinHostPort(host, port),
-		User:     url.User(username.RootUser),
-		RawQuery: "sslmode=disable",
-	}
+	pgBaseURL, cleanupFn := tt.PGUrl(t)
+	defer cleanupFn()
 
 	db, err := gosql.Open("postgres", pgBaseURL.String())
 	if err != nil {
@@ -148,17 +132,11 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 	defer srv.Stopper().Stop(ctx)
 	s := srv.ApplicationLayer()
 
-	host, port, err := net.SplitHostPort(s.AdvSQLAddr())
+	pgBaseURL, cleanupFn, err := s.PGUrlE()
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	pgBaseURL := url.URL{
-		Scheme:   "postgres",
-		Host:     net.JoinHostPort(host, port),
-		User:     url.User(username.RootUser),
-		RawQuery: "sslmode=disable",
-	}
+	defer cleanupFn()
 
 	db, err := gosql.Open("postgres", pgBaseURL.String())
 	if err != nil {
@@ -277,10 +255,10 @@ func TestPGPrepareFail(t *testing.T) {
 		"SELECT $1":                                 "pq: could not determine data type of placeholder $1",
 		"SELECT $1 + $1":                            "pq: could not determine data type of placeholder $1",
 		"SELECT CASE WHEN TRUE THEN $1 END":         "pq: could not determine data type of placeholder $1",
-		"SELECT CASE WHEN TRUE THEN $1 ELSE $2 END": "pq: could not determine data type of placeholder $1",
+		"SELECT CASE WHEN TRUE THEN $1 ELSE $2 END": "pq: could not determine data type of placeholder $2",
 		"SELECT $1 > 0 AND NOT $1":                  "pq: placeholder $1 already has type int, cannot assign bool",
 		"CREATE TABLE $1 (id INT)":                  "pq: at or near \"1\": syntax error",
-		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <anyelement> (desired <string>)",
+		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <anyelement> (returning <string>)",
 		"SELECT $0 > 0":                             "pq: lexical error: placeholder index must be between 1 and 65536",
 		"SELECT $2 > 0":                             "pq: could not determine data type of placeholder $1",
 		"SELECT 3 + CASE (4) WHEN 4 THEN $1 END":    "pq: could not determine data type of placeholder $1",
@@ -314,6 +292,11 @@ func TestPGPrepareWithCreateDropInTxn(t *testing.T) {
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
+
+	_, err := db.Exec("SET autocommit_before_ddl = false")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	{
 		tx, err := db.Begin()
@@ -502,7 +485,7 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SET application_name = $1", []preparedQueryTest{
 			baseTest.SetArgs("hello world"),
 		}},
-		{"SET CLUSTER SETTING cluster.organization = $1", []preparedQueryTest{
+		{"SET CLUSTER SETTING cluster.label = $1", []preparedQueryTest{
 			baseTest.SetArgs("hello world"),
 		}},
 		{"SHOW DATABASE", []preparedQueryTest{
@@ -540,7 +523,7 @@ func TestPGPreparedQuery(t *testing.T) {
 				Results("users", "users_user_id_idx", false, 2, "username", "username", "ASC", true, true, true, 1),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
-			baseTest.Results("crdb_internal", gosql.NullString{}).Others(4),
+			baseTest.Results("crdb_internal", "node").Others(4),
 		}},
 		{"SHOW CONSTRAINTS FROM system.users", []preparedQueryTest{
 			baseTest.Results("users", "primary", "PRIMARY KEY", "PRIMARY KEY (username ASC)", true).
@@ -819,9 +802,6 @@ func TestPGPreparedQuery(t *testing.T) {
 	ctx := context.Background()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-
-	ts := s.ApplicationLayer()
-	sql.SecondaryTenantZoneConfigsEnabled.Override(ctx, &ts.ClusterSettings().SV, true)
 
 	// Update the default AS OF time for querying the system.table_statistics
 	// table to create the crdb_internal.table_row_statistics table.
@@ -1309,7 +1289,7 @@ func TestPGPrepareNameQual(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db2 := s.ApplicationLayer().SQLConn(t, "testing")
+	db2 := s.ApplicationLayer().SQLConn(t, serverutils.DBName("testing"))
 
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS f (v INT)`,
@@ -1548,8 +1528,9 @@ func TestSQLNetworkMetrics(t *testing.T) {
 	srv := s.ApplicationLayer()
 
 	// Setup pgwire client.
-	pgURL, cleanupFn := sqlutils.PGUrl(
-		t, srv.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+	pgURL, cleanupFn := srv.PGUrl(
+		t, serverutils.CertsDirPrefix(t.Name()), serverutils.User(username.RootUser),
+	)
 	defer cleanupFn()
 
 	const minbytes = 10

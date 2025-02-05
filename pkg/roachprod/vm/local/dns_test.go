@@ -1,16 +1,12 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package local
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -35,12 +31,13 @@ func createTestDNSRecords(testRecords ...dnsTestRec) []vm.DNSRecord {
 
 func createTestDNSProvider(t *testing.T, testRecords ...dnsTestRec) vm.DNSProvider {
 	p := NewDNSProvider(t.TempDir(), "local-zone")
-	err := p.CreateRecords(createTestDNSRecords(testRecords...)...)
+	err := p.CreateRecords(context.Background(), createTestDNSRecords(testRecords...)...)
 	require.NoError(t, err)
 	return p
 }
 
 func TestLookupRecords(t *testing.T) {
+	ctx := context.Background()
 	p := createTestDNSProvider(t, []dnsTestRec{
 		{"_system-sql._tcp.local.local-zone", "0 1000 29001 local-0001.local-zone"},
 		{"_system-sql._tcp.local.local-zone", "0 1000 29002 local-0002.local-zone"},
@@ -51,7 +48,7 @@ func TestLookupRecords(t *testing.T) {
 	}...)
 
 	t.Run("lookup system", func(t *testing.T) {
-		records, err := p.LookupSRVRecords("system-sql", "tcp", "local")
+		records, err := p.LookupSRVRecords(ctx, "_system-sql._tcp.local.local-zone")
 		require.NoError(t, err)
 		require.Equal(t, 3, len(records))
 		for _, r := range records {
@@ -61,7 +58,7 @@ func TestLookupRecords(t *testing.T) {
 	})
 
 	t.Run("parse SRV data", func(t *testing.T) {
-		records, err := p.LookupSRVRecords("tenant-1-sql", "tcp", "local")
+		records, err := p.LookupSRVRecords(ctx, "_tenant-1-sql._tcp.local.local-zone")
 		require.NoError(t, err)
 		require.Equal(t, 1, len(records))
 		data, err := records[0].ParseSRVRecord()

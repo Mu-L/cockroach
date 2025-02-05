@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -20,13 +15,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -100,13 +94,11 @@ func runSampleAggregator(
 
 	sketchSpecs := []execinfrapb.SketchSpec{
 		{
-			SketchType:        execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
 			Columns:           []uint32{0},
 			GenerateHistogram: false,
 			StatName:          "a",
 		},
 		{
-			SketchType:          execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
 			Columns:             []uint32{1},
 			GenerateHistogram:   true,
 			HistogramMaxBuckets: maxBuckets,
@@ -154,6 +146,7 @@ func runSampleAggregator(
 		panic(errors.AssertionFailedf("Type %T not supported for inputRows", t))
 	}
 
+	ctx := execversion.TestingWithLatestCtx
 	outputs := make([]*distsqlutils.RowBuffer, numSamplers)
 	for i := 0; i < numSamplers; i++ {
 		outputs[i] = distsqlutils.NewRowBuffer(samplerOutTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -164,12 +157,12 @@ func runSampleAggregator(
 			Sketches:      sketchSpecs,
 		}
 		p, err := newSamplerProcessor(
-			context.Background(), &flowCtx, 0 /* processorID */, spec, in[i], &execinfrapb.PostProcessSpec{},
+			ctx, &flowCtx, 0 /* processorID */, spec, in[i], &execinfrapb.PostProcessSpec{},
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		p.Run(context.Background(), outputs[i])
+		p.Run(ctx, outputs[i])
 	}
 	// Randomly interleave the output rows from the samplers into a single buffer.
 	samplerResults := distsqlutils.NewRowBuffer(samplerOutTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
@@ -198,12 +191,12 @@ func runSampleAggregator(
 	}
 
 	agg, err := newSampleAggregator(
-		context.Background(), &flowCtx, 0 /* processorID */, spec, samplerResults, &execinfrapb.PostProcessSpec{},
+		ctx, &flowCtx, 0 /* processorID */, spec, samplerResults, &execinfrapb.PostProcessSpec{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	agg.Run(context.Background(), finalOut)
+	agg.Run(ctx, finalOut)
 	// Make sure there was no error.
 	finalOut.GetRowsNoMeta(t)
 	r := sqlutils.MakeSQLRunner(sqlDB)
@@ -249,21 +242,16 @@ func runSampleAggregator(
 				t.Fatal(err)
 			}
 
+			var a tree.DatumAlloc
 			for _, b := range h.Buckets {
-				ed, _, err := rowenc.EncDatumFromBuffer(
-					catenumpb.DatumEncoding_ASCENDING_KEY, b.UpperBound,
-				)
+				datum, err := stats.DecodeUpperBound(h.Version, histEncType, &a, b.UpperBound)
 				if err != nil {
-					t.Fatal(err)
-				}
-				var d tree.DatumAlloc
-				if err := ed.EnsureDecoded(histEncType, &d); err != nil {
 					t.Fatal(err)
 				}
 				r.buckets = append(r.buckets, resultBucket{
 					numEq:    int(b.NumEq),
 					numRange: int(b.NumRange),
-					upper:    int(*ed.Datum.(*tree.DInt)),
+					upper:    int(*datum.(*tree.DInt)),
 				})
 			}
 

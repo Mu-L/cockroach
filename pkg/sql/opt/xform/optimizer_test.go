@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package xform_test
 
@@ -144,7 +139,7 @@ func TestCoster(t *testing.T) {
 	runDataDrivenTest(
 		t, tu.TestDataPath(t, "coster", ""),
 		memo.ExprFmtHideRuleProps|memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|
-			memo.ExprFmtHideTypes|memo.ExprFmtHideNotVisibleIndexInfo,
+			memo.ExprFmtHideTypes|memo.ExprFmtHideNotVisibleIndexInfo|memo.ExprFmtHideFastPathChecks,
 	)
 }
 
@@ -165,7 +160,8 @@ func TestPhysicalProps(t *testing.T) {
 			memo.ExprFmtHideQualifications|
 			memo.ExprFmtHideScalars|
 			memo.ExprFmtHideTypes|
-			memo.ExprFmtHideNotVisibleIndexInfo,
+			memo.ExprFmtHideNotVisibleIndexInfo|
+			memo.ExprFmtHideFastPathChecks,
 	)
 }
 
@@ -180,7 +176,7 @@ func TestRuleProps(t *testing.T) {
 		t,
 		tu.TestDataPath(t, "ruleprops"),
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideQualifications|
-			memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|memo.ExprFmtHideNotVisibleIndexInfo,
+			memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|memo.ExprFmtHideNotVisibleIndexInfo|memo.ExprFmtHideFastPathChecks,
 	)
 }
 
@@ -197,7 +193,7 @@ func TestRules(t *testing.T) {
 		tu.TestDataPath(t, "rules"),
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
 			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|
-			memo.ExprFmtHideNotVisibleIndexInfo,
+			memo.ExprFmtHideNotVisibleIndexInfo|memo.ExprFmtHideFastPathChecks,
 	)
 }
 
@@ -226,7 +222,7 @@ func TestExternal(t *testing.T) {
 		*externalTestData,
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
 			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|
-			memo.ExprFmtHideNotVisibleIndexInfo,
+			memo.ExprFmtHideNotVisibleIndexInfo|memo.ExprFmtHideFastPathChecks,
 	)
 }
 
@@ -238,7 +234,7 @@ func TestPlaceholderFastPath(t *testing.T) {
 		tu.TestDataPath(t, "placeholder-fast-path"),
 		memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
 			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|
-			memo.ExprFmtHideNotVisibleIndexInfo,
+			memo.ExprFmtHideNotVisibleIndexInfo|memo.ExprFmtHideFastPathChecks,
 	)
 }
 

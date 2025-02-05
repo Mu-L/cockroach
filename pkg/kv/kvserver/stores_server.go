@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -74,6 +69,8 @@ func (is Server) CollectChecksum(
 //
 // It is the caller's responsibility to cancel or set a timeout on the context.
 // If the context is never canceled, WaitForApplication will retry forever.
+//
+// TODO(erikgrinaker): consider using Replica.WaitForLeaseAppliedIndex().
 func (is Server) WaitForApplication(
 	ctx context.Context, req *WaitForApplicationRequest,
 ) (*WaitForApplicationResponse, error) {
@@ -90,7 +87,7 @@ func (is Server) WaitForApplication(
 				return err
 			}
 			repl.mu.RLock()
-			leaseAppliedIndex := repl.mu.state.LeaseAppliedIndex
+			leaseAppliedIndex := repl.shMu.state.LeaseAppliedIndex
 			repl.mu.RUnlock()
 			if leaseAppliedIndex >= req.LeaseIndex {
 				// For performance reasons, we don't sync to disk when

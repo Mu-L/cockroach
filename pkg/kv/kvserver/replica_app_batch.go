@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -22,8 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -53,12 +48,22 @@ type replicaAppBatch struct {
 	// backing memory has already been provided and which may thus be
 	// modified directly.
 	state kvserverpb.ReplicaState
+	// truncState is this batch's view of the raft log truncation state. It is
+	// copied from under the Replica.mu when the batch is initialized, and remains
+	// constant since raftMu is being held throughout the lifetime of this batch.
+	truncState kvserverpb.RaftTruncatedState
+
 	// closedTimestampSetter maintains historical information about the
 	// advancement of the closed timestamp.
 	closedTimestampSetter closedTimestampSetterInfo
 	// changeRemovesReplica tracks whether the command in the batch (there must
 	// be only one) removes this replica from the range.
 	changeRemovesReplica bool
+	// changeTruncatesSideloadedFiles tracks whether the command in the batch
+	// (there must be only one) is a truncation request that removes at least one
+	// sideloaded storage file. Such commands may apply side effects only after
+	// their application to state machine is synced.
+	changeTruncatesSideloadedFiles bool
 
 	start                   time.Time // time at NewBatch()
 	followerStoreWriteBytes kvadmission.FollowerStoreWriteBytes
@@ -105,7 +110,7 @@ func (b *replicaAppBatch) Stage(
 
 	// Then, maybe override the result with testing knobs.
 	if b.r.store.TestingKnobs() != nil {
-		fr = replicaApplyTestingFilters(ctx, b.r, cmd, fr)
+		fr = replicaApplyTestingFilters(ctx, b.r, cmd, fr, false /* ephemeral */)
 	}
 
 	// Now update cmd. We'll either put the lease index in it or zero out
@@ -114,12 +119,8 @@ func (b *replicaAppBatch) Stage(
 
 	// TODO(tbg): these assertions should be pushed into
 	// (*appBatch).assertAndCheckCommand.
-	if err := b.assertNoCmdClosedTimestampRegression(ctx, cmd); err != nil {
-		return nil, err
-	}
-	if err := b.assertNoWriteBelowClosedTimestamp(cmd); err != nil {
-		return nil, err
-	}
+	b.assertNoCmdClosedTimestampRegression(ctx, cmd)
+	b.assertNoWriteBelowClosedTimestamp(ctx, cmd)
 
 	// Run any triggers that should occur before the batch is applied
 	// and before the write batch is staged in the batch.
@@ -161,7 +162,9 @@ func (b *replicaAppBatch) Stage(
 	// non-trivial commands will be in their own batch, so delaying their
 	// non-trivial ReplicatedState updates until later (without ever staging
 	// them in the batch) is sufficient.
-	b.stageTrivialReplicatedEvalResult(ctx, cmd)
+	if err := b.stageTrivialReplicatedEvalResult(ctx, cmd); err != nil {
+		return nil, err
+	}
 	b.ab.numEntriesProcessed++
 	size := len(cmd.Data)
 	b.ab.numEntriesProcessedBytes += int64(size)
@@ -287,6 +290,12 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		}
 		res.AddSSTable = nil
 	}
+	if res.LinkExternalSSTable != nil {
+		// All watching rangefeeds should error until we teach clients how to
+		// process linked external ssts.
+		b.r.disconnectRangefeedSpanWithErr(res.LinkExternalSSTable.Span, kvpb.NewError(errors.New("LinkExternalSSTable not supported in rangefeeds")))
+		res.LinkExternalSSTable = nil
+	}
 
 	if res.Split != nil {
 		// Splits require a new HardState to be written to the new RHS
@@ -306,8 +315,12 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		// TODO(nvanbenschoten): It should be possible to only reject registrations
 		// that overlap with the new range of the split and keep registrations that
 		// are only interested in keys that are still on the original range running.
+		reason := kvpb.RangeFeedRetryError_REASON_RANGE_SPLIT
+		if res.Split.SplitTrigger.ManualSplit {
+			reason = kvpb.RangeFeedRetryError_REASON_MANUAL_RANGE_SPLIT
+		}
 		b.r.disconnectRangefeedWithReason(
-			kvpb.RangeFeedRetryError_REASON_RANGE_SPLIT,
+			reason,
 		)
 	}
 
@@ -393,7 +406,7 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		res.State.GCThreshold = nil
 	}
 
-	if res.State != nil && res.State.TruncatedState != nil {
+	if truncatedState := res.GetRaftTruncatedState(); truncatedState != nil {
 		var err error
 		// Typically one should not be checking the cluster version below raft,
 		// since it can cause state machine divergence. However, this check is
@@ -415,19 +428,42 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		apply := !looselyCoupledTruncation || res.RaftExpectedFirstIndex == 0
 		if apply {
 			if apply, err = handleTruncatedStateBelowRaftPreApply(
-				ctx, b.state.TruncatedState, res.State.TruncatedState, b.r.raftMu.stateLoader, b.batch,
+				ctx, b.truncState, truncatedState,
+				b.r.raftMu.stateLoader.StateLoader, b.batch,
 			); err != nil {
 				return errors.Wrap(err, "unable to handle truncated state")
 			}
 		} else {
 			b.r.store.raftTruncator.addPendingTruncation(
-				ctx, (*raftTruncatorReplica)(b.r), *res.State.TruncatedState, res.RaftExpectedFirstIndex,
+				ctx, (*raftTruncatorReplica)(b.r), *truncatedState, res.RaftExpectedFirstIndex,
 				res.RaftLogDelta)
 		}
-		if !apply {
+		if apply {
+			// This truncation command will apply synchronously in this batch.
+			// Determine if there are any sideloaded entries that will be removed as a
+			// side effect.
+			//
+			// We must sync state machine batch application if the command removes any
+			// sideloaded log entries. Not doing so can lead to losing the entries.
+			// See the usage of changeTruncatesSideloadedFiles flag at the other end.
+			//
+			// We only need to check sideloaded entries in this path. The loosely
+			// coupled truncation mechanism in the other branch already ensures
+			// enacting truncations only after state machine synced.
+			if has, err := b.r.raftMu.sideloaded.HasAnyEntry(
+				ctx, b.truncState.Index, truncatedState.Index+1, // include end Index
+			); err != nil {
+				return errors.Wrap(err, "failed searching for sideloaded entries")
+			} else if has {
+				b.changeTruncatesSideloadedFiles = true
+			}
+		} else {
 			// The truncated state was discarded, or we are queuing a pending
 			// truncation, so make sure we don't apply it to our in-memory state.
-			res.State.TruncatedState = nil
+			if res.State != nil {
+				res.State.TruncatedState = nil
+			}
+			res.RaftTruncatedState = nil
 			res.RaftLogDelta = 0
 			res.RaftExpectedFirstIndex = 0
 			if !looselyCoupledTruncation {
@@ -442,7 +478,7 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 				// TODO(sumeer): this code will be deleted when there is no
 				// !looselyCoupledTruncation code path.
 				b.r.mu.Lock()
-				b.r.mu.raftLogSizeTrusted = false
+				b.r.shMu.raftLogSizeTrusted = false
 				b.r.mu.Unlock()
 			}
 		}
@@ -512,7 +548,7 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 // inspect the command's ReplicatedEvalResult.
 func (b *replicaAppBatch) stageTrivialReplicatedEvalResult(
 	ctx context.Context, cmd *replicatedCmd,
-) {
+) error {
 	b.state.RaftAppliedIndex = cmd.Index()
 	b.state.RaftAppliedIndexTerm = kvpb.RaftTerm(cmd.Term)
 
@@ -534,6 +570,19 @@ func (b *replicaAppBatch) stageTrivialReplicatedEvalResult(
 	// serialize on the stats key.
 	deltaStats := res.Delta.ToStats()
 	b.state.Stats.Add(deltaStats)
+
+	if res.DoTimelyApplicationToAllReplicas && !b.changeRemovesReplica {
+		// Update in-memory and persistent state. A later command accumulated in
+		// this batch may update these again. Also, a later command may set
+		// changeRemovesReplica to true and wipe out the state in the batch. These
+		// are all safe.
+		b.state.ForceFlushIndex = roachpb.ForceFlushIndex{Index: cmd.Entry.Index}
+		if err := b.r.raftMu.stateLoader.SetForceFlushIndex(
+			ctx, b.batch, b.state.Stats, &b.state.ForceFlushIndex); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ApplyToStateMachine implements the apply.Batch interface. The method handles
@@ -554,15 +603,33 @@ func (b *replicaAppBatch) ApplyToStateMachine(ctx context.Context) error {
 		}
 	}
 
-	// Apply the write batch to RockDB. Entry application is done without
-	// syncing to disk. The atomicity guarantees of the batch and the fact that
-	// the applied state is stored in this batch, ensure that if the batch ends
-	// up not being durably committed then the entries in this batch will be
-	// applied again upon startup. However, if we're removing the replica's data
-	// then we sync this batch as it is not safe to call postDestroyRaftMuLocked
-	// before ensuring that the replica's data has been synchronously removed.
-	// See handleChangeReplicasResult().
-	sync := b.changeRemovesReplica
+	// Apply the write batch to Pebble. Entry application is done without syncing
+	// to disk. The atomicity guarantees of the batch, and the fact that the
+	// applied state is stored in this batch, ensure that if the batch ends up not
+	// being durably committed then the entries in this batch will be applied
+	// again upon startup. However, there are a couple of exceptions.
+	//
+	// If we're removing the replica's data then we sync this batch as it is not
+	// safe to call postDestroyRaftMuLocked before ensuring that the replica's
+	// data has been synchronously removed. See handleChangeReplicasResult().
+	//
+	// We also sync the batch if the command truncates the log and removes at
+	// least one sideloaded entry. Sideloaded entries live in a separate special
+	// engine, and are removed as a side effect of applying this command, but not
+	// atomically with it.
+	//
+	// TODO(#36262, #93248): once the legacy log truncation mechanism is removed,
+	// and the behaviour under "kv.raft_log.loosely_coupled_truncation.enabled"
+	// cluster setting is the default, we will no longer need to sync here upon
+	// log truncations. The sync will happen by other means with a lag.
+	//
+	// TODO(sep-raft-log): when the log and state machine engines are completely
+	// separated, we must either sync here unconditionally upon log truncation
+	// (which would be expensive), or apply the side effects (remove the entries)
+	// asynchronously when sure that the state machine engine has synced the
+	// application of this command. I.e. the loosely coupled truncation migration
+	// mentioned above likely needs to be done first.
+	sync := b.changeRemovesReplica || b.changeTruncatesSideloadedFiles
 	if err := b.batch.Commit(sync); err != nil {
 		return errors.Wrapf(err, "unable to commit Raft entry batch")
 	}
@@ -572,24 +639,29 @@ func (b *replicaAppBatch) ApplyToStateMachine(ctx context.Context) error {
 	// Update the replica's applied indexes, mvcc stats and closed timestamp.
 	r := b.r
 	r.mu.Lock()
-	r.mu.state.RaftAppliedIndex = b.state.RaftAppliedIndex
-	r.mu.state.RaftAppliedIndexTerm = b.state.RaftAppliedIndexTerm
-	r.mu.state.LeaseAppliedIndex = b.state.LeaseAppliedIndex
+	r.shMu.state.RaftAppliedIndex = b.state.RaftAppliedIndex
+	r.shMu.state.RaftAppliedIndexTerm = b.state.RaftAppliedIndexTerm
+	r.shMu.state.LeaseAppliedIndex = b.state.LeaseAppliedIndex
 
 	// Sanity check that the RaftClosedTimestamp doesn't go backwards.
-	existingClosed := r.mu.state.RaftClosedTimestamp
+	existingClosed := r.shMu.state.RaftClosedTimestamp
 	newClosed := b.state.RaftClosedTimestamp
-	if !newClosed.IsEmpty() && newClosed.Less(existingClosed) && raftClosedTimestampAssertionsEnabled {
-		r.mu.Unlock()
-		return errors.AssertionFailedf(
+	if !newClosed.IsEmpty() && newClosed.Less(existingClosed) {
+		err := errors.AssertionFailedf(
 			"raft closed timestamp regression; replica has: %s, new batch has: %s.",
 			existingClosed.String(), newClosed.String())
+		logcrash.ReportOrPanic(ctx, &b.r.ClusterSettings().SV, "%v", err)
 	}
 	r.mu.closedTimestampSetter = b.closedTimestampSetter
+	closedTimestampUpdated := r.shMu.state.RaftClosedTimestamp.Forward(b.state.RaftClosedTimestamp)
 
-	closedTimestampUpdated := r.mu.state.RaftClosedTimestamp.Forward(b.state.RaftClosedTimestamp)
-	prevStats := *r.mu.state.Stats
-	*r.mu.state.Stats = *b.state.Stats
+	if b.state.ForceFlushIndex != r.shMu.state.ForceFlushIndex {
+		r.shMu.state.ForceFlushIndex = b.state.ForceFlushIndex
+		r.flowControlV2.ForceFlushIndexChangedLocked(ctx, b.state.ForceFlushIndex.Index)
+	}
+
+	prevStats := *r.shMu.state.Stats
+	*r.shMu.state.Stats = *b.state.Stats
 
 	// If the range is now less than its RangeMaxBytes, clear the history of its
 	// largest previous max bytes.
@@ -666,10 +738,6 @@ func (b *replicaAppBatch) Close() {
 	*b = replicaAppBatch{}
 }
 
-// raftClosedTimestampAssertionsEnabled provides an emergency way of shutting
-// down assertions.
-var raftClosedTimestampAssertionsEnabled = envutil.EnvOrDefaultBool("COCKROACH_RAFT_CLOSEDTS_ASSERTIONS_ENABLED", true)
-
 // Assert that the current command is not writing under the closed timestamp.
 // This check only applies to certain write commands, mainly IsIntentWrite,
 // since others (for example, EndTxn) can operate below the closed timestamp.
@@ -679,12 +747,11 @@ var raftClosedTimestampAssertionsEnabled = envutil.EnvOrDefaultBool("COCKROACH_R
 // cmd.Cmd.ClosedTimestamp. A command is allowed to write below the closed
 // timestamp carried by itself; in other words cmd.Cmd.ClosedTimestamp is a
 // promise about future commands, not the command carrying it.
-func (b *replicaAppBatch) assertNoWriteBelowClosedTimestamp(cmd *replicatedCmd) error {
+func (b *replicaAppBatch) assertNoWriteBelowClosedTimestamp(
+	ctx context.Context, cmd *replicatedCmd,
+) {
 	if !cmd.IsLocal() || !cmd.proposal.Request.AppliesTimestampCache() {
-		return nil
-	}
-	if !raftClosedTimestampAssertionsEnabled {
-		return nil
+		return
 	}
 	wts := cmd.Cmd.ReplicatedEvalResult.WriteTimestamp
 	if !wts.IsEmpty() && wts.LessEq(b.state.RaftClosedTimestamp) {
@@ -695,26 +762,21 @@ func (b *replicaAppBatch) assertNoWriteBelowClosedTimestamp(cmd *replicatedCmd) 
 		} else {
 			req.SafeString("request unknown; not leaseholder")
 		}
-		return errors.AssertionFailedf(
+		err := errors.AssertionFailedf(
 			"command writing below closed timestamp; cmd: %x, write ts: %s, "+
-				"batch state closed: %s, command closed: %s, request: %s, lease: %s.\n"+
-				"This assertion will fire again on restart; to ignore run with env var\n"+
-				"COCKROACH_RAFT_CLOSEDTS_ASSERTIONS_ENABLED=false",
+				"batch state closed: %s, command closed: %s, request: %s, lease: %s.\n",
 			cmd.ID, wts,
 			b.state.RaftClosedTimestamp, cmd.Cmd.ClosedTimestamp,
 			req, b.state.Lease)
+		logcrash.ReportOrPanic(ctx, &b.r.ClusterSettings().SV, "%v", err)
 	}
-	return nil
 }
 
 // Assert that the closed timestamp carried by the command is not below one from
 // previous commands.
 func (b *replicaAppBatch) assertNoCmdClosedTimestampRegression(
 	ctx context.Context, cmd *replicatedCmd,
-) error {
-	if !raftClosedTimestampAssertionsEnabled {
-		return nil
-	}
+) {
 	existingClosed := &b.state.RaftClosedTimestamp
 	newClosed := cmd.Cmd.ClosedTimestamp
 	if newClosed != nil && !newClosed.IsEmpty() && newClosed.Less(*existingClosed) {
@@ -740,16 +802,15 @@ func (b *replicaAppBatch) assertNoCmdClosedTimestampRegression(
 			}
 		}
 
-		return errors.AssertionFailedf(
+		err = errors.AssertionFailedf(
 			"raft closed timestamp regression in cmd: %x (term: %d, index: %d); batch state: %s, command: %s, lease: %s, req: %s, applying at LAI: %d.\n"+
 				"Closed timestamp was set by req: %s under lease: %s; applied at LAI: %d. Batch idx: %d.\n"+
-				"This assertion will fire again on restart; to ignore run with env var COCKROACH_RAFT_CLOSEDTS_ASSERTIONS_ENABLED=false\n"+
 				"Raft log tail:\n%s",
 			cmd.ID, cmd.Term, cmd.Index(), existingClosed, newClosed, b.state.Lease, req, cmd.LeaseIndex,
 			prevReq, b.closedTimestampSetter.lease, b.closedTimestampSetter.leaseIdx, b.ab.numEntriesProcessed,
 			logTail)
+		logcrash.ReportOrPanic(ctx, &b.r.ClusterSettings().SV, "%v", err)
 	}
-	return nil
 }
 
 // ephemeralReplicaAppBatch implements the apply.Batch interface.
@@ -770,7 +831,7 @@ func (mb *ephemeralReplicaAppBatch) Stage(
 	fr := kvserverbase.CheckForcedErr(
 		ctx, cmd.ID, &cmd.Cmd, cmd.IsLocal(), &mb.state,
 	)
-	fr = replicaApplyTestingFilters(ctx, mb.r, cmd, fr)
+	fr = replicaApplyTestingFilters(ctx, mb.r, cmd, fr, true /* ephemeral */)
 	cmd.ForcedErrResult = fr
 	if !cmd.Rejected() && cmd.LeaseIndex > mb.state.LeaseAppliedIndex {
 		mb.state.LeaseAppliedIndex = cmd.LeaseIndex

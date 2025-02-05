@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // This file provides generic interfaces that allow tests to set up test tenants
 // without importing the server package (avoiding circular dependencies). This
@@ -17,6 +12,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"net/http"
+	"net/url"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -43,13 +39,60 @@ import (
 	"google.golang.org/grpc"
 )
 
-// TestServerInterface defines test server functionality that tests need; it is
-// implemented by server.TestServer.
-type TestServerInterface interface {
+// TestServerInterfaceRaw is the interface of server.testServer.
+type TestServerInterfaceRaw interface {
+	TestServerController
 	StorageLayerInterface
-	ApplicationLayerInterface
 	TenantControlInterface
 
+	// in testServer, the base implementation of
+	// ApplicationLayerInterface always points to the system tenant.
+	ApplicationLayerInterface
+}
+
+type TestServerInterface interface {
+	TestServerController
+
+	// StorageLayerInterface is implemented by TestServerInterface
+	// for backward-compatibility with existing test code.
+	// New code should spell out their intent clearly by calling
+	// the .StorageLayer() method.
+	StorageLayerInterface
+
+	// ApplicationLayerInterface is implemented by TestServerInterface
+	// for backward-compatibility with existing test code.
+	// It is equivalent to the result of calling .ApplicationLayer().
+	//
+	// New tests should spell out their intent clearly by calling the
+	// .ApplicationLayer() (preferred) or .SystemLayer() methods
+	// directly.
+	ApplicationLayerInterface
+
+	// TenantControlInterface is implemented by TestServerInterface
+	// for backward-compatibility with existing test code.
+	// New code should spell out their intent clearly by calling
+	// the .TenantController() method.
+	TenantControlInterface
+
+	// ApplicationLayer returns the interface to the application layer that is
+	// exercised by the test. Depending on how the test server is started
+	// and (optionally) randomization, this can be either the SQL layer
+	// of a virtual cluster or that of the system interface.
+	ApplicationLayer() ApplicationLayerInterface
+
+	// SystemLayer returns the interface to the application layer
+	// of the system tenant.
+	SystemLayer() ApplicationLayerInterface
+
+	// StorageLayer returns the interface to the storage layer.
+	StorageLayer() StorageLayerInterface
+
+	// TenantController returns the interface to the tenant controller.
+	TenantController() TenantControlInterface
+}
+
+// TestServerController defines the control interface for a test server.
+type TestServerController interface {
 	// Start runs the server. This is pre-called by StartServer().
 	// It is provided for tests that use the TestServerFactory directly
 	// (mostly 'cockroach demo').
@@ -68,6 +111,10 @@ type TestServerInterface interface {
 	// Activate is the service activation phase of Start().
 	Activate(context.Context) error
 
+	// Stopper returns the stopper used by the server.
+	// TODO(knz): replace uses by Stop().
+	Stopper() *stop.Stopper
+
 	// Stop stops the server. This must be called at the end of a test
 	// to avoid leaking resources.
 	Stop(context.Context)
@@ -75,26 +122,6 @@ type TestServerInterface interface {
 	// SetReadyFn can be configured to notify a test when the server is
 	// ready. This is only effective when called before Start().
 	SetReadyFn(fn func(bool))
-
-	// ApplicationLayer returns the interface to the application layer that is
-	// exercised by the test. Depending on how the test server is started
-	// and (optionally) randomization, this can be either the SQL layer
-	// of a secondary tenant or that of the system tenant.
-	ApplicationLayer() ApplicationLayerInterface
-
-	// SystemLayer returns the interface to the application layer
-	// of the system tenant.
-	SystemLayer() ApplicationLayerInterface
-
-	// StorageLayer returns the interface to the storage layer.
-	StorageLayer() StorageLayerInterface
-
-	// TenantController returns the interface to the tenant controller.
-	TenantController() TenantControlInterface
-
-	// BinaryVersionOverride returns the value of an override if set using
-	// TestingKnobs.
-	BinaryVersionOverride() roachpb.Version
 
 	// RunInitialSQL is used by 'cockroach demo' to initialize
 	// an admin user.
@@ -105,8 +132,7 @@ type TestServerInterface interface {
 
 // ApplicationLayerInterface defines accessors to the application
 // layer of a test server. Tests written against this interface are
-// effectively agnostic to whether they use a secondary tenant or not.
-// This interface is implemented by server.Test{Tenant,Server}.
+// effectively agnostic to whether they use a virtual cluster or not.
 type ApplicationLayerInterface interface {
 	// Readiness returns true when the server is ready, that is,
 	// when it is accepting connections and it is not draining.
@@ -136,26 +162,28 @@ type ApplicationLayerInterface interface {
 	// RPCAddr returns the server's RPC address.
 	RPCAddr() string
 
-	// SQLConn returns a handle to the server's SQL interface, opened
-	// with the 'root' user.
+	// NodeDialer exposes the instance-to-instance dialer interface{}.
+	// The concrete type is *nodedialer.Dialer.
+	NodeDialer() interface{}
+
+	// SQLConn returns a handle to the server's SQL interface, opened with the
+	// 'root' user if no user option is passed. If no database name option is
+	// passed, DefaultDatabaseName is used.
 	// The connection is closed automatically when the server is stopped.
 	// Beware that each call returns a separate, new connection object.
-	//
-	// For the second argument use catalogkeys.DefaultDatabaseName or
-	// catconstants.SystemDatabaseName when in doubt. An empty
-	// string results in DefaultDatabaseName being used.
-	SQLConn(t TestFataler, dbName string) *gosql.DB
+	SQLConn(t TestFataler, opts ...SQLConnOption) *gosql.DB
 
-	// SQLConnE is like SQLConn but it allows the test to check the error.
-	SQLConnE(dbName string) (*gosql.DB, error)
+	// SQLConnE is like SQLConn, but it allows the test to check the error.
+	SQLConnE(opts ...SQLConnOption) (*gosql.DB, error)
 
-	// SQLConnForUser is like SQLConn but allows the test to specify a
-	// username.
-	SQLConnForUser(t TestFataler, userName, dbName string) *gosql.DB
+	// PGUrl returns a postgres connection URL for the server's SQL interface
+	// similar to the URL that SQLConn uses to open a SQL connection. The SQLConn
+	// method should be preferred and this method only should be used when the
+	// test needs to open a connection with special options, or in a specific way.
+	PGUrl(t TestFataler, opts ...SQLConnOption) (url.URL, func())
 
-	// SQLConnForUserE is like SQLConnForUser but it allows the test to
-	// check the error.
-	SQLConnForUserE(userName, dbName string) (*gosql.DB, error)
+	// PGUrlE is like PGUrl, but it allows the test to check the error.
+	PGUrlE(opts ...SQLConnOption) (url.URL, func(), error)
 
 	// DB returns a handle to the cluster's KV interface.
 	DB() *kv.DB
@@ -181,6 +209,12 @@ type ApplicationLayerInterface interface {
 
 	// HTTPAuthServer returns the authserver.Server as an interface{}.
 	HTTPAuthServer() interface{}
+
+	// HTTPServer returns the server.httpServer as an interface{}.
+	HTTPServer() interface{}
+
+	// SQLLoopbackListener returns the *netutil.LoopbackListener as an interface{}.
+	SQLLoopbackListener() interface{}
 
 	// SQLServer returns the *sql.Server as an interface{}.
 	SQLServer() interface{}
@@ -258,8 +292,8 @@ type ApplicationLayerInterface interface {
 	// tenant server.
 	SettingsWatcher() interface{}
 
-	// Stopper returns the stopper used by the tenant.
-	Stopper() *stop.Stopper
+	// AppStopper returns the stopper used by the tenant.
+	AppStopper() *stop.Stopper
 
 	// Clock returns the clock used by the tenant.
 	Clock() *hlc.Clock
@@ -286,6 +320,9 @@ type ApplicationLayerInterface interface {
 
 	// TestingKnobs returns the TestingKnobs in use by the test server.
 	TestingKnobs() *base.TestingKnobs
+
+	// ExternalIODir returns ExternalIODir form the server config.
+	ExternalIODir() string
 
 	// SQLServerInternal returns the *server.SQLServer as an interface{}
 	// Note: most tests should use SQLServer() and InternalExecutor() instead.
@@ -406,7 +443,7 @@ type ApplicationLayerInterface interface {
 	PrivilegeChecker() interface{}
 
 	// NodeDescStoreI returns the node descriptor lookup interface.
-	// The concrete return type is compatible with interface kvcoord.NodeDescStore.
+	// The concrete return type is compatible with interface kvclient.NodeDescStore.
 	NodeDescStoreI() interface{}
 
 	// Locality returns the locality used by the server.
@@ -420,7 +457,7 @@ type ApplicationLayerInterface interface {
 // start the SQL and HTTP service for secondary tenants (virtual
 // clusters).
 type TenantControlInterface interface {
-	// StartSharedProcessTenant starts the service for a secondary tenant
+	// StartSharedProcessTenant starts the service for a virtual cluster
 	// using the special configuration we define for shared-process deployments.
 	//
 	// args.TenantName must be specified. If a tenant with that name already
@@ -435,7 +472,7 @@ type TenantControlInterface interface {
 		ctx context.Context, args base.TestSharedProcessTenantArgs,
 	) (ApplicationLayerInterface, *gosql.DB, error)
 
-	// StartTenant starts the service for a secondary tenant using the special
+	// StartTenant starts the service for a virtual cluster using the special
 	// configuration we define for separate-process deployments. This incidentally
 	// is also the configuration we use in CC Serverless.
 	//
@@ -453,14 +490,27 @@ type TenantControlInterface interface {
 	// if the tenant record exists in KV.
 	WaitForTenantReadiness(ctx context.Context, tenantID roachpb.TenantID) error
 
-	// TestTenants returns the test tenants associated with the server.
+	// WaitForTenantCapabilities waits until the in-RAM cache of
+	// tenant capabilities has been populated for the given tenant ID
+	// with the expected target capability values.
+	WaitForTenantCapabilities(
+		ctx context.Context,
+		tenID roachpb.TenantID,
+		targetCaps map[tenantcapabilities.ID]string,
+		errPrefix string,
+	) error
+
+	// TestTenant returns the test tenant associated with the server.
 	//
-	// TODO(knz): rename to TestApplicationServices.
-	TestTenants() []ApplicationLayerInterface
+	// TODO(knz): rename to TestApplicationService.
+	TestTenant() ApplicationLayerInterface
 
 	// StartedDefaultTestTenant returns true if the server has started
 	// the service for the default test tenant.
 	StartedDefaultTestTenant() bool
+
+	// ServerController returns the *server.serverController as an interface{}
+	ServerController() interface{}
 }
 
 // StorageLayerInterface defines accessors to the storage layer of a
@@ -490,10 +540,6 @@ type StorageLayerInterface interface {
 
 	// HeartbeatNodeLiveness heartbeats the server's NodeLiveness record.
 	HeartbeatNodeLiveness() error
-
-	// NodeDialer exposes the NodeDialer instance used by the TestServer as an
-	// interface{}.
-	NodeDialer() interface{}
 
 	// WriteSummaries records summaries of time-series data, which is required for
 	// any tests that query server stats.
@@ -541,12 +587,6 @@ type StorageLayerInterface interface {
 	// assuming no additional information is added outside of the normal bootstrap
 	// process.
 	ExpectedInitialRangeCount() (int, error)
-
-	// ForceTableGC sends a GCRequest for the ranges corresponding to a table.
-	//
-	// An error will be returned if the same table name exists in multiple schemas
-	// inside the specified database.
-	ForceTableGC(ctx context.Context, database, table string, timestamp hlc.Timestamp) error
 
 	// UpdateChecker returns the server's *diagnostics.UpdateChecker as an
 	// interface{}. The UpdateChecker periodically phones home to check for new
@@ -599,6 +639,10 @@ type StorageLayerInterface interface {
 	// RaftTransport returns access to the raft transport.
 	// The return value is of type *kvserver.RaftTransport.
 	RaftTransport() interface{}
+
+	// StoreLivenessTransport provides access to the store liveness transport.
+	// The return value is of type *storeliveness.Transport.
+	StoreLivenessTransport() interface{}
 
 	// GetRangeLease returns information on the lease for the range
 	// containing key, and a timestamp taken from the node. The lease is

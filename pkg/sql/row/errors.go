@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package row
 
@@ -26,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -55,7 +51,7 @@ func ConvertBatchError(ctx context.Context, tableDesc catalog.TableDescriptor, b
 		}
 		return NewUniquenessConstraintViolationError(ctx, tableDesc, kv.Key, v.ActualValue)
 
-	case *kvpb.LockConflictError:
+	case *kvpb.WriteIntentError:
 		key := v.Locks[0].Key
 		decodeKeyFn := func() (tableName string, indexName string, colNames []string, values []string, err error) {
 			codec, index, err := decodeKeyCodecAndIndex(tableDesc, key)
@@ -79,17 +75,17 @@ func ConvertBatchError(ctx context.Context, tableDesc catalog.TableDescriptor, b
 // key-value fetch to a user friendly SQL error.
 func ConvertFetchError(spec *fetchpb.IndexFetchSpec, err error) error {
 	var errs struct {
-		lc *kvpb.LockConflictError
+		wi *kvpb.WriteIntentError
 		bs *kvpb.MinTimestampBoundUnsatisfiableError
 	}
 	switch {
-	case errors.As(err, &errs.lc):
-		key := errs.lc.Locks[0].Key
+	case errors.As(err, &errs.wi):
+		key := errs.wi.Locks[0].Key
 		decodeKeyFn := func() (tableName string, indexName string, colNames []string, values []string, err error) {
 			colNames, values, err = decodeKeyValsUsingSpec(spec, key)
 			return spec.TableName, spec.IndexName, colNames, values, err
 		}
-		return newLockNotAvailableError(errs.lc.Reason, decodeKeyFn)
+		return newLockNotAvailableError(errs.wi.Reason, decodeKeyFn)
 
 	case errors.As(err, &errs.bs):
 		return pgerror.WithCandidateCode(
@@ -160,11 +156,11 @@ func decodeKeyValsUsingSpec(
 // acquire a lock. It uses an IndexFetchSpec for the corresponding index (the
 // fetch columns in the spec are not used).
 func newLockNotAvailableError(
-	reason kvpb.LockConflictError_Reason,
+	reason kvpb.WriteIntentError_Reason,
 	decodeKeyFn func() (tableName string, indexName string, colNames []string, values []string, err error),
 ) error {
 	baseMsg := "could not obtain lock on row"
-	if reason == kvpb.LockConflictError_REASON_LOCK_TIMEOUT {
+	if reason == kvpb.WriteIntentError_REASON_LOCK_TIMEOUT {
 		baseMsg = "canceling statement due to lock timeout on row"
 	}
 	tableName, indexName, colNames, values, err := decodeKeyFn()
@@ -300,6 +296,7 @@ func DecodeRowInfo(
 // CheckFailed returns error message when a check constraint is violated.
 func CheckFailed(
 	ctx context.Context,
+	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 	sessionData *sessiondata.SessionData,
 	tabDesc catalog.TableDescriptor,
@@ -308,7 +305,7 @@ func CheckFailed(
 	// Failed to satisfy CHECK constraint, so unwrap the serialized
 	// check expression to display to the user.
 	expr, err := schemaexpr.FormatExprForDisplay(
-		ctx, tabDesc, check.GetExpr(), semaCtx, sessionData, tree.FmtParsable,
+		ctx, tabDesc, check.GetExpr(), evalCtx, semaCtx, sessionData, tree.FmtParsable,
 	)
 	if err != nil {
 		// If we ran into an error trying to read the check constraint, wrap it

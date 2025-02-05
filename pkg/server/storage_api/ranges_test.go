@@ -1,17 +1,13 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -22,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -32,12 +29,20 @@ func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	defer kvserver.EnableLeaseHistoryForTesting(100)()
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
+
+	// Create few ranges
+	r := sqlutils.MakeSQLRunner(ts.SQLConn(t))
+	r.Exec(t, "CREATE TABLE t (x INT PRIMARY KEY, xsquared INT)")
+	for i := 0; i < 5; i++ {
+		r.Exec(t, fmt.Sprintf("ALTER TABLE t SPLIT AT VALUES (%d)", 100*i/5))
+	}
 
 	t.Run("test ranges response", func(t *testing.T) {
 		// Perform a scan to ensure that all the raft groups are initialized.
-		if _, err := ts.DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
+		if _, err := srv.SystemLayer().DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
 			t.Fatal(err)
 		}
 
@@ -100,12 +105,17 @@ func TestRangesResponse(t *testing.T) {
 	})
 }
 
-func TestTenantRangesResponse(t *testing.T) {
+// TestTenantRangesSecurity checks that the storage layer properly zeroes out
+// if it's missing a tenant ID in the TenantRanges back-end RPC.
+func TestTenantRangesSecurity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(ctx)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
+	defer srv.Stopper().Stop(ctx)
+	ts := srv.SystemLayer()
 
 	t.Run("returns error when TenantID not set in ctx", func(t *testing.T) {
 		rpcStopper := stop.NewStopper()
@@ -122,34 +132,63 @@ func TestRangeResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	defer kvserver.EnableLeaseHistoryForTesting(100)()
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
 
 	// Perform a scan to ensure that all the raft groups are initialized.
-	if _, err := ts.DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
+	if _, err := srv.SystemLayer().DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
 		t.Fatal(err)
 	}
 
+	t.Run("access range endpoint within current tenant's scope", func(t *testing.T) {
+		var currentTenantRangeId int64
+		// Create a new table in the current tenant.
+		r := sqlutils.MakeSQLRunner(ts.SQLConn(t))
+		r.Exec(t, "CREATE TABLE t (x INT PRIMARY KEY, xsquared INT)")
+		for i := 0; i < 5; i++ {
+			r.Exec(t, fmt.Sprintf("ALTER TABLE t SPLIT AT VALUES (%d)", 100*i/5))
+		}
+		// Get some ranges from the given table
+		r.QueryRow(t, "SELECT range_id FROM [SHOW RANGES FROM TABLE t WITH DETAILS] LIMIT 1;").Scan(&currentTenantRangeId)
+		t.Logf("Table 't' range: %d", currentTenantRangeId)
+		require.NoError(t, validateRangeBelongsToTenant(ts, currentTenantRangeId))
+	})
+
+	t.Run("access range endpoint within system tenant's scope", func(t *testing.T) {
+		if !srv.StartedDefaultTestTenant() {
+			require.NoError(t, validateRangeBelongsToTenant(ts, 1))
+		} else {
+			expectedError := fmt.Errorf("got the wrong number of ranges in the response, expected %d, actual %d", 1, 0)
+			actualError := validateRangeBelongsToTenant(ts, 1)
+			require.Error(t, actualError)
+			require.Equal(t, expectedError, actualError)
+		}
+
+	})
+}
+
+func validateRangeBelongsToTenant(ts serverutils.ApplicationLayerInterface, rangeId int64) error {
 	var response serverpb.RangeResponse
-	if err := srvtestutils.GetStatusJSONProto(ts, "range/1", &response); err != nil {
-		t.Fatal(err)
+	if err := srvtestutils.GetStatusJSONProto(ts, fmt.Sprintf("range/%d", rangeId), &response); err != nil {
+		return err
 	}
 
 	// This is a single node cluster, so only expect a single response.
 	if e, a := 1, len(response.ResponsesByNodeID); e != a {
-		t.Errorf("got the wrong number of responses, expected %d, actual %d", e, a)
+		return fmt.Errorf("got the wrong number of responses, expected %d, actual %d", e, a)
 	}
 
 	node1Response := response.ResponsesByNodeID[response.NodeID]
 
 	// The response should come back as valid.
 	if !node1Response.Response {
-		t.Errorf("node1's response returned as false, expected true")
+		return fmt.Errorf("node1's response returned as false, expected true")
 	}
 
 	// The response should include just the one range.
 	if e, a := 1, len(node1Response.Infos); e != a {
-		t.Errorf("got the wrong number of ranges in the response, expected %d, actual %d", e, a)
+		return fmt.Errorf("got the wrong number of ranges in the response, expected %d, actual %d", e, a)
 	}
 
 	info := node1Response.Infos[0]
@@ -161,18 +200,19 @@ func TestRangeResponse(t *testing.T) {
 
 	// Check some other values.
 	if len(info.State.Desc.InternalReplicas) != 1 || info.State.Desc.InternalReplicas[0] != expReplica {
-		t.Errorf("unexpected replica list %+v", info.State.Desc.InternalReplicas)
+		return fmt.Errorf("unexpected replica list %+v", info.State.Desc.InternalReplicas)
 	}
 
 	if info.State.Lease == nil || info.State.Lease.Empty() {
-		t.Error("expected a nontrivial Lease")
+		return fmt.Errorf("expected a nontrivial Lease")
 	}
 
 	if info.State.LastIndex == 0 {
-		t.Error("expected positive LastIndex")
+		return fmt.Errorf("expected positive LastIndex")
 	}
 
 	if len(info.LeaseHistory) == 0 {
-		t.Error("expected at least one lease history entry")
+		return fmt.Errorf("expected at least one lease history entry")
 	}
+	return nil
 }

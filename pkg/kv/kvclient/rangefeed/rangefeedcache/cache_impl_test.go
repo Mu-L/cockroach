@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rangefeedcache
 
@@ -27,7 +22,7 @@ import (
 // cache provides a consistent snapshot when available, but the snapshot
 // may be stale.
 type Cache struct {
-	w *Watcher
+	w *Watcher[*kvpb.RangeFeedValue]
 
 	mu struct {
 		syncutil.RWMutex
@@ -45,12 +40,14 @@ func NewCache(
 	// many rows.
 	const bufferSize = 1 << 20 // infinite?
 	const withPrevValue = false
+	const withRowTSInInitialScan = true
 	c := Cache{}
 	c.w = NewWatcher(
 		name, clock, f,
 		bufferSize,
 		spans,
 		withPrevValue,
+		withRowTSInInitialScan,
 		passThroughTranslation,
 		c.handleUpdate,
 		nil)
@@ -73,7 +70,7 @@ func (c *Cache) GetSnapshot() ([]roachpb.KeyValue, hlc.Timestamp, bool) {
 	return c.mu.data, c.mu.timestamp, true
 }
 
-func (c *Cache) handleUpdate(ctx context.Context, update Update) {
+func (c *Cache) handleUpdate(ctx context.Context, update Update[*kvpb.RangeFeedValue]) {
 	updateKVs := rangefeedbuffer.EventsToKVs(update.Events,
 		rangefeedbuffer.RangeFeedValueEventToKV)
 	var updatedData []roachpb.KeyValue
@@ -94,6 +91,8 @@ func (c *Cache) handleUpdate(ctx context.Context, update Update) {
 	c.mu.timestamp = update.Timestamp
 }
 
-func passThroughTranslation(ctx context.Context, value *kvpb.RangeFeedValue) rangefeedbuffer.Event {
-	return value
+func passThroughTranslation(
+	ctx context.Context, value *kvpb.RangeFeedValue,
+) (*kvpb.RangeFeedValue, bool) {
+	return value, value != nil
 }

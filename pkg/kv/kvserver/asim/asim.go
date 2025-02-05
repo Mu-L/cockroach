@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package asim
 
@@ -15,11 +10,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/event"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/gossip"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/history"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/metrics"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/op"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/queue"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/scheduled"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/state"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/storerebalancer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
@@ -38,13 +34,15 @@ type Simulator struct {
 	interval time.Duration
 
 	// The simulator can run multiple workload Generators in parallel.
-	generators []workload.Generator
-	events     event.DelayedEventList
+	generators    []workload.Generator
+	eventExecutor scheduled.EventExecutor
 
 	pacers map[state.StoreID]queue.ReplicaPacer
 
 	// Store replicate queues.
 	rqs map[state.StoreID]queue.RangeQueue
+	// Store lease queues.
+	lqs map[state.StoreID]queue.RangeQueue
 	// Store split queues.
 	sqs map[state.StoreID]queue.RangeQueue
 	// Store rebalancers.
@@ -60,20 +58,19 @@ type Simulator struct {
 	settings *config.SimulationSettings
 
 	metrics *metrics.Tracker
-	history History
+	history history.History
 }
 
-// History contains recorded information that summarizes a simulation run.
-// Currently it only contains the store metrics of the run.
-// TODO(kvoli): Add a range log like structure to the history.
-type History struct {
-	Recorded [][]metrics.StoreMetrics
-	S        state.State
+func (s *Simulator) Curr() time.Time {
+	return s.curr
 }
 
-// Listen implements the metrics.StoreMetricListener interface.
-func (h *History) Listen(ctx context.Context, sms []metrics.StoreMetrics) {
-	h.Recorded = append(h.Recorded, sms)
+func (s *Simulator) State() state.State {
+	return s.state
+}
+
+func (s *Simulator) EventExecutor() scheduled.EventExecutor {
+	return s.eventExecutor
 }
 
 // NewSimulator constructs a valid Simulator.
@@ -83,10 +80,11 @@ func NewSimulator(
 	initialState state.State,
 	settings *config.SimulationSettings,
 	m *metrics.Tracker,
-	events ...event.DelayedEvent,
+	eventExecutor scheduled.EventExecutor,
 ) *Simulator {
 	pacers := make(map[state.StoreID]queue.ReplicaPacer)
 	rqs := make(map[state.StoreID]queue.RangeQueue)
+	lqs := make(map[state.StoreID]queue.RangeQueue)
 	sqs := make(map[state.StoreID]queue.RangeQueue)
 	srs := make(map[state.StoreID]storerebalancer.StoreRebalancer)
 	changer := state.NewReplicaChanger()
@@ -101,6 +99,7 @@ func NewSimulator(
 		state:          initialState,
 		changer:        changer,
 		rqs:            rqs,
+		lqs:            lqs,
 		sqs:            sqs,
 		controllers:    controllers,
 		srs:            srs,
@@ -110,9 +109,9 @@ func NewSimulator(
 		shuffler:       state.NewShuffler(settings.Seed),
 		// TODO(kvoli): Keeping the state around is a bit hacky, find a better
 		// method of reporting the ranges.
-		history:  History{Recorded: [][]metrics.StoreMetrics{}, S: initialState},
-		events:   events,
-		settings: settings,
+		history:       history.History{Recorded: [][]metrics.StoreMetrics{}, S: initialState},
+		eventExecutor: eventExecutor,
+		settings:      settings,
 	}
 
 	for _, store := range initialState.Stores() {
@@ -135,6 +134,14 @@ func (s *Simulator) addStore(storeID state.StoreID, tick time.Time) {
 	allocator := s.state.MakeAllocator(storeID)
 	storePool := s.state.StorePool(storeID)
 	s.rqs[storeID] = queue.NewReplicateQueue(
+		storeID,
+		s.changer,
+		s.settings,
+		allocator,
+		storePool,
+		tick,
+	)
+	s.lqs[storeID] = queue.NewLeaseQueue(
 		storeID,
 		s.changer,
 		s.settings,
@@ -182,7 +189,7 @@ func (s *Simulator) GetNextTickTime() (done bool, tick time.Time) {
 
 // History returns the current recorded history of a simulation run. Calling
 // this on a Simulator that has not begun will return an empty history.
-func (s *Simulator) History() History {
+func (s *Simulator) History() history.History {
 	return s.history
 }
 
@@ -288,6 +295,8 @@ func (s *Simulator) tickQueues(ctx context.Context, tick time.Time, state state.
 		s.sqs[storeID].Tick(ctx, tick, state)
 		// Tick the replicate queue.
 		s.rqs[storeID].Tick(ctx, tick, state)
+		// Tick the lease queue.
+		s.lqs[storeID].Tick(ctx, tick, state)
 
 		// Tick changes that may have been enqueued with a lower completion
 		// than the current tick, from the queues.
@@ -317,6 +326,8 @@ func (s *Simulator) tickQueues(ctx context.Context, tick time.Time, state state.
 			s.sqs[storeID].MaybeAdd(ctx, r, state)
 			// Try adding the replica to the replicate queue.
 			s.rqs[storeID].MaybeAdd(ctx, r, state)
+			// Try adding the replica to the lease queue.
+			s.lqs[storeID].MaybeAdd(ctx, r, state)
 		}
 	}
 }
@@ -338,19 +349,5 @@ func (s *Simulator) tickMetrics(ctx context.Context, tick time.Time) {
 
 // tickEvents ticks the registered simulation events.
 func (s *Simulator) tickEvents(ctx context.Context, tick time.Time) {
-	var idx int
-	// Assume the events are in sorted order and the event list is never added
-	// to.
-	for i := range s.events {
-		if !tick.Before(s.events[i].At) {
-			idx = i + 1
-			log.Infof(ctx, "applying event (scheduled=%s tick=%s)", s.events[i].At, tick)
-			s.events[i].EventFn(ctx, tick, s.state)
-		} else {
-			break
-		}
-	}
-	if idx != 0 {
-		s.events = s.events[idx:]
-	}
+	s.eventExecutor.TickEvents(ctx, tick, s.state, s.history)
 }

@@ -1,18 +1,13 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -38,7 +33,7 @@ func declareKeysGC(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
+) error {
 	gcr := req.(*kvpb.GCRequest)
 	if gcr.RangeKeys != nil {
 		// When GC-ing MVCC range key tombstones, we need to serialize with
@@ -112,6 +107,7 @@ func declareKeysGC(
 	// Needed for updating optional GC hint.
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.RangeGCHintKey(rs.GetRangeID())})
 	latchSpans.DisableUndeclaredAccessAssertions()
+	return nil
 }
 
 // Create latches and merge adjacent.
@@ -119,8 +115,8 @@ func mergeAdjacentSpans(spans []roachpb.Span) []roachpb.Span {
 	if len(spans) == 0 {
 		return nil
 	}
-	sort.Slice(spans, func(i, j int) bool {
-		return spans[i].Key.Compare(spans[j].Key) < 0
+	slices.SortFunc(spans, func(a, b roachpb.Span) int {
+		return a.Key.Compare(b.Key)
 	})
 	j := 0
 	for i := 1; i < len(spans); i++ {
@@ -277,15 +273,15 @@ func GC(
 		if err != nil {
 			return result.Result{}, err
 		}
-		if !hint.IsEmpty() {
-			if hint.LatestRangeDeleteTimestamp.LessEq(gcThreshold) {
-				hint.ResetLatestRangeDeleteTimestamp()
-				res.Replicated.State = &kvserverpb.ReplicaState{
-					GCHint: hint,
-				}
-				if _, err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint); err != nil {
-					return result.Result{}, err
-				}
+		if hint.UpdateAfterGC(gcThreshold) {
+			// NB: Replicated.State can already contain GCThreshold from above. Make
+			// sure we don't accidentally remove it.
+			if res.Replicated.State == nil {
+				res.Replicated.State = &kvserverpb.ReplicaState{}
+			}
+			res.Replicated.State.GCHint = hint
+			if err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint); err != nil {
+				return result.Result{}, err
 			}
 		}
 	}

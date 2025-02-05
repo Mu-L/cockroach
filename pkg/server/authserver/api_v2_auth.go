@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package authserver
 
@@ -19,13 +14,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/apiutil"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -39,7 +35,6 @@ const (
 // verification of sessions for regular endpoints happens in authenticationV2Mux,
 // not here.
 type authenticationV2Server struct {
-	ctx        context.Context
 	sqlServer  SQLServerInterface
 	authServer *authenticationServer
 	mux        *http.ServeMux
@@ -83,15 +78,12 @@ func (a *authenticationV2Server) createSessionFor(
 	return value, nil
 }
 
-// swagger:model loginResponse
 type loginResponse struct {
 	// Session string for a valid API session. Specify this in header for any API
 	// requests that require authentication.
 	Session string `json:"session"`
 }
 
-// swagger:operation POST /login/ login
-//
 // # API Login
 //
 // Creates an API session for use with API endpoints that require
@@ -135,8 +127,9 @@ func (a *authenticationV2Server) login(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+	ctx := r.Context()
 	if err := r.ParseForm(); err != nil {
-		srverrors.APIV2InternalError(r.Context(), err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 	if r.Form.Get("username") == "" {
@@ -151,10 +144,21 @@ func (a *authenticationV2Server) login(w http.ResponseWriter, r *http.Request) {
 	// without further normalization.
 	username, _ := username.MakeSQLUsernameFromUserInput(r.Form.Get("username"), username.PurposeValidation)
 
-	// Verify the provided username/password pair.
-	verified, expired, err := a.authServer.VerifyPasswordDBConsole(a.ctx, username, r.Form.Get("password"))
+	// Verify the user and check if DB console session could be started.
+	verified, pwRetrieveFn, err := a.authServer.VerifyUserSessionDBConsole(ctx, username)
 	if err != nil {
-		srverrors.APIV2InternalError(r.Context(), err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
+		return
+	}
+	if !verified {
+		http.Error(w, "the provided credentials did not match any account on the server", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify the provided username/password pair.
+	verified, expired, err := a.authServer.VerifyPasswordDBConsole(ctx, username, r.Form.Get("password"), pwRetrieveFn)
+	if err != nil {
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 	if expired {
@@ -166,23 +170,20 @@ func (a *authenticationV2Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, err := a.createSessionFor(a.ctx, username)
+	session, err := a.createSessionFor(ctx, username)
 	if err != nil {
-		srverrors.APIV2InternalError(r.Context(), err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 
-	apiutil.WriteJSONResponse(r.Context(), w, http.StatusOK, &loginResponse{Session: session})
+	apiutil.WriteJSONResponse(ctx, w, http.StatusOK, &loginResponse{Session: session})
 }
 
-// swagger:model logoutResponse
 type logoutResponse struct {
 	// Indicates whether logout was successful.
 	LoggedOut bool `json:"logged_out"`
 }
 
-// swagger:operation POST /logout/ logout
-//
 // # API Logout
 //
 // Logs out on a previously-created API session.
@@ -214,36 +215,37 @@ func (a *authenticationV2Server) logout(w http.ResponseWriter, r *http.Request) 
 	}
 	var sessionCookie serverpb.SessionCookie
 	decoded, err := base64.StdEncoding.DecodeString(session)
+	ctx := r.Context()
 	if err != nil {
-		srverrors.APIV2InternalError(r.Context(), err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 	if err := protoutil.Unmarshal(decoded, &sessionCookie); err != nil {
-		srverrors.APIV2InternalError(r.Context(), err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	}
 
 	// Revoke the session.
 	if n, err := a.sqlServer.InternalExecutor().ExecEx(
-		a.ctx,
+		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		`UPDATE system.web_sessions SET "revokedAt" = now() WHERE id = $1`,
 		sessionCookie.ID,
 	); err != nil {
-		srverrors.APIV2InternalError(r.Context(), err, w)
+		srverrors.APIV2InternalError(ctx, err, w)
 		return
 	} else if n == 0 {
 		err := status.Errorf(
 			codes.InvalidArgument,
 			"session with id %d nonexistent", sessionCookie.ID)
-		log.Infof(a.ctx, "%v", err)
+		log.Infof(ctx, "%v", err)
 		http.Error(w, "invalid session", http.StatusBadRequest)
 		return
 	}
 
-	apiutil.WriteJSONResponse(r.Context(), w, http.StatusOK, &logoutResponse{LoggedOut: true})
+	apiutil.WriteJSONResponse(ctx, w, http.StatusOK, &logoutResponse{LoggedOut: true})
 }
 
 func (a *authenticationV2Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -345,24 +347,21 @@ type APIRole int
 const (
 	// RegularRole is the default role for an APIv2 endpoint.
 	RegularRole APIRole = iota
-	// AdminRole is the role for an APIv2 endpoint that requires
-	// admin privileges.
-	AdminRole
-	// SuperUserRole is the role for an APIv2 endpoint that requires
-	// superuser privileges.
-	SuperUserRole
+	// ViewClusterMetadataRole is the role for an APIv2 endpoint that requires
+	// VIEWCLUSTERMETADATA privileges.
+	ViewClusterMetadataRole
 )
 
-// roleAuthorizationMux enforces a role (eg. type of user, role option)
-// for an arbitrary inner mux. Meant to be used under authenticationV2Mux. If
-// the logged-in user is not at least of `role` type, and doesn't have
-// the `option` roleoption, an HTTP 403 forbidden error is returned. Otherwise,
-// the request is passed onto the inner http.Handler.
+type authzAccessorFactory func(ctx context.Context, opName redact.SafeString) (_ sql.AuthorizationAccessor, cleanup func())
+
+// roleAuthorizationMux enforces a role (eg. type of user) for an arbitrary
+// inner mux. Meant to be used under authenticationV2Mux. If the logged-in user
+// is not at least of `role` type, an HTTP 403 forbidden error is returned.
+// Otherwise, the request is passed onto the inner http.Handler.
 type roleAuthorizationMux struct {
-	ie     isql.Executor
-	role   APIRole
-	option roleoption.Option
-	inner  http.Handler
+	authzAccessorFactory authzAccessorFactory
+	role                 APIRole
+	inner                http.Handler
 }
 
 func (r *roleAuthorizationMux) getRoleForUser(
@@ -370,56 +369,20 @@ func (r *roleAuthorizationMux) getRoleForUser(
 ) (APIRole, error) {
 	if user.IsRootUser() {
 		// Shortcut.
-		return SuperUserRole, nil
+		return ViewClusterMetadataRole, nil
 	}
-	row, err := r.ie.QueryRowEx(
-		ctx, "check-is-admin", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: user},
-		"SELECT crdb_internal.is_admin()")
+
+	authzAccessor, cleanup := r.authzAccessorFactory(ctx, "check-privilege")
+	defer cleanup()
+
+	hasPriv, err := authzAccessor.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERMETADATA, user)
 	if err != nil {
 		return RegularRole, err
+	} else if hasPriv {
+		return ViewClusterMetadataRole, nil
+	} else {
+		return RegularRole, nil
 	}
-	if row == nil {
-		return RegularRole, errors.AssertionFailedf("hasAdminRole: expected 1 row, got 0")
-	}
-	if len(row) != 1 {
-		return RegularRole, errors.AssertionFailedf("hasAdminRole: expected 1 column, got %d", len(row))
-	}
-	dbDatum, ok := tree.AsDBool(row[0])
-	if !ok {
-		return RegularRole, errors.AssertionFailedf("hasAdminRole: expected bool, got %T", row[0])
-	}
-	if dbDatum {
-		return AdminRole, nil
-	}
-	return RegularRole, nil
-}
-
-func (r *roleAuthorizationMux) hasRoleOption(
-	ctx context.Context, user username.SQLUsername, roleOption roleoption.Option,
-) (bool, error) {
-	if user.IsRootUser() {
-		// Shortcut.
-		return true, nil
-	}
-	row, err := r.ie.QueryRowEx(
-		ctx, "check-role-option", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: user},
-		"SELECT crdb_internal.has_role_option($1)", roleOption.String())
-	if err != nil {
-		return false, err
-	}
-	if row == nil {
-		return false, errors.AssertionFailedf("hasRoleOption: expected 1 row, got 0")
-	}
-	if len(row) != 1 {
-		return false, errors.AssertionFailedf("hasRoleOption: expected 1 column, got %d", len(row))
-	}
-	dbDatum, ok := tree.AsDBool(row[0])
-	if !ok {
-		return false, errors.AssertionFailedf("hasRoleOption: expected bool, got %T", row[0])
-	}
-	return bool(dbDatum), nil
 }
 
 func (r *roleAuthorizationMux) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -433,16 +396,6 @@ func (r *roleAuthorizationMux) ServeHTTP(w http.ResponseWriter, req *http.Reques
 			http.Error(w, "user not allowed to access this endpoint", http.StatusForbidden)
 		}
 		return
-	}
-	if r.option > 0 {
-		ok, err := r.hasRoleOption(req.Context(), username, r.option)
-		if err != nil {
-			srverrors.APIV2InternalError(req.Context(), err, w)
-			return
-		} else if !ok {
-			http.Error(w, "user not allowed to access this endpoint", http.StatusForbidden)
-			return
-		}
 	}
 	r.inner.ServeHTTP(w, req)
 }

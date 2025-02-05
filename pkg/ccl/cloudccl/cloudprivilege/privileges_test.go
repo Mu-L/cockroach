@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cloudprivilege
 
@@ -42,7 +39,7 @@ func TestURIRequiresAdminOrPrivilege(t *testing.T) {
 	rootDB := sqlutils.MakeSQLRunner(conn)
 
 	rootDB.Exec(t, `CREATE USER testuser`)
-	testuser := tc.ApplicationLayer(0).SQLConnForUser(t, username.TestUser, "")
+	testuser := tc.ApplicationLayer(0).SQLConn(t, serverutils.User(username.TestUser))
 	rootDB.Exec(t, `CREATE TABLE foo (id INT)`)
 
 	// Grant SELECT so that EXPORT fails when checking URI privileges.

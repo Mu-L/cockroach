@@ -24,20 +24,21 @@ go_test(
     name = "schemachanger_test",
     size = "enormous",
     srcs = [
+        "dml_injection_test.go",
         "main_test.go",
         "schemachanger_test.go",
         ":test_gen",  # keep
     ],
-    args = select({
-        "//build/toolchains:use_ci_timeouts": ["-test.timeout=895s"],
-        "//conditions:default": ["-test.timeout=3595s"],
+    data = glob(["testdata/**"]) + [
+        "//pkg/sql/logictest:testdata",
+    ],
+    exec_properties = select({
+        "//build/toolchains:is_heavy": {"test.Pool": "heavy"},
+        "//conditions:default": {"test.Pool": "large"},
     }),
-    data = glob(["testdata/**"]),
-    exec_properties = {"Pool": "large"},
-    shard_count = 16,
+    shard_count = 32,
     deps = [
         "//pkg/base",
-        "//pkg/ccl",
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
         "//pkg/keys",
@@ -56,11 +57,13 @@ go_test(
         "//pkg/sql/schemachanger/scop",
         "//pkg/sql/schemachanger/scplan",
         "//pkg/sql/schemachanger/sctest",  # keep
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sessiondatapb",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
+        "//pkg/testutils/testcluster",
         "//pkg/util/ctxgroup",
         "//pkg/util/leaktest",
         "//pkg/util/log",

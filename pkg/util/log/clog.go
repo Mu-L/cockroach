@@ -1,13 +1,8 @@
 // Copyright 2013 Google Inc. All Rights Reserved.
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code originated in the github.com/golang/glog package.
 
@@ -15,13 +10,13 @@ package log
 
 import (
 	"context"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
+	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -99,7 +94,7 @@ type loggingT struct {
 		// active indicates that at least one event has been logged
 		// to this logger already.
 		active        bool
-		firstUseStack string
+		firstUseStack debugutil.SafeStack
 
 		// redactionPolicyManaged indicates whether we're running as part of a managed
 		// service (sourced from COCKROACH_REDACTION_POLICY_MANAGED env var). Impacts
@@ -110,6 +105,7 @@ type loggingT struct {
 	allSinkInfos sinkInfoRegistry
 	allLoggers   loggerRegistry
 	metrics      LogMetrics
+	processor    StructuredLogProcessor
 }
 
 // SetLogMetrics injects an initialized implementation of
@@ -122,6 +118,13 @@ type loggingT struct {
 // LogMetrics during server startups.
 func SetLogMetrics(m LogMetrics) {
 	logging.metrics = m
+}
+
+func SetStructuredLogProcessor(p StructuredLogProcessor) {
+	if logging.processor != nil {
+		panic(errors.AssertionFailedf("log package's StructuredLogProcessor has already been set"))
+	}
+	logging.processor = p
 }
 
 func init() {
@@ -254,6 +257,15 @@ func (l *loggingT) hasManagedRedactionPolicy() bool {
 	return l.mu.redactionPolicyManaged
 }
 
+func (l *loggingT) processStructured(ctx context.Context, eventType EventType, e any) {
+	// TODO(abarganier): I'm not sure how possible this is, need to examine further (we use dependency injection).
+	// For now, panic.
+	if l.processor == nil {
+		panic(errors.AssertionFailedf("attempted to process a structured record before processor initialized"))
+	}
+	l.processor.Process(ctx, eventType, e)
+}
+
 // outputLogEntry marshals a log entry proto into bytes, and writes
 // the data to the log files. If a trace location is set, stack traces
 // are added to the entry before marshaling.
@@ -264,6 +276,12 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 	var fatalTrigger chan struct{}
 	extraFlush := false
 	isFatal := entry.sev == severity.FATAL
+	// NB: Generally, we don't need to make this nil check. However, logging.metrics
+	// is injected from an external package's init() function, which isn't guaranteed
+	// to be called (e.g. during tests). Therefore, we protect against such a case.
+	if logging.metrics != nil {
+		logging.metrics.IncrementCounter(LogMessageCount, 1)
+	}
 
 	if isFatal {
 		extraFlush = true
@@ -271,7 +289,7 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 
 		switch traceback {
 		case tracebackSingle:
-			entry.stacks = debug.Stack()
+			entry.stacks = debugutil.Stack()
 		case tracebackAll:
 			entry.stacks = allstacks.Get()
 		}
@@ -370,7 +388,7 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 				// The sink was not accepting entries at this level. Nothing to do.
 				continue
 			}
-			if err := s.sink.output(bufs.b[i].Bytes(), sinkOutputOptions{extraFlush: extraFlush, forceSync: isFatal}); err != nil {
+			if err := s.sink.output(bufs.b[i].Bytes(), sinkOutputOptions{extraFlush: extraFlush, tryForceSync: isFatal}); err != nil {
 				if !s.criticality {
 					// An error on this sink is not critical. Just report
 					// the error and move on.
@@ -428,7 +446,7 @@ func setActive() {
 	defer logging.mu.Unlock()
 	if !logging.mu.active {
 		logging.mu.active = true
-		logging.mu.firstUseStack = string(debug.Stack())
+		logging.mu.firstUseStack = debugutil.Stack()
 	}
 }
 

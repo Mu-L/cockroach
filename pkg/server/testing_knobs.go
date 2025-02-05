@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -16,11 +11,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/blobs"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -60,46 +55,27 @@ type TestingKnobs struct {
 	// server fails to start.
 	RPCListener net.Listener
 
-	// BinaryVersionOverride overrides the binary version that the CRDB server
-	// will end up running. This value could also influence what version the
-	// cluster is bootstrapped at.
+	// ClusterVersionOverride can be used to override the version of the cluster
+	// (assuming that one has to be created).
 	//
-	// This value, when set, influences test cluster/server creation in two
-	// different ways:
+	// Normally (when this knob isn't used), the cluster is initialized at
+	// cluster.Settings.Version.LatestVersion().
 	//
-	// Case 1:
-	// ------
-	// If the test has not overridden the
-	// `cluster.Settings.Version.BinaryMinSupportedVersion`, then the cluster will
-	// be bootstrapped at `binaryMinSupportedVersion`  (if this server is the one
-	// bootstrapping the cluster). After all the servers in the test cluster have
-	// been started, `SET CLUSTER SETTING version = BinaryVersionOverride` will be
-	// run to step through the upgrades until the specified override.
+	// When ClusterVersionOverride is set, the cluster will be at this version
+	// once initialization is complete. Note that we cannot bootstrap clusters at
+	// arbitrary versions - we can only bootstrap clusters at the Latest version
+	// and at final versions of previous supported releases. The cluster will be
+	// bootstrapped at the most recent bootstrappable version that is at most
+	// ClusterVersionOverride; after all the servers in the test cluster have been
+	// started, `SET CLUSTER SETTING version = ClusterVersionOverride` will be run
+	// to step through the upgrades until the specified version.
 	//
-	// TODO(adityamaru): We should force tests that set BinaryVersionOverride to
-	// also set BootstrapVersionKeyOverride so as to specify what image they would
-	// like the cluster bootstrapped at before upgrading to BinaryVersionOverride.
-	//
-	// Case 2:
-	// ------
-	// If the test has overridden the
-	// `cluster.Settings.Version.BinaryMinSupportedVersion` then it is not safe
-	// for us to bootstrap at `binaryMinSupportedVersion` as it might be less than
-	// the overridden minimum supported version. Furthermore, we do not have the
-	// initial cluster data (system tables etc.) to bootstrap at the overridden
-	// minimum supported version. In this case we bootstrap at
-	// `BinaryVersionOverride` and populate the cluster with initial data
-	// corresponding to the `binaryVersion`. In other words no upgrades are
-	// *really* run and the server only thinks that it is running at
-	// `BinaryVersionOverride`. Tests that fall in this category should be audited
-	// for correctness.
-	//
-	// The version that we bootstrap at is also used when advertising this
-	// server's binary version when sending out join requests.
+	// ClusterVersionOverride is also used when advertising this server's binary
+	// version when sending out join requests.
 	//
 	// NB: When setting this, you probably also want to set
 	// DisableAutomaticVersionUpgrade.
-	BinaryVersionOverride roachpb.Version
+	ClusterVersionOverride roachpb.Version
 	// An (additional) callback invoked whenever a
 	// node is permanently removed from the cluster.
 	OnDecommissionedCallback func(id roachpb.NodeID)
@@ -108,7 +84,7 @@ type TestingKnobs struct {
 	//
 	// When supplied to a TestCluster, StickyVFSIDs will be associated auto-
 	// matically to the StoreSpecs used.
-	StickyVFSRegistry StickyVFSRegistry
+	StickyVFSRegistry fs.StickyRegistry
 	// WallClock is used to inject a custom clock for testing the server. It is
 	// typically either an hlc.HybridManualClock or hlc.ManualClock.
 	WallClock hlc.WallClock
@@ -130,10 +106,6 @@ type TestingKnobs struct {
 	// StubTimeNow allows tests to override the timeutil.Now() function used
 	// in the jobs endpoint to calculate earliest_retained_time.
 	StubTimeNow func() time.Time
-
-	// We use clusterversion.Key rather than a roachpb.Version because it will be used
-	// to get initial values to use during bootstrap.
-	BootstrapVersionKeyOverride clusterversion.Key
 
 	// RequireGracefulDrain, if set, causes a shutdown to fail with a log.Fatal
 	// if the server is not gracefully drained prior to its stopper shutting down.
@@ -157,6 +129,26 @@ type TestingKnobs struct {
 	// on a remote node in a cluster fan-out. It is invoked by the nodeFn argument
 	// of server.iterateNodes.
 	IterateNodesNodeCallback func(ctx context.Context, nodeID roachpb.NodeID) error
+
+	// DialNodeCallback is used to mock dial errors when dialing a node. It is
+	// invoked by the dialNode method of server.serverIterator.
+	DialNodeCallback func(ctx context.Context, nodeID roachpb.NodeID) error
+
+	// DisableSettingsWatcher disables the watcher that monitors updates
+	// to system.settings.
+	DisableSettingsWatcher bool
+
+	TenantAutoUpgradeInfo chan struct {
+		Status    int
+		UpgradeTo roachpb.Version
+	}
+
+	// TenantAutoUpgradeLoopFrequency indicates how often the tenant
+	// auto upgrade loop will check if the tenant can be auto-upgraded.
+	TenantAutoUpgradeLoopFrequency time.Duration
+
+	// EnvironmentSampleInterval overrides base.DefaultMetricsSampleInterval when used to construct sampleEnvironmentCfg.
+	EnvironmentSampleInterval time.Duration
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

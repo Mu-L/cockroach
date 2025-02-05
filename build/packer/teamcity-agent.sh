@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2017 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -euxo pipefail
 
 write_teamcity_config() {
@@ -31,6 +37,8 @@ echo "deb https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) mai
 # Some images come with apt autoupgrade job running at start, let's give it a few minutes to finish to avoid races.
 echo "Sleeping for 3 minutes to allow apt daily cronjob to finish..."
 sleep 3m
+
+add-apt-repository ppa:git-core/ppa
 apt-get update
 
 # Installing gnome-keyring prevents the error described in
@@ -44,26 +52,29 @@ apt-get install --yes \
   docker-ce \
   docker-compose \
   flex \
+  git \
   gnome-keyring \
   google-cloud-sdk \
   google-cloud-cli-gke-gcloud-auth-plugin \
   gnupg2 \
-  git \
   jq \
   openjdk-11-jre-headless \
   pass \
   python2 \
   python3 \
   sudo \
-  unzip
+  unzip \
+  zip
 
 # Enable support for executing binaries of all architectures via qemu emulation
 # (necessary for building arm64 Docker images)
 apt-get install --yes qemu binfmt-support qemu-user-static
 
 # Verify that both of the platforms we support Docker for can be built.
-docker run --attach=stdout --attach=stderr --platform=linux/amd64 --rm --pull=always registry.access.redhat.com/ubi8/ubi-minimal uname -p
-docker run --attach=stdout --attach=stderr --platform=linux/arm64 --rm --pull=always registry.access.redhat.com/ubi8/ubi-minimal uname -p
+if [[ $ARCH = x86_64 ]]; then
+    docker run --attach=stdout --attach=stderr --platform=linux/amd64 --rm --pull=always registry.access.redhat.com/ubi9/ubi-minimal uname -p
+    docker run --attach=stdout --attach=stderr --platform=linux/arm64 --rm --pull=always registry.access.redhat.com/ubi9/ubi-minimal uname -p
+fi
 
 case $ARCH in
     x86_64) WHICH=x86_64; SHASUM=97bf730372f9900b2dfb9206fccbcf92f5c7f3b502148b832e77451aa0f9e0e6 ;;
@@ -76,10 +87,12 @@ EOF
 tar --strip-components=1 -C /usr -xzf /tmp/cmake.tar.gz
 rm -f /tmp/cmake.tar.gz
 
+# NB: The Go version should match up to the version required by managed-service.
+# CRDB builds use Bazel and therefore have no dependency on the globally-installed Go CLI.
 if [[ $ARCH = x86_64 ]]; then
-    curl -fsSL https://dl.google.com/go/go1.19.10.linux-amd64.tar.gz > /tmp/go.tgz
+    curl -fsSL https://dl.google.com/go/go1.21.3.linux-amd64.tar.gz > /tmp/go.tgz
     sha256sum -c - <<EOF
-8b045a483d3895c6edba2e90a9189262876190dbbd21756870cdd63821810677  /tmp/go.tgz
+1241381b2843fae5a9707eec1f8fb2ef94d827990582c7c7c32f5bdfbfd420c8  /tmp/go.tgz
 EOF
     tar -C /usr/local -zxf /tmp/go.tgz && rm /tmp/go.tgz
     # Explicitly symlink the pinned version to /usr/bin.
@@ -101,6 +114,22 @@ $SHASUM /tmp/bazelisk
 EOF
 chmod +x /tmp/bazelisk
 mv /tmp/bazelisk /usr/bin/bazel
+
+# Install protoc.
+case $ARCH in
+    x86_64) WHICH=x86_64; SHASUM=ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50 ;;
+    aarch64) WHICH=aarch_64; SHASUM=99975a8c11b83cd65c3e1151ae1714bf959abc0521acb659bf720524276ab0c8 ;;
+esac
+
+curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-$WHICH.zip > /tmp/protoc.zip
+sha256sum -c - <<EOF
+$SHASUM /tmp/protoc.zip
+EOF
+unzip /tmp/protoc.zip -d /tmp/protoc
+rm /tmp/protoc.zip
+mv /tmp/protoc/bin/protoc /usr/bin/protoc
+mv /tmp/protoc/include/google /usr/include/google
+rm -rf /tmp/protoc
 
 # Add a user for the TeamCity agent if it doesn't exist already.
 id -u agent &>/dev/null 2>&1 || adduser agent --disabled-password
@@ -156,7 +185,7 @@ if [ $ARCH = x86_64 ]; then
     do
         git checkout "$branch"
         # TODO(benesch): store the acceptanceversion somewhere more accessible.
-        docker pull $(git grep cockroachdb/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
+        docker pull $(git grep us-east1-docker.pkg.dev/crl-ci-images/cockroach/acceptance -- '*.go' | sed -E 's/.*"([^"]*).*"/\1/') || true
     done
     cd -
 fi

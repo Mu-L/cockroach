@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs_test
 
@@ -17,7 +12,6 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,21 +20,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -109,12 +105,17 @@ RETURNING id;
 	terminalStatuses := []jobs.Status{jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed}
 	terminalIDs := make([]jobspb.JobID, len(terminalStatuses))
 	terminalClaims := make([][]byte, len(terminalStatuses))
+	mkSessionID := func() []byte {
+		sessionID, err := slstorage.MakeSessionID([]byte("us"), uuid.MakeV4())
+		require.NoError(t, err)
+		return []byte(sessionID)
+	}
 	for i, s := range terminalStatuses {
-		terminalClaims[i] = uuid.MakeV4().GetBytes() // bogus claim
+		terminalClaims[i] = mkSessionID() // bogus claim
 		tdb.QueryRow(t, insertQuery, s, terminalClaims[i], 42).Scan(&terminalIDs[i])
 	}
 	var nonTerminalID jobspb.JobID
-	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, uuid.MakeV4().GetBytes(), 42).Scan(&nonTerminalID)
+	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, mkSessionID(), 42).Scan(&nonTerminalID)
 
 	checkClaimEqual := func(id jobspb.JobID, exp []byte) error {
 		const getClaimQuery = `SELECT claim_session_id FROM system.jobs WHERE id = $1`
@@ -363,9 +364,9 @@ func TestGCDurationControl(t *testing.T) {
 		},
 	}
 
-	jobs.RegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
-		return jobs.FakeResumer{}
-	}, jobs.UsesTenantCostControl)
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+		return jobstest.FakeResumer{}
+	}, jobs.UsesTenantCostControl)()
 	s, sqlDB, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
@@ -377,7 +378,7 @@ func TestGCDurationControl(t *testing.T) {
 		_, err := registry.CreateJobWithTxn(ctx, jobs.Record{
 			// Job does not accept an empty Details field, so arbitrarily provide
 			// ImportDetails.
-			Details:  jobspb.ImportDetails{},
+			Details:  jobspb.ImportDetails{Walltime: 1},
 			Progress: jobspb.ImportProgress{},
 			Username: username.TestUserName(),
 		}, id, txn)
@@ -390,8 +391,22 @@ func TestGCDurationControl(t *testing.T) {
 
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	existsQuery := fmt.Sprintf("SELECT count(*) = 1 FROM system.jobs WHERE id = %d", id)
+	infoExistsQuery := fmt.Sprintf("SELECT count(*) > 0 FROM system.job_info WHERE job_id = %d", id)
+	messageExistsQuery := fmt.Sprintf("SELECT count(*) > 0 FROM system.job_message WHERE job_id = %d", id)
+	statusExistsQuery := fmt.Sprintf("SELECT count(*) > 0 FROM system.job_status WHERE job_id = %d", id)
+	progressExistsQuery := fmt.Sprintf("SELECT count(*) > 0 FROM system.job_progress WHERE job_id = %d", id)
+	progressHistoryExistsQuery := fmt.Sprintf("SELECT count(*) > 0 FROM system.job_progress_history WHERE job_id = %d", id)
+
 	// Make sure the job exists even though it has completed.
 	tdb.CheckQueryResults(t, existsQuery, [][]string{{"true"}})
+	tdb.CheckQueryResults(t, infoExistsQuery, [][]string{{"true"}})
+	tdb.CheckQueryResults(t, messageExistsQuery, [][]string{{"true"}})
+
+	// Also add some bogus rows to other job tables to test gc.
+	tdb.Exec(t, fmt.Sprintf("INSERT INTO system.job_status (job_id, status) VALUES (%d, 'bogus')", id))
+	tdb.Exec(t, fmt.Sprintf("INSERT INTO system.job_progress (job_id, fraction) VALUES (%d, 0.5)", id))
+	tdb.Exec(t, fmt.Sprintf("INSERT INTO system.job_progress_history (job_id, fraction) VALUES (%d, 0.5)", id))
+
 	// Shorten the GC interval to try deleting the job.
 	tdb.Exec(t, fmt.Sprintf("SET CLUSTER SETTING %s = '5ms'", jobs.GcIntervalSettingKey))
 	// Wait for GC to run at least once.
@@ -411,309 +426,89 @@ func TestGCDurationControl(t *testing.T) {
 	tdb.Exec(t, fmt.Sprintf("SET CLUSTER SETTING %s = '1ms'", jobs.RetentionTimeSettingKey))
 	// Wait for the job to be deleted.
 	tdb.CheckQueryResultsRetry(t, existsQuery, [][]string{{"false"}})
+	tdb.CheckQueryResultsRetry(t, infoExistsQuery, [][]string{{"false"}})
+	tdb.CheckQueryResultsRetry(t, messageExistsQuery, [][]string{{"false"}})
+	tdb.CheckQueryResultsRetry(t, statusExistsQuery, [][]string{{"false"}})
+	tdb.CheckQueryResultsRetry(t, progressExistsQuery, [][]string{{"false"}})
+	tdb.CheckQueryResultsRetry(t, progressHistoryExistsQuery, [][]string{{"false"}})
 }
 
-// TestErrorsPopulatedOnRetry confirms that when a job fails with a retriable
-// error that that error makes its way to the payload.
-func TestErrorsPopulatedOnRetry(t *testing.T) {
+// TestWaitWithRetryableError tests retryable errors when querying
+// for jobs.
+func TestWaitWithRetryableError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ls := log.Scope(t)
-	defer ls.Close(t)
-
-	type event struct {
-		id     jobspb.JobID
-		resume chan error
-	}
-	mkEvent := func(j *jobs.Job) event {
-		return event{id: j.ID(), resume: make(chan error)}
-	}
-	evChan := make(chan event)
-	jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, cs *cluster.Settings) jobs.Resumer {
-		execFn := func(ctx context.Context) error {
-			ev := mkEvent(j)
-			select {
-			case evChan <- ev:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			select {
-			case err := <-ev.resume:
-				return err
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		return jobs.FakeResumer{
-			OnResume:     execFn,
-			FailOrCancel: execFn,
-		}
-	}, jobs.UsesTenantCostControl)
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{
-			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-		},
-	})
-	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	defer log.Scope(t).Close(t)
+	defer jobs.ResetConstructors()()
 	ctx := context.Background()
+
+	cs := cluster.MakeTestingClusterSettings()
+	// Set the lease duration to zero for instanty expiry.
+	lease.LeaseDuration.Override(ctx, &cs.SV, 0)
+	// Renewal timeout to 0 saying that the lease will get renewed only
+	// after the lease expires when a request requests the descriptor.
+	lease.LeaseRenewalDuration.Override(ctx, &cs.SV, 0)
+
+	var targetJobID atomic.Int64
+	var numberOfTimesDetected atomic.Int64
+	const targetNumberOfRetries = 5
+	args := base.TestServerArgs{
+		Settings: cs,
+		// Leasing settings used above conflict with some updates
+		// when starting the server, so skip those.
+		PartOfCluster: true,
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				DisableAutoCommitDuringExec: true,
+				AfterExecute: func(ctx context.Context, stmt string, isInternal bool, err error) {
+					if targetJobID.Load() > 0 &&
+						strings.Contains(stmt, "SELECT count(*) FROM system.jobs") &&
+						strings.Contains(stmt, fmt.Sprintf("%d", targetJobID.Load())) {
+						// Leases expire almost instantly, without a renewal we will need
+						// a retry.
+						time.Sleep(time.Second)
+						// Detect this multiple times to ensure retries, once observed
+						// enough times disable the after execution.
+						if numberOfTimesDetected.Add(1) > targetNumberOfRetries-1 {
+							targetJobID.Store(0)
+						}
+					}
+				},
+			},
+		},
+	}
+
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+		return jobstest.FakeResumer{}
+	}, jobs.UsesTenantCostControl)()
+	s := serverutils.StartServerOnly(t, args)
 	defer s.Stopper().Stop(ctx)
-	registry := s.JobRegistry().(*jobs.Registry)
-	mkJob := func(t *testing.T) jobspb.JobID {
-		id := registry.MakeJobID()
+	ts := s.ApplicationLayer()
+	registry := ts.JobRegistry().(*jobs.Registry)
+
+	// Create and run a dummy job.
+	idb := ts.InternalDB().(isql.DB)
+	id := registry.MakeJobID()
+	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		_, err := registry.CreateJobWithTxn(ctx, jobs.Record{
 			// Job does not accept an empty Details field, so arbitrarily provide
 			// ImportDetails.
 			Details:  jobspb.ImportDetails{},
 			Progress: jobspb.ImportProgress{},
 			Username: username.TestUserName(),
-		}, id, nil /* txn */)
-		require.NoError(t, err)
-		return id
+		}, id, txn)
+		return err
+	}))
+	targetJobID.Store(int64(id))
+	require.NoError(t,
+		registry.WaitForJobs(
+			ctx, []jobspb.JobID{id},
+		))
+	if !skip.Duress() {
+		require.Equalf(t, int64(targetNumberOfRetries), numberOfTimesDetected.Load(), "jobs query did not retry")
+	} else {
+		// For stress be lenient since we are relying on timing for leasing
+		// expiration, which can be imprecise. So, lets aim for at least one
+		// retry.
+		require.GreaterOrEqualf(t, numberOfTimesDetected.Load(), int64(2), "jobs query did not retry")
 	}
-	type parsedError struct {
-		start, end time.Time
-		status     jobs.Status
-		error      string
-		instance   base.SQLInstanceID
-	}
-	var (
-		executionErrorRE = regexp.MustCompile(
-			`(?P<status>\w+) execution from '(?P<Start>.*)' to '(?P<End>.*)' on (?P<instance>\d+) failed: (?P<error>.*)`,
-		)
-		statusIdx   = executionErrorRE.SubexpIndex("status")
-		startIdx    = executionErrorRE.SubexpIndex("Start")
-		endIdx      = executionErrorRE.SubexpIndex("End")
-		instanceIdx = executionErrorRE.SubexpIndex("instance")
-		errorIdx    = executionErrorRE.SubexpIndex("error")
-	)
-	parseTimestamp := func(t *testing.T, s string) time.Time {
-		ptc := tree.NewParseContext(timeutil.Now())
-		ts, _, err := tree.ParseDTimestamp(ptc, s, time.Microsecond)
-		require.NoError(t, err)
-		return ts.Time
-	}
-	parseInstanceID := func(t *testing.T, s string) base.SQLInstanceID {
-		i, err := strconv.ParseInt(s, 10, 32)
-		require.NoError(t, err)
-		return base.SQLInstanceID(i)
-	}
-	parseExecutionError := func(t *testing.T, s string) (ret parsedError) {
-		matches := executionErrorRE.FindStringSubmatch(s)
-		require.NotNil(t, matches)
-		ret.status = jobs.Status(matches[statusIdx])
-		ret.start = parseTimestamp(t, matches[startIdx])
-		ret.end = parseTimestamp(t, matches[endIdx])
-		ret.instance = parseInstanceID(t, matches[instanceIdx])
-		ret.error = matches[errorIdx]
-		return ret
-	}
-	parseExecutionErrors := func(t *testing.T, s [][]string) (ret []parsedError) {
-		for _, res := range s {
-			require.Len(t, res, 1)
-			ret = append(ret, parseExecutionError(t, res[0]))
-		}
-		return ret
-	}
-	tsEqual := func(t *testing.T, a, b time.Time) {
-		require.Truef(t, a.Equal(b), "%v != %v", a, b)
-	}
-	tsBefore := func(t *testing.T, a, b time.Time) {
-		require.Truef(t, a.Before(b), "%v >= %v", a, b)
-	}
-	executionErrorEqual := func(t *testing.T, a, b parsedError) {
-		tsEqual(t, a.start, b.start)
-		tsEqual(t, a.end, b.end)
-		require.Equal(t, a.instance, b.instance)
-		require.Equal(t, a.error, b.error)
-		require.Equal(t, a.status, b.status)
-	}
-	waitForEvent := func(t *testing.T, id jobspb.JobID) (ev event, start time.Time) {
-		ev = <-evChan
-		require.Equal(t, id, ev.id)
-		tdb.QueryRow(t, "SELECT last_run FROM crdb_internal.jobs WHERE job_id = $1", id).Scan(&start)
-		return ev, start
-	}
-	checkExecutionError := func(
-		t *testing.T, execErr parsedError, status jobs.Status, start, afterEnd time.Time, cause string,
-	) {
-		require.Equal(t, base.SQLInstanceID(1), execErr.instance)
-		require.Equal(t, status, execErr.status)
-		tsEqual(t, start, execErr.start)
-		tsBefore(t, execErr.start, execErr.end)
-		tsBefore(t, execErr.end, afterEnd)
-		require.Equal(t, cause, execErr.error)
-	}
-	getExecErrors := func(t *testing.T, id jobspb.JobID) []parsedError {
-		return parseExecutionErrors(t,
-			tdb.QueryStr(t, `
-SELECT unnest(execution_errors)
-  FROM crdb_internal.jobs
- WHERE job_id = $1;`, id),
-		)
-	}
-	checkLogEntry := func(
-		t *testing.T, id jobspb.JobID, status jobs.Status,
-		from, to time.Time, cause string,
-	) {
-		log.Flush()
-		entries, err := log.FetchEntriesFromFiles(
-			from.UnixNano(), to.UnixNano(), 2,
-			regexp.MustCompile(fmt.Sprintf(
-				"job %d: %s execution encountered retriable error: %s",
-				id, status, cause,
-			)),
-			log.WithFlattenedSensitiveData,
-		)
-		require.NoError(t, err)
-		require.Len(t, entries, 1)
-	}
-	t.Run("retriable error makes it into payload", func(t *testing.T) {
-		id := mkJob(t)
-		firstRun, firstStart := waitForEvent(t, id)
-		const err1 = "boom1"
-		firstRun.resume <- jobs.MarkAsRetryJobError(errors.New(err1))
-
-		// Wait for the job to get restarted.
-		secondRun, secondStart := waitForEvent(t, id)
-
-		// Confirm the previous execution error was properly recorded.
-		var firstExecErr parsedError
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			firstExecErr = execErrs[0]
-			checkExecutionError(t, firstExecErr, jobs.StatusRunning, firstStart, secondStart, err1)
-			checkLogEntry(t, id, jobs.StatusRunning, firstStart, secondStart, err1)
-		}
-		const err2 = "boom2"
-		secondRun.resume <- jobs.MarkAsRetryJobError(errors.New(err2))
-		thirdRun, thirdStart := waitForEvent(t, id)
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 2)
-			executionErrorEqual(t, firstExecErr, execErrs[0])
-			secondExecErr := execErrs[1]
-			checkExecutionError(t, secondExecErr, jobs.StatusRunning, secondStart, thirdStart, err2)
-			checkLogEntry(t, id, jobs.StatusRunning, secondStart, thirdStart, err2)
-		}
-		close(thirdRun.resume)
-		require.NoError(t, registry.WaitForJobs(ctx, []jobspb.JobID{id}))
-	})
-	t.Run("fail or cancel error", func(t *testing.T) {
-		id := mkJob(t)
-		firstRun, firstStart := waitForEvent(t, id)
-		const err1 = "boom1"
-		firstRun.resume <- jobs.MarkAsRetryJobError(errors.New(err1))
-
-		// Wait for the job to get restarted.
-		secondRun, secondStart := waitForEvent(t, id)
-
-		// Confirm the previous execution error was properly recorded.
-		var firstExecErr parsedError
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			firstExecErr = execErrs[0]
-			checkExecutionError(t, firstExecErr, jobs.StatusRunning, firstStart, secondStart, err1)
-			checkLogEntry(t, id, jobs.StatusRunning, firstStart, secondStart, err1)
-		}
-		const err2 = "boom2"
-		secondRun.resume <- errors.New(err2)
-		thirdRun, thirdStart := waitForEvent(t, id) // thirdRun is Reverting
-		// Confirm that no new error was recorded in the log. It will be in
-		// FinalResumeError.
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			executionErrorEqual(t, firstExecErr, execErrs[0])
-		}
-		const err3 = "boom3"
-		thirdRun.resume <- jobs.MarkAsRetryJobError(errors.New(err3))
-		fourthRun, fourthStart := waitForEvent(t, id)
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 2)
-			executionErrorEqual(t, firstExecErr, execErrs[0])
-			checkExecutionError(t, execErrs[1], jobs.StatusReverting, thirdStart, fourthStart, err3)
-			checkLogEntry(t, id, jobs.StatusReverting, thirdStart, fourthStart, err3)
-		}
-		close(fourthRun.resume)
-		require.Regexp(t, err2, registry.WaitForJobs(ctx, []jobspb.JobID{id}))
-	})
-	t.Run("truncation", func(t *testing.T) {
-		id := mkJob(t)
-		firstRun, firstStart := waitForEvent(t, id)
-		const maxSize, largeSize = 2 << 10, 8 << 10
-		tdb.Exec(t, "SET CLUSTER SETTING "+jobs.ExecutionErrorsMaxEntrySizeKey+" = $1", maxSize)
-		tdb.Exec(t, "SET CLUSTER SETTING "+jobs.ExecutionErrorsMaxEntriesKey+" = $1", 1)
-		err1 := strings.Repeat("a", largeSize)
-		firstRun.resume <- jobs.MarkAsRetryJobError(fmt.Errorf("%s", err1))
-
-		// Wait for the job to get restarted.
-		secondRun, secondStart := waitForEvent(t, id)
-		// Confirm the previous execution error was properly recorded.
-		var firstExecErr parsedError
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			firstExecErr = execErrs[0]
-			// Ensure we see the truncated error in the table but the full error
-			// in the logs.
-			expTruncatedError := "(truncated) " + err1[:maxSize]
-			checkExecutionError(t, firstExecErr, jobs.StatusRunning, firstStart, secondStart, expTruncatedError)
-			checkLogEntry(t, id, jobs.StatusRunning, firstStart, secondStart, err1)
-		}
-		const err2 = "boom2"
-		secondRun.resume <- jobs.MarkAsRetryJobError(errors.New(err2))
-		thirdRun, thirdStart := waitForEvent(t, id)
-		var secondExecErr parsedError
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			secondExecErr = execErrs[0]
-			checkExecutionError(t, secondExecErr, jobs.StatusRunning, secondStart, thirdStart, err2)
-			checkLogEntry(t, id, jobs.StatusRunning, secondStart, thirdStart, err2)
-		}
-		// Fail the job so we can also test the truncation of reverting retry
-		// errors.
-		const err3 = "boom3"
-		thirdRun.resume <- errors.New(err3)           // not retriable
-		fourthRun, fourthStart := waitForEvent(t, id) // first Reverting run
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			executionErrorEqual(t, secondExecErr, execErrs[0])
-		}
-		err4 := strings.Repeat("b", largeSize)
-		fourthRun.resume <- jobs.MarkAsRetryJobError(fmt.Errorf("%s", err4))
-		fifthRun, fifthStart := waitForEvent(t, id)
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			// Ensure we see the truncated error in the table but the full error
-			// in the logs.
-			expTruncatedError := "(truncated) " + err4[:maxSize]
-			checkExecutionError(t, execErrs[0], jobs.StatusReverting, fourthStart, fifthStart, expTruncatedError)
-			checkLogEntry(t, id, jobs.StatusReverting, fourthStart, fifthStart, err4)
-		}
-		const err5 = "boom5"
-		fifthRun.resume <- jobs.MarkAsRetryJobError(errors.New(err5))
-		sixthRun, sixthStart := waitForEvent(t, id)
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 1)
-			checkExecutionError(t, execErrs[0], jobs.StatusReverting, fifthStart, sixthStart, err5)
-			checkLogEntry(t, id, jobs.StatusReverting, fifthStart, sixthStart, err5)
-		}
-		const err6 = "boom5"
-		tdb.Exec(t, "SET CLUSTER SETTING "+jobs.ExecutionErrorsMaxEntriesKey+" = $1", 0)
-		sixthRun.resume <- jobs.MarkAsRetryJobError(errors.New(err6))
-		seventhRun, seventhStart := waitForEvent(t, id)
-		{
-			execErrs := getExecErrors(t, id)
-			require.Len(t, execErrs, 0)
-			checkLogEntry(t, id, jobs.StatusReverting, sixthStart, seventhStart, err6)
-		}
-		close(seventhRun.resume)
-		require.Regexp(t, err3, registry.WaitForJobs(ctx, []jobspb.JobID{id}))
-	})
 }

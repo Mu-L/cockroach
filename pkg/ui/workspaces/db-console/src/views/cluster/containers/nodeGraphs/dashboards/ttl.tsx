@@ -1,26 +1,21 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
+import map from "lodash/map";
 import React from "react";
-import _ from "lodash";
 
 import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
-import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 import { GraphDashboardProps } from "./dashboardUtils";
 
 export default function (props: GraphDashboardProps) {
   const { nodeSources, tenantSource } = props;
 
-  const percentiles = ["p50", "p75", "p90", "p95", "p99"];
+  const percentiles = ["p50", "p75", "p90", "p99"];
 
   return [
     <LineGraph
@@ -28,6 +23,7 @@ export default function (props: GraphDashboardProps) {
       isKvGraph={false}
       sources={nodeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis label="rows per second" units={AxisUnits.Count}>
         <Metric
@@ -47,6 +43,7 @@ export default function (props: GraphDashboardProps) {
       isKvGraph={false}
       sources={nodeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis label="row count" units={AxisUnits.Count}>
         <Metric
@@ -67,9 +64,10 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tenantSource={tenantSource}
       tooltip={`Latency of scanning and deleting within the job.`}
+      showMetricsInTooltip={true}
     >
       <Axis label="latency" units={AxisUnits.Duration}>
-        {_.map(percentiles, p => (
+        {map(percentiles, p => (
           <>
             <Metric
               name={`cr.node.jobs.row_level_ttl.select_duration-${p}`}
@@ -91,6 +89,7 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tenantSource={tenantSource}
       tooltip={`Number of active spans being processed by TTL.`}
+      showMetricsInTooltip={true}
     >
       <Axis label="span count" units={AxisUnits.Count}>
         <Metric

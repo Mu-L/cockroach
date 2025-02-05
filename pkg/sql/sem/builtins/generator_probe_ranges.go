@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
@@ -19,18 +14,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 func init() {
@@ -118,16 +114,10 @@ type probeRangeGenerator struct {
 func makeProbeRangeGenerator(
 	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
-	// The user must be an admin to use this builtin.
-	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
-	if err != nil {
+	if err := evalCtx.SessionAccessor.CheckPrivilege(
+		ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+	); err != nil {
 		return nil, err
-	}
-	if !isAdmin {
-		return nil, pgerror.Newf(
-			pgcode.InsufficientPrivilege,
-			"only users with the admin role are allowed to use crdb_internal.probe_range",
-		)
 	}
 	// Trace the query to meta2. Return it as part of the error string if the query fails.
 	// This improves observability into a meta2 outage. We expect crdb_internal.probe_range
@@ -140,6 +130,7 @@ func makeProbeRangeGenerator(
 		)
 		defer sp.Finish()
 		// Handle args passed in.
+		var err error
 		ranges, err = kvclient.ScanMetaKVs(ctx, evalCtx.Txn, roachpb.Span{
 			Key:    keys.MinKey,
 			EndKey: keys.MaxKey,
@@ -161,17 +152,17 @@ func makeProbeRangeGenerator(
 	}, nil
 }
 
-// ResolvedType implements the tree.ValueGenerator interface.
+// ResolvedType implements the eval.ValueGenerator interface.
 func (p *probeRangeGenerator) ResolvedType() *types.T {
 	return probeRangeGeneratorType
 }
 
-// Start implements the tree.ValueGenerator interface.
+// Start implements the eval.ValueGenerator interface.
 func (p *probeRangeGenerator) Start(_ context.Context, _ *kv.Txn) error {
 	return nil
 }
 
-// Next implements the tree.ValueGenerator interface.
+// Next implements the eval.ValueGenerator interface.
 func (p *probeRangeGenerator) Next(ctx context.Context) (bool, error) {
 	if len(p.ranges) == 0 {
 		return false, nil
@@ -180,14 +171,14 @@ func (p *probeRangeGenerator) Next(ctx context.Context) (bool, error) {
 	p.ranges = p.ranges[1:]
 	p.curr = probeRangeRow{}
 
-	var opName string
+	var opName redact.RedactableString
 	if p.isWrite {
 		opName = "write probe"
 	} else {
 		opName = "read probe"
 	}
 	ctx, sp := tracing.EnsureChildSpan(
-		ctx, p.tracer, opName,
+		ctx, p.tracer, opName.StripMarkers(),
 		tracing.WithRecording(tracingpb.RecordingVerbose),
 	)
 	defer func() {
@@ -214,7 +205,7 @@ func (p *probeRangeGenerator) Next(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// Values implements the tree.ValueGenerator interface.
+// Values implements the eval.ValueGenerator interface.
 func (p *probeRangeGenerator) Values() (tree.Datums, error) {
 	return tree.Datums{
 		tree.NewDInt(tree.DInt(p.curr.rangeID)),
@@ -224,5 +215,5 @@ func (p *probeRangeGenerator) Values() (tree.Datums, error) {
 	}, nil
 }
 
-// Close implements the tree.ValueGenerator interface.
+// Close implements the eval.ValueGenerator interface.
 func (p *probeRangeGenerator) Close(_ context.Context) {}

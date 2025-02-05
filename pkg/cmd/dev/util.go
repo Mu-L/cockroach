@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -35,7 +30,8 @@ const (
 
 var (
 	// Shared flags.
-	numCPUs int
+	numCPUs    int
+	pgoEnabled bool
 )
 
 var archivedCdepConfigurations = []configuration{
@@ -104,6 +100,7 @@ func mustGetFlagDuration(cmd *cobra.Command, name string) time.Duration {
 
 func (d *dev) getBazelInfo(ctx context.Context, key string, extraArgs []string) (string, error) {
 	args := []string{"info", key, "--color=no"}
+	args = append(args, extraArgs...)
 	out, err := d.exec.CommandContextSilent(ctx, "bazel", args...)
 	if err != nil {
 		return "", err
@@ -126,8 +123,8 @@ func (d *dev) getBazelBin(ctx context.Context, configArgs []string) (string, err
 	return d.getBazelInfo(ctx, "bazel-bin", configArgs)
 }
 
-func (d *dev) getExecutionRoot(ctx context.Context) (string, error) {
-	return d.getBazelInfo(ctx, "execution_root", []string{})
+func (d *dev) getExecutionRoot(ctx context.Context, configArgs []string) (string, error) {
+	return d.getBazelInfo(ctx, "execution_root", configArgs)
 }
 
 // getArchivedCdepString returns a non-empty string iff the force_build_cdeps
@@ -167,7 +164,8 @@ func (d *dev) getArchivedCdepString(bazelBin string) (string, error) {
 }
 
 func addCommonBuildFlags(cmd *cobra.Command) {
-	cmd.Flags().IntVar(&numCPUs, "cpus", 0, "cap the number of cpu cores used")
+	cmd.Flags().IntVar(&numCPUs, "cpus", 0, "cap the number of CPU cores used for building and testing at the Bazel level (note that this has no impact on GOMAXPROCS or the functionality of any build or test action under the Bazel level)")
+	cmd.Flags().BoolVar(&pgoEnabled, "pgo", false, "build with profile-guided optimization (PGO)")
 }
 
 func addCommonTestFlags(cmd *cobra.Command) {
@@ -247,5 +245,38 @@ func (d *dev) warnAboutChangeInStressBehavior(timeout time.Duration) {
 			log.Printf("WARNING: The behavior of --timeout under --stress has changed. --timeout controls the timeout of the test, not the entire `stress` invocation.")
 		}
 		log.Printf("Set DEV_I_UNDERSTAND_ABOUT_STRESS=1 to squelch this message")
+	}
+}
+
+// This function retrieves the merge-base hash between the current branch and master
+func (d *dev) getMergeBaseHash(ctx context.Context) (string, error) {
+	// List files changed against `master`
+	remotes, err := d.exec.CommandContextSilent(ctx, "git", "remote", "-v")
+	if err != nil {
+		return "", err
+	}
+	var upstream string
+	for _, remote := range strings.Split(strings.TrimSpace(string(remotes)), "\n") {
+		if (strings.Contains(remote, "github.com/cockroachdb/cockroach") || strings.Contains(remote, "github.com:cockroachdb/cockroach")) && strings.HasSuffix(remote, "(fetch)") {
+			upstream = strings.Fields(remote)[0]
+			break
+		}
+	}
+	if upstream == "" {
+		return "", fmt.Errorf("could not find git upstream, run `git remote add upstream git@github.com:cockroachdb/cockroach.git`")
+	}
+	baseBytes, err := d.exec.CommandContextSilent(ctx, "git", "merge-base", fmt.Sprintf("%s/master", upstream), "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(baseBytes)), nil
+}
+
+func addCommonBazelArguments(args *[]string) {
+	if numCPUs != 0 {
+		*args = append(*args, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
+	}
+	if pgoEnabled {
+		*args = append(*args, "--config=pgo")
 	}
 }

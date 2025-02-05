@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -41,6 +36,15 @@ const (
 	vModuleFlag      = "vmodule"
 	showDiffFlag     = "show-diff"
 )
+
+// List of bazel integration tests that will fail when running `dev test pkg/...`
+var integrationTests = map[string]struct{ testName, commandToRun string }{
+	"pkg/acceptance":              {"acceptance_test", "dev acceptance"},
+	"pkg/compose":                 {"compose_test", "dev compose"},
+	"pkg/compose/compare/compare": {"compare_test", "dev compose"},
+	"pkg/testutils/docker":        {"docker_test", ""},
+	"pkg/testutils/lint":          {"lint_test", "dev lint"},
+}
 
 func makeTestCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
 	// testCmd runs the specified cockroachdb tests.
@@ -78,7 +82,7 @@ pkg/kv/kvserver:kvserver_test) instead.`,
         Same as above, but time out after 60 seconds if no test has failed
           (Note: the timeout command is called "gtimeout" on macOS and can be installed with "brew install coreutils")
 
-    dev test pkg/cmd/dev:dev_test --stress --test-args='-test.timeout 5s'
+    dev test pkg/cmd/dev:dev_test --stress --timeout 5s
         Run a test repeatedly until it runs longer than 5s
 
     end=$((SECONDS+N))
@@ -110,7 +114,7 @@ pkg/kv/kvserver:kvserver_test) instead.`,
 	// visible.
 	testCmd.Flags().BoolP(vFlag, "v", false, "show testing process output")
 	testCmd.Flags().Bool(changedFlag, false, "automatically determine tests to run. This is done on a best-effort basis by asking git which files have changed. Only .go files and files in testdata/ directories are factored into this analysis.")
-	testCmd.Flags().Int(countFlag, 1, "run test the given number of times")
+	testCmd.Flags().Int(countFlag, 0, "run test the given number of times")
 	testCmd.Flags().BoolP(showLogsFlag, "", false, "show crdb logs in-line")
 	testCmd.Flags().Bool(stressFlag, false, "run tests under stress")
 	testCmd.Flags().Bool(raceFlag, false, "run tests using race builds")
@@ -171,6 +175,7 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 		extraRewritablePaths = []struct{ pkg, path string }{
 			{"pkg/ccl/logictestccl", "pkg/sql/logictest"},
 			{"pkg/ccl/logictestccl", "pkg/sql/opt/exec/execbuilder"},
+			{"pkg/ccl/schemachangerccl", "pkg/sql/schemachanger/testdata"},
 			{"pkg/sql/opt/memo", "pkg/sql/opt/testutils/opttester/testfixtures"},
 			{"pkg/sql/opt/norm", "pkg/sql/opt/testutils/opttester/testfixtures"},
 			{"pkg/sql/opt/xform", "pkg/sql/opt/testutils/opttester/testfixtures"},
@@ -220,11 +225,9 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	var args []string
 	var goTags []string
 	args = append(args, "test")
-	if numCPUs != 0 {
-		args = append(args, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
-	}
+	addCommonBazelArguments(&args)
 	if race {
-		args = append(args, "--config=race")
+		args = append(args, "--config=race", "--test_sharding_strategy=disabled")
 	}
 	if deadlock {
 		goTags = append(goTags, "deadlock")
@@ -243,24 +246,47 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 		pkg = strings.TrimPrefix(pkg, "./")
 		pkg = strings.TrimRight(pkg, "/")
 
-		if !strings.HasPrefix(pkg, "pkg/") {
+		if !strings.HasPrefix(pkg, "pkg/") && !strings.HasPrefix(pkg, "pkg:") {
 			return fmt.Errorf("malformed package %q, expecting %q", pkg, "pkg/{...}")
 		}
 
-		var target string
-		if strings.Contains(pkg, ":") || strings.HasSuffix(pkg, "/...") {
-			// For parity with bazel, we allow specifying named build targets.
-			target = pkg
-		} else {
-			target = fmt.Sprintf("%s:all", pkg)
+		if !strings.Contains(pkg, ":") && !strings.HasSuffix(pkg, "/...") {
+			pkg = fmt.Sprintf("%s:all", pkg)
 		}
-		testTargets = append(testTargets, target)
+		// Filter out only test targets.
+		queryArgs := []string{"query", fmt.Sprintf("kind(.*_test, %s)", pkg)}
+		labelsBytes, err := d.exec.CommandContextSilent(ctx, "bazel", queryArgs...)
+		if err != nil {
+			return fmt.Errorf("could not query for tests within %s: got error %w", pkg, err)
+		}
+		labels := strings.TrimSpace(string(labelsBytes))
+		if labels == "" {
+			log.Printf("WARNING: no test targets were found matching %s", pkg)
+			continue
+		}
+		testTargets = append(testTargets, strings.Split(labels, "\n")...)
+	}
+
+	for _, target := range testTargets {
+		testTarget := strings.Split(target, ":")
+		integrationTest, ok := integrationTests[testTarget[0]]
+		if ok {
+			// If the test targets all tests in the package or the individual test, warn the user
+			if testTarget[1] == "all" || testTarget[1] == integrationTest.testName {
+				if integrationTest.commandToRun == "" {
+					return fmt.Errorf("%s:%s will fail since it is an integration test", testTarget[0], integrationTest.testName)
+				}
+				return fmt.Errorf("%s:%s will fail since it is an integration test. To run this test, run `%s`", testTarget[0], integrationTest.testName, integrationTest.commandToRun)
+			}
+		}
+	}
+
+	if len(testTargets) == 0 {
+		log.Printf("WARNING: no matching test targets were found and no tests will be run")
+		return nil
 	}
 
 	args = append(args, testTargets...)
-	if ignoreCache {
-		args = append(args, "--nocache_test_results")
-	}
 	args = append(args, "--test_env=GOTRACEBACK=all")
 
 	if rewrite {
@@ -301,19 +327,11 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 		args = append(args, "--test_arg", "-show-diff")
 	}
 	if timeout > 0 {
-		// The bazel timeout should be higher than the timeout passed to the
-		// test binary (giving it ample time to clean up, 5 seconds is probably
-		// enough).
-		args = append(args, fmt.Sprintf("--test_timeout=%d", 5+int(timeout.Seconds())))
-		args = append(args, "--test_arg", fmt.Sprintf("-test.timeout=%s", timeout.String()))
-
-		// If --test-args '-test.timeout=X' is specified as well, or
-		// -- --test_arg '-test.timeout=X', that'll take precedence further
-		// below.
+		args = append(args, fmt.Sprintf("--test_timeout=%d", int(timeout.Seconds())))
 	}
 
 	if stress {
-		if count == 1 {
+		if count == 0 {
 			// Default to 1000 unless a different count was provided.
 			count = 1000
 		}
@@ -339,8 +357,10 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	if showLogs {
 		args = append(args, "--test_arg", "-show-logs")
 	}
-	if count != 1 {
-		args = append(args, fmt.Sprintf("--runs_per_test=%d", count))
+	if count == 1 {
+		ignoreCache = true
+	} else if count != 0 {
+		args = append(args, fmt.Sprintf("--runs_per_test=%d", count), "--runs_per_test=.*disallowed_imports_test@1")
 	}
 	if vModule != "" {
 		args = append(args, "--test_arg", fmt.Sprintf("-vmodule=%s", vModule))
@@ -354,6 +374,10 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	}
 	if disableTestSharding {
 		args = append(args, "--test_sharding_strategy=disabled")
+	}
+
+	if ignoreCache {
+		args = append(args, "--nocache_test_results")
 	}
 
 	if len(goTags) > 0 {
@@ -451,28 +475,10 @@ func getDirectoryFromTarget(target string) string {
 }
 
 func (d *dev) determineAffectedTargets(ctx context.Context) ([]string, error) {
-	// List files changed against `master`.
-	remotes, err := d.exec.CommandContextSilent(ctx, "git", "remote", "-v")
+	base, err := d.getMergeBaseHash(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var upstream string
-	for _, remote := range strings.Split(strings.TrimSpace(string(remotes)), "\n") {
-		if (strings.Contains(remote, "github.com/cockroachdb/cockroach") || strings.Contains(remote, "github.com:cockroachdb/cockroach")) && strings.HasSuffix(remote, "(fetch)") {
-			upstream = strings.Fields(remote)[0]
-			break
-		}
-	}
-	if upstream == "" {
-		return nil, fmt.Errorf("could not find git upstream")
-	}
-
-	baseBytes, err := d.exec.CommandContextSilent(ctx, "git", "merge-base", fmt.Sprintf("%s/master", upstream), "HEAD")
-	if err != nil {
-		return nil, err
-	}
-	base := strings.TrimSpace(string(baseBytes))
-
 	changedFiles, err := d.exec.CommandContextSilent(ctx, "git", "diff", "--no-ext-diff", "--name-only", base, "--", "*.go", "**/testdata/**")
 	if err != nil {
 		return nil, err

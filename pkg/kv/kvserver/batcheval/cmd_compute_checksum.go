@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -36,7 +31,7 @@ func declareKeysComputeChecksum(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
+) error {
 	// The correctness of range merges depends on the lease applied index of a
 	// range not being bumped while the RHS is subsumed. ComputeChecksum bumps a
 	// range's LAI and thus needs to be serialized with Subsume requests, in order
@@ -47,11 +42,12 @@ func declareKeysComputeChecksum(
 	// declare access over at least one key. We choose to declare read-only access
 	// over the range descriptor key.
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
+	return nil
 }
 
 // ReplicaChecksumVersion versions the checksum computation. Requests silently no-op
 // unless the versions between the requesting and requested replica are compatible.
-const ReplicaChecksumVersion = 4
+const ReplicaChecksumVersion = 5
 
 // ComputeChecksum starts the process of computing a checksum on the replica at
 // a particular snapshot. The checksum is later verified through a

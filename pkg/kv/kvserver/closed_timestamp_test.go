@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -115,7 +110,7 @@ func TestClosedTimestampCanServe(t *testing.T) {
 			baWrite := &kvpb.BatchRequest{}
 			r := &kvpb.DeleteRequest{}
 			r.Key = desc.StartKey.AsRawKey()
-			txn := roachpb.MakeTransaction("testwrite", r.Key, isolation.Serializable, roachpb.NormalUserPriority, ts, 100, int32(tc.Server(0).SQLInstanceID()))
+			txn := roachpb.MakeTransaction("testwrite", r.Key, isolation.Serializable, roachpb.NormalUserPriority, ts, 100, int32(tc.Server(0).SQLInstanceID()), 0, false /* omitInRangefeeds */)
 			baWrite.Txn = &txn
 			baWrite.Add(r)
 			baWrite.RangeID = repls[0].RangeID
@@ -286,7 +281,7 @@ func TestClosedTimestampCantServeWithConflictingIntent(t *testing.T) {
 	// replica.
 	txnKey := desc.StartKey.AsRawKey()
 	txnKey = txnKey[:len(txnKey):len(txnKey)] // avoid aliasing
-	txn := roachpb.MakeTransaction("txn", txnKey, 0, 0, tc.Server(0).Clock().Now(), 0, int32(tc.Server(0).SQLInstanceID()))
+	txn := roachpb.MakeTransaction("txn", txnKey, 0, 0, tc.Server(0).Clock().Now(), 0, int32(tc.Server(0).SQLInstanceID()), 0, false /* omitInRangefeeds */)
 	var keys []roachpb.Key
 	for i := range repls {
 		key := append(txnKey, []byte(strconv.Itoa(i))...)
@@ -630,6 +625,7 @@ func TestClosedTimestampFrozenAfterSubsumption(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t)
+	skip.UnderDeadlock(t)
 
 	for _, test := range []struct {
 		name string
@@ -666,7 +662,7 @@ func TestClosedTimestampFrozenAfterSubsumption(t *testing.T) {
 					NodeID:  newLeaseholder.NodeID(),
 					StoreID: newLeaseholder.StoreID(),
 				}
-				newLease, err := tc.MoveRangeLeaseNonCooperatively(ctx, rhsDesc, target, clock)
+				newLease, err := tc.MoveRangeLeaseNonCooperatively(t, ctx, rhsDesc, target, clock)
 				require.NoError(t, err)
 				return target, newLease.Start.ToTimestamp()
 			},
@@ -1369,7 +1365,7 @@ func verifyCanReadFromAllRepls(
 }
 
 func makeTxnReadBatchForDesc(desc roachpb.RangeDescriptor, ts hlc.Timestamp) *kvpb.BatchRequest {
-	txn := roachpb.MakeTransaction("txn", nil, 0, 0, ts, 0, 0)
+	txn := roachpb.MakeTransaction("txn", nil, 0, 0, ts, 0, 0, 0, false /* omitInRangefeeds */)
 
 	baRead := &kvpb.BatchRequest{}
 	baRead.Header.RangeID = desc.RangeID

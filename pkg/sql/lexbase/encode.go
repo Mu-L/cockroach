@@ -7,13 +7,8 @@
 //
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -47,6 +42,10 @@ const (
 	// without wrapping quotes.
 	EncBareIdentifiers
 
+	// EncBareReservedKeywords indicates that reserved keywords will be rendered
+	// without wrapping quotes.
+	EncBareReservedKeywords
+
 	// EncFirstFreeFlagBit needs to remain unused; it is used as base
 	// bit offset for tree.FmtFlags.
 	EncFirstFreeFlagBit
@@ -57,7 +56,8 @@ const (
 // contains special characters, or the identifier is a reserved SQL
 // keyword.
 func EncodeRestrictedSQLIdent(buf *bytes.Buffer, s string, flags EncodeFlags) {
-	if flags.HasFlags(EncBareIdentifiers) || (!isReservedKeyword(s) && IsBareIdentifier(s)) {
+	if flags.HasFlags(EncBareIdentifiers) ||
+		(IsBareIdentifier(s) && (flags.HasFlags(EncBareReservedKeywords) || !isReservedKeyword(s))) {
 		buf.WriteString(s)
 		return
 	}
@@ -108,7 +108,12 @@ func EncodeEscapedSQLIdent(buf *bytes.Buffer, s string) {
 	buf.WriteByte('"')
 }
 
-var mustQuoteMap = map[byte]bool{
+const (
+	minPrintableChar = 0x20 // ' '
+	maxPrintableChar = 0x7E // '~'
+)
+
+var mustQuoteMap = [maxPrintableChar + 1]bool{
 	' ': true,
 	',': true,
 	'{': true,
@@ -146,7 +151,7 @@ func EncodeSQLStringWithFlags(buf *bytes.Buffer, in string, flags EncodeFlags) {
 			continue
 		}
 		ch := byte(r)
-		if r >= 0x20 && r < 0x7F {
+		if r >= minPrintableChar && r <= maxPrintableChar {
 			if mustQuoteMap[ch] {
 				// We have to quote this string - ignore bareStrings setting
 				bareStrings = false
@@ -161,6 +166,7 @@ func EncodeSQLStringWithFlags(buf *bytes.Buffer, in string, flags EncodeFlags) {
 			escapedString = true
 		}
 		buf.WriteString(in[start:i])
+
 		ln := utf8.RuneLen(r)
 		if ln < 0 {
 			start = i + 1

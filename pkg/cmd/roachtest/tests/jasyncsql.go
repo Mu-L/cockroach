@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -30,8 +25,13 @@ func registerJasyncSQL(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+		// jasync does not support changing the default sslmode for postgresql, defaulting
+		// sslmode=disable. See: https://github.com/jasync-sql/jasync-sql/issues/422
+		// TODO(darrylwong): If the above issue is addressed we can enable secure mode
+		c.Start(
+			ctx, t.L(), option.NewStartOpts(sqlClientsInMemoryDB),
+			install.MakeClusterSettings(install.SecureOption(false)),
+		)
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
@@ -58,7 +58,7 @@ func registerJasyncSQL(r registry.Registry) {
 
 		if err := c.RunE(
 			ctx,
-			node,
+			option.WithNodes(node),
 			"cd /mnt/data1 && git clone https://github.com/jasync-sql/jasync-sql.git",
 		); err != nil {
 			t.Fatal(err)
@@ -66,7 +66,7 @@ func registerJasyncSQL(r registry.Registry) {
 
 		// TODO: Currently we are pointing to a JasyncSQL branch, we will change
 		// this once the official release is available
-		if err := c.RunE(ctx, node, fmt.Sprintf("cd /mnt/data1/jasync-sql && git checkout %s",
+		if err := c.RunE(ctx, option.WithNodes(node), fmt.Sprintf("cd /mnt/data1/jasync-sql && git checkout %s",
 			supportedJasyncCommit)); err != nil {
 			t.Fatal(err)
 		}
@@ -93,15 +93,15 @@ func registerJasyncSQL(r registry.Registry) {
 
 		_ = c.RunE(
 			ctx,
-			node,
-			`cd /mnt/data1/jasync-sql && PGUSER=root PGHOST=localhost PGPORT=26257 PGDATABASE=defaultdb ./gradlew :postgresql-async:test`,
+			option.WithNodes(node),
+			`cd /mnt/data1/jasync-sql && PGHOST=localhost PGUSER=test_admin PGPORT={pgport:1} PGDATABASE=defaultdb ./gradlew :postgresql-async:test`,
 		)
 
-		_ = c.RunE(ctx, node, `mkdir -p ~/logs/report/jasyncsql-results`)
+		_ = c.RunE(ctx, option.WithNodes(node), `mkdir -p ~/logs/report/jasyncsql-results`)
 
 		t.Status("making test directory")
 
-		_ = c.RunE(ctx, node,
+		_ = c.RunE(ctx, option.WithNodes(node),
 			`mkdir -p ~/logs/report/jasyncsql-results`,
 		)
 
@@ -140,11 +140,12 @@ func registerJasyncSQL(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "jasync",
-		Owner:   registry.OwnerSQLFoundations,
-		Cluster: r.MakeClusterSpec(1),
-		Leases:  registry.MetamorphicLeases,
-		Tags:    registry.Tags(`default`, `orm`),
+		Name:             "jasync",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.ORM),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runJasyncSQL(ctx, t, c)
 		},

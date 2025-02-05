@@ -1,27 +1,21 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ttljob
 
 import (
 	"context"
-	"math"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -40,37 +34,10 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-var (
-	defaultSelectBatchSize = settings.RegisterIntSetting(
-		settings.TenantWritable,
-		"sql.ttl.default_select_batch_size",
-		"default amount of rows to select in a single query during a TTL job",
-		500,
-		settings.PositiveInt,
-		settings.WithPublic)
-	defaultDeleteBatchSize = settings.RegisterIntSetting(
-		settings.TenantWritable,
-		"sql.ttl.default_delete_batch_size",
-		"default amount of rows to delete in a single query during a TTL job",
-		100,
-		settings.PositiveInt,
-		settings.WithPublic)
-	defaultDeleteRateLimit = settings.RegisterIntSetting(
-		settings.TenantWritable,
-		"sql.ttl.default_delete_rate_limit",
-		"default delete rate limit for all TTL jobs. Use 0 to signify no rate limit.",
-		0,
-		settings.NonNegativeInt,
-		settings.WithPublic)
-
-	jobEnabled = settings.RegisterBoolSetting(
-		settings.TenantWritable,
-		"sql.ttl.job.enabled",
-		"whether the TTL job is enabled",
-		true,
-		settings.WithPublic)
-)
-
+// rowLevelTTLResumer implements the TTL job. The job can run on any node, but
+// the job node distributes SELECT/DELETE work via DistSQL to ttlProcessor
+// nodes. DistSQL divides work into spans that each ttlProcessor scans in a
+// SELECT/DELETE loop.
 type rowLevelTTLResumer struct {
 	job *jobs.Job
 	st  *cluster.Settings
@@ -79,14 +46,24 @@ type rowLevelTTLResumer struct {
 var _ jobs.Resumer = (*rowLevelTTLResumer)(nil)
 
 // Resume implements the jobs.Resumer interface.
-func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) error {
+func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) (retErr error) {
+	defer func() {
+		if retErr == nil {
+			return
+		} else if joberror.IsPermanentBulkJobError(retErr) {
+			retErr = jobs.MarkAsPermanentJobError(retErr)
+		} else {
+			retErr = jobs.MarkAsRetryJobError(retErr)
+		}
+	}()
+
 	jobExecCtx := execCtx.(sql.JobExecContext)
 	execCfg := jobExecCtx.ExecCfg()
 	db := execCfg.DB
 	descsCol := jobExecCtx.ExtendedEvalContext().Descs
 
 	settingsValues := execCfg.SV()
-	if err := checkEnabled(settingsValues); err != nil {
+	if err := ttlbase.CheckJobEnabled(settingsValues); err != nil {
 		return err
 	}
 
@@ -103,15 +80,8 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 	if knobs.AOSTDuration != nil {
 		aostDuration = *knobs.AOSTDuration
 	}
-	aost := details.Cutoff.Add(aostDuration)
 
-	ttlSpecAOST := aost
-	// Set ttlSpec.AOST to 0 to avoid overriding 0 duration in tests.
-	if knobs.AOSTDuration != nil {
-		ttlSpecAOST = time.Time{}
-	}
-
-	var rowLevelTTL catpb.RowLevelTTL
+	var rowLevelTTL *catpb.RowLevelTTL
 	var relationName string
 	var entirePKSpan roachpb.Span
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -122,6 +92,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		// If the AOST timestamp is before the latest descriptor timestamp, exit
 		// early as the delete will not work.
 		modificationTime := desc.GetModificationTime().GoTime()
+		aost := details.Cutoff.Add(aostDuration)
 		if modificationTime.After(aost) {
 			return pgerror.Newf(
 				pgcode.ObjectNotInPrerequisiteState,
@@ -134,7 +105,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 			return errors.Newf("unable to find TTL on table %s", desc.GetName())
 		}
 
-		rowLevelTTL = *desc.GetRowLevelTTL()
+		rowLevelTTL = desc.GetRowLevelTTL()
 
 		if rowLevelTTL.Pause {
 			return pgerror.Newf(pgcode.OperatorIntervention, "ttl jobs on table %s are currently paused", tree.Name(desc.GetName()))
@@ -155,41 +126,30 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 	ttlExpr := rowLevelTTL.GetTTLExpr()
 
 	labelMetrics := rowLevelTTL.LabelMetrics
-	group := ctxgroup.WithContext(ctx)
+	statsCtx, statsCancel := context.WithCancelCause(ctx)
+	defer statsCancel(nil)
+	statsGroup := ctxgroup.WithContext(statsCtx)
 	err := func() error {
-		statsCloseCh := make(chan struct{})
-		defer close(statsCloseCh)
 		if rowLevelTTL.RowStatsPollInterval != 0 {
-
+			defer statsCancel(errors.New("cancelling TTL stats query because TTL job completed"))
 			metrics := execCfg.JobRegistry.MetricsStruct().RowLevelTTL.(*RowLevelTTLAggMetrics).loadMetrics(
 				labelMetrics,
 				relationName,
 			)
 
-			group.GoCtx(func(ctx context.Context) error {
-
-				handleError := func(err error) error {
-					if knobs.ReturnStatsError {
-						return err
-					}
-					log.Warningf(ctx, "failed to get statistics for table id %d: %s", details.TableID, err)
-					return nil
-				}
-
+			statsGroup.GoCtx(func(ctx context.Context) error {
 				// Do once initially to ensure we have some base statistics.
-				err := metrics.fetchStatistics(ctx, execCfg, relationName, details, aostDuration, ttlExpr)
-				if err := handleError(err); err != nil {
+				if err := metrics.fetchStatistics(ctx, execCfg, relationName, details, aostDuration, ttlExpr); err != nil {
 					return err
 				}
 				// Wait until poll interval is reached, or early exit when we are done
 				// with the TTL job.
 				for {
 					select {
-					case <-statsCloseCh:
+					case <-ctx.Done():
 						return nil
 					case <-time.After(rowLevelTTL.RowStatsPollInterval):
-						err := metrics.fetchStatistics(ctx, execCfg, relationName, details, aostDuration, ttlExpr)
-						if err := handleError(err); err != nil {
+						if err := metrics.fetchStatistics(ctx, execCfg, relationName, details, aostDuration, ttlExpr); err != nil {
 							return err
 						}
 					}
@@ -206,7 +166,7 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		if err != nil {
 			return err
 		}
-		spanPartitions, err := distSQLPlanner.PartitionSpans(ctx, planCtx, []roachpb.Span{entirePKSpan})
+		spanPartitions, err := distSQLPlanner.PartitionSpans(ctx, planCtx, []roachpb.Span{entirePKSpan}, sql.PartitionSpansBoundDefault)
 		if err != nil {
 			return err
 		}
@@ -222,24 +182,26 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		}
 
 		jobID := t.job.ID()
-		selectBatchSize := getSelectBatchSize(settingsValues, rowLevelTTL)
-		deleteBatchSize := getDeleteBatchSize(settingsValues, rowLevelTTL)
-		deleteRateLimit := getDeleteRateLimit(settingsValues, rowLevelTTL)
+		selectBatchSize := ttlbase.GetSelectBatchSize(settingsValues, rowLevelTTL)
+		deleteBatchSize := ttlbase.GetDeleteBatchSize(settingsValues, rowLevelTTL)
+		selectRateLimit := ttlbase.GetSelectRateLimit(settingsValues, rowLevelTTL)
+		deleteRateLimit := ttlbase.GetDeleteRateLimit(settingsValues, rowLevelTTL)
+		disableChangefeedReplication := ttlbase.GetChangefeedReplicationDisabled(settingsValues, rowLevelTTL)
 		newTTLSpec := func(spans []roachpb.Span) *execinfrapb.TTLSpec {
 			return &execinfrapb.TTLSpec{
-				JobID:              jobID,
-				RowLevelTTLDetails: details,
-				// Set AOST in case of mixed 22.2.0/22.2.1+ cluster where the job started on a 22.2.1+ node.
-				AOST:                        ttlSpecAOST,
-				TTLExpr:                     ttlExpr,
-				Spans:                       spans,
-				SelectBatchSize:             selectBatchSize,
-				DeleteBatchSize:             deleteBatchSize,
-				DeleteRateLimit:             deleteRateLimit,
-				LabelMetrics:                rowLevelTTL.LabelMetrics,
-				PreDeleteChangeTableVersion: knobs.PreDeleteChangeTableVersion,
-				PreSelectStatement:          knobs.PreSelectStatement,
-				AOSTDuration:                aostDuration,
+				JobID:                        jobID,
+				RowLevelTTLDetails:           details,
+				TTLExpr:                      ttlExpr,
+				Spans:                        spans,
+				SelectBatchSize:              selectBatchSize,
+				DeleteBatchSize:              deleteBatchSize,
+				SelectRateLimit:              selectRateLimit,
+				DeleteRateLimit:              deleteRateLimit,
+				LabelMetrics:                 rowLevelTTL.LabelMetrics,
+				PreDeleteChangeTableVersion:  knobs.PreDeleteChangeTableVersion,
+				PreSelectStatement:           knobs.PreSelectStatement,
+				AOSTDuration:                 aostDuration,
+				DisableChangefeedReplication: disableChangefeedReplication,
 			}
 		}
 
@@ -248,16 +210,15 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 			jobSpanCount += len(spanPartition.Spans)
 		}
 
-		jobRegistry := execCfg.JobRegistry
-		if err := jobRegistry.UpdateJobWithTxn(
-			ctx,
-			jobID,
-			nil,  /* txn */
-			true, /* useReadLock */
+		if err := t.job.NoTxn().Update(ctx,
 			func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 				progress := md.Progress
 				rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
-				rowLevelTTL.JobSpanCount = int64(jobSpanCount)
+				rowLevelTTL.JobTotalSpanCount = int64(jobSpanCount)
+				rowLevelTTL.JobProcessedSpanCount = 0
+				progress.Progress = &jobspb.Progress_FractionCompleted{
+					FractionCompleted: 0,
+				}
 				ju.UpdateProgress(progress)
 				return nil
 			},
@@ -323,51 +284,26 @@ func (t rowLevelTTLResumer) Resume(ctx context.Context, execCtx interface{}) err
 		return err
 	}
 
-	return group.Wait()
-}
-
-func checkEnabled(settingsValues *settings.Values) error {
-	if enabled := jobEnabled.Get(settingsValues); !enabled {
-		return errors.Newf(
-			"ttl jobs are currently disabled by CLUSTER SETTING %s",
-			jobEnabled.Name(),
-		)
+	if err := statsGroup.Wait(); err != nil {
+		// If the stats group was cancelled, use that error instead.
+		err = errors.CombineErrors(context.Cause(statsCtx), err)
+		if knobs.ReturnStatsError {
+			return err
+		}
+		log.Warningf(ctx, "failed to get statistics for table id %d: %v", details.TableID, err)
 	}
 	return nil
-}
-
-func getSelectBatchSize(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
-	bs := ttl.SelectBatchSize
-	if bs == 0 {
-		bs = defaultSelectBatchSize.Get(sv)
-	}
-	return bs
-}
-
-func getDeleteBatchSize(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
-	bs := ttl.DeleteBatchSize
-	if bs == 0 {
-		bs = defaultDeleteBatchSize.Get(sv)
-	}
-	return bs
-}
-
-func getDeleteRateLimit(sv *settings.Values, ttl catpb.RowLevelTTL) int64 {
-	rl := ttl.DeleteRateLimit
-	if rl == 0 {
-		rl = defaultDeleteRateLimit.Get(sv)
-	}
-	// Put the maximum tokens possible if there is no rate limit.
-	if rl == 0 {
-		rl = math.MaxInt64
-	}
-	return rl
 }
 
 // OnFailOrCancel implements the jobs.Resumer interface.
 func (t rowLevelTTLResumer) OnFailOrCancel(
 	ctx context.Context, execCtx interface{}, _ error,
 ) error {
+	return nil
+}
+
+// CollectProfile implements the jobs.Resumer interface.
+func (t rowLevelTTLResumer) CollectProfile(_ context.Context, _ interface{}) error {
 	return nil
 }
 

@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -38,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
 )
@@ -185,13 +183,30 @@ func (s *scheduledChangefeedExecutor) executeChangefeed(
 		return errors.AssertionFailedf("scheduled unexpectedly paused")
 	}
 
-	log.Infof(ctx, "Starting scheduled changefeed %d: %s",
-		sj.ScheduleID(), tree.AsString(changefeedStmt))
-
 	// Invoke changefeed plan hook.
 	hook, cleanup := cfg.PlanHookMaker(ctx, "exec-changefeed", txn.KV(), sj.Owner())
 	defer cleanup()
-	changefeedFn, err := planCreateChangefeed(ctx, hook.(sql.PlanHookState), changefeedStmt)
+
+	planner := hook.(sql.PlanHookState)
+	currentClusterID := planner.ExtendedEvalContext().ClusterID
+	currentDetails := sj.ScheduleDetails()
+
+	// If the current cluster ID is different than the schedule's cluster ID,
+	// pause the schedule. To maintain backward compatability with schedules
+	// without a clusterID, don't pause schedules without a clusterID.
+	if !currentDetails.ClusterID.Equal(uuid.Nil) && currentClusterID != currentDetails.ClusterID {
+		log.Infof(ctx, "scheduled changedfeed %d last run by different cluster %s, pausing until manually resumed",
+			sj.ScheduleID(),
+			currentDetails.ClusterID)
+		currentDetails.ClusterID = currentClusterID
+		sj.SetScheduleDetails(*currentDetails)
+		sj.Pause()
+		return nil
+	}
+
+	log.Infof(ctx, "Starting scheduled changefeed %d: %s",
+		sj.ScheduleID(), tree.AsString(changefeedStmt))
+	changefeedFn, err := planCreateChangefeed(ctx, planner, changefeedStmt)
 	if err != nil {
 		return err
 	}
@@ -217,7 +232,7 @@ func extractChangefeedStatement(sj *jobs.ScheduledJob) (*annotatedChangefeedStat
 			CreateChangefeed: stmt,
 			CreatedByInfo: &jobs.CreatedByInfo{
 				Name: jobs.CreatedByScheduledJobs,
-				ID:   sj.ScheduleID(),
+				ID:   int64(sj.ScheduleID()),
 			},
 		}, nil
 	}
@@ -321,7 +336,7 @@ func makeScheduledChangefeedSpec(
 	}
 
 	enterpriseCheckErr := utilccl.CheckEnterpriseEnabled(
-		p.ExecCfg().Settings, p.ExecCfg().NodeInfo.LogicalClusterID(),
+		p.ExecCfg().Settings,
 		opName)
 
 	if !(enterpriseCheckErr == nil) {
@@ -368,7 +383,7 @@ func makeChangefeedSchedule(
 	sj.SetScheduleLabel(label)
 	sj.SetOwner(owner)
 
-	if err := sj.SetSchedule(recurrence.Cron); err != nil {
+	if err := sj.SetScheduleAndNextRun(recurrence.Cron); err != nil {
 		return nil, err
 	}
 
@@ -392,7 +407,7 @@ func makeChangefeedSchedule(
 func dryRunCreateChangefeed(
 	ctx context.Context,
 	p sql.PlanHookState,
-	scheduleID int64,
+	scheduleID jobspb.ScheduleID,
 	createChangefeedNode *tree.CreateChangefeed,
 ) error {
 	sp, err := p.ExtendedEvalContext().Txn.CreateSavepoint(ctx)
@@ -405,7 +420,7 @@ func dryRunCreateChangefeed(
 			CreateChangefeed: createChangefeedNode,
 			CreatedByInfo: &jobs.CreatedByInfo{
 				Name: jobs.CreatedByScheduledJobs,
-				ID:   scheduleID,
+				ID:   int64(scheduleID),
 			},
 		}
 		changefeedFn, err := planCreateChangefeed(ctx, p, annotated)
@@ -427,7 +442,7 @@ func dryRunCreateChangefeed(
 func planCreateChangefeed(
 	ctx context.Context, p sql.PlanHookState, createChangefeedStmt tree.Statement,
 ) (sql.PlanHookRowFn, error) {
-	fn, cols, _, _, err := changefeedPlanHook(ctx, createChangefeedStmt, p)
+	fn, cols, _, err := changefeedPlanHook(ctx, createChangefeedStmt, p)
 
 	if err != nil {
 		return nil, errors.Wrapf(err, "changefeed table eval: %q", tree.AsString(createChangefeedStmt))
@@ -455,13 +470,16 @@ func invokeCreateChangefeed(ctx context.Context, createChangefeedFn sql.PlanHook
 	})
 
 	g.GoCtx(func(ctx context.Context) error {
-		return createChangefeedFn(ctx, nil, resultCh)
+		return createChangefeedFn(ctx, resultCh)
 	})
 
 	return g.Wait()
 }
 
-func makeScheduleDetails(opts map[string]string) (jobspb.ScheduleDetails, error) {
+// TODO(msbutler): move this function into scheduleBase and remove duplicate function in scheduled backups.
+func makeScheduleDetails(
+	opts map[string]string, clusterID uuid.UUID, version clusterversion.ClusterVersion,
+) (jobspb.ScheduleDetails, error) {
 	var details jobspb.ScheduleDetails
 	if v, ok := opts[optOnExecFailure]; ok {
 		if err := schedulebase.ParseOnError(v, &details); err != nil {
@@ -474,6 +492,8 @@ func makeScheduleDetails(opts map[string]string) (jobspb.ScheduleDetails, error)
 			return details, err
 		}
 	}
+	details.ClusterID = clusterID
+	details.CreationClusterVersion = version
 	return details, nil
 }
 
@@ -486,7 +506,7 @@ func emitSchedule(
 	resultsCh chan<- tree.Datums,
 ) error {
 	opts := changefeedbase.MakeStatementOptions(createChangefeedOpts)
-	redactedChangefeedNode, err := changefeedJobDescription(ctx, createChangefeedNode, sinkURI, opts)
+	redactedChangefeedNode, err := makeChangefeedDescription(ctx, createChangefeedNode, sinkURI, opts)
 	if err != nil {
 		return err
 	}
@@ -600,7 +620,7 @@ func doCreateChangefeedSchedule(
 		return err
 	}
 
-	details, err := makeScheduleDetails(spec.scheduleOpts)
+	details, err := makeScheduleDetails(spec.scheduleOpts, evalCtx.ClusterID, p.ExecCfg().Settings.Version.ActiveVersion(ctx))
 	if err != nil {
 		return err
 	}
@@ -649,18 +669,18 @@ func doCreateChangefeedSchedule(
 
 func createChangefeedScheduleHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, colinfo.ResultColumns, []sql.PlanNode, bool, error) {
+) (sql.PlanHookRowFn, colinfo.ResultColumns, bool, error) {
 	schedule, ok := stmt.(*tree.ScheduledChangefeed)
 	if !ok {
-		return nil, nil, nil, false, nil
+		return nil, nil, false, nil
 	}
 
 	spec, err := makeScheduledChangefeedSpec(ctx, p, schedule)
 	if err != nil {
-		return nil, nil, nil, false, err
+		return nil, nil, false, err
 	}
 
-	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
+	fn := func(ctx context.Context, resultsCh chan<- tree.Datums) error {
 		err := doCreateChangefeedSchedule(ctx, p, spec, resultsCh)
 		if err != nil {
 			telemetry.Count("scheduled-changefeed.create.failed")
@@ -669,7 +689,7 @@ func createChangefeedScheduleHook(
 		return nil
 	}
 
-	return fn, headerCols, nil, false, nil
+	return fn, headerCols, false, nil
 }
 
 func createChangefeedScheduleTypeCheck(
@@ -678,15 +698,6 @@ func createChangefeedScheduleTypeCheck(
 	schedule, ok := stmt.(*tree.ScheduledChangefeed)
 	if !ok {
 		return false, nil, nil
-	}
-
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V23_1ScheduledChangefeeds) {
-		return false, nil,
-			pgerror.Newf(
-				pgcode.FeatureNotSupported,
-				"cannot use scheduled changefeeds until cluster is upgraded to %s",
-				clusterversion.V23_1ScheduledChangefeeds.String,
-			)
 	}
 
 	changefeedStmt := schedule.CreateChangefeed

@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvstorage
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
@@ -29,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/raft/v3/raftpb"
 )
 
 type env struct {
@@ -45,7 +40,7 @@ func newEnv(t *testing.T) *env {
 	// all of it with the datadriven harness!
 	require.NoError(t, WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 	require.NoError(t, InitEngine(ctx, eng, roachpb.StoreIdent{
-		ClusterID: uuid.FastMakeV4(),
+		ClusterID: uuid.MakeV4(),
 		NodeID:    1,
 		StoreID:   1,
 	}))
@@ -102,6 +97,8 @@ func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	reStripFileLinePrefix := regexp.MustCompile(`^[^ ]+ `)
+	// Scan stats (shown after loading the range descriptors) can be non-deterministic.
+	reStripScanStats := regexp.MustCompile(`stats: .*$`)
 
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		e := newEnv(t)
@@ -124,8 +121,11 @@ func TestDataDriven(t *testing.T) {
 					if !printTrace || !strings.Contains(string(l.Message), "kvstorage") {
 						continue
 					}
+					msg := string(l.Message)
+					msg = reStripFileLinePrefix.ReplaceAllString(msg, ``)
+					msg = reStripScanStats.ReplaceAllString(msg, `stats: <redacted>`)
 
-					fmt.Fprintln(&buf, reStripFileLinePrefix.ReplaceAllString(string(l.Message), ``))
+					fmt.Fprintln(&buf, msg)
 				}
 				if buf.Len() == 0 {
 					fmt.Fprintln(&buf, "ok")

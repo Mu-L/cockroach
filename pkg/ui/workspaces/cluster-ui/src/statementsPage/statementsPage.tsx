@@ -1,27 +1,61 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { InlineAlert } from "@cockroachlabs/ui-components";
+import classNames from "classnames/bind";
+import flatMap from "lodash/flatMap";
+import groupBy from "lodash/groupBy";
+import isString from "lodash/isString";
+import merge from "lodash/merge";
+import moment from "moment-timezone";
 import React from "react";
 import { RouteComponentProps } from "react-router-dom";
-import { flatMap, merge, groupBy } from "lodash";
-import classNames from "classnames/bind";
-import { getValidErrorsList, Loading } from "src/loading";
+
+import {
+  SqlStatsSortType,
+  StatementsRequest,
+  createCombinedStmtsRequest,
+  SqlStatsSortOptions,
+} from "src/api/statementsApi";
+import { RequestState } from "src/api/types";
+import { isSelectedColumn } from "src/columnsSelector/utils";
 import { Delayed } from "src/delayed";
+import { getValidErrorsList, Loading } from "src/loading";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
+import { Pagination, ResultsPerPageLabel } from "src/pagination";
+import { Search } from "src/search";
+import { SearchCriteria } from "src/searchCriteria/searchCriteria";
 import {
   handleSortSettingFromQueryString,
   SortSetting,
   updateSortSettingQueryParamsOnTab,
 } from "src/sortedtable";
-import { Search } from "src/search";
-import { Pagination, ResultsPerPageLabel } from "src/pagination";
+import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
+import {
+  ActivateDiagnosticsModalRef,
+  ActivateStatementDiagnosticsModal,
+} from "src/statementsDiagnostics";
+import { TimeScaleLabel } from "src/timeScaleDropdown/timeScaleLabel";
+import { Timestamp, TimestampToMoment, syncHistory, unique } from "src/util";
+import {
+  STATS_LONG_LOADING_DURATION,
+  getSortLabel,
+  getSortColumn,
+  getSubsetWarning,
+  getReqSortColumn,
+} from "src/util/sqlActivityConstants";
+
+import {
+  InsertStmtDiagnosticRequest,
+  StatementDiagnosticsReport,
+  SqlStatsResponse,
+  StatementDiagnosticsResponse,
+} from "../api";
+import ColumnsSelector from "../columnsSelector/columnsSelector";
+import { commonStyles } from "../common";
+import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
 import {
   calculateActiveFilters,
   defaultFilters,
@@ -31,8 +65,14 @@ import {
   SelectedFilters,
   updateFiltersQueryParamsOnTab,
 } from "../queryFilter";
-
-import { syncHistory, unique } from "src/util";
+import { ISortedTablePagination } from "../sortedtable";
+import ClearStats from "../sqlActivity/clearStats";
+import LoadingError from "../sqlActivity/errorComponent";
+import {
+  filterStatementsData,
+  convertRawStmtsToAggregateStatisticsMemoized,
+  getAppsFromStmtsResponseMemoized,
+} from "../sqlActivity/util";
 import {
   AggregateStatistics,
   makeStatementsColumns,
@@ -43,59 +83,18 @@ import {
   getLabel,
   StatisticTableColumnKeys,
 } from "../statsTableUtil/statsTableUtil";
-import {
-  ActivateDiagnosticsModalRef,
-  ActivateStatementDiagnosticsModal,
-} from "src/statementsDiagnostics";
-import { ISortedTablePagination } from "../sortedtable";
-import styles from "./statementsPage.module.scss";
-import { EmptyStatementsPlaceholder } from "./emptyStatementsPlaceholder";
-import { InlineAlert } from "@cockroachlabs/ui-components";
-import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
-import ColumnsSelector from "../columnsSelector/columnsSelector";
-import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
 import { UIConfigState } from "../store";
-import {
-  SqlStatsSortType,
-  StatementsRequest,
-  createCombinedStmtsRequest,
-  SqlStatsSortOptions,
-} from "src/api/statementsApi";
-import ClearStats from "../sqlActivity/clearStats";
-import LoadingError from "../sqlActivity/errorComponent";
 import {
   getValidOption,
   TimeScale,
   timeScale1hMinOptions,
   toRoundedDateRange,
 } from "../timeScaleDropdown";
-
-import { commonStyles } from "../common";
-import { isSelectedColumn } from "src/columnsSelector/utils";
-import { StatementViewType } from "./statementPageTypes";
-import moment from "moment-timezone";
-import {
-  InsertStmtDiagnosticRequest,
-  StatementDiagnosticsReport,
-  SqlStatsResponse,
-  StatementDiagnosticsResponse,
-} from "../api";
-import {
-  filterStatementsData,
-  convertRawStmtsToAggregateStatisticsMemoized,
-  getAppsFromStmtsResponseMemoized,
-} from "../sqlActivity/util";
-import {
-  STATS_LONG_LOADING_DURATION,
-  getSortLabel,
-  getSortColumn,
-  getSubsetWarning,
-  getReqSortColumn,
-} from "src/util/sqlActivityConstants";
-import { SearchCriteria } from "src/searchCriteria/searchCriteria";
 import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
-import { RequestState } from "src/api/types";
-import { FormattedTimescale } from "../timeScaleDropdown/formattedTimeScale";
+
+import { EmptyStatementsPlaceholder } from "./emptyStatementsPlaceholder";
+import { StatementViewType } from "./statementPageTypes";
+import styles from "./statementsPage.module.scss";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
@@ -154,6 +153,7 @@ export interface StatementsPageStateProps {
   stmtsTotalRuntimeSecs: number;
   statementDiagnostics: StatementDiagnosticsResponse | null;
   requestTime: moment.Moment;
+  oldestDataAvailable: Timestamp;
 }
 
 export interface StatementsPageState {
@@ -220,7 +220,7 @@ export class StatementsPage extends React.Component<
 
     // Search query.
     const searchQuery = searchParams.get("q") || undefined;
-    if (onSearchComplete && searchQuery && search != searchQuery) {
+    if (onSearchComplete && searchQuery && search !== searchQuery) {
       onSearchComplete(searchQuery);
     }
 
@@ -260,7 +260,7 @@ export class StatementsPage extends React.Component<
 
   isSortSettingSameAsReqSort = (): boolean => {
     return (
-      getSortColumn(this.props.reqSortSetting) ==
+      getSortColumn(this.props.reqSortSetting) ===
       this.props.sortSetting.columnTitle
     );
   };
@@ -354,9 +354,9 @@ export class StatementsPage extends React.Component<
     this.props.refreshUserSQLRoles();
     if (!this.props.isTenant) {
       this.props.refreshNodes();
-      if (!this.props.hasViewActivityRedactedRole) {
-        this.props.refreshStatementDiagnosticsRequests();
-      }
+    }
+    if (!this.props.hasViewActivityRedactedRole) {
+      this.props.refreshStatementDiagnosticsRequests();
     }
   }
 
@@ -368,7 +368,7 @@ export class StatementsPage extends React.Component<
     const searchParams = new URLSearchParams(history.location.search);
     const currentTab = searchParams.get("tab") || "";
     const searchQueryString = searchParams.get("q") || "";
-    if (currentTab === tab && search && search != searchQueryString) {
+    if (currentTab === tab && search && search !== searchQueryString) {
       syncHistory(
         {
           q: search,
@@ -396,9 +396,9 @@ export class StatementsPage extends React.Component<
     this.updateQueryParams();
     if (!this.props.isTenant) {
       this.props.refreshNodes();
-      if (!this.props.hasViewActivityRedactedRole) {
-        this.props.refreshStatementDiagnosticsRequests();
-      }
+    }
+    if (!this.props.hasViewActivityRedactedRole) {
+      this.props.refreshStatementDiagnosticsRequests();
     }
   };
 
@@ -504,8 +504,9 @@ export class StatementsPage extends React.Component<
 
   hasReqSortOption = (): boolean => {
     let found = false;
-    Object.values(SqlStatsSortOptions).forEach((option: SqlStatsSortType) => {
-      if (getSortColumn(option) == this.props.sortSetting.columnTitle) {
+    Object.values(SqlStatsSortOptions).forEach(option => {
+      const optionString = isString(option) ? option : getSortColumn(option);
+      if (optionString === this.props.sortSetting.columnTitle) {
         found = true;
       }
     });
@@ -551,7 +552,7 @@ export class StatementsPage extends React.Component<
 
     // Creates a list of all possible columns,
     // hiding nodeRegions if is not multi-region and
-    // hiding columns that won't be displayed for tenants.
+    // hiding columns that won't be displayed for virtual clusters.
     const columns = makeStatementsColumns(
       statements,
       filters.app?.split(","),
@@ -586,12 +587,6 @@ export class StatementsPage extends React.Component<
       isSelectedColumn(userSelectedColumnsToShow, c),
     );
 
-    const period = (
-      <FormattedTimescale
-        ts={this.props.timeScale}
-        requestTime={moment(this.props.requestTime)}
-      />
-    );
     const sortSettingLabel = getSortLabel(
       this.props.reqSortSetting,
       "Statement",
@@ -599,7 +594,7 @@ export class StatementsPage extends React.Component<
     const showSortWarning =
       !this.isSortSettingSameAsReqSort() &&
       this.hasReqSortOption() &&
-      data.length == this.props.limit;
+      data.length === this.props.limit;
 
     return (
       <>
@@ -641,8 +636,14 @@ export class StatementsPage extends React.Component<
           <PageConfig className={cx("float-right")}>
             <PageConfigItem>
               <p className={timeScaleStylesCx("time-label")}>
-                Showing aggregated stats from{" "}
-                <span className={timeScaleStylesCx("bold")}>{period}</span>
+                <TimeScaleLabel
+                  timeScale={this.props.timeScale}
+                  requestTime={moment(this.props.requestTime)}
+                  oldestDataTime={
+                    this.props.oldestDataAvailable &&
+                    TimestampToMoment(this.props.oldestDataAvailable)
+                  }
+                />
                 {", "}
                 <ResultsPerPageLabel
                   pagination={{ ...pagination, total: data.length }}
@@ -762,6 +763,10 @@ export class StatementsPage extends React.Component<
               LoadingError({
                 statsType: "statements",
                 error: this.props.statementsResponse?.error,
+                sourceTables: this.props.statementsResponse?.data
+                  ?.stmts_source_table && [
+                  this.props.statementsResponse?.data?.stmts_source_table,
+                ],
               })
             }
           />

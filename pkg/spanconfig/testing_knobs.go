@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfig
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 )
@@ -53,7 +49,7 @@ type TestingKnobs struct {
 
 	// JobPersistCheckpointInterceptor, if set, is invoked before the
 	// reconciliation job persists checkpoints.
-	JobOnCheckpointInterceptor func() error
+	JobOnCheckpointInterceptor func(lastCheckpoint hlc.Timestamp) error
 
 	// KVSubscriberRangeFeedKnobs control lifecycle events for the rangefeed
 	// underlying the KVSubscriber.
@@ -61,7 +57,7 @@ type TestingKnobs struct {
 
 	// StoreKVSubscriberOverride is used to override the KVSubscriber used when
 	// setting up a new store.
-	StoreKVSubscriberOverride KVSubscriber
+	StoreKVSubscriberOverride func(KVSubscriber) KVSubscriber
 
 	// KVAccessorPaginationInterceptor, if set, is invoked on every pagination
 	// event.
@@ -127,9 +123,9 @@ type TestingKnobs struct {
 	// coalescing system database ranges for the host tenant.
 	StoreIgnoreCoalesceAdjacentExceptions bool
 
-	// StoreInternConfigsInDryRuns, if set, will intern span configs even when
-	// applying mutations in dry run mode.
-	StoreInternConfigsInDryRuns bool
+	// OverrideFallbackConf, if set, allows tests to override fields in the
+	// fallback config that will be applied to the span.
+	OverrideFallbackConf func(roachpb.SpanConfig) roachpb.SpanConfig
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

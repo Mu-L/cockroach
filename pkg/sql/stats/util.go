@@ -1,17 +1,16 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
 import (
+	"math/rand"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
@@ -31,3 +30,11 @@ func MakeSortedColStatKey(cols []descpb.ColumnID) string {
 	})
 	return colSet.String()
 }
+
+// These two are used only by tests and are defined to prevent an import cycle.
+var (
+	// RandType is randgen.RandType.
+	RandType func(rng *rand.Rand) *types.T
+	// RandDatum is randgen.RandDatum.
+	RandDatum func(rng *rand.Rand, typ *types.T, nullOk bool) tree.Datum
+)

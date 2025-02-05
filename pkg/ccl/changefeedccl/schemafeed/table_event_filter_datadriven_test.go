@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemafeed_test
 
@@ -69,7 +66,7 @@ func TestDataDriven(t *testing.T) {
 		ts := srv.ApplicationLayer()
 
 		tdb := sqlutils.MakeSQLRunner(sqlDB)
-		ctx, cancel := ts.Stopper().WithCancelOnQuiesce(ctx)
+		ctx, cancel := ts.AppStopper().WithCancelOnQuiesce(ctx)
 		defer cancel()
 		schemaFeeds := map[int]schemafeed.SchemaFeed{}
 		parseTargets := func(t *testing.T, in string) (targets changefeedbase.Targets) {

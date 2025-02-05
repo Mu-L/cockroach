@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colinfo
 
@@ -55,6 +50,7 @@ func TestCanHaveCompositeKeyEncoding(t *testing.T) {
 		{types.Jsonb, true},
 		{types.Name, false},
 		{types.Oid, false},
+		{types.RefCursor, false},
 		{types.String, false},
 		{types.StringArray, false},
 		{types.Time, false},

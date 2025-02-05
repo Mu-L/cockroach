@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
@@ -45,6 +40,21 @@ var allWindowBuiltinNames stringSet
 // AllBuiltinNames that corresponds to window functions.
 func AllWindowBuiltinNames() []string {
 	return allWindowBuiltinNames.Ordered()
+}
+
+// GetBuiltinFunctionProperties returns the FunctionProperties common to all
+// overloads of the builtin function with the given name. It returns nil if no
+// such builtin function was found.
+//
+// Callers that need access to builtin function properties at init-time can use
+// this function to ensure the builtin function definitions have been
+// initialized first.
+func GetBuiltinFunctionProperties(name string) *tree.FunctionProperties {
+	def, ok := tree.FunDefs[name]
+	if !ok {
+		return nil
+	}
+	return &def.FunctionProperties
 }
 
 func init() {

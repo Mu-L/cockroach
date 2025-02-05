@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanset
 
@@ -14,13 +9,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/rangekey"
 )
@@ -83,12 +79,6 @@ func (i *MVCCIterator) Valid() (bool, error) {
 func (i *MVCCIterator) SeekGE(key storage.MVCCKey) {
 	i.i.SeekGE(key)
 	i.checkAllowed(roachpb.Span{Key: key.Key}, true)
-}
-
-// SeekIntentGE is part of the storage.MVCCIterator interface.
-func (i *MVCCIterator) SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID) {
-	i.i.SeekIntentGE(key, txnUUID)
-	i.checkAllowed(roachpb.Span{Key: key}, true)
 }
 
 // SeekLT is part of the storage.MVCCIterator interface.
@@ -401,14 +391,24 @@ func (i *EngineIterator) UnsafeEngineKey() (storage.EngineKey, error) {
 	return i.i.UnsafeEngineKey()
 }
 
+// EngineKey is part of the storage.EngineIterator interface.
+func (i *EngineIterator) EngineKey() (storage.EngineKey, error) {
+	return i.i.EngineKey()
+}
+
+// UnsafeRawEngineKey is part of the storage.EngineIterator interface.
+func (i *EngineIterator) UnsafeRawEngineKey() []byte {
+	return i.i.UnsafeRawEngineKey()
+}
+
 // UnsafeValue is part of the storage.EngineIterator interface.
 func (i *EngineIterator) UnsafeValue() ([]byte, error) {
 	return i.i.UnsafeValue()
 }
 
-// EngineKey is part of the storage.EngineIterator interface.
-func (i *EngineIterator) EngineKey() (storage.EngineKey, error) {
-	return i.i.EngineKey()
+// UnsafeLazyValue is part of the storage.EngineIterator interface.
+func (i *EngineIterator) UnsafeLazyValue() pebble.LazyValue {
+	return i.i.UnsafeLazyValue()
 }
 
 // Value is part of the storage.EngineIterator interface.
@@ -419,11 +419,6 @@ func (i *EngineIterator) Value() ([]byte, error) {
 // ValueLen is part of the storage.EngineIterator interface.
 func (i *EngineIterator) ValueLen() int {
 	return i.i.ValueLen()
-}
-
-// UnsafeRawEngineKey is part of the storage.EngineIterator interface.
-func (i *EngineIterator) UnsafeRawEngineKey() []byte {
-	return i.i.UnsafeRawEngineKey()
 }
 
 // CloneContext is part of the storage.EngineIterator interface.
@@ -450,11 +445,12 @@ func (s spanSetReader) ScanInternal(
 	ctx context.Context,
 	lower, upper roachpb.Key,
 	visitPointKey func(key *pebble.InternalKey, value pebble.LazyValue, info pebble.IteratorLevel) error,
-	visitRangeDel func(start []byte, end []byte, seqNum uint64) error,
+	visitRangeDel func(start []byte, end []byte, seqNum pebble.SeqNum) error,
 	visitRangeKey func(start []byte, end []byte, keys []rangekey.Key) error,
 	visitSharedFile func(sst *pebble.SharedSSTMeta) error,
+	visitExternalFile func(sst *pebble.ExternalFile) error,
 ) error {
-	return s.r.ScanInternal(ctx, lower, upper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile)
+	return s.r.ScanInternal(ctx, lower, upper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile, visitExternalFile)
 }
 
 func (s spanSetReader) Close() {
@@ -466,9 +462,11 @@ func (s spanSetReader) Closed() bool {
 }
 
 func (s spanSetReader) MVCCIterate(
+	ctx context.Context,
 	start, end roachpb.Key,
 	iterKind storage.MVCCIterKind,
 	keyTypes storage.IterKeyType,
+	readCategory fs.ReadCategory,
 	f func(storage.MVCCKeyValue, storage.MVCCRangeKeyStack) error,
 ) error {
 	if s.spansOnly {
@@ -480,13 +478,13 @@ func (s spanSetReader) MVCCIterate(
 			return err
 		}
 	}
-	return s.r.MVCCIterate(start, end, iterKind, keyTypes, f)
+	return s.r.MVCCIterate(ctx, start, end, iterKind, keyTypes, readCategory, f)
 }
 
 func (s spanSetReader) NewMVCCIterator(
-	iterKind storage.MVCCIterKind, opts storage.IterOptions,
+	ctx context.Context, iterKind storage.MVCCIterKind, opts storage.IterOptions,
 ) (storage.MVCCIterator, error) {
-	mvccIter, err := s.r.NewMVCCIterator(iterKind, opts)
+	mvccIter, err := s.r.NewMVCCIterator(ctx, iterKind, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -496,18 +494,10 @@ func (s spanSetReader) NewMVCCIterator(
 	return NewIteratorAt(mvccIter, s.spans, s.ts), nil
 }
 
-func (s spanSetReader) MustMVCCIterator(
-	iterKind storage.MVCCIterKind, opts storage.IterOptions,
-) storage.MVCCIterator {
-	iter, err := s.NewMVCCIterator(iterKind, opts)
-	if err != nil {
-		panic(err)
-	}
-	return iter
-}
-
-func (s spanSetReader) NewEngineIterator(opts storage.IterOptions) (storage.EngineIterator, error) {
-	engineIter, err := s.r.NewEngineIterator(opts)
+func (s spanSetReader) NewEngineIterator(
+	ctx context.Context, opts storage.IterOptions,
+) (storage.EngineIterator, error) {
+	engineIter, err := s.r.NewEngineIterator(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -519,22 +509,14 @@ func (s spanSetReader) NewEngineIterator(opts storage.IterOptions) (storage.Engi
 	}, nil
 }
 
-func (s spanSetReader) MustEngineIterator(opts storage.IterOptions) storage.EngineIterator {
-	iter, err := s.NewEngineIterator(opts)
-	if err != nil {
-		panic(err)
-	}
-	return iter
-}
-
 // ConsistentIterators implements the storage.Reader interface.
 func (s spanSetReader) ConsistentIterators() bool {
 	return s.r.ConsistentIterators()
 }
 
 // PinEngineStateForIterators implements the storage.Reader interface.
-func (s spanSetReader) PinEngineStateForIterators() error {
-	return s.r.PinEngineStateForIterators()
+func (s spanSetReader) PinEngineStateForIterators(readCategory fs.ReadCategory) error {
+	return s.r.PinEngineStateForIterators(readCategory)
 }
 
 type spanSetWriter struct {
@@ -764,6 +746,14 @@ func makeSpanSetReadWriterAt(rw storage.ReadWriter, spans *SpanSet, ts hlc.Times
 	}
 }
 
+// NewReader returns a storage.Reader that asserts access of the underlying
+// Reader against the given SpanSet at a given timestamp. If zero timestamp is
+// provided, accesses are considered non-MVCC.
+func NewReader(r storage.Reader, spans *SpanSet, ts hlc.Timestamp) storage.Reader {
+	spans = addLockTableSpans(spans)
+	return spanSetReader{r: r, spans: spans, ts: ts}
+}
+
 // NewReadWriterAt returns a storage.ReadWriter that asserts access of the
 // underlying ReadWriter against the given SpanSet at a given timestamp.
 // If zero timestamp is provided, accesses are considered non-MVCC.
@@ -782,13 +772,20 @@ type spanSetBatch struct {
 
 var _ storage.Batch = spanSetBatch{}
 
+func (s spanSetBatch) NewBatchOnlyMVCCIterator(
+	ctx context.Context, opts storage.IterOptions,
+) (storage.MVCCIterator, error) {
+	panic("unimplemented")
+}
+
 func (s spanSetBatch) ScanInternal(
 	ctx context.Context,
 	lower, upper roachpb.Key,
 	visitPointKey func(key *pebble.InternalKey, value pebble.LazyValue, info pebble.IteratorLevel) error,
-	visitRangeDel func(start []byte, end []byte, seqNum uint64) error,
+	visitRangeDel func(start []byte, end []byte, seqNum pebble.SeqNum) error,
 	visitRangeKey func(start []byte, end []byte, keys []rangekey.Key) error,
 	visitSharedFile func(sst *pebble.SharedSSTMeta) error,
+	visitExternalFile func(sst *pebble.ExternalFile) error,
 ) error {
 	// Only used on Engine.
 	panic("unimplemented")
@@ -911,7 +908,45 @@ func addLockTableSpans(spans *SpanSet) *SpanSet {
 		if span.EndKey != nil {
 			ltEndKey, _ = keys.LockTableSingleKey(span.EndKey, nil)
 		}
+		if sa == SpanReadOnly && span.Timestamp == hlc.MaxTimestamp {
+			// Shared lock acquisition uses a read-only latch access with
+			// the maximum timestamp. This gives it sufficient isolation to
+			// write to the lock table without having to declare a write
+			// latch and be serialized with other shared lock acquisitions.
+			// For details, see DefaultDeclareIsolatedKeys.
+			//
+			// For the sake of this function, we consider this to be strong
+			// enough to declare write access to the lock table. This could
+			// be made cleaner if latch spans operated on locking strengths
+			// instead of read/write access.
+			sa = SpanReadWrite
+		}
 		withLocks.AddNonMVCC(sa, roachpb.Span{Key: ltKey, EndKey: ltEndKey})
 	})
 	return withLocks
+}
+
+type spanSetEFOS struct {
+	spanSetReader
+	efos storage.EventuallyFileOnlyReader
+}
+
+// NewEventuallyFileOnlySnapshot returns a storage.EventuallyFileOnlyReader that
+// asserts access of the underlying EFOS against the given SpanSet. We only
+// consider span boundaries, associated timestamps are not considered.
+func NewEventuallyFileOnlySnapshot(
+	e storage.EventuallyFileOnlyReader, spans *SpanSet,
+) storage.EventuallyFileOnlyReader {
+	spans = addLockTableSpans(spans)
+	return &spanSetEFOS{
+		spanSetReader: spanSetReader{r: e, spans: spans, spansOnly: true},
+		efos:          e,
+	}
+}
+
+// WaitForFileOnly implements the storage.EventuallyFileOnlyReader interface.
+func (e *spanSetEFOS) WaitForFileOnly(
+	ctx context.Context, gracePeriodBeforeFlush time.Duration,
+) error {
+	return e.efos.WaitForFileOnly(ctx, gracePeriodBeforeFlush)
 }

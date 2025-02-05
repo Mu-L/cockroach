@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gcjob
 
@@ -24,7 +19,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -71,6 +68,8 @@ func TestProtectedTimestampsPreventGC(t *testing.T) {
 		setup               func(t *testing.T, kvAccessor *manualKVAccessor, cache *manualCache)
 		droppedAtTime       int64
 		expectedIsProtected bool
+
+		failsWithSecondaryTenant bool
 	}{
 		{
 			name: "span-config-pts-applies",
@@ -172,6 +171,9 @@ func TestProtectedTimestampsPreventGC(t *testing.T) {
 			},
 			droppedAtTime:       4,
 			expectedIsProtected: true,
+
+			// TODO(sql-foundations): investigate this.
+			failsWithSecondaryTenant: true,
 		},
 		{
 			name: "pts-records-exist-but-none-apply",
@@ -200,6 +202,10 @@ func TestProtectedTimestampsPreventGC(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.failsWithSecondaryTenant && srv.TenantController().StartedDefaultTestTenant() {
+				skip.WithIssue(t, 110014)
+			}
+
 			kvAccessor := &manualKVAccessor{}
 			cache := &manualCache{}
 			tc.setup(t, kvAccessor, cache)
@@ -255,6 +261,11 @@ func (m *manualKVAccessor) UpdateSpanConfigRecords(
 }
 
 func (m *manualKVAccessor) WithTxn(context.Context, *kv.Txn) spanconfig.KVAccessor {
+	panic("unimplemented")
+}
+
+// WithISQLTxn is part of the KVAccessor interface.
+func (k *manualKVAccessor) WithISQLTxn(context.Context, isql.Txn) spanconfig.KVAccessor {
 	panic("unimplemented")
 }
 

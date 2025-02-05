@@ -38,6 +38,11 @@ wire_prepare s5
 SELECT a, b FROM t2 AS OF SYSTEM TIME '-2us'
 ----
 
+# Regression test for transferring statements with AOST and placeholders.
+wire_prepare s6
+SELECT a, b FROM t2 AS OF SYSTEM TIME '-2us' WHERE b > $1
+----
+
 wire_prepare s_empty
 ;
 ----
@@ -116,6 +121,10 @@ wire_query s5
 ----
 1 cat
 
+wire_query s6 0
+----
+1 cat
+
 reset
 ----
 
@@ -135,7 +144,7 @@ DEALLOCATE ALL
 ----
 
 exec
-SET prepared_statements_cache_size = '10 KiB'
+SET prepared_statements_cache_size = '12 KiB'
 ----
 
 wire_prepare pscs1

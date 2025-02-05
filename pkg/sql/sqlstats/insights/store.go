@@ -1,37 +1,38 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package insights
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
-type lockingStore struct {
+type LockingStore struct {
+	// stmtCount keeps track of the number of statement insights
+	// that have been observed in the underlying cache.
+	stmtCount atomic.Int64
+
 	mu struct {
 		syncutil.RWMutex
 		insights *cache.UnorderedCache
 	}
 }
 
-func (s *lockingStore) AddInsight(insight *Insight) {
+func (s *LockingStore) addInsight(insight *Insight) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stmtCount.Add(int64(len(insight.Statements)))
 	s.mu.insights.Add(insight.Transaction.ID, insight)
 }
 
-func (s *lockingStore) IterateInsights(
+func (s *LockingStore) IterateInsights(
 	ctx context.Context, visitor func(context.Context, *Insight),
 ) {
 	s.mu.RLock()
@@ -41,21 +42,20 @@ func (s *lockingStore) IterateInsights(
 	})
 }
 
-var _ Reader = &lockingStore{}
-var _ sink = &lockingStore{}
-
-func newStore(st *cluster.Settings) *lockingStore {
+func newStore(st *cluster.Settings) *LockingStore {
+	s := &LockingStore{}
 	config := cache.Config{
 		Policy: cache.CacheFIFO,
 		ShouldEvict: func(size int, key, value interface{}) bool {
-			return int64(size) > ExecutionInsightsCapacity.Get(&st.SV)
+			return s.stmtCount.Load() > ExecutionInsightsCapacity.Get(&st.SV)
 		},
 		OnEvicted: func(_, value interface{}) {
-			releaseInsight(value.(*Insight))
+			i := value.(*Insight)
+			s.stmtCount.Add(-int64(len(i.Statements)))
+			releaseInsight(i)
 		},
 	}
 
-	s := &lockingStore{}
 	s.mu.insights = cache.NewUnorderedCache(config)
 	return s
 }

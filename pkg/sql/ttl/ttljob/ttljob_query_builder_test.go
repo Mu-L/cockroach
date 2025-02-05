@@ -1,18 +1,14 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ttljob_test
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,9 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttljob"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -292,13 +291,12 @@ func TestSelectQueryBuilder(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			ctx := context.Background()
-			testCluster := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-			defer testCluster.Stopper().Stop(ctx)
+			srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+			defer srv.Stopper().Stop(ctx)
 
-			testServer := testCluster.Server(0)
-			ie := testServer.InternalExecutor().(*sql.InternalExecutor)
+			ie := srv.ApplicationLayer().InternalExecutor().(*sql.InternalExecutor)
 
-			// Generate pkColNames.
+			// Generate PKColNames.
 			pkColDirs := tc.pkColDirs
 			numPKCols := len(pkColDirs)
 			pkColNames := ttlbase.GenPKColNames(numPKCols)
@@ -333,14 +331,22 @@ func TestSelectQueryBuilder(t *testing.T) {
 
 			// Setup SelectQueryBuilder.
 			queryBuilder := ttljob.MakeSelectQueryBuilder(
+				ttljob.SelectQueryParams{
+					RelationName:    relationName,
+					PKColNames:      pkColNames,
+					PKColDirs:       pkColDirs,
+					Bounds:          tc.bounds,
+					AOSTDuration:    0,
+					SelectBatchSize: 2,
+					TTLExpr:         ttlColName,
+					SelectDuration:  testHistogram(),
+					SelectRateLimiter: quotapool.NewRateLimiter(
+						"",
+						quotapool.Inf(),
+						math.MaxInt64,
+					),
+				},
 				cutoff,
-				pkColNames,
-				pkColDirs,
-				relationName,
-				tc.bounds,
-				0,
-				2,
-				ttlColName,
 			)
 
 			// Verify queryBuilder iterations.
@@ -410,15 +416,14 @@ func TestDeleteQueryBuilder(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			ctx := context.Background()
+			srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+			defer srv.Stopper().Stop(ctx)
+			s := srv.ApplicationLayer()
 
-			testCluster := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-			defer testCluster.Stopper().Stop(ctx)
+			ie := s.InternalExecutor().(*sql.InternalExecutor)
+			db := s.InternalDB().(*sql.InternalDB)
 
-			testServer := testCluster.Server(0)
-			ie := testServer.InternalExecutor().(*sql.InternalExecutor)
-			db := testServer.InternalDB().(*sql.InternalDB)
-
-			// Generate pkColNames.
+			// Generate PKColNames.
 			numPKCols := tc.numPKCols
 			pkColNames := ttlbase.GenPKColNames(numPKCols)
 
@@ -446,11 +451,19 @@ func TestDeleteQueryBuilder(t *testing.T) {
 
 			// Setup DeleteQueryBuilder.
 			queryBuilder := ttljob.MakeDeleteQueryBuilder(
+				ttljob.DeleteQueryParams{
+					RelationName:    relationName,
+					PKColNames:      pkColNames,
+					DeleteBatchSize: 2,
+					TTLExpr:         ttlColName,
+					DeleteDuration:  testHistogram(),
+					DeleteRateLimiter: quotapool.NewRateLimiter(
+						"",
+						quotapool.Inf(),
+						math.MaxInt64,
+					),
+				},
 				cutoff,
-				pkColNames,
-				relationName,
-				2, /* deleteBatchSize */
-				ttlColName,
 			)
 
 			// Verify rows are deleted.
@@ -469,4 +482,10 @@ func TestDeleteQueryBuilder(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func testHistogram() *aggmetric.Histogram {
+	return aggmetric.MakeBuilder().Histogram(metric.HistogramOptions{
+		SigFigs: 1,
+	}).AddChild()
 }

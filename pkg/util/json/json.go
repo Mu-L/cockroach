@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package json
 
@@ -24,16 +19,14 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/apd/v3"
-	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/keysbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/deduplicate"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
-	uniq "github.com/cockroachdb/cockroach/pkg/util/unique"
 	"github.com/cockroachdb/errors"
 )
 
@@ -74,8 +67,8 @@ func (t Type) String() string {
 const (
 	wordSize          = unsafe.Sizeof(big.Word(0))
 	decimalSize       = unsafe.Sizeof(apd.Decimal{})
-	stringHeaderSize  = unsafe.Sizeof(reflect.StringHeader{})
-	sliceHeaderSize   = unsafe.Sizeof(reflect.SliceHeader{})
+	stringHeaderSize  = unsafe.Sizeof(reflect.StringHeader{}) //lint:ignore SA1019 deprecated, but no clear replacement
+	sliceHeaderSize   = unsafe.Sizeof(reflect.SliceHeader{})  //lint:ignore SA1019 deprecated, but no clear replacement
 	keyValuePairSize  = unsafe.Sizeof(jsonKeyValuePair{})
 	jsonInterfaceSize = unsafe.Sizeof((JSON)(nil))
 )
@@ -191,11 +184,6 @@ type JSON interface {
 	// AsArray returns the JSON document as an Array if it is a array type,
 	// and a boolean indicating if this JSON value is a array type.
 	AsArray() ([]JSON, bool)
-
-	// AreKeysSorted returns if the keys in a JSON Object are sorted by
-	// increasing order. It returns false if the underlying JSON value
-	// is not a JSON object.
-	AreKeysSorted() bool
 
 	// Exists implements the `?` operator: does the string exist as a top-level
 	// key within the JSON value?
@@ -784,6 +772,7 @@ const hexAlphabet = "0123456789abcdef"
 // encodeJSONString writes a string literal to buf as a JSON string.
 // Cribbed from https://github.com/golang/go/blob/7badae85f20f1bce4cc344f9202447618d45d414/src/encoding/json/encode.go.
 func encodeJSONString(buf *bytes.Buffer, s string) {
+	buf.Grow(len(s) + 2)
 	buf.WriteByte('"')
 	start := 0
 	for i := 0; i < len(s); {
@@ -927,38 +916,6 @@ func (j jsonNumber) AsArray() ([]JSON, bool) {
 	return nil, false
 }
 
-func (j jsonNull) AreKeysSorted() bool {
-	return false
-}
-
-func (j jsonString) AreKeysSorted() bool {
-	return false
-}
-
-func (j jsonFalse) AreKeysSorted() bool {
-	return false
-}
-
-func (j jsonTrue) AreKeysSorted() bool {
-	return false
-}
-
-func (j jsonNumber) AreKeysSorted() bool {
-	return false
-}
-
-func (j jsonArray) AreKeysSorted() bool {
-	return false
-}
-
-func (j jsonObject) AreKeysSorted() bool {
-	keys := make([]string, 0, j.Len())
-	for _, a := range j {
-		keys = append(keys, a.k.String())
-	}
-	return sort.StringsAreSorted(keys)
-}
-
 // parseJSONGoStd parses json using encoding/json library.
 // TODO(yevgeniy): Remove this code once we get more confidence in lexer implementation.
 func parseJSONGoStd(s string, _ parseConfig) (JSON, error) {
@@ -1008,6 +965,19 @@ func ParseJSON(s string, opts ...ParseOption) (JSON, error) {
 		o.apply(&cfg)
 	}
 	return cfg.parseJSON(s)
+}
+
+func init() {
+	encoding.PrettyPrintJSONValueEncoded = func(b []byte) (string, error) {
+		rem, j, err := DecodeJSON(b)
+		if err != nil {
+			return "", err
+		}
+		if len(rem) != 0 {
+			return "", errors.Newf("unexpected remainder after decoding JSON: %v", rem)
+		}
+		return j.String(), nil
+	}
 }
 
 // EncodeInvertedIndexKeys takes in a key prefix and returns a slice of inverted index keys,
@@ -1229,7 +1199,7 @@ func (j jsonArray) encodeInvertedIndexKeys(b []byte) ([][]byte, error) {
 	// to emit duplicate keys from this method, as it's more expensive to
 	// deduplicate keys via KV (which will actually write the keys) than to do
 	// it now (just an in-memory sort and distinct).
-	outKeys = uniq.UniquifyByteSlices(outKeys)
+	outKeys = deduplicate.ByteSlices(outKeys)
 	return outKeys, nil
 }
 
@@ -1804,15 +1774,6 @@ func (j jsonObject) allPaths() ([]JSON, error) {
 	return ret, nil
 }
 
-// FromSpatialObject transforms a SpatialObject into the json.JSON type.
-func FromSpatialObject(so geopb.SpatialObject, numDecimalDigits int) (JSON, error) {
-	j, err := geo.SpatialObjectToGeoJSON(so, numDecimalDigits, geo.SpatialObjectToGeoJSONFlagZero)
-	if err != nil {
-		return nil, err
-	}
-	return ParseJSON(string(j))
-}
-
 // FromDecimal returns a JSON value given a apd.Decimal.
 func FromDecimal(v apd.Decimal) JSON {
 	return jsonNumber(v)
@@ -2033,7 +1994,11 @@ func (j jsonObject) EncodeForwardIndex(buf []byte, dir encoding.Direction) ([]by
 	buf = encoding.EncodeJSONValueLength(buf, dir, int64(len(j)))
 
 	if buildutil.CrdbTestBuild {
-		if ordered := j.AreKeysSorted(); !ordered {
+		keys := make([]string, 0, j.Len())
+		for _, a := range j {
+			keys = append(keys, string(a.k))
+		}
+		if !sort.StringsAreSorted(keys) {
 			return nil, errors.AssertionFailedf("unexpectedly unordered keys in jsonObject %s", j)
 		}
 	}

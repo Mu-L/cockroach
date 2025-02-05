@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package intentresolver
 
@@ -27,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -52,8 +48,9 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 	defer stopper.Stop(ctx)
 	clock := hlc.NewClockForTesting(nil)
 	cfg := Config{
-		Stopper: stopper,
-		Clock:   clock,
+		Stopper:  stopper,
+		Clock:    clock,
+		Settings: cluster.MakeTestingClusterSettings(),
 	}
 	type testCase struct {
 		txn *roachpb.Transaction
@@ -74,8 +71,8 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 	txn0 := newTransaction("txn0", key, 1, clock)
 	// Txn1 is in the pending state but is expired.
 	txn1 := newTransaction("txn1", key, 1, clock)
-	txn1.ReadTimestamp.WallTime -= int64(100 * time.Second)
-	txn1.LastHeartbeat = txn1.ReadTimestamp
+	txn1.MinTimestamp.WallTime -= int64(100 * time.Second)
+	txn1.LastHeartbeat = txn1.MinTimestamp
 	// Txn2 is in the staging state and is not old enough to have expired so the
 	// code ought to send nothing.
 	txn2 := newTransaction("txn2", key, 1, clock)
@@ -83,8 +80,8 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 	// Txn3 is in the staging state but is expired.
 	txn3 := newTransaction("txn3", key, 1, clock)
 	txn3.Status = roachpb.STAGING
-	txn3.ReadTimestamp.WallTime -= int64(100 * time.Second)
-	txn3.LastHeartbeat = txn3.ReadTimestamp
+	txn3.MinTimestamp.WallTime -= int64(100 * time.Second)
+	txn3.LastHeartbeat = txn3.MinTimestamp
 	// Txn4 is in the committed state.
 	txn4 := newTransaction("txn4", key, 1, clock)
 	txn4.Status = roachpb.COMMITTED
@@ -229,7 +226,8 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 			}
 			txn := c.txn.Clone()
 			txn.LockSpans = append([]roachpb.Span{}, c.intentSpans...)
-			err := ir.CleanupTxnIntentsOnGCAsync(ctx, 1, txn, clock.Now(), onComplete)
+			err := ir.CleanupTxnIntentsOnGCAsync(
+				ctx, kvpb.AdmissionHeader{}, 1, txn, clock.Now(), onComplete)
 			if err != nil {
 				t.Fatalf("unexpected error sending async transaction")
 			}
@@ -255,8 +253,9 @@ func TestCleanupIntentsAsyncThrottled(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 	cfg := Config{
-		Stopper: stopper,
-		Clock:   clock,
+		Stopper:  stopper,
+		Clock:    clock,
+		Settings: cluster.MakeTestingClusterSettings(),
 	}
 	txn := newTransaction("txn", roachpb.Key("a"), 1, clock)
 	sf := newSendFuncs(t,
@@ -283,12 +282,14 @@ func TestCleanupIntentsAsyncThrottled(t *testing.T) {
 	}
 	// Running with allowSyncProcessing = false should result in an error and no
 	// requests being sent.
-	err := ir.CleanupIntentsAsync(context.Background(), testIntents, false)
+	err := ir.CleanupIntentsAsync(
+		context.Background(), kvpb.AdmissionHeader{}, testIntents, false)
 	assert.True(t, errors.Is(err, stop.ErrThrottled))
 	// Running with allowSyncProcessing = true should result in the synchronous
 	// processing of the intents resulting in no error and the consumption of the
 	// sendFuncs.
-	err = ir.CleanupIntentsAsync(context.Background(), testIntents, true)
+	err = ir.CleanupIntentsAsync(
+		context.Background(), kvpb.AdmissionHeader{}, testIntents, true)
 	assert.Nil(t, err)
 	assert.Equal(t, sf.len(), 0)
 }
@@ -303,6 +304,7 @@ func TestCleanupIntentsAsync(t *testing.T) {
 	}
 	clock := hlc.NewClockForTesting(nil)
 	txn := newTransaction("txn", roachpb.Key("a"), 1, clock)
+	st := cluster.MakeTestingClusterSettings()
 	testIntents := []roachpb.Intent{
 		roachpb.MakeIntent(&txn.TxnMeta, roachpb.Key("a")),
 	}
@@ -333,11 +335,13 @@ func TestCleanupIntentsAsync(t *testing.T) {
 			stopper := stop.NewStopper()
 			sf := newSendFuncs(t, c.sendFuncs...)
 			cfg := Config{
-				Stopper: stopper,
-				Clock:   clock,
+				Stopper:  stopper,
+				Clock:    clock,
+				Settings: st,
 			}
 			ir := newIntentResolverWithSendFuncs(cfg, sf, stopper)
-			err := ir.CleanupIntentsAsync(context.Background(), c.intents, true)
+			err := ir.CleanupIntentsAsync(
+				context.Background(), kvpb.AdmissionHeader{}, c.intents, true)
 			sf.drain(t)
 			stopper.Stop(context.Background())
 			assert.Nil(t, err, "error from CleanupIntentsAsync")
@@ -400,9 +404,10 @@ func TestCleanupMultipleIntentsAsync(t *testing.T) {
 		TestingKnobs: kvserverbase.IntentResolverTestingKnobs{
 			MaxIntentResolutionBatchSize: 1,
 		},
+		Settings: cluster.MakeTestingClusterSettings(),
 	}
 	ir := newIntentResolverWithSendFuncs(cfg, sf, stopper)
-	err := ir.CleanupIntentsAsync(ctx, testIntents, false)
+	err := ir.CleanupIntentsAsync(ctx, kvpb.AdmissionHeader{}, testIntents, false)
 	sf.drain(t)
 	stopper.Stop(ctx)
 	assert.Nil(t, err)
@@ -497,8 +502,9 @@ func TestCleanupTxnIntentsAsyncWithPartialRollback(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 	cfg := Config{
-		Stopper: stopper,
-		Clock:   clock,
+		Stopper:  stopper,
+		Clock:    clock,
+		Settings: cluster.MakeTestingClusterSettings(),
 	}
 	ir := newIntentResolverWithSendFuncs(cfg, sf, stopper)
 
@@ -571,8 +577,9 @@ func TestCleanupTxnIntentsAsync(t *testing.T) {
 			stopper := stop.NewStopper()
 			clock := hlc.NewClockForTesting(nil)
 			cfg := Config{
-				Stopper: stopper,
-				Clock:   clock,
+				Stopper:  stopper,
+				Clock:    clock,
+				Settings: cluster.MakeTestingClusterSettings(),
 			}
 			ir := newIntentResolverWithSendFuncs(cfg, c.sendFuncs, stopper)
 			if c.before != nil {
@@ -671,6 +678,7 @@ func TestCleanupMultipleTxnIntentsAsync(t *testing.T) {
 			MaxGCBatchSize:               1,
 			MaxIntentResolutionBatchSize: 1,
 		},
+		Settings: cluster.MakeTestingClusterSettings(),
 	}
 	ir := newIntentResolverWithSendFuncs(cfg, sf, stopper)
 	err := ir.CleanupTxnIntentsAsync(ctx, 1, testEndTxnIntents, false)
@@ -696,6 +704,7 @@ func TestCleanupIntents(t *testing.T) {
 	testIntents := []roachpb.Intent{
 		roachpb.MakeIntent(&txn.TxnMeta, roachpb.Key("a")),
 	}
+	st := cluster.MakeTestingClusterSettings()
 	type testCase struct {
 		intents     []roachpb.Intent
 		sendFuncs   *sendFuncs
@@ -751,8 +760,10 @@ func TestCleanupIntents(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			c.cfg.Stopper = stopper
 			c.cfg.Clock = clock
+			c.cfg.Settings = st
 			ir := newIntentResolverWithSendFuncs(c.cfg, c.sendFuncs, stopper)
-			num, err := ir.CleanupIntents(context.Background(), c.intents, clock.Now(), kvpb.PUSH_ABORT)
+			num, err := ir.CleanupIntents(
+				context.Background(), kvpb.AdmissionHeader{}, c.intents, clock.Now(), kvpb.PUSH_ABORT)
 			assert.Equal(t, num, c.expectedNum, "number of resolved intents")
 			assert.Equal(t, err != nil, c.expectedErr, "error during CleanupIntents: %v", err)
 		})
@@ -762,6 +773,14 @@ func TestCleanupIntents(t *testing.T) {
 // TestIntentResolutionTimeout tests that running intent resolution with an
 // unavailable range eventually times out and finishes, and does not block
 // intent resolution on another available range.
+//
+// TODO(sumeer): this test clogs up batched intent resolution via an inflight
+// backpressure limit, which by default in no longer limited. But an inflight
+// backpressure limit does exist for GC of txn records. This test should
+// continue to exist until we have production experience with no inflight
+// backpressure for intent resolution. And after that we should create an
+// equivalent test for inflight backpressure for GC of txn records and remove
+// this test.
 func TestIntentResolutionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -785,7 +804,7 @@ func TestIntentResolutionTimeout(t *testing.T) {
 	}()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
-	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */, base.DefaultMaxClockOffset)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */, base.DefaultMaxClockOffset, hlc.PanicLogger)
 	cfg := Config{
 		Stopper: stopper,
 		Clock:   clock,
@@ -793,13 +812,15 @@ func TestIntentResolutionTimeout(t *testing.T) {
 			InFlightBackpressureLimit:           1,
 			MaxIntentResolutionSendBatchTimeout: 1 * time.Second,
 		},
+		Settings: cluster.MakeTestingClusterSettings(),
 	}
 	ir := newIntentResolverWithSendFuncsConcurrentSend(cfg, sf, stopper, true)
 
 	// Intent resolution on unavailable range.
 	var cleanupIntentsErrFinished int32
 	go func() {
-		num, err := ir.CleanupIntents(context.Background(), makeTxnIntents(t, clock, 1), clock.Now(), kvpb.PUSH_ABORT)
+		num, err := ir.CleanupIntents(context.Background(), kvpb.AdmissionHeader{},
+			makeTxnIntents(t, clock, 1), clock.Now(), kvpb.PUSH_ABORT)
 		require.Error(t, err)
 		require.Equal(t, num, 0)
 		atomic.StoreInt32(&cleanupIntentsErrFinished, 1)
@@ -810,7 +831,8 @@ func TestIntentResolutionTimeout(t *testing.T) {
 	go func() {
 		// Ensure intent resolution occurs after that of the unavailable range.
 		<-c
-		num, err := ir.CleanupIntents(context.Background(), makeTxnIntents(t, clock, 1), clock.Now(), kvpb.PUSH_ABORT)
+		num, err := ir.CleanupIntents(context.Background(), kvpb.AdmissionHeader{},
+			makeTxnIntents(t, clock, 1), clock.Now(), kvpb.PUSH_ABORT)
 		require.NoError(t, err)
 		require.Equal(t, num, 1)
 		atomic.StoreInt32(&cleanupIntentsSuccessFinished, 1)
@@ -838,7 +860,8 @@ func newTransaction(
 		now = clock.Now()
 	}
 	txn := roachpb.MakeTransaction(
-		name, baseKey, isolation.Serializable, userPriority, now, offset, 1 /* coordinatorNodeID */)
+		name, baseKey, isolation.Serializable, userPriority, now, offset,
+		1 /* coordinatorNodeID */, 0, false /* omitInRangefeeds */)
 	return &txn
 }
 

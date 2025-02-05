@@ -1,21 +1,17 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package inverted
 
 import (
 	"bytes"
 	"fmt"
-	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keysbase"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -107,7 +103,7 @@ func MakeSingleValSpan(val EncVal) Span {
 
 // IsSingleVal returns true iff the span is equivalent to [val, val].
 func (s Span) IsSingleVal() bool {
-	return bytes.Equal(keysbase.PrefixEnd(s.Start), s.End)
+	return s.Start != nil && bytes.Equal(keysbase.PrefixEnd(s.Start), s.End)
 }
 
 // Equals returns true if this span has the same start and end as the given
@@ -158,16 +154,20 @@ func (is Spans) Format(tp treeprinter.Node, label string, redactable bool) {
 }
 
 func formatSpan(span Span, redactable bool) string {
-	end := span.End
 	spanEndOpenOrClosed := ')'
+	vals, _ := encoding.PrettyPrintValuesWithTypes(nil, span.Start)
+	start := strings.Join(vals, "/")
+	var end string
 	if span.IsSingleVal() {
-		end = span.Start
+		end = start
 		spanEndOpenOrClosed = ']'
+	} else {
+		vals, _ := encoding.PrettyPrintValuesWithTypes(nil, span.End)
+		end = strings.Join(vals, "/")
 	}
-	output := fmt.Sprintf("[%s, %s%c", strconv.Quote(string(span.Start)),
-		strconv.Quote(string(end)), spanEndOpenOrClosed)
+	output := fmt.Sprintf("[%s, %s%c", start, end, spanEndOpenOrClosed)
 	if redactable {
-		output = string(redact.Sprintf("%s", redact.Unsafe(output)))
+		output = string(redact.Sprintf("%s", encoding.Unsafe(output)))
 	}
 	return output
 }
@@ -309,7 +309,7 @@ type SpanExpression struct {
 	// produce duplicate primary keys. Otherwise, Unique is false. Unique may
 	// be true for certain JSON or Array SpanExpressions, and it holds when
 	// unique SpanExpressions are combined with And. It does not hold when
-	// these SpanExpressions are combined with Or.
+	// these non-empty SpanExpressions are combined with Or.
 	//
 	// Once a SpanExpression is built, this field is relevant if the root
 	// SpanExpression has no children (i.e., Operator is None). In this case,
@@ -685,14 +685,17 @@ func intersectSpanExpressions(left, right *SpanExpression) *SpanExpression {
 		left.FactoredUnionSpans = subtractSpans(left.FactoredUnionSpans, expr.FactoredUnionSpans)
 		right.FactoredUnionSpans = subtractSpans(right.FactoredUnionSpans, expr.FactoredUnionSpans)
 	}
-	tryPruneChildren(expr, SetIntersection)
+	tryPruneChildren(expr)
 	return expr
 }
 
 // Unions two SpanExpressions.
 func unionSpanExpressions(left, right *SpanExpression) *SpanExpression {
 	expr := &SpanExpression{
-		Tight:              left.Tight && right.Tight,
+		Tight: left.Tight && right.Tight,
+		// Whenever one side is empty, we keep the Unique property from the
+		// other side.
+		Unique:             (left.Unique && len(right.FactoredUnionSpans) == 0) || (right.Unique && len(left.FactoredUnionSpans) == 0),
 		SpansToRead:        unionSpans(left.SpansToRead, right.SpansToRead),
 		FactoredUnionSpans: unionSpans(left.FactoredUnionSpans, right.FactoredUnionSpans),
 		Operator:           SetUnion,
@@ -701,13 +704,13 @@ func unionSpanExpressions(left, right *SpanExpression) *SpanExpression {
 	}
 	left.FactoredUnionSpans = nil
 	right.FactoredUnionSpans = nil
-	tryPruneChildren(expr, SetUnion)
+	tryPruneChildren(expr)
 	return expr
 }
 
-// tryPruneChildren takes an expr with two child *SpanExpression and removes the empty
-// children.
-func tryPruneChildren(expr *SpanExpression, op SetOperator) {
+// tryPruneChildren takes an expr with two child *SpanExpression and removes
+// children when safe to do so.
+func tryPruneChildren(expr *SpanExpression) {
 	isEmptyExpr := func(e *SpanExpression) bool {
 		return len(e.FactoredUnionSpans) == 0 && e.Left == nil && e.Right == nil
 	}
@@ -717,41 +720,50 @@ func tryPruneChildren(expr *SpanExpression, op SetOperator) {
 	if isEmptyExpr(expr.Right.(*SpanExpression)) {
 		expr.Right = nil
 	}
-	// Promotes the left and right sub-expressions of child to the parent expr, when
-	// the other child is empty.
-	promoteChild := func(child *SpanExpression) {
-		// For SetUnion, the FactoredUnionSpans for the child is already nil
-		// since it has been unioned into expr. For SetIntersection, the
-		// FactoredUnionSpans for the child may be non-empty, but is being
-		// intersected with the other child that is empty, so can be discarded.
-		// Either way, we don't need to update expr.FactoredUnionSpans.
-		expr.Operator = child.Operator
-		expr.Left = child.Left
-		expr.Right = child.Right
+	if expr.Operator == SetUnion {
+		// Promotes the left and right sub-expressions of child to the parent
+		// expr, when the other child is empty.
+		promoteChild := func(child *SpanExpression) {
+			// For SetUnion, the FactoredUnionSpans for the child is already nil
+			// since it has been unioned into expr. Therefore, we don't need to
+			// update expr.FactoredUnionSpans.
+			expr.Operator = child.Operator
+			expr.Left = child.Left
+			expr.Right = child.Right
 
-		// If child.FactoredUnionSpans is non-empty, we need to recalculate
-		// SpansToRead since it may have contained some spans that were removed by
-		// discarding child.FactoredUnionSpans.
-		if child.FactoredUnionSpans != nil {
-			expr.SpansToRead = expr.FactoredUnionSpans
-			if expr.Left != nil {
-				expr.SpansToRead = unionSpans(expr.SpansToRead, expr.Left.(*SpanExpression).SpansToRead)
-			}
-			if expr.Right != nil {
-				expr.SpansToRead = unionSpans(expr.SpansToRead, expr.Right.(*SpanExpression).SpansToRead)
+			// If child.FactoredUnionSpans is non-empty, we need to recalculate
+			// SpansToRead since it may have contained some spans that were
+			// removed by discarding child.FactoredUnionSpans.
+			if child.FactoredUnionSpans != nil {
+				expr.SpansToRead = expr.FactoredUnionSpans
+				if expr.Left != nil {
+					expr.SpansToRead = unionSpans(expr.SpansToRead, expr.Left.(*SpanExpression).SpansToRead)
+				}
+				if expr.Right != nil {
+					expr.SpansToRead = unionSpans(expr.SpansToRead, expr.Right.(*SpanExpression).SpansToRead)
+				}
 			}
 		}
-	}
-	promoteLeft := expr.Left != nil && expr.Right == nil
-	promoteRight := expr.Left == nil && expr.Right != nil
-	if promoteLeft {
-		promoteChild(expr.Left.(*SpanExpression))
-	}
-	if promoteRight {
-		promoteChild(expr.Right.(*SpanExpression))
+		promoteLeft := expr.Left != nil && expr.Right == nil
+		promoteRight := expr.Left == nil && expr.Right != nil
+		if promoteLeft {
+			promoteChild(expr.Left.(*SpanExpression))
+		}
+		if promoteRight {
+			promoteChild(expr.Right.(*SpanExpression))
+		}
+	} else if expr.Operator == SetIntersection {
+		// The result of intersecting with the empty set is the empty set. In
+		// this case, we can discard the non-empty child.
+		if expr.Left == nil {
+			expr.Right = nil
+		} else if expr.Right == nil {
+			expr.Left = nil
+		}
 	}
 	if expr.Left == nil && expr.Right == nil {
 		expr.Operator = None
+		expr.SpansToRead = expr.FactoredUnionSpans
 	}
 }
 

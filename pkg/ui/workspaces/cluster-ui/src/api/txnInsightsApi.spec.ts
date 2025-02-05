@@ -1,45 +1,27 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import {
-  getTxnInsightsContentionDetailsApi,
-  TxnStmtFingerprintsResponseColumns,
-  FingerprintStmtsResponseColumns,
-} from "./txnInsightsApi";
-import * as sqlApi from "./sqlApi";
-import { SqlExecutionResponse } from "./sqlApi";
+import moment from "moment-timezone";
+
 import {
   InsightExecEnum,
   InsightNameEnum,
   TxnContentionInsightDetails,
 } from "../insights";
-import { ContentionResponseColumns } from "./contentionApi";
-import moment from "moment-timezone";
+import { MockSqlResponse } from "../util/testing";
 
-function mockSqlResponse<T>(rows: T[]): SqlExecutionResponse<T> {
-  return {
-    execution: {
-      retries: 0,
-      txn_results: [
-        {
-          tag: "",
-          start: "",
-          end: "",
-          rows_affected: 0,
-          statement: 1,
-          rows: [...rows],
-        },
-      ],
-    },
-  };
-}
+import {
+  ContentionResponseColumns,
+  getTxnInsightsContentionDetailsApi,
+} from "./contentionApi";
+import * as sqlApi from "./sqlApi";
+import { SqlExecutionResponse } from "./sqlApi";
+import {
+  TxnStmtFingerprintsResponseColumns,
+  FingerprintStmtsResponseColumns,
+} from "./txnInsightsApi";
 
 type TxnContentionDetailsTests = {
   name: string;
@@ -65,6 +47,7 @@ describe("test txn insights api functions", () => {
     blocking_txn_fingerprint_id: "4329ab5f4493f82d",
     waiting_txn_id: waitingTxnID,
     waiting_txn_fingerprint_id: "1831d909096f992c",
+    contention_type: "LOCK_WAIT",
   };
 
   afterEach(() => {
@@ -75,16 +58,16 @@ describe("test txn insights api functions", () => {
   test.each([
     {
       name: "all api responses empty",
-      contentionResp: mockSqlResponse([]),
-      txnFingerprintsResp: mockSqlResponse([]),
-      stmtsFingerprintsResp: mockSqlResponse([]),
+      contentionResp: MockSqlResponse([]),
+      txnFingerprintsResp: MockSqlResponse([]),
+      stmtsFingerprintsResp: MockSqlResponse([]),
       expected: null,
     },
     {
       name: "no fingerprints available",
-      contentionResp: mockSqlResponse([contentionDetailsMock]),
-      txnFingerprintsResp: mockSqlResponse([]),
-      stmtsFingerprintsResp: mockSqlResponse([]),
+      contentionResp: MockSqlResponse([contentionDetailsMock]),
+      txnFingerprintsResp: MockSqlResponse([]),
+      stmtsFingerprintsResp: MockSqlResponse([]),
       expected: {
         transactionExecutionID: contentionDetailsMock.waiting_txn_id,
         application: undefined,
@@ -109,16 +92,17 @@ describe("test txn insights api functions", () => {
             waitingTxnFingerprintID:
               contentionDetailsMock.waiting_txn_fingerprint_id,
             waitingTxnID: contentionDetailsMock.waiting_txn_id,
+            contentionType: "LOCK_WAIT",
           },
         ],
         execType: InsightExecEnum.TRANSACTION,
-        insightName: InsightNameEnum.highContention,
+        insightName: InsightNameEnum.HIGH_CONTENTION,
       },
     },
     {
       name: "no stmt fingerprints available",
-      contentionResp: mockSqlResponse([contentionDetailsMock]),
-      txnFingerprintsResp: mockSqlResponse<TxnStmtFingerprintsResponseColumns>([
+      contentionResp: MockSqlResponse([contentionDetailsMock]),
+      txnFingerprintsResp: MockSqlResponse<TxnStmtFingerprintsResponseColumns>([
         {
           transaction_fingerprint_id:
             contentionDetailsMock.blocking_txn_fingerprint_id,
@@ -126,7 +110,7 @@ describe("test txn insights api functions", () => {
           app_name: undefined,
         },
       ]),
-      stmtsFingerprintsResp: mockSqlResponse([]),
+      stmtsFingerprintsResp: MockSqlResponse([]),
       expected: {
         transactionExecutionID: contentionDetailsMock.waiting_txn_id,
         application: undefined,
@@ -155,16 +139,17 @@ describe("test txn insights api functions", () => {
             waitingTxnFingerprintID:
               contentionDetailsMock.waiting_txn_fingerprint_id,
             waitingTxnID: contentionDetailsMock.waiting_txn_id,
+            contentionType: "LOCK_WAIT",
           },
         ],
         execType: InsightExecEnum.TRANSACTION,
-        insightName: InsightNameEnum.highContention,
+        insightName: InsightNameEnum.HIGH_CONTENTION,
       },
     },
     {
       name: "all info available",
-      contentionResp: mockSqlResponse([contentionDetailsMock]),
-      txnFingerprintsResp: mockSqlResponse<TxnStmtFingerprintsResponseColumns>([
+      contentionResp: MockSqlResponse([contentionDetailsMock]),
+      txnFingerprintsResp: MockSqlResponse<TxnStmtFingerprintsResponseColumns>([
         {
           transaction_fingerprint_id:
             contentionDetailsMock.blocking_txn_fingerprint_id,
@@ -172,7 +157,7 @@ describe("test txn insights api functions", () => {
           app_name: undefined,
         },
       ]),
-      stmtsFingerprintsResp: mockSqlResponse<FingerprintStmtsResponseColumns>([
+      stmtsFingerprintsResp: MockSqlResponse<FingerprintStmtsResponseColumns>([
         {
           statement_fingerprint_id: "a",
           query: "select 1",
@@ -210,10 +195,11 @@ describe("test txn insights api functions", () => {
             waitingTxnFingerprintID:
               contentionDetailsMock.waiting_txn_fingerprint_id,
             waitingTxnID: contentionDetailsMock.waiting_txn_id,
+            contentionType: "LOCK_WAIT",
           },
         ],
         execType: InsightExecEnum.TRANSACTION,
-        insightName: InsightNameEnum.highContention,
+        insightName: InsightNameEnum.HIGH_CONTENTION,
       },
     },
   ] as TxnContentionDetailsTests[])(

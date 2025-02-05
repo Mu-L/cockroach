@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -33,14 +28,13 @@ import (
 )
 
 type dropFunctionNode struct {
+	zeroInputPlanNode
 	toDrop       []*funcdesc.Mutable
 	dropBehavior tree.DropBehavior
 }
 
 // DropFunction drops a function.
-func (p *planner) DropFunction(
-	ctx context.Context, n *tree.DropFunction,
-) (ret planNode, err error) {
+func (p *planner) DropFunction(ctx context.Context, n *tree.DropRoutine) (ret planNode, err error) {
 	if err := checkSchemaChangeEnabled(
 		ctx,
 		p.ExecCfg(),
@@ -54,12 +48,16 @@ func (p *planner) DropFunction(
 		return nil, unimplemented.Newf("DROP FUNCTION...CASCADE", "drop function cascade not supported")
 	}
 	dropNode := &dropFunctionNode{
-		toDrop:       make([]*funcdesc.Mutable, 0, len(n.Functions)),
+		toDrop:       make([]*funcdesc.Mutable, 0, len(n.Routines)),
 		dropBehavior: n.DropBehavior,
 	}
+	routineType := tree.UDFRoutine
+	if n.Procedure {
+		routineType = tree.ProcedureRoutine
+	}
 	fnResolved := intsets.MakeFast()
-	for _, fn := range n.Functions {
-		ol, err := p.matchUDF(ctx, &fn, !n.IfExists)
+	for _, fn := range n.Routines {
+		ol, err := p.matchRoutine(ctx, &fn, !n.IfExists, routineType, true /* inDropContext */)
 		if err != nil {
 			return nil, err
 		}
@@ -115,37 +113,46 @@ func (n *dropFunctionNode) Next(params runParams) (bool, error) { return false, 
 func (n *dropFunctionNode) Values() tree.Datums                 { return tree.Datums{} }
 func (n *dropFunctionNode) Close(ctx context.Context)           {}
 
-// matchUDF tries to resolve a user-defined function with the given signature
-// from the current search path, only overloads with exactly the same argument
-// types are considered a match. If required is true, an error is returned if
-// the function is not found. An error is also returning if a builtin function
-// is matched.
-func (p *planner) matchUDF(
-	ctx context.Context, fn *tree.FuncObj, required bool,
+// matchRoutine tries to resolve a user-defined function or procedure with the
+// given signature from the current search path, only overloads with exactly the
+// same argument types are considered a match. If required is true, an error is
+// returned if the function is not found. An error is also returning if a
+// builtin function is matched.
+func (p *planner) matchRoutine(
+	ctx context.Context,
+	routineObj *tree.RoutineObj,
+	required bool,
+	routineType tree.RoutineType,
+	inDropContext bool,
 ) (*tree.QualifiedOverload, error) {
 	path := p.CurrentSearchPath()
-	fnDef, err := p.ResolveFunction(ctx, fn.FuncName.ToUnresolvedObjectName().ToUnresolvedName(), &path)
+	unresolvedName := routineObj.FuncName.ToUnresolvedObjectName().ToUnresolvedName()
+	var name tree.UnresolvedRoutineName
+	if routineType == tree.ProcedureRoutine {
+		name = tree.MakeUnresolvedProcedureName(unresolvedName)
+	} else {
+		name = tree.MakeUnresolvedFunctionName(unresolvedName)
+	}
+	fnDef, err := p.ResolveFunction(ctx, name, &path)
 	if err != nil {
-		if !required && errors.Is(err, tree.ErrFunctionUndefined) {
+		if !required && errors.Is(err, tree.ErrRoutineUndefined) {
 			return nil, nil
 		}
 		return nil, err
 	}
 
-	paramTypes, err := fn.ParamTypes(ctx, p)
+	ol, err := fnDef.MatchOverload(
+		ctx, p, routineObj, &path, routineType, inDropContext, false, /* tryDefaultExprs */
+	)
 	if err != nil {
-		return nil, err
-	}
-	ol, err := fnDef.MatchOverload(paramTypes, fn.FuncName.Schema(), &path)
-	if err != nil {
-		if !required && errors.Is(err, tree.ErrFunctionUndefined) {
+		if !required && errors.Is(err, tree.ErrRoutineUndefined) {
 			return nil, nil
 		}
 		return nil, err
 	}
 	// Note that we don't check ol.HasSQLBody() here, because builtin functions
 	// can't be dropped even if they are defined using a SQL string.
-	if !ol.IsUDF {
+	if ol.Type == tree.BuiltinRoutine {
 		return nil, errors.Errorf(
 			"cannot drop function %s%s because it is required by the database system",
 			fnDef.Name, ol.Signature(true /*Simplify*/),
@@ -180,7 +187,7 @@ func (p *planner) canDropFunction(ctx context.Context, fnDesc catalog.FunctionDe
 		return err
 	}
 	if !hasOwernship {
-		return errors.Errorf("must be owner of function %s", fnDesc.GetName())
+		return pgerror.Newf(pgcode.InsufficientPrivilege, "must be owner of function %s", fnDesc.GetName())
 	}
 	return nil
 }
@@ -213,6 +220,20 @@ func (p *planner) dropFunctionImpl(ctx context.Context, fnMutable *funcdesc.Muta
 				fnMutable.Name, fnMutable.ID, refMutable.Name, refMutable.ID,
 			),
 		); err != nil {
+			return err
+		}
+	}
+
+	// Remove this function from the dependencies
+	for _, id := range fnMutable.DependsOnFunctions {
+		refMutable, err := p.Descriptors().MutableByID(p.txn).Function(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := refMutable.RemoveFunctionReference(fnMutable.ID); err != nil {
+			return err
+		}
+		if err := p.writeFuncDesc(ctx, refMutable); err != nil {
 			return err
 		}
 	}

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package replicaoracle
 
@@ -17,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -44,16 +39,18 @@ func TestClosest(t *testing.T) {
 		nd2, err := g.GetNodeDescriptor(2)
 		require.NoError(t, err)
 		o := NewOracle(ClosestChoice, Config{
-			NodeDescs: g,
-			NodeID:    1,
-			Locality:  nd2.Locality, // pretend node 2 is closest.
+			NodeDescs:  g,
+			NodeID:     1,
+			Locality:   nd2.Locality, // pretend node 2 is closest.
+			Settings:   cluster.MakeTestingClusterSettings(),
+			HealthFunc: func(_ roachpb.NodeID) bool { return true },
+			LatencyFunc: func(id roachpb.NodeID) (time.Duration, bool) {
+				if id == 2 {
+					return time.Nanosecond, validLatencyFunc
+				}
+				return time.Millisecond, validLatencyFunc
+			},
 		})
-		o.(*closestOracle).latencyFunc = func(id roachpb.NodeID) (time.Duration, bool) {
-			if id == 2 {
-				return time.Nanosecond, validLatencyFunc
-			}
-			return time.Millisecond, validLatencyFunc
-		}
 		internalReplicas := []roachpb.ReplicaDescriptor{
 			{NodeID: 4, StoreID: 4},
 			{NodeID: 2, StoreID: 2},
@@ -88,7 +85,7 @@ func makeGossip(t *testing.T, stopper *stop.Stopper, nodeIDs []int) (*gossip.Gos
 	clock := hlc.NewClockForTesting(nil)
 
 	const nodeID = 1
-	g := gossip.NewTest(nodeID, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	g := gossip.NewTest(nodeID, stopper, metric.NewRegistry())
 	if err := g.SetNodeDescriptor(newNodeDesc(nodeID)); err != nil {
 		t.Fatal(err)
 	}

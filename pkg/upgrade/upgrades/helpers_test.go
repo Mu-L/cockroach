@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package upgrades
 
@@ -18,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -26,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -50,7 +47,7 @@ type Schema struct {
 func Upgrade(
 	t *testing.T, sqlDB *gosql.DB, key clusterversion.Key, done chan struct{}, expectError bool,
 ) {
-	UpgradeToVersion(t, sqlDB, clusterversion.ByKey(key), done, expectError)
+	UpgradeToVersion(t, sqlDB, key.Version(), done, expectError)
 }
 
 func UpgradeToVersion(
@@ -161,7 +158,7 @@ func GetTable(
 	err := s.InternalDB().(descs.DB).DescsTxn(ctx, func(
 		ctx context.Context, txn descs.Txn,
 	) (err error) {
-		table, err = txn.Descriptors().ByID(txn.KV()).WithoutNonPublic().Get().Table(ctx, tableID)
+		table, err = txn.Descriptors().ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, tableID)
 		return err
 	})
 	require.NoError(t, err)
@@ -197,4 +194,30 @@ func ExecForCountInTxns(
 		})
 		require.NoError(t, err)
 	}
+}
+
+// ValidateSystemDatabaseSchemaVersionBumped validates that the system database
+// schema version has been bumped to the expected version.
+func ValidateSystemDatabaseSchemaVersionBumped(
+	t *testing.T, sqlDB *gosql.DB, expectedVersion clusterversion.Key,
+) {
+	expectedSchemaVersion := expectedVersion.Version()
+
+	var actualSchemaVersionBytes []byte
+	require.NoError(t, sqlDB.QueryRow(
+		`SELECT crdb_internal.json_to_pb(
+    'cockroach.roachpb.Version',
+    crdb_internal.pb_to_json(
+        'cockroach.sql.sqlbase.Descriptor',
+        descriptor,
+        false
+    )->'database'->'systemDatabaseSchemaVersion')
+FROM system.descriptor WHERE id = $1`,
+		keys.SystemDatabaseID,
+	).Scan(&actualSchemaVersionBytes))
+
+	actualSchemaVersion := roachpb.Version{}
+	require.NoError(t, protoutil.Unmarshal(actualSchemaVersionBytes, &actualSchemaVersion))
+
+	require.Equal(t, expectedSchemaVersion, actualSchemaVersion)
 }

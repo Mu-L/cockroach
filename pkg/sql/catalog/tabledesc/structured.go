@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tabledesc
 
@@ -17,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -35,7 +29,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -236,8 +232,11 @@ func generatedFamilyName(familyID descpb.FamilyID, columnNames []string) string 
 
 // ForEachExprStringInTableDesc runs a closure for each expression string
 // within a TableDescriptor. The closure takes in a string pointer so that
-// it can mutate the TableDescriptor if desired.
-func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *string) error) error {
+// it can mutate the TableDescriptor if desired. It also takes SerializedExprTyp
+// to indicate the type of the expression.
+func ForEachExprStringInTableDesc(
+	descI catalog.TableDescriptor, f func(expr *string, typ catalog.DescExprType) error,
+) error {
 	var desc *wrapper
 	switch descV := descI.(type) {
 	case *wrapper:
@@ -252,17 +251,17 @@ func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *st
 	// Helpers for each schema element type that can contain an expression.
 	doCol := func(c *descpb.ColumnDescriptor) error {
 		if c.HasDefault() {
-			if err := f(c.DefaultExpr); err != nil {
+			if err := f(c.DefaultExpr, catalog.SQLExpr); err != nil {
 				return err
 			}
 		}
 		if c.IsComputed() {
-			if err := f(c.ComputeExpr); err != nil {
+			if err := f(c.ComputeExpr, catalog.SQLExpr); err != nil {
 				return err
 			}
 		}
 		if c.HasOnUpdate() {
-			if err := f(c.OnUpdateExpr); err != nil {
+			if err := f(c.OnUpdateExpr, catalog.SQLExpr); err != nil {
 				return err
 			}
 		}
@@ -270,16 +269,40 @@ func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *st
 	}
 	doIndex := func(i catalog.Index) error {
 		if i.IsPartial() {
-			return f(&i.IndexDesc().Predicate)
+			return f(&i.IndexDesc().Predicate, catalog.SQLExpr)
 		}
 		return nil
 	}
 	doCheck := func(c *descpb.TableDescriptor_CheckConstraint) error {
-		return f(&c.Expr)
+		return f(&c.Expr, catalog.SQLExpr)
 	}
 	doUwi := func(uwi *descpb.UniqueWithoutIndexConstraint) error {
 		if uwi.Predicate != "" {
-			return f(&uwi.Predicate)
+			return f(&uwi.Predicate, catalog.SQLExpr)
+		}
+		return nil
+	}
+	doTrigger := func(t *descpb.TriggerDescriptor) error {
+		if t.WhenExpr != "" {
+			if err := f(&t.WhenExpr, catalog.SQLExpr); err != nil {
+				return err
+			}
+		}
+		if t.FuncBody == "" {
+			panic(errors.AssertionFailedf("expected non-empty trigger function body"))
+		}
+		return f(&t.FuncBody, catalog.PLpgSQLStmt)
+	}
+	doPolicy := func(p *descpb.PolicyDescriptor) error {
+		if p.UsingExpr != "" {
+			if err := f(&p.UsingExpr, catalog.SQLExpr); err != nil {
+				return err
+			}
+		}
+		if p.WithCheckExpr != "" {
+			if err := f(&p.WithCheckExpr, catalog.SQLExpr); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -334,7 +357,46 @@ func ForEachExprStringInTableDesc(descI catalog.TableDescriptor, f func(expr *st
 			}
 		}
 	}
+
+	// Process all triggers.
+	for i := range desc.Triggers {
+		if err := doTrigger(&desc.Triggers[i]); err != nil {
+			return err
+		}
+	}
+
+	// Process all policies.
+	for i := range desc.Policies {
+		if err := doPolicy(&desc.Policies[i]); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// GetAllReferencedTableIDs implements the TableDescriptor interface.
+func (desc *wrapper) GetAllReferencedTableIDs() descpb.IDs {
+	var ids catalog.DescriptorIDSet
+
+	// Collect referenced table IDs in foreign keys.
+	for _, fk := range desc.OutboundForeignKeys() {
+		ids.Add(fk.GetReferencedTableID())
+	}
+	for _, fk := range desc.InboundForeignKeys() {
+		ids.Add(fk.GetOriginTableID())
+	}
+	// Add trigger dependencies.
+	for i := range desc.Triggers {
+		ids = ids.Union(catalog.MakeDescriptorIDSet(desc.Triggers[i].DependsOn...))
+	}
+	// Add policy dependencies.
+	for i := range desc.Policies {
+		ids = ids.Union(catalog.MakeDescriptorIDSet(desc.Policies[i].DependsOnRelations...))
+	}
+	// Add view dependencies.
+	ids = ids.Union(catalog.MakeDescriptorIDSet(desc.DependsOn...))
+
+	return ids.Ordered()
 }
 
 // GetAllReferencedTypeIDs implements the TableDescriptor interface.
@@ -355,6 +417,16 @@ func (desc *wrapper) GetAllReferencedTypeIDs(
 			return nil, nil, err
 		}
 		ids.Add(regionEnumID)
+	}
+
+	// Add type dependencies from triggers.
+	for i := range desc.Triggers {
+		ids = ids.Union(catalog.MakeDescriptorIDSet(desc.Triggers[i].DependsOnTypes...))
+	}
+
+	// Add type dependencies from policies.
+	for i := range desc.Policies {
+		ids = ids.Union(catalog.MakeDescriptorIDSet(desc.Policies[i].DependsOnTypes...))
 	}
 
 	// Add any other type dependencies that are not
@@ -381,6 +453,14 @@ func (desc *wrapper) GetAllReferencedFunctionIDs() (catalog.DescriptorIDSet, err
 			ret.Add(id)
 		}
 	}
+	// Add routine dependencies from triggers.
+	for i := range desc.Triggers {
+		ret = ret.Union(catalog.MakeDescriptorIDSet(desc.Triggers[i].DependsOnRoutines...))
+	}
+	// Add deps from policies
+	for i := range desc.Policies {
+		ret = ret.Union(catalog.MakeDescriptorIDSet(desc.Policies[i].DependsOnFunctions...))
+	}
 	// TODO(chengxiong): add logic to extract references from indexes when UDFs
 	// are allowed in them.
 	return ret.Union(catalog.MakeDescriptorIDSet(desc.DependsOnFunctions...)), nil
@@ -401,6 +481,29 @@ func (desc *wrapper) GetAllReferencedFunctionIDsInConstraint(
 		return catalog.DescriptorIDSet{}, err
 	}
 	return ret, nil
+}
+
+// GetAllReferencedFunctionIDsInTrigger implements the TableDescriptor
+// interface.
+func (desc *wrapper) GetAllReferencedFunctionIDsInTrigger(
+	triggerID descpb.TriggerID,
+) (fnIDs catalog.DescriptorIDSet) {
+	t := catalog.FindTriggerByID(desc, triggerID)
+	for _, id := range t.DependsOnRoutines {
+		fnIDs.Add(id)
+	}
+	return fnIDs
+}
+
+// GetAllReferencedFunctionIDsInPolicy implements the TableDescriptor interface.
+func (desc *wrapper) GetAllReferencedFunctionIDsInPolicy(
+	policyID descpb.PolicyID,
+) (fnIDs catalog.DescriptorIDSet) {
+	t := catalog.FindPolicyByID(desc, policyID)
+	for _, id := range t.DependsOnFunctions {
+		fnIDs.Add(id)
+	}
+	return fnIDs
 }
 
 // GetAllReferencedFunctionIDsInColumnExprs implements the TableDescriptor
@@ -440,7 +543,7 @@ func (desc *wrapper) GetAllReferencedFunctionIDsInColumnExprs(
 // show for it is a REGIONAL BY TABLE table (homed in the non-primary region).
 // These use a value from the multi-region enum to denote the homing region, but
 // do so in the locality config as opposed to through a column.
-// GetAllReferencedTypesByID accounts for this dependency.
+// GetAllReferencedTypeIDs accounts for this dependency.
 func (desc *wrapper) getAllReferencedTypesInTableColumns(
 	getType func(descpb.ID) (catalog.TypeDescriptor, error),
 ) (ret catalog.DescriptorIDSet, _ error) {
@@ -450,7 +553,11 @@ func (desc *wrapper) getAllReferencedTypesInTableColumns(
 		OIDs: make(map[oid.Oid]struct{}),
 	}
 
-	addOIDsInExpr := func(exprStr *string) error {
+	addOIDsInExpr := func(exprStr *string, typ catalog.DescExprType) error {
+		if typ != catalog.SQLExpr {
+			// Skip trigger function bodies.
+			return nil
+		}
 		expr, err := parser.ParseExpr(*exprStr)
 		if err != nil {
 			return err
@@ -525,7 +632,7 @@ func (desc *Mutable) MaybeFillColumnID(
 // or index which has an ID of 0. It's the same as AllocateIDsWithoutValidation,
 // but does validation on the table elements.
 func (desc *Mutable) AllocateIDs(ctx context.Context, version clusterversion.ClusterVersion) error {
-	if err := desc.AllocateIDsWithoutValidation(ctx); err != nil {
+	if err := desc.AllocateIDsWithoutValidation(ctx, true /*createMissingPrimaryKey*/); err != nil {
 		return err
 	}
 
@@ -544,9 +651,13 @@ func (desc *Mutable) AllocateIDs(ctx context.Context, version clusterversion.Clu
 
 // AllocateIDsWithoutValidation allocates column, family, and index ids for any
 // column, family, or index which has an ID of 0.
-func (desc *Mutable) AllocateIDsWithoutValidation(ctx context.Context) error {
-	// Only tables with physical data can have / need a primary key.
-	if desc.IsPhysicalTable() {
+func (desc *Mutable) AllocateIDsWithoutValidation(
+	ctx context.Context, createMissingPrimaryKey bool,
+) error {
+	// Only tables with physical data can have / need a primary key. In the
+	// declarative schema changer the primary key is always created explicitly,
+	// so we don't need to create it here.
+	if desc.IsPhysicalTable() && createMissingPrimaryKey {
 		if err := desc.ensurePrimaryKey(); err != nil {
 			return err
 		}
@@ -679,7 +790,7 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 		// index encoding. It is the set difference of the primary key minus the
 		// non-inverted columns in the index's key.
 		colIDs := idx.CollectKeyColumnIDs()
-		isInverted := idx.GetType() == descpb.IndexDescriptor_INVERTED
+		isInverted := idx.GetType() == idxtype.INVERTED
 		invID := catid.ColumnID(0)
 		if isInverted {
 			invID = idx.InvertedColumnID()
@@ -740,16 +851,13 @@ func (desc *Mutable) allocateIndexIDs(columnNames map[string]descpb.ColumnID) er
 			if primaryColIDs.Contains(col.GetID()) && idx.GetEncodingType() == catenumpb.SecondaryIndexEncoding {
 				// If the primary index contains a stored column, we don't need to
 				// store it - it's already part of the index.
-				err = pgerror.Newf(pgcode.DuplicateColumn,
-					"index %q already contains column %q", idx.GetName(), col.GetName())
-				err = errors.WithDetailf(err,
+				err = errors.WithDetailf(
+					sqlerrors.NewColumnAlreadyExistsInIndexError(idx.GetName(), col.GetName()),
 					"column %q is part of the primary index and therefore implicit in all indexes", col.GetName())
 				return err
 			}
 			if colIDs.Contains(col.GetID()) {
-				return pgerror.Newf(
-					pgcode.DuplicateColumn,
-					"index %q already contains column %q", idx.GetName(), col.GetName())
+				return sqlerrors.NewColumnAlreadyExistsInIndexError(idx.GetName(), col.GetName())
 			}
 			if indexHasOldStoredColumns {
 				idx.IndexDesc().KeySuffixColumnIDs = append(idx.IndexDesc().KeySuffixColumnIDs, col.GetID())
@@ -975,94 +1083,38 @@ func (desc *Mutable) ClusterVersion() descpb.TableDescriptor {
 // current heuristic will assign to a family.
 const FamilyHeuristicTargetBytes = 256
 
-func notIndexableError(cols []descpb.ColumnDescriptor) error {
-	if len(cols) == 0 {
-		return nil
-	}
-	var msg string
-	var typInfo string
-	if len(cols) == 1 {
-		col := &cols[0]
-		msg = "column %s is of type %s and thus is not indexable"
-		typInfo = col.Type.DebugString()
-		msg = fmt.Sprintf(msg, col.Name, col.Type.Name())
-	} else {
-		msg = "the following columns are not indexable due to their type: "
-		for i := range cols {
-			col := &cols[i]
-			msg += fmt.Sprintf("%s (type %s)", col.Name, col.Type.Name())
-			typInfo += col.Type.DebugString()
-			if i != len(cols)-1 {
-				msg += ", "
-				typInfo += ","
-			}
-		}
-	}
-	return unimplemented.NewWithIssueDetailf(35730, typInfo, "%s", msg)
-}
-
-func checkColumnsValidForIndex(tableDesc *Mutable, indexColNames []string) error {
-	invalidColumns := make([]descpb.ColumnDescriptor, 0, len(indexColNames))
-	for _, indexCol := range indexColNames {
-		for _, col := range tableDesc.NonDropColumns() {
-			if col.GetName() == indexCol {
-				if !colinfo.ColumnTypeIsIndexable(col.GetType()) {
-					invalidColumns = append(invalidColumns, *col.ColumnDesc())
-				}
-			}
-		}
-	}
-	if len(invalidColumns) > 0 {
-		return notIndexableError(invalidColumns)
-	}
-	return nil
-}
-
-func checkColumnsValidForInvertedIndex(
-	tableDesc *Mutable, indexColNames []string, colDirs []catenumpb.IndexColumn_Direction,
-) error {
+func checkColumnsValidForIndex(tableDesc *Mutable, indexDesc *descpb.IndexDescriptor) error {
+	indexColNames := indexDesc.KeyColumnNames
+	indexColDirs := indexDesc.KeyColumnDirections
 	lastCol := len(indexColNames) - 1
 	for i, indexCol := range indexColNames {
-		for _, col := range tableDesc.NonDropColumns() {
-			if col.GetName() == indexCol {
-				// The last column indexed by an inverted index must be
-				// inverted indexable.
-				if i == lastCol && !colinfo.ColumnTypeIsInvertedIndexable(col.GetType()) {
-					return NewInvalidInvertedColumnError(col.GetName(), col.GetType().String())
-				}
-				if i == lastCol && colDirs[i] == catenumpb.IndexColumn_DESC {
-					return pgerror.New(pgcode.FeatureNotSupported,
-						"the last column in an inverted index cannot have the DESC option")
-				}
-				// Any preceding columns must not be inverted indexable.
-				if i < lastCol && !colinfo.ColumnTypeIsIndexable(col.GetType()) {
-					return errors.WithHint(
-						pgerror.Newf(
-							pgcode.FeatureNotSupported,
-							"column %s of type %s is only allowed as the last column in an inverted index",
-							col.GetName(),
-							col.GetType().Name(),
-						),
-						"see the documentation for more information about inverted indexes: "+docs.URL("inverted-indexes.html"),
-					)
+		for _, tableCol := range tableDesc.NonDropColumns() {
+			// Skip until we find the matching column in the table, by name.
+			if tableCol.GetName() != indexCol {
+				continue
+			}
+
+			// Report error if the index type does not allow DESC to be used in
+			// the last column, because it has no linear ordering.
+			if !indexDesc.Type.HasLinearOrdering() {
+				if i == lastCol && indexColDirs[i] == catenumpb.IndexColumn_DESC {
+					return pgerror.Newf(pgcode.FeatureNotSupported,
+						"the last column in %s cannot have the DESC option",
+						idxtype.ErrorText(indexDesc.Type))
 				}
 			}
+
+			// Check whether column is allowed in the index, at this position.
+			err := colinfo.ValidateColumnForIndex(
+				indexDesc.Type, tableCol.GetName(), tableCol.GetType(), i == lastCol)
+			if err != nil {
+				return err
+			}
+
+			break
 		}
 	}
 	return nil
-}
-
-// NewInvalidInvertedColumnError returns an error for a column that's not
-// inverted indexable.
-func NewInvalidInvertedColumnError(colName, colType string) error {
-	return errors.WithHint(
-		pgerror.Newf(
-			pgcode.FeatureNotSupported,
-			"column %s of type %s is not allowed as the last column in an inverted index",
-			colName, colType,
-		),
-		"see the documentation for more information about inverted indexes: "+docs.URL("inverted-indexes.html"),
-	)
 }
 
 // AddColumn adds a column to the table.
@@ -1078,10 +1130,10 @@ func (desc *Mutable) AddFamily(fam descpb.ColumnFamilyDescriptor) {
 // AddPrimaryIndex adds a primary index to a mutable table descriptor, assuming
 // that none has yet been set, and performs some sanity checks.
 func (desc *Mutable) AddPrimaryIndex(idx descpb.IndexDescriptor) error {
-	if idx.Type == descpb.IndexDescriptor_INVERTED {
-		return fmt.Errorf("primary index cannot be inverted")
+	if !idx.Type.CanBePrimary() {
+		return fmt.Errorf("primary index cannot be %s", idxtype.ErrorText(idx.Type))
 	}
-	if err := checkColumnsValidForIndex(desc, idx.KeyColumnNames); err != nil {
+	if err := checkColumnsValidForIndex(desc, &idx); err != nil {
 		return err
 	}
 	if desc.PrimaryIndex.Name != "" {
@@ -1118,16 +1170,8 @@ func (desc *Mutable) AddPrimaryIndex(idx descpb.IndexDescriptor) error {
 
 // AddSecondaryIndex adds a secondary index to a mutable table descriptor.
 func (desc *Mutable) AddSecondaryIndex(idx descpb.IndexDescriptor) error {
-	if idx.Type == descpb.IndexDescriptor_FORWARD {
-		if err := checkColumnsValidForIndex(desc, idx.KeyColumnNames); err != nil {
-			return err
-		}
-	} else {
-		if err := checkColumnsValidForInvertedIndex(
-			desc, idx.KeyColumnNames, idx.KeyColumnDirections,
-		); err != nil {
-			return err
-		}
+	if err := checkColumnsValidForIndex(desc, &idx); err != nil {
+		return err
 	}
 	desc.AddPublicNonPrimaryIndex(idx)
 	return nil
@@ -1454,8 +1498,17 @@ func (desc *Mutable) MakeMutationComplete(m descpb.DescriptorMutation) error {
 			desc.AddColumn(t.Column)
 
 		case *descpb.DescriptorMutation_Index:
-			if err := desc.AddSecondaryIndex(*t.Index); err != nil {
-				return err
+			// If a primary index is being made public, then we only need set the
+			// index inside the descriptor directly. Only the declarative schema
+			// changer will use index mutations like this.
+			isPrimaryIndexToPublic := desc.IsPrimaryKeySwapMutation(&m)
+			if isPrimaryIndexToPublic {
+				desc.SetPrimaryIndex(*t.Index)
+			} else {
+				// Otherwise, we need to add this index as a secondary index.
+				if err := desc.AddSecondaryIndex(*t.Index); err != nil {
+					return err
+				}
 			}
 
 		case *descpb.DescriptorMutation_Constraint:
@@ -1667,6 +1720,17 @@ func (desc *Mutable) performComputedColumnSwap(swap *descpb.ComputedColumnSwap) 
 
 	// Make the oldCol a computed column by setting its computed expression.
 	oldCol.ColumnDesc().ComputeExpr = &swap.InverseExpr
+
+	// Swap the onUpdate/default expressions. These expressions can only be stored
+	// for non-computed columns, so they need to be swapped at the same time as
+	// the computed expression. Additionally, we have already validated in
+	// AlterColumnType that these expressions can be applied to the new column
+	// type with an automatic cast. Therefore, there is no need to validate the
+	// cast here.
+	newCol.ColumnDesc().OnUpdateExpr = oldCol.ColumnDesc().OnUpdateExpr
+	oldCol.ColumnDesc().OnUpdateExpr = nil
+	newCol.ColumnDesc().DefaultExpr = oldCol.ColumnDesc().DefaultExpr
+	oldCol.ColumnDesc().DefaultExpr = nil
 
 	// Generate unique name for old column.
 	nameExists := func(name string) bool {
@@ -1893,7 +1957,7 @@ func (desc *Mutable) AddColumnMutation(
 // AddDropIndexMutation adds a a dropping index mutation for the given
 // index descriptor.
 func (desc *Mutable) AddDropIndexMutation(idx *descpb.IndexDescriptor) error {
-	if err := desc.checkValidIndex(idx); err != nil {
+	if err := checkColumnsValidForIndex(desc, idx); err != nil {
 		return err
 	}
 	m := descpb.DescriptorMutation{
@@ -1909,7 +1973,7 @@ func (desc *Mutable) AddDropIndexMutation(idx *descpb.IndexDescriptor) error {
 func (desc *Mutable) AddIndexMutationMaybeWithTempIndex(
 	idx *descpb.IndexDescriptor, direction descpb.DescriptorMutation_Direction,
 ) error {
-	if err := desc.checkValidIndex(idx); err != nil {
+	if err := checkColumnsValidForIndex(desc, idx); err != nil {
 		return err
 	}
 	m := descpb.DescriptorMutation{
@@ -1927,7 +1991,7 @@ func (desc *Mutable) AddIndexMutation(
 	direction descpb.DescriptorMutation_Direction,
 	state descpb.DescriptorMutation_State,
 ) error {
-	if err := desc.checkValidIndex(idx); err != nil {
+	if err := checkColumnsValidForIndex(desc, idx); err != nil {
 		return err
 	}
 	stateIsValid := func() bool {
@@ -1951,22 +2015,6 @@ func (desc *Mutable) AddIndexMutation(
 		Descriptor_: &descpb.DescriptorMutation_Index{Index: idx},
 		Direction:   direction,
 	}, state)
-	return nil
-}
-
-func (desc *Mutable) checkValidIndex(idx *descpb.IndexDescriptor) error {
-	switch idx.Type {
-	case descpb.IndexDescriptor_FORWARD:
-		if err := checkColumnsValidForIndex(desc, idx.KeyColumnNames); err != nil {
-			return err
-		}
-	case descpb.IndexDescriptor_INVERTED:
-		if err := checkColumnsValidForInvertedIndex(
-			desc, idx.KeyColumnNames, idx.KeyColumnDirections,
-		); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -2067,9 +2115,9 @@ func (desc *wrapper) MakeFirstMutationPublic(
 		}
 		i++
 		switch {
-		case policy.shouldSkip(&mutation):
+		case policy.shouldSkip(desc, &mutation):
 			// Don't add to clone.
-		case policy.shouldRetain(&mutation):
+		case policy.shouldRetain(desc, &mutation):
 			mutation.Direction = descpb.DescriptorMutation_ADD
 			fallthrough
 		default:
@@ -2101,9 +2149,11 @@ func (p mutationPublicationPolicy) includes(f catalog.MutationPublicationFilter)
 	return p.policy.Contains(int(f))
 }
 
-func (p mutationPublicationPolicy) shouldSkip(m *descpb.DescriptorMutation) bool {
+func (p mutationPublicationPolicy) shouldSkip(
+	desc catalog.TableDescriptor, m *descpb.DescriptorMutation,
+) bool {
 	switch {
-	case m.GetPrimaryKeySwap() != nil:
+	case desc.IsPrimaryKeySwapMutation(m):
 		return p.includes(catalog.IgnorePKSwaps)
 	case m.GetConstraint() != nil:
 		return p.includes(catalog.IgnoreConstraints)
@@ -2112,7 +2162,9 @@ func (p mutationPublicationPolicy) shouldSkip(m *descpb.DescriptorMutation) bool
 	}
 }
 
-func (p mutationPublicationPolicy) shouldRetain(m *descpb.DescriptorMutation) bool {
+func (p mutationPublicationPolicy) shouldRetain(
+	desc catalog.TableDescriptor, m *descpb.DescriptorMutation,
+) bool {
 	switch {
 	case m.GetColumn() != nil && m.Direction == descpb.DescriptorMutation_DROP:
 		return p.includes(catalog.RetainDroppingColumns)
@@ -2189,12 +2241,31 @@ func (desc *wrapper) PrimaryIndexSpan(codec keys.SQLCodec) roachpb.Span {
 
 // IndexSpan implements the TableDescriptor interface.
 func (desc *wrapper) IndexSpan(codec keys.SQLCodec, indexID descpb.IndexID) roachpb.Span {
+	if desc.External != nil {
+		panic(errors.AssertionFailedf("%s uses external row data", desc.Name))
+	}
 	prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(codec, desc.GetID(), indexID))
+	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
+}
+
+// IndexSpanAllowingExternalRowData implements the TableDescriptor interface.
+func (desc *wrapper) IndexSpanAllowingExternalRowData(
+	codec keys.SQLCodec, indexID descpb.IndexID,
+) roachpb.Span {
+	tableID := desc.GetID()
+	if desc.External != nil {
+		codec = keys.MakeSQLCodec(desc.External.TenantID)
+		tableID = desc.External.TableID
+	}
+	prefix := roachpb.Key(rowenc.MakeIndexKeyPrefix(codec, tableID, indexID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
 
 // TableSpan implements the TableDescriptor interface.
 func (desc *wrapper) TableSpan(codec keys.SQLCodec) roachpb.Span {
+	if desc.External != nil {
+		panic(errors.AssertionFailedf("%s uses external row data", desc.Name))
+	}
 	prefix := codec.TablePrefix(uint32(desc.ID))
 	return roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
 }
@@ -2305,6 +2376,13 @@ func (desc *Mutable) SetOffline(reason string) {
 	desc.OfflineReason = reason
 }
 
+func (desc *Mutable) SetExternalRowData(ext *descpb.ExternalRowData) {
+	// Do not set materialized views for sequences, they will
+	// handle this on their own.
+	desc.IsMaterializedView = !desc.IsSequence()
+	desc.External = ext
+}
+
 // IsLocalityRegionalByRow implements the TableDescriptor interface.
 func (desc *wrapper) IsLocalityRegionalByRow() bool {
 	return desc.LocalityConfig.GetRegionalByRow() != nil
@@ -2380,12 +2458,17 @@ func (desc *wrapper) GetStorageParams(spaceBetweenEqual bool) []string {
 			escapedTTLExpirationExpression := lexbase.EscapeSQLString(string(ttl.ExpirationExpr))
 			appendStorageParam(`ttl_expiration_expression`, escapedTTLExpirationExpression)
 		}
-		appendStorageParam(`ttl_job_cron`, fmt.Sprintf(`'%s'`, ttl.DeletionCronOrDefault()))
+		if ttl.DeletionCron != "" {
+			appendStorageParam(`ttl_job_cron`, fmt.Sprintf(`'%s'`, ttl.DeletionCronOrDefault()))
+		}
 		if bs := ttl.SelectBatchSize; bs != 0 {
 			appendStorageParam(`ttl_select_batch_size`, fmt.Sprintf(`%d`, bs))
 		}
 		if bs := ttl.DeleteBatchSize; bs != 0 {
 			appendStorageParam(`ttl_delete_batch_size`, fmt.Sprintf(`%d`, bs))
+		}
+		if rl := ttl.SelectRateLimit; rl != 0 {
+			appendStorageParam(`ttl_select_rate_limit`, fmt.Sprintf(`%d`, rl))
 		}
 		if rl := ttl.DeleteRateLimit; rl != 0 {
 			appendStorageParam(`ttl_delete_rate_limit`, fmt.Sprintf(`%d`, rl))
@@ -2398,6 +2481,9 @@ func (desc *wrapper) GetStorageParams(spaceBetweenEqual bool) []string {
 		}
 		if labelMetrics := ttl.LabelMetrics; labelMetrics {
 			appendStorageParam(`ttl_label_metrics`, fmt.Sprintf(`%t`, labelMetrics))
+		}
+		if ttl.DisableChangefeedReplication {
+			appendStorageParam(`ttl_disable_changefeed_replication`, fmt.Sprintf("%t", ttl.DisableChangefeedReplication))
 		}
 	}
 	if exclude := desc.GetExcludeDataFromBackup(); exclude {
@@ -2417,6 +2503,21 @@ func (desc *wrapper) GetStorageParams(spaceBetweenEqual bool) []string {
 		if settings.FractionStaleRows != nil {
 			value := *settings.FractionStaleRows
 			appendStorageParam(catpb.AutoStatsFractionStaleTableSettingName,
+				fmt.Sprintf("%g", value))
+		}
+		if settings.PartialEnabled != nil {
+			value := *settings.PartialEnabled
+			appendStorageParam(catpb.AutoPartialStatsEnabledTableSettingName,
+				fmt.Sprintf("%v", value))
+		}
+		if settings.PartialMinStaleRows != nil {
+			value := *settings.PartialMinStaleRows
+			appendStorageParam(catpb.AutoPartialStatsMinStaleTableSettingName,
+				fmt.Sprintf("%d", value))
+		}
+		if settings.PartialFractionStaleRows != nil {
+			value := *settings.PartialFractionStaleRows
+			appendStorageParam(catpb.AutoPartialStatsFractionStaleTableSettingName,
 				fmt.Sprintf("%g", value))
 		}
 	}
@@ -2466,6 +2567,13 @@ func (desc *wrapper) AutoStatsCollectionEnabled() catpb.AutoStatsCollectionStatu
 	return desc.AutoStatsSettings.AutoStatsCollectionEnabled()
 }
 
+func (desc *wrapper) AutoPartialStatsCollectionEnabled() catpb.AutoPartialStatsCollectionStatus {
+	if desc.AutoStatsSettings == nil {
+		return catpb.AutoPartialStatsCollectionNotSet
+	}
+	return desc.AutoStatsSettings.AutoPartialStatsCollectionEnabled()
+}
+
 // AutoStatsMinStaleRows implements the TableDescriptor interface.
 func (desc *wrapper) AutoStatsMinStaleRows() (minStaleRows int64, ok bool) {
 	if desc.AutoStatsSettings == nil {
@@ -2509,6 +2617,11 @@ func (desc *wrapper) HistogramBucketsCount() (histogramBucketsCount uint32, ok b
 		return 0, false
 	}
 	return *desc.HistogramBuckets, true
+}
+
+// GetReplicatedPCRVersion is a part of the catalog.Descriptor
+func (desc *wrapper) GetReplicatedPCRVersion() descpb.DescriptorVersion {
+	return desc.ReplicatedPCRVersion
 }
 
 // SetTableLocalityRegionalByTable sets the descriptor's locality config to
@@ -2610,4 +2723,25 @@ func (desc *Mutable) UpdateColumnsDependedOnBy(id descpb.ID, colIDs catalog.Tabl
 		}
 	}
 	desc.DependedOnBy = append(desc.DependedOnBy, ref)
+}
+
+// BumpExternalAsOf increases the timestamp for external data row tables.
+func (desc *Mutable) BumpExternalAsOf(timestamp hlc.Timestamp) error {
+	if desc.External == nil {
+		return errors.AssertionFailedf("cannot advanced timestamp on a real table (%d)", desc.GetID())
+	}
+	if timestamp.Less(desc.External.AsOf) {
+		return errors.AssertionFailedf("new timestamp (%s) is less than the existing as of timestamp (%s)",
+			timestamp,
+			desc.External.AsOf)
+	}
+	desc.External.AsOf = timestamp
+	return nil
+}
+
+// ForceModificationTime allows the modification time to be set externally.
+// Note: This API is only used by the leasing code to adjust modification time
+// since the builder will not populate it for offline descriptors.
+func (desc *Mutable) ForceModificationTime(modificationTime hlc.Timestamp) {
+	desc.ModificationTime = modificationTime
 }

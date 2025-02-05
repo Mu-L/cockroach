@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -23,6 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -35,15 +32,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/raft/v3/tracker"
 )
 
 func TestLastUpdateTimesMap(t *testing.T) {
@@ -64,7 +60,7 @@ func TestLastUpdateTimesMap(t *testing.T) {
 
 	t4 := t3.Add(time.Second)
 	descs = append(descs, []roachpb.ReplicaDescriptor{{ReplicaID: 5}, {ReplicaID: 6}}...)
-	prs := map[uint64]tracker.Progress{
+	prs := map[raftpb.PeerID]tracker.Progress{
 		1: {State: tracker.StateReplicate}, // should be updated
 		// 2 is missing because why not
 		3: {State: tracker.StateProbe},     // should be ignored
@@ -87,9 +83,9 @@ func Test_handleRaftReadyStats_SafeFormat(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	now := timeutil.Now()
-	ts := func(s int) time.Time {
-		return now.Add(time.Duration(s) * time.Second)
+	now := crtime.NowMono()
+	ts := func(s int) crtime.Mono {
+		return now + crtime.Mono(time.Duration(s)*time.Second)
 	}
 
 	stats := handleRaftReadyStats{
@@ -103,6 +99,8 @@ func Test_handleRaftReadyStats_SafeFormat(t *testing.T) {
 				numEntriesProcessed:      2,
 				numEntriesProcessedBytes: 3,
 				numEmptyEntries:          5,
+				numAddSST:                3,
+				numAddSSTCopies:          1,
 			},
 			stateAssertions:      4,
 			numConfChangeEntries: 6,
@@ -164,16 +162,12 @@ func testProposalsWithInjectedLeaseIndexAndReproposalError(t *testing.T, pipelin
 	isOurCommand := func(ba *kvpb.BatchRequest) (_ string, ok bool) {
 		if ba == nil {
 			return "", false // not local proposal
-		}
-		inc := ba.Requests[0].GetIncrement()
-		if inc == nil {
+		} else if inc, found := ba.GetArg(kvpb.Increment); !found {
 			return "", false
+		} else if key := string(inc.(*kvpb.IncrementRequest).Key); strings.HasSuffix(key, "-testing") {
+			return key, true
 		}
-		key := string(inc.Key)
-		if !strings.HasSuffix(key, "-testing") {
-			return "", false
-		}
-		return key, true
+		return "", false
 	}
 
 	rnd, seed := randutil.NewPseudoRand()
@@ -191,7 +185,7 @@ func testProposalsWithInjectedLeaseIndexAndReproposalError(t *testing.T, pipelin
 
 	cfg := TestStoreConfig(hlc.NewClockForTesting(nil))
 
-	var injectedReproposalErrors atomic.Int32
+	var injectedReproposalErrors atomic.Int64
 	{
 		var mu syncutil.Mutex
 		seen := map[string]int{} // access from proposal buffer under raftMu
@@ -206,12 +200,13 @@ func testProposalsWithInjectedLeaseIndexAndReproposalError(t *testing.T, pipelin
 			if !shouldInject(0.2, seen[key]) {
 				return nil
 			}
+			injectedReproposalErrors.Add(1)
 			t.Logf("inserting reproposal error for %s (seen %d times)", key, seen[key])
 			return errors.Errorf("injected error")
 		}
 	}
 
-	var insertedIllegalLeaseIndex atomic.Int32
+	var insertedIllegalLeaseIndex atomic.Int64
 	{
 		var mu syncutil.Mutex
 		seen := map[string]int{}
@@ -253,8 +248,8 @@ func testProposalsWithInjectedLeaseIndexAndReproposalError(t *testing.T, pipelin
 		key = append(key, "-testing"...)
 		return key
 	}
-	var observedAsyncWriteFailures atomic.Int32
-	var observedReproposalErrors atomic.Int32
+	var observedAsyncWriteFailures atomic.Int64
+	var observedReproposalErrors atomic.Int64
 	const iters = 300
 	expectations := map[string]int{}
 	for i := 0; i < iters; i++ {
@@ -337,19 +332,29 @@ func testProposalsWithInjectedLeaseIndexAndReproposalError(t *testing.T, pipelin
 		require.NoError(t, err)
 		require.EqualValues(t, exp, n)
 	}
+
 	t.Logf("observed %d async write restarts, observed %d/%d injected aborts, %d injected illegal lease applied indexes",
 		observedAsyncWriteFailures.Load(), observedReproposalErrors.Load(), injectedReproposalErrors.Load(), insertedIllegalLeaseIndex.Load())
+	t.Logf("commands reproposed (unchanged): %d", tc.store.metrics.RaftCommandsReproposed.Count())
+	t.Logf("commands reproposed (new LAI): %d", tc.store.metrics.RaftCommandsReproposedLAI.Count())
+
 	if pipelined {
 		// If we did pipelined writes, if we needed to repropose and injected an
 		// error, this should surface as an async write failure instead.
 		require.Zero(t, observedReproposalErrors.Load())
-	}
-	if !pipelined {
+		require.Equal(t, injectedReproposalErrors.Load(), observedAsyncWriteFailures.Load())
+	} else {
 		// If we're not pipelined, we shouldn't be able to get an async write
 		// failure. This isn't testing anything about reproposals per se, rather
 		// it's validation that we're truly not doing pipelined writes.
 		require.Zero(t, observedAsyncWriteFailures.Load())
+		// All the injected reproposal errors should manifest to the transaction.
+		require.Equal(t, injectedReproposalErrors.Load(), observedReproposalErrors.Load())
 	}
+	// All incorrect lease indices should manifest either as a reproposal, or a
+	// failed reproposal (when an error is injected).
+	require.Equal(t, insertedIllegalLeaseIndex.Load(),
+		tc.store.metrics.RaftCommandsReproposedLAI.Count()+injectedReproposalErrors.Load())
 }
 
 func checkNoLeakedTraceSpans(t *testing.T, store *Store) {

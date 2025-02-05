@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -29,13 +24,14 @@ func declareKeysProbe(
 	_ *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
+) error {
 	// Declare no keys. This means that we're not even serializing with splits
 	// (i.e. a probe could be directed at a key that will become the right-hand
 	// side of the split, and the split races ahead of the probe though the probe
 	// will still execute on the left-hand side). This is acceptable; we want the
 	// probe to bypass as much of the above-raft machinery as possible so that it
 	// gives us a signal on the replication layer alone.
+	return nil
 }
 
 func init() {

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcat
 
@@ -17,7 +12,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -25,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -33,10 +29,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -49,10 +48,20 @@ const (
 
 // Catalog implements the cat.Catalog interface for testing purposes.
 type Catalog struct {
-	testSchema Schema
-	counter    int
-	enumTypes  map[string]*types.T
-	udfs       map[string]*tree.ResolvedFunctionDefinition
+	testSchema       Schema
+	counter          int
+	dependencyDigest int64
+	enumTypes        map[string]*types.T
+
+	udfs           map[string]*tree.ResolvedFunctionDefinition
+	revokedUDFOids intsets.Fast
+
+	users       map[username.SQLUsername]roleMembership
+	currentUser username.SQLUsername
+}
+
+type roleMembership struct {
+	isMemberOfAdminRole bool
 }
 
 type dataSource interface {
@@ -64,6 +73,9 @@ var _ cat.Catalog = &Catalog{}
 
 // New creates a new empty instance of the test catalog.
 func New() *Catalog {
+	users := make(map[username.SQLUsername]roleMembership)
+	users[username.RootUserName()] = roleMembership{isMemberOfAdminRole: true}
+
 	return &Catalog{
 		testSchema: Schema{
 			SchemaID: 1,
@@ -75,6 +87,8 @@ func New() *Catalog {
 			},
 			dataSources: make(map[string]dataSource),
 		},
+		users:       users,
+		currentUser: username.RootUserName(),
 	}
 }
 
@@ -260,7 +274,9 @@ func (tc *Catalog) ResolveIndex(
 }
 
 // CheckPrivilege is part of the cat.Catalog interface.
-func (tc *Catalog) CheckPrivilege(ctx context.Context, o cat.Object, priv privilege.Kind) error {
+func (tc *Catalog) CheckPrivilege(
+	ctx context.Context, o cat.Object, user username.SQLUsername, priv privilege.Kind,
+) error {
 	return tc.CheckAnyPrivilege(ctx, o)
 }
 
@@ -283,20 +299,36 @@ func (tc *Catalog) CheckAnyPrivilege(ctx context.Context, o cat.Object) error {
 		if t.Revoked {
 			return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to access %v", t.SeqName)
 		}
+	case *syntheticprivilege.GlobalPrivilege:
+
 	default:
 		panic("invalid Object")
 	}
 	return nil
 }
 
-// HasAdminRole is part of the cat.Catalog interface.
-func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
-	return true, nil
+// CheckExecutionPrivilege is part of the cat.Catalog interface.
+func (tc *Catalog) CheckExecutionPrivilege(
+	ctx context.Context, oid oid.Oid, user username.SQLUsername,
+) error {
+	if tc.revokedUDFOids.Contains(int(oid)) {
+		return pgerror.Newf(pgcode.InsufficientPrivilege, "user does not have privilege to execute function with OID %d", oid)
+	}
+	return nil
 }
 
-// RequireAdminRole is part of the cat.Catalog interface.
-func (tc *Catalog) RequireAdminRole(ctx context.Context, action string) error {
-	return nil
+// HasAdminRole is part of the cat.Catalog interface.
+func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
+	return tc.UserHasAdminRole(ctx, tc.currentUser)
+}
+
+// UserHasAdminRole is part of the cat.Catalog interface.
+func (tc *Catalog) UserHasAdminRole(ctx context.Context, user username.SQLUsername) (bool, error) {
+	roleMembership, found := tc.users[user]
+	if !found {
+		return false, errors.AssertionFailedf("user %q not found", user)
+	}
+	return roleMembership.isMemberOfAdminRole, nil
 }
 
 // HasRoleOption is part of the cat.Catalog interface.
@@ -311,14 +343,26 @@ func (tc *Catalog) FullyQualifiedName(
 	return ds.(dataSource).fqName(), nil
 }
 
-// RoleExists is part of the cat.Catalog interface.
-func (tc *Catalog) RoleExists(ctx context.Context, role username.SQLUsername) (bool, error) {
-	return true, nil
+// CheckRoleExists is part of the cat.Catalog interface.
+func (tc *Catalog) CheckRoleExists(ctx context.Context, role username.SQLUsername) error {
+	return nil
 }
 
 // Optimizer is part of the cat.Catalog interface.
 func (tc *Catalog) Optimizer() interface{} {
 	return nil
+}
+
+// GetCurrentUser is part of the cat.Catalog interface.
+func (tc *Catalog) GetCurrentUser() username.SQLUsername {
+	return tc.currentUser
+}
+
+// GetRoutineOwner is part of the cat.Catalog interface.
+func (tc *Catalog) GetRoutineOwner(
+	ctx context.Context, routineOid oid.Oid,
+) (username.SQLUsername, error) {
+	return tc.GetCurrentUser(), nil
 }
 
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
@@ -353,7 +397,7 @@ func (tc *Catalog) Schema() *Schema {
 
 // Table returns the test table that was previously added with the given name.
 func (tc *Catalog) Table(name *tree.TableName) *Table {
-	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
+	ds, _, err := tc.ResolveDataSource(context.Background(), cat.Flags{}, name)
 	if err != nil {
 		panic(err)
 	}
@@ -367,7 +411,7 @@ func (tc *Catalog) Table(name *tree.TableName) *Table {
 // LookupTable returns the test table that was previously added with the given
 // name but returns an error if the name does not exist instead of panicking.
 func (tc *Catalog) LookupTable(name *tree.TableName) (*Table, error) {
-	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
+	ds, _, err := tc.ResolveDataSource(context.Background(), cat.Flags{}, name)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +445,7 @@ func (tc *Catalog) AddTable(tab *Table) {
 
 // View returns the test view that was previously added with the given name.
 func (tc *Catalog) View(name *cat.DataSourceName) *View {
-	ds, _, err := tc.ResolveDataSource(context.TODO(), cat.Flags{}, name)
+	ds, _, err := tc.ResolveDataSource(context.Background(), cat.Flags{}, name)
 	if err != nil {
 		panic(err)
 	}
@@ -430,6 +474,21 @@ func (tc *Catalog) AddSequence(seq *Sequence) {
 			"sequence %q already exists", tree.ErrString(&seq.SeqName)))
 	}
 	tc.testSchema.dataSources[fq] = seq
+}
+
+// GetDependencyDigest always assume that the generations are changing
+// on us.
+func (tc *Catalog) GetDependencyDigest() cat.DependencyDigest {
+	tc.dependencyDigest++
+	return cat.DependencyDigest{
+		LeaseGeneration: tc.dependencyDigest,
+		CurrentUser:     tc.currentUser,
+	}
+}
+
+// LeaseByStableID does not do anything since no leasing is used here.
+func (tc *Catalog) LeaseByStableID(_ context.Context, _ cat.StableID) error {
+	return nil
 }
 
 // ExecuteMultipleDDL parses the given semicolon-separated DDL SQL statements
@@ -470,6 +529,21 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 	if err != nil {
 		return "", err
 	}
+	return tc.executeDDLStmtWithIndexVersion(stmt, indexVersion)
+}
+
+// ExecuteDDLStmtWithIndexVersion statement and creates objects in the test
+// catalog from the given statement. This is used to test without spinning up a
+// cluster.
+func (tc *Catalog) ExecuteDDLStmt(stmt statements.Statement[tree.Statement]) (string, error) {
+	return tc.executeDDLStmtWithIndexVersion(stmt, descpb.LatestIndexDescriptorVersion)
+}
+
+// executeDDLStmtWithIndexVersion statement and creates objects in the test
+// catalog from the given statement.
+func (tc *Catalog) executeDDLStmtWithIndexVersion(
+	stmt statements.Statement[tree.Statement], indexVersion descpb.IndexDescriptorVersion,
+) (string, error) {
 
 	switch stmt := stmt.AST.(type) {
 	case *tree.CreateTable:
@@ -505,7 +579,7 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 		return "", nil
 
 	case *tree.CreateRoutine:
-		tc.CreateFunction(stmt)
+		tc.CreateRoutine(stmt)
 		return "", nil
 
 	case *tree.SetZoneConfig:
@@ -520,13 +594,37 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 		}
 		return ds.(fmt.Stringer).String(), nil
 
-	case *tree.ShowCreateFunction:
-		fn := stmt.Name.FunctionReference.(*tree.UnresolvedName)
+	case *tree.ShowCreateRoutine:
+		fn := tree.MakeUnresolvedFunctionName(stmt.Name.FunctionReference.(*tree.UnresolvedName))
 		def, err := tc.ResolveFunction(context.Background(), fn, tree.EmptySearchPath)
 		if err != nil {
 			return "", err
 		}
 		return formatFunction(def), nil
+
+	case *tree.CreateTrigger:
+		tc.CreateTrigger(stmt)
+		return "", nil
+
+	case *tree.DropTrigger:
+		tc.DropTrigger(stmt)
+		return "", nil
+
+	case *tree.CreatePolicy:
+		tc.CreatePolicy(stmt)
+		return "", nil
+
+	case *tree.DropPolicy:
+		tc.DropPolicy(stmt)
+		return "", nil
+
+	case *tree.SetVar:
+		tc.SetVar(stmt)
+		return "", nil
+
+	case *tree.CreateRole:
+		tc.CreateRole(stmt)
+		return "", nil
 
 	default:
 		return "", errors.AssertionFailedf("unsupported statement: %v", stmt)
@@ -631,6 +729,7 @@ type View struct {
 	ViewName    cat.DataSourceName
 	QueryText   string
 	ColumnNames tree.NameList
+	Triggers    []Trigger
 
 	// If Revoked is true, then the user has had privileges on the view revoked.
 	Revoked bool
@@ -698,6 +797,16 @@ func (tv *View) CollectTypes(ord int) (descpb.IDs, error) {
 	return nil, nil
 }
 
+// TriggerCount is a part of the cat.View interface.
+func (tv *View) TriggerCount() int {
+	return len(tv.Triggers)
+}
+
+// Trigger is a part of the cat.View interface.
+func (tv *View) Trigger(i int) cat.Trigger {
+	return &tv.Triggers[i]
+}
+
 // Table implements the cat.Table interface for testing purposes.
 type Table struct {
 	TabID      cat.StableID
@@ -709,6 +818,7 @@ type Table struct {
 	Stats      TableStats
 	Checks     []cat.CheckConstraint
 	Families   []*Family
+	Triggers   []Trigger
 	IsVirtual  bool
 	IsSystem   bool
 	Catalog    *Catalog
@@ -733,13 +843,16 @@ type Table struct {
 	implicitRBRIndexElem *tree.IndexElem
 
 	homeRegion string
+
+	rlsEnabled bool
+	policies   cat.Policies
 }
 
 var _ cat.Table = &Table{}
 
 func (tt *Table) String() string {
 	tp := treeprinter.New()
-	cat.FormatTable(tt.Catalog, tt, tp, false /* redactableValues */)
+	cat.FormatTable(context.Background(), tt.Catalog, tt, tp, false /* redactableValues */)
 	return tp.String()
 }
 
@@ -998,6 +1111,59 @@ func (tt *Table) IsRefreshViewRequired() bool {
 	return false
 }
 
+// TriggerCount is a part of the cat.Table interface.
+func (tt *Table) TriggerCount() int {
+	return len(tt.Triggers)
+}
+
+// Trigger is a part of the cat.Table interface.
+func (tt *Table) Trigger(i int) cat.Trigger {
+	return &tt.Triggers[i]
+}
+
+// IsRowLevelSecurityEnabled is part of the cat.Table interface.
+func (tt *Table) IsRowLevelSecurityEnabled() bool { return tt.rlsEnabled }
+
+// PolicyCount is part of the cat.Table interface
+func (tt *Table) PolicyCount(polType tree.PolicyType) int {
+	switch polType {
+	case tree.PolicyTypeRestrictive:
+		return len(tt.policies.Restrictive)
+	default:
+		return len(tt.policies.Permissive)
+	}
+}
+
+// Policy is part of the cat.Table interface
+func (tt *Table) Policy(policyType tree.PolicyType, index int) cat.Policy {
+	var policies []cat.Policy
+	switch policyType {
+	case tree.PolicyTypeRestrictive:
+		policies = tt.policies.Restrictive
+	default:
+		policies = tt.policies.Permissive
+	}
+	if index >= len(policies) {
+		panic(errors.AssertionFailedf("policy of type %v at index %d not found", policyType, index))
+	}
+	return policies[index]
+}
+
+// findPolicyByName will lookup the policy by its name. It returns it's policy
+// type and index within that policy type slice so that callers can do removal
+// if needed.
+func (tt *Table) findPolicyByName(policyName tree.Name) (*cat.Policy, tree.PolicyType, int) {
+	for _, pt := range []tree.PolicyType{tree.PolicyTypePermissive, tree.PolicyTypeRestrictive} {
+		for i := range tt.PolicyCount(pt) {
+			p := tt.Policy(pt, i)
+			if p.Name == policyName {
+				return &p, pt, i
+			}
+		}
+	}
+	return nil, tree.PolicyTypePermissive, -1
+}
+
 // Index implements the cat.Index interface for testing purposes.
 type Index struct {
 	IdxName string
@@ -1018,8 +1184,8 @@ type Index struct {
 	// Unique is true if this index is declared as UNIQUE in the schema.
 	Unique bool
 
-	// Inverted is true when this index is an inverted index.
-	Inverted bool
+	// Typ is the type of the index: forward, inverted, vector, etc.
+	Typ idxtype.T
 
 	// Invisibility specifies the invisibility of an index and can be any float64
 	// between [0.0, 1.0]. An index with invisibility 0.0 means that the index is
@@ -1050,9 +1216,13 @@ type Index struct {
 	// an inverted index.
 	invertedOrd int
 
+	// vectorOrd is the ordinal of the vector column, if the index is a vector
+	// index.
+	vectorOrd int
+
 	// geoConfig is the geospatial index configuration, if this is a geospatial
 	// inverted index.
-	geoConfig geoindex.Config
+	geoConfig geopb.Config
 
 	// version is the index descriptor version of the index.
 	version descpb.IndexDescriptorVersion
@@ -1087,9 +1257,9 @@ func (ti *Index) IsUnique() bool {
 	return ti.Unique
 }
 
-// IsInverted is part of the cat.Index interface.
-func (ti *Index) IsInverted() bool {
-	return ti.Inverted
+// Type is part of the cat.Index interface.
+func (ti *Index) Type() idxtype.T {
+	return ti.Typ
 }
 
 // GetInvisibility is part of the cat.Index interface.
@@ -1117,12 +1287,16 @@ func (ti *Index) LaxKeyColumnCount() int {
 	return ti.LaxKeyCount
 }
 
-// NonInvertedPrefixColumnCount is part of the cat.Index interface.
-func (ti *Index) NonInvertedPrefixColumnCount() int {
-	if !ti.IsInverted() {
-		panic("not supported for non-inverted indexes")
+// PrefixColumnCount is part of the cat.Index interface.
+func (ti *Index) PrefixColumnCount() int {
+	switch ti.Type() {
+	case idxtype.INVERTED:
+		return ti.invertedOrd
+	case idxtype.VECTOR:
+		return ti.vectorOrd
+	default:
+		panic("only supported for inverted and vector indexes")
 	}
-	return ti.invertedOrd
 }
 
 // Column is part of the cat.Index interface.
@@ -1132,10 +1306,18 @@ func (ti *Index) Column(i int) cat.IndexColumn {
 
 // InvertedColumn is part of the cat.Index interface.
 func (ti *Index) InvertedColumn() cat.IndexColumn {
-	if !ti.IsInverted() {
+	if ti.Type() != idxtype.INVERTED {
 		panic("non-inverted indexes do not have inverted columns")
 	}
 	return ti.Column(ti.invertedOrd)
+}
+
+// VectorColumn is part of the cat.Index interface.
+func (ti *Index) VectorColumn() cat.IndexColumn {
+	if ti.Type() != idxtype.VECTOR {
+		panic("non-vector indexes do not have indexed vector columns")
+	}
+	return ti.Column(ti.vectorOrd)
 }
 
 // Zone is part of the cat.Index interface.
@@ -1166,7 +1348,7 @@ func (ti *Index) ImplicitPartitioningColumnCount() int {
 }
 
 // GeoConfig is part of the cat.Index interface.
-func (ti *Index) GeoConfig() geoindex.Config {
+func (ti *Index) GeoConfig() geopb.Config {
 	return ti.geoConfig
 }
 
@@ -1217,6 +1399,36 @@ func (p *Partition) PartitionByListPrefixes() []tree.Datums {
 // SetDatums manually sets the partitioning values.
 func (p *Partition) SetDatums(datums []tree.Datums) {
 	p.datums = datums
+}
+
+// CheckConstraint implements cat.CheckConstraint. See that interface
+// for more information on the fields.
+type CheckConstraint struct {
+	constraint     string
+	validated      bool
+	columnOrdinals []int
+}
+
+var _ cat.CheckConstraint = &CheckConstraint{}
+
+// Constraint is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) Constraint() string {
+	return c.constraint
+}
+
+// Validated is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) Validated() bool {
+	return c.validated
+}
+
+// ColumnCount is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) ColumnCount() int {
+	return len(c.columnOrdinals)
+}
+
+// ColumnOrdinal is part of the cat.CheckConstraint interface.
+func (c *CheckConstraint) ColumnOrdinal(i int) int {
+	return c.columnOrdinals[i]
 }
 
 // TableStat implements the cat.TableStatistic interface for testing purposes.
@@ -1313,7 +1525,7 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 
 	for i := offset; i < len(ts.histogram); i++ {
 		bucket := &ts.js.HistogramBuckets[i-offset]
-		datum, err := rowenc.ParseDatumStringAs(context.Background(), colType, bucket.UpperBound, evalCtx)
+		datum, err := rowenc.ParseDatumStringAs(context.Background(), colType, bucket.UpperBound, evalCtx, nil /* semaCtx */)
 		if err != nil {
 			panic(err)
 		}
@@ -1461,12 +1673,14 @@ func (fk *ForeignKeyConstraint) UpdateReferenceAction() tree.ReferenceAction {
 // UniqueConstraint implements cat.UniqueConstraint. See that interface
 // for more information on the fields.
 type UniqueConstraint struct {
-	name           string
-	tabID          cat.StableID
-	columnOrdinals []int
-	predicate      string
-	withoutIndex   bool
-	validated      bool
+	name                  string
+	tabID                 cat.StableID
+	columnOrdinals        []int
+	predicate             string
+	withoutIndex          bool
+	canUseTombstones      bool
+	tombstoneIndexOrdinal cat.IndexOrdinal
+	validated             bool
 }
 
 var _ cat.UniqueConstraint = &UniqueConstraint{}
@@ -1505,6 +1719,17 @@ func (u *UniqueConstraint) Predicate() (string, bool) {
 // WithoutIndex is part of the cat.UniqueConstraint interface.
 func (u *UniqueConstraint) WithoutIndex() bool {
 	return u.withoutIndex
+}
+
+// TombstoneIndexOrdinal is part of the cat.UniqueConstraint interface
+func (u *UniqueConstraint) TombstoneIndexOrdinal() (ordinal cat.IndexOrdinal, ok bool) {
+	ok = u.canUseTombstones
+	if ok {
+		ordinal = u.tombstoneIndexOrdinal
+	} else {
+		ordinal = -1
+	}
+	return ordinal, ok
 }
 
 // Validated is part of the cat.UniqueConstraint interface.
@@ -1610,4 +1835,74 @@ func (tf *Family) ColumnCount() int {
 // Column is part of the cat.Family interface.
 func (tf *Family) Column(i int) cat.FamilyColumn {
 	return tf.Columns[i]
+}
+
+// Trigger implements the cat.Trigger interface for testing purposes.
+type Trigger struct {
+	TriggerName               tree.Name
+	TriggerActionTime         tree.TriggerActionTime
+	TriggerEvents             []*tree.TriggerEvent
+	TriggerTableID            cat.StableID
+	TriggerNewTransitionAlias tree.Name
+	TriggerOldTransitionAlias tree.Name
+	TriggerForEachRow         bool
+	TriggerWhenExpr           string
+	TriggerFuncID             cat.StableID
+	TriggerFuncArgs           tree.Datums
+	TriggerFuncBody           string
+	TriggerEnabled            bool
+}
+
+var _ cat.Trigger = &Trigger{}
+
+func (t *Trigger) Name() tree.Name {
+	return t.TriggerName
+}
+
+func (t *Trigger) ActionTime() tree.TriggerActionTime {
+	return t.TriggerActionTime
+}
+
+func (t *Trigger) EventCount() int {
+	return len(t.TriggerEvents)
+}
+
+func (t *Trigger) Event(i int) tree.TriggerEvent {
+	return *t.TriggerEvents[i]
+}
+
+func (t *Trigger) TableID() cat.StableID {
+	return t.TriggerTableID
+}
+
+func (t *Trigger) NewTransitionAlias() tree.Name {
+	return t.TriggerNewTransitionAlias
+}
+
+func (t *Trigger) OldTransitionAlias() tree.Name {
+	return t.TriggerOldTransitionAlias
+}
+
+func (t *Trigger) ForEachRow() bool {
+	return t.TriggerForEachRow
+}
+
+func (t *Trigger) WhenExpr() string {
+	return t.TriggerWhenExpr
+}
+
+func (t *Trigger) FuncID() cat.StableID {
+	return t.TriggerFuncID
+}
+
+func (t *Trigger) FuncArgs() tree.Datums {
+	return t.TriggerFuncArgs
+}
+
+func (t *Trigger) FuncBody() string {
+	return t.TriggerFuncBody
+}
+
+func (t *Trigger) Enabled() bool {
+	return t.TriggerEnabled
 }

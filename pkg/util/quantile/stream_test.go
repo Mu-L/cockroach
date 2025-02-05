@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright 2013 Blake Mizerany
 // Use of this source code is governed by a MIT-style
@@ -97,10 +92,10 @@ func verifyHighPercsWithRelativeEpsilon(t *testing.T, a []float64, s *Stream) {
 	}
 }
 
-func populateStream(s *Stream) []float64 {
+func populateStream(s *Stream, randSource *rand.Rand) []float64 {
 	a := make([]float64, 0, 1e5+100)
 	for i := 0; i < cap(a); i++ {
-		v := rand.NormFloat64()
+		v := randSource.NormFloat64()
 		// Add 5% asymmetric outliers.
 		if i%20 == 0 {
 			v = v*v + 1
@@ -112,14 +107,13 @@ func populateStream(s *Stream) []float64 {
 }
 
 func TestTargetedQuery(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s := NewTargeted(Targets)
-	a := populateStream(s)
+	a := populateStream(s, randSource)
 	verifyPercsWithAbsoluteEpsilon(t, a, s)
 }
 
 func TestTargetedQuerySmallSampleSize(t *testing.T) {
-	rand.Seed(42)
 	s := NewTargeted(TargetsSmallEpsilon)
 	a := []float64{1, 2, 3, 4, 5}
 	for _, v := range a {
@@ -143,48 +137,48 @@ func TestTargetedQuerySmallSampleSize(t *testing.T) {
 }
 
 func TestLowBiasedQuery(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s := NewLowBiased(RelativeEpsilon)
-	a := populateStream(s)
+	a := populateStream(s, randSource)
 	verifyLowPercsWithRelativeEpsilon(t, a, s)
 }
 
 func TestHighBiasedQuery(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s := NewHighBiased(RelativeEpsilon)
-	a := populateStream(s)
+	a := populateStream(s, randSource)
 	verifyHighPercsWithRelativeEpsilon(t, a, s)
 }
 
 // BrokenTestTargetedMerge is broken, see Merge doc comment.
 func BrokenTestTargetedMerge(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s1 := NewTargeted(Targets)
 	s2 := NewTargeted(Targets)
-	a := populateStream(s1)
-	a = append(a, populateStream(s2)...)
+	a := populateStream(s1, randSource)
+	a = append(a, populateStream(s2, randSource)...)
 	s1.Merge(s2.Samples())
 	verifyPercsWithAbsoluteEpsilon(t, a, s1)
 }
 
 // BrokenTestLowBiasedMerge is broken, see Merge doc comment.
 func BrokenTestLowBiasedMerge(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s1 := NewLowBiased(RelativeEpsilon)
 	s2 := NewLowBiased(RelativeEpsilon)
-	a := populateStream(s1)
-	a = append(a, populateStream(s2)...)
+	a := populateStream(s1, randSource)
+	a = append(a, populateStream(s2, randSource)...)
 	s1.Merge(s2.Samples())
 	verifyLowPercsWithRelativeEpsilon(t, a, s2)
 }
 
 // BrokenTestHighBiasedMerge is broken, see Merge doc comment.
 func BrokenTestHighBiasedMerge(t *testing.T) {
-	rand.Seed(42)
+	randSource := rand.New(rand.NewSource(42))
 	s1 := NewHighBiased(RelativeEpsilon)
 	s2 := NewHighBiased(RelativeEpsilon)
-	a := populateStream(s1)
-	a = append(a, populateStream(s2)...)
+	a := populateStream(s1, randSource)
+	a = append(a, populateStream(s2, randSource)...)
 	s1.Merge(s2.Samples())
 	verifyHighPercsWithRelativeEpsilon(t, a, s2)
 }

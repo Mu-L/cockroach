@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package application_api_test
 
@@ -15,7 +10,6 @@ import (
 	gosql "database/sql"
 	"encoding/hex"
 	"fmt"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -40,8 +34,10 @@ import (
 func TestListSessionsSecurity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+
+	s := srv.ApplicationLayer()
 
 	ctx := context.Background()
 
@@ -112,10 +108,12 @@ func TestListSessionsPrivileges(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Skip under stress race as the sleep query might finish before the stress race can finish.
-	skip.UnderStressRace(t, "list sessions privileges")
+	skip.UnderRace(t, "list sessions privileges")
 
-	ts, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
+
 	endpoint := "sessions"
 	appName := "test_sessions_privileges"
 	user := apiconstants.TestingUserNameNoAdmin().Normalized()
@@ -235,8 +233,11 @@ func TestStatusCancelSessionGatewayMetadataPropagation(t *testing.T) {
 	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(ctx)
 
+	s0 := testCluster.Server(0).ApplicationLayer()
+	s1 := testCluster.Server(1).ApplicationLayer()
+
 	// Start a SQL session as admin on node 1.
-	sql0 := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
+	sql0 := sqlutils.MakeSQLRunner(s0.SQLConn(t))
 	results := sql0.QueryStr(t, "SELECT session_id FROM [SHOW SESSIONS] LIMIT 1")
 	sessionID, err := hex.DecodeString(results[0][0])
 	require.NoError(t, err)
@@ -246,7 +247,7 @@ func TestStatusCancelSessionGatewayMetadataPropagation(t *testing.T) {
 		SessionID: sessionID,
 	}
 	resp := &serverpb.CancelSessionResponse{}
-	err = srvtestutils.PostStatusJSONProtoWithAdminOption(testCluster.Server(1), "cancel_session/1", req, resp, false)
+	err = srvtestutils.PostStatusJSONProtoWithAdminOption(s1, "cancel_session/1", req, resp, false)
 	require.NotNil(t, err)
 	require.Contains(t, err.Error(), "status: 403 Forbidden")
 }
@@ -259,8 +260,8 @@ func TestStatusAPIListSessions(t *testing.T) {
 	testCluster := serverutils.StartCluster(t, 1, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(ctx)
 
-	serverProto := testCluster.Server(0)
-	serverSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
+	s0 := testCluster.Server(0).ApplicationLayer()
+	serverSQL := sqlutils.MakeSQLRunner(s0.SQLConn(t))
 
 	appName := "test_sessions_api"
 	serverSQL.Exec(t, fmt.Sprintf(`SET application_name = "%s"`, appName))
@@ -279,13 +280,13 @@ func TestStatusAPIListSessions(t *testing.T) {
 	userNoAdmin := apiconstants.TestingUserNameNoAdmin()
 	var resp serverpb.ListSessionsResponse
 	// Non-admin without VIEWWACTIVITY or VIEWACTIVITYREDACTED should work and fetch user's own sessions.
-	err := srvtestutils.GetStatusJSONProtoWithAdminOption(serverProto, "sessions", &resp, false)
+	err := srvtestutils.GetStatusJSONProtoWithAdminOption(s0, "sessions", &resp, false)
 	require.NoError(t, err)
 
 	// Grant VIEWACTIVITYREDACTED.
 	serverSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITYREDACTED", userNoAdmin.Normalized()))
 	serverSQL.Exec(t, "SELECT 1")
-	err = srvtestutils.GetStatusJSONProtoWithAdminOption(serverProto, "sessions", &resp, false)
+	err = srvtestutils.GetStatusJSONProtoWithAdminOption(s0, "sessions", &resp, false)
 	require.NoError(t, err)
 	session := getSessionWithTestAppName(&resp)
 	require.Equal(t, session.LastActiveQuery, session.LastActiveQueryNoConstants)
@@ -294,7 +295,7 @@ func TestStatusAPIListSessions(t *testing.T) {
 	// Grant VIEWACTIVITY, VIEWACTIVITYREDACTED should take precedence.
 	serverSQL.Exec(t, fmt.Sprintf("ALTER USER %s VIEWACTIVITY", userNoAdmin.Normalized()))
 	serverSQL.Exec(t, "SELECT 1, 1")
-	err = srvtestutils.GetStatusJSONProtoWithAdminOption(serverProto, "sessions", &resp, false)
+	err = srvtestutils.GetStatusJSONProtoWithAdminOption(s0, "sessions", &resp, false)
 	require.NoError(t, err)
 	session = getSessionWithTestAppName(&resp)
 	require.Equal(t, appName, session.ApplicationName)
@@ -304,7 +305,7 @@ func TestStatusAPIListSessions(t *testing.T) {
 	// Remove VIEWACTIVITYREDCATED. User should now see full query.
 	serverSQL.Exec(t, fmt.Sprintf("ALTER USER %s NOVIEWACTIVITYREDACTED", userNoAdmin.Normalized()))
 	serverSQL.Exec(t, "SELECT 2")
-	err = srvtestutils.GetStatusJSONProtoWithAdminOption(serverProto, "sessions", &resp, false)
+	err = srvtestutils.GetStatusJSONProtoWithAdminOption(s0, "sessions", &resp, false)
 	require.NoError(t, err)
 	session = getSessionWithTestAppName(&resp)
 	require.Equal(t, "SELECT _", session.LastActiveQueryNoConstants)
@@ -316,13 +317,13 @@ func TestListClosedSessions(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// The active sessions might close before the stress race can finish.
-	skip.UnderStressRace(t, "active sessions")
+	skip.UnderRace(t, "active sessions")
 
 	ctx := context.Background()
 	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(ctx)
 
-	server := testCluster.Server(0)
+	server := testCluster.Server(0).ApplicationLayer()
 
 	doSessionsRequest := func(username string) serverpb.ListSessionsResponse {
 		var resp serverpb.ListSessionsResponse
@@ -332,15 +333,10 @@ func TestListClosedSessions(t *testing.T) {
 		return resp
 	}
 
-	getUserConn := func(t *testing.T, username string, server serverutils.TestServerInterface) *gosql.DB {
-		pgURL := url.URL{
-			Scheme: "postgres",
-			User:   url.UserPassword(username, "hunter2"),
-			Host:   server.AdvSQLAddr(),
-		}
-		db, err := gosql.Open("postgres", pgURL.String())
-		require.NoError(t, err)
-		return db
+	getUserConn := func(t *testing.T, username string, server serverutils.ApplicationLayerInterface) *gosql.DB {
+		return server.SQLConn(
+			t, serverutils.UserPassword(username, "hunter2"), serverutils.ClientCerts(false),
+		)
 	}
 
 	// Create a test user.
@@ -358,7 +354,7 @@ CREATE USER %s with password 'hunter2';
 	// Open 10 sessions for the user and then close them.
 	for _, user := range users {
 		for i := 0; i < 10; i++ {
-			targetDB := getUserConn(t, user, testCluster.Server(0))
+			targetDB := getUserConn(t, user, server)
 			dbs = append(dbs, targetDB)
 			sqlutils.MakeSQLRunner(targetDB).Exec(t, `SELECT version()`)
 		}
@@ -377,7 +373,7 @@ CREATE USER %s with password 'hunter2';
 			wg.Add(1)
 			go func(user string) {
 				// Open a session for the target user.
-				targetDB := getUserConn(t, user, testCluster.Server(0))
+				targetDB := getUserConn(t, user, server)
 				defer targetDB.Close()
 				defer wg.Done()
 				sqlutils.MakeSQLRunner(targetDB).Exec(t, `SELECT pg_sleep(30)`)
@@ -388,7 +384,7 @@ CREATE USER %s with password 'hunter2';
 	// Open 3 sessions for the user and leave them idle by running version().
 	for _, user := range users {
 		for i := 0; i < 3; i++ {
-			targetDB := getUserConn(t, user, testCluster.Server(0))
+			targetDB := getUserConn(t, user, server)
 			defer targetDB.Close()
 			sqlutils.MakeSQLRunner(targetDB).Exec(t, `SELECT version()`)
 		}

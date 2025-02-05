@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package importer_test
 
@@ -24,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -32,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -69,7 +64,6 @@ func TestProtectedTimestampsDuringImportInto(t *testing.T) {
 	s := tc.Server(0).ApplicationLayer()
 	tenantSettings := s.ClusterSettings()
 	protectedts.PollInterval.Override(ctx, &tenantSettings.SV, 100*time.Millisecond)
-	sql.SecondaryTenantZoneConfigsEnabled.Override(ctx, &tenantSettings.SV, true)
 
 	tc.WaitForNodeLiveness(t)
 	require.NoError(t, tc.WaitForFullReplication())
@@ -135,9 +129,10 @@ ORDER BY raw_start_key ASC`)
 			var startKey roachpb.Key
 			require.NoError(t, rows.Scan(&startKey))
 			s, repl := getFirstStoreReplica(t, tc.Server(0), startKey)
-			trace, _, err := s.Enqueue(ctx, "mvccGC", repl, skipShouldQueue, false /* async */)
+			traceCtx, rec := tracing.ContextWithRecordingSpan(ctx, s.GetStoreConfig().Tracer(), "trace-enqueue")
+			_, err := s.Enqueue(traceCtx, "mvccGC", repl, skipShouldQueue, false /* async */)
 			require.NoError(t, err)
-			fmt.Fprintf(&traceBuf, "%s\n", trace.String())
+			fmt.Fprintf(&traceBuf, "%s\n", rec().String())
 		}
 		require.NoError(t, rows.Err())
 		return traceBuf.String()
@@ -186,4 +181,62 @@ func getFirstStoreReplica(
 		return nil
 	})
 	return store, repl
+}
+
+// TestImportIntoWithUDTArray verifies that we can support importing data into a
+// table with a column typed as an array of user-defined types.
+func TestImportIntoWithUDTArray(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	dir, dirCleanupFn := testutils.TempDir(t)
+	defer dirCleanupFn()
+
+	ctx := context.Background()
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		ExternalIODir: dir,
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	runner := sqlutils.MakeSQLRunner(db)
+	runner.Exec(t, `
+CREATE TYPE weekday AS ENUM('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday');
+CREATE TABLE shifts (employee STRING, days weekday[]);
+INSERT INTO shifts VALUES ('John', ARRAY['Monday', 'Wednesday', 'Friday']);
+INSERT INTO shifts VALUES ('Bob', ARRAY['Tuesday', 'Thursday']);
+`)
+	// Sanity check that we currently have the expected state.
+	expected := [][]string{
+		{"John", "{Monday,Wednesday,Friday}"},
+		{"Bob", "{Tuesday,Thursday}"},
+	}
+	runner.CheckQueryResults(t, "SELECT * FROM shifts;", expected)
+	// Export has to run in a separate implicit txn.
+	runner.Exec(t, `EXPORT INTO CSV 'nodelocal://1/export1/' FROM SELECT * FROM shifts;`)
+	// Now clear the table since we'll be importing into it.
+	runner.Exec(t, `DELETE FROM shifts WHERE true;`)
+	runner.CheckQueryResults(t, "SELECT count(*) FROM shifts;", [][]string{{"0"}})
+	// Import two rows once.
+	runner.Exec(t, "IMPORT INTO shifts CSV DATA ('nodelocal://1/export1/export*-n*.0.csv');")
+	runner.CheckQueryResults(t, "SELECT * FROM shifts;", expected)
+	// Import two rows again - we'll now have four rows in the table.
+	runner.Exec(t, "IMPORT INTO shifts CSV DATA ('nodelocal://1/export1/export*-n*.0.csv');")
+	runner.CheckQueryResults(t, "SELECT * FROM shifts;", append(expected, expected...))
+
+	// We currently don't support importing into a table that has columns with
+	// UDTs with the same name but different schemas.
+	runner.Exec(t, `
+CREATE SCHEMA short;
+CREATE TYPE short.weekday AS ENUM('M', 'Tu', 'W', 'Th', 'F');
+DROP TABLE shifts;
+CREATE TABLE shifts (employee STRING, days weekday[], days_short short.weekday[]);
+INSERT INTO shifts VALUES ('John', ARRAY['Monday', 'Wednesday', 'Friday'], ARRAY['M', 'W', 'F']);
+INSERT INTO shifts VALUES ('Bob', ARRAY['Tuesday', 'Thursday'], ARRAY['Tu', 'Th']);
+`)
+	runner.Exec(t, `EXPORT INTO CSV 'nodelocal://1/export2/' FROM SELECT * FROM shifts;`)
+	runner.ExpectErr(
+		t,
+		".*tables with multiple user-defined types with the same name are currently unsupported.*",
+		"IMPORT INTO shifts CSV DATA ('nodelocal://1/export2/export*-n*.0.csv');",
+	)
 }

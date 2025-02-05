@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlproxyccl
 
@@ -32,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenantdirsvr"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
+	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -40,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -48,9 +47,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
 	pgproto3 "github.com/jackc/pgproto3/v2"
-	pgx "github.com/jackc/pgx/v4"
+	pgx "github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	proxyproto "github.com/pires/go-proxyproto"
 	"github.com/pires/go-proxyproto/tlvparse"
 	"github.com/stretchr/testify/assert"
@@ -65,8 +64,15 @@ const backendError = "Backend error!"
 // the test directory server.
 const notFoundTenantID = 99
 
+type serverAddresses struct {
+	listenAddr              string
+	proxyProtocolListenAddr string
+	httpAddr                string
+}
+
 func TestProxyHandler_ValidateConnection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -89,15 +95,17 @@ func TestProxyHandler_ValidateConnection(t *testing.T) {
 
 	options := &ProxyOptions{}
 	options.testingKnobs.directoryServer = tds
-	s, _, _ := newSecureProxyServer(ctx, t, stop, options)
+	s, _ := newSecureProxyServer(ctx, t, stop, options)
 
 	t.Run("not found/no cluster name", func(t *testing.T) {
 		err := s.handler.validateConnection(ctx, invalidTenantID, "")
 		require.Regexp(t, "codeParamsRoutingFailed: cluster -99 not found", err.Error())
+		require.True(t, errors.Is(err, highFreqErrorMarker))
 	})
 	t.Run("not found", func(t *testing.T) {
 		err := s.handler.validateConnection(ctx, invalidTenantID, "foo-bar")
 		require.Regexp(t, "codeParamsRoutingFailed: cluster foo-bar-99 not found", err.Error())
+		require.True(t, errors.Is(err, highFreqErrorMarker))
 	})
 	t.Run("found/tenant without name", func(t *testing.T) {
 		err := s.handler.validateConnection(ctx, tenantWithoutNameID, "foo-bar")
@@ -110,10 +118,12 @@ func TestProxyHandler_ValidateConnection(t *testing.T) {
 	t.Run("found/connection without name", func(t *testing.T) {
 		err := s.handler.validateConnection(ctx, tenantID, "")
 		require.Regexp(t, "codeParamsRoutingFailed: cluster -10 not found", err.Error())
+		require.True(t, errors.Is(err, highFreqErrorMarker))
 	})
 	t.Run("found/tenant name mismatch", func(t *testing.T) {
 		err := s.handler.validateConnection(ctx, tenantID, "foo-bar")
 		require.Regexp(t, "codeParamsRoutingFailed: cluster foo-bar-10 not found", err.Error())
+		require.True(t, errors.Is(err, highFreqErrorMarker))
 	})
 
 	// Stop the directory server.
@@ -124,18 +134,22 @@ func TestProxyHandler_ValidateConnection(t *testing.T) {
 		// Use a new tenant ID here to force GetTenant.
 		err := s.handler.validateConnection(ctx, roachpb.MustMakeTenantID(100), "")
 		require.Regexp(t, "directory server has not been started", err.Error())
+		require.False(t, errors.Is(err, highFreqErrorMarker))
 	})
 }
 
 func TestProxyProtocol(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 
 	ts := sql.ApplicationLayer()
 	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
@@ -148,7 +162,7 @@ func TestProxyProtocol(t *testing.T) {
 	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
 
 	var validateFn func(h *proxyproto.Header) error
-	withProxyProtocol := func(p bool) (server *Server, addr, httpAddr string) {
+	withProxyProtocol := func(p bool) (server *Server, addrs *serverAddresses) {
 		options := &ProxyOptions{
 			RoutingRule:          ts.AdvSQLAddr(),
 			SkipVerify:           true,
@@ -206,8 +220,6 @@ func TestProxyProtocol(t *testing.T) {
 		}
 	}
 
-	s, sqlAddr, httpAddr := withProxyProtocol(true)
-
 	defer testutils.TestingHook(&validateFn, func(h *proxyproto.Header) error {
 		if h.SourceAddr.String() != "10.20.30.40:4242" {
 			return errors.Newf("got source addr %s, expected 10.20.30.40:4242", h.SourceAddr)
@@ -215,36 +227,85 @@ func TestProxyProtocol(t *testing.T) {
 		return nil
 	})()
 
-	// Test SQL. Only request with PROXY should go through.
-	url := fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-42.defaultdb?sslmode=require", sqlAddr)
-	te.TestConnectWithPGConfig(
-		ctx, t, url,
-		func(c *pgx.ConnConfig) {
-			c.DialFunc = proxyDialer
-		},
-		func(conn *pgx.Conn) {
-			require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
-			require.NoError(t, runTestQuery(ctx, conn))
-		},
-	)
-	_ = te.TestConnectErr(ctx, t, url, codeClientReadFailed, "tls error")
+	testSQLNoRequiredProxyProtocol := func(s *Server, addr string) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-42.defaultdb?sslmode=require", addr)
+		// No proxy protocol.
+		te.TestConnect(ctx, t, url,
+			func(conn *pgx.Conn) {
+				t.Log("B")
+				require.NotZero(t, s.metrics.CurConnCount.Value())
+				require.NoError(t, runTestQuery(ctx, conn))
+			},
+		)
+		// Proxy protocol.
+		_ = te.TestConnectErrWithPGConfig(
+			ctx, t, url,
+			func(c *pgx.ConnConfig) {
+				c.DialFunc = proxyDialer
+			}, codeClientReadFailed, "tls error",
+		)
+	}
 
-	// Test HTTP. Should support with or without PROXY.
-	client := http.Client{Timeout: timeout}
-	makeHttpReq(t, &client, httpAddr, true)
-	proxyClient := http.Client{Transport: &http.Transport{DialContext: proxyDialer}}
-	makeHttpReq(t, &proxyClient, httpAddr, true)
+	testSQLRequiredProxyProtocol := func(s *Server, addr string) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-42.defaultdb?sslmode=require", addr)
+		// No proxy protocol.
+		_ = te.TestConnectErr(ctx, t, url, codeClientReadFailed, "tls error")
+		// Proxy protocol.
+		te.TestConnectWithPGConfig(
+			ctx, t, url,
+			func(c *pgx.ConnConfig) {
+				c.DialFunc = proxyDialer
+			},
+			func(conn *pgx.Conn) {
+				require.NotZero(t, s.metrics.CurConnCount.Value())
+				require.NoError(t, runTestQuery(ctx, conn))
+			},
+		)
+	}
+
+	t.Run("server doesn't require proxy protocol", func(t *testing.T) {
+		s, addrs := withProxyProtocol(false)
+		// Test SQL on the default listener. Both should go through.
+		testSQLNoRequiredProxyProtocol(s, addrs.listenAddr)
+		// Test SQL on the proxy protocol listener. Only request with PROXY should go
+		// through.
+		testSQLRequiredProxyProtocol(s, addrs.proxyProtocolListenAddr)
+
+		// Test HTTP. Shouldn't support PROXY.
+		client := http.Client{Timeout: timeout}
+		makeHttpReq(t, &client, addrs.httpAddr, true)
+		proxyClient := http.Client{Transport: &http.Transport{DialContext: proxyDialer}}
+		makeHttpReq(t, &proxyClient, addrs.httpAddr, false)
+	})
+
+	t.Run("server requires proxy protocol", func(t *testing.T) {
+		s, addrs := withProxyProtocol(true)
+		// Test SQL on the default listener. Both should go through.
+		testSQLRequiredProxyProtocol(s, addrs.listenAddr)
+		// Test SQL on the proxy protocol listener. Only request with PROXY should go
+		// through.
+		testSQLRequiredProxyProtocol(s, addrs.proxyProtocolListenAddr)
+
+		// Test HTTP. Should support with or without PROXY.
+		client := http.Client{Timeout: timeout}
+		makeHttpReq(t, &client, addrs.httpAddr, true)
+		proxyClient := http.Client{Transport: &http.Transport{DialContext: proxyDialer}}
+		makeHttpReq(t, &proxyClient, addrs.httpAddr, true)
+	})
 }
 
 func TestPrivateEndpointsACL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 	defer sql.Stopper().Stop(ctx)
 
 	ts := sql.ApplicationLayer()
@@ -293,7 +354,7 @@ func TestPrivateEndpointsACL(t *testing.T) {
 		PollConfigInterval:   10 * time.Millisecond,
 	}
 	options.testingKnobs.directoryServer = tds
-	s, sqlAddr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), options)
+	s, addrs := newSecureProxyServer(ctx, t, sql.Stopper(), options)
 
 	timeout := 3 * time.Second
 	proxyDialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -330,7 +391,7 @@ func TestPrivateEndpointsACL(t *testing.T) {
 	}
 
 	t.Run("private connection allowed", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://bob:builder@%s/my-tenant-10.defaultdb?sslmode=require", sqlAddr)
+		url := fmt.Sprintf("postgres://bob:builder@%s/my-tenant-10.defaultdb?sslmode=require", addrs.listenAddr)
 		te.TestConnectWithPGConfig(
 			ctx, t, url,
 			func(c *pgx.ConnConfig) {
@@ -380,7 +441,7 @@ func TestPrivateEndpointsACL(t *testing.T) {
 	})
 
 	t.Run("private connection disallowed on another tenant", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://bob:builder@%s/other-tenant-20.defaultdb?sslmode=require", sqlAddr)
+		url := fmt.Sprintf("postgres://bob:builder@%s/other-tenant-20.defaultdb?sslmode=require", addrs.listenAddr)
 		_ = te.TestConnectErrWithPGConfig(
 			ctx, t, url,
 			func(c *pgx.ConnConfig) {
@@ -392,7 +453,7 @@ func TestPrivateEndpointsACL(t *testing.T) {
 	})
 
 	t.Run("private connection disallowed on public tenant", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://bob:builder@%s/public-tenant-30.defaultdb?sslmode=require", sqlAddr)
+		url := fmt.Sprintf("postgres://bob:builder@%s/public-tenant-30.defaultdb?sslmode=require", addrs.listenAddr)
 		_ = te.TestConnectErrWithPGConfig(
 			ctx, t, url,
 			func(c *pgx.ConnConfig) {
@@ -406,13 +467,16 @@ func TestPrivateEndpointsACL(t *testing.T) {
 
 func TestAllowedCIDRRangesACL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 	defer sql.Stopper().Stop(ctx)
 
 	ts := sql.ApplicationLayer()
@@ -460,10 +524,10 @@ func TestAllowedCIDRRangesACL(t *testing.T) {
 		PollConfigInterval: 10 * time.Millisecond,
 	}
 	options.testingKnobs.directoryServer = tds
-	s, sqlAddr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), options)
+	s, addrs := newSecureProxyServer(ctx, t, sql.Stopper(), options)
 
 	t.Run("public connection allowed", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://bob:builder@%s/my-tenant-10.defaultdb?sslmode=require", sqlAddr)
+		url := fmt.Sprintf("postgres://bob:builder@%s/my-tenant-10.defaultdb?sslmode=require", addrs.listenAddr)
 		te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 			// Initial connection.
 			require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
@@ -506,18 +570,19 @@ func TestAllowedCIDRRangesACL(t *testing.T) {
 	})
 
 	t.Run("public connection disallowed on another tenant", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://bob:builder@%s/other-tenant-20.defaultdb?sslmode=require", sqlAddr)
+		url := fmt.Sprintf("postgres://bob:builder@%s/other-tenant-20.defaultdb?sslmode=require", addrs.listenAddr)
 		_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "connection refused")
 	})
 
 	t.Run("public connection disallowed on private tenant", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://bob:builder@%s/private-tenant-30.defaultdb?sslmode=require", sqlAddr)
+		url := fmt.Sprintf("postgres://bob:builder@%s/private-tenant-30.defaultdb?sslmode=require", addrs.listenAddr)
 		_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "connection refused")
 	})
 }
 
 func TestLongDBName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -533,11 +598,11 @@ func TestLongDBName(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	s, addr, _ := newSecureProxyServer(
+	s, addrs := newSecureProxyServer(
 		ctx, t, stopper, &ProxyOptions{RoutingRule: "127.0.0.1:26257"})
 
 	longDB := strings.Repeat("x", 70) // 63 is limit
-	pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addr, longDB)
+	pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr, longDB)
 	_ = te.TestConnectErr(ctx, t, pgurl, codeParamsRoutingFailed, "boom")
 	require.Equal(t, int64(1), s.metrics.RoutingErrCount.Count())
 }
@@ -547,6 +612,7 @@ func TestLongDBName(t *testing.T) {
 // deleted.
 func TestBackendDownRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -559,7 +625,7 @@ func TestBackendDownRetry(t *testing.T) {
 	// Set RefreshDelay to -1 so that we could simulate a ListPod call under
 	// the hood, which then triggers an EnsurePod again.
 	opts.testingKnobs.dirOpts = []tenant.DirOption{tenant.RefreshDelay(-1)}
-	server, addr, _ := newSecureProxyServer(ctx, t, stopper, opts)
+	server, addrs := newSecureProxyServer(ctx, t, stopper, opts)
 	directoryServer := mustGetTestSimpleDirectoryServer(t, server.handler)
 
 	callCount := 0
@@ -575,14 +641,20 @@ func TestBackendDownRetry(t *testing.T) {
 	})()
 
 	// Valid connection, but no backend server running.
-	pgurl := fmt.Sprintf("postgres://unused:unused@%s/db?options=--cluster=tenant-cluster-28&sslmode=require", addr)
+	pgurl := fmt.Sprintf("postgres://unused:unused@%s/db?options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 	_ = te.TestConnectErr(ctx, t, pgurl, codeParamsRoutingFailed, "cluster tenant-cluster-28 not found")
 	require.Equal(t, 3, callCount)
 }
 
 func TestFailedConnection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
+
+	// This test is asserting against specific counter values and error messages.
+	// The counter assertions make it difficult to insert retries and the test
+	// flakes once a month under stress.
+	skip.UnderStress(t)
 
 	ctx := context.Background()
 	te := newTester()
@@ -590,12 +662,12 @@ func TestFailedConnection(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	s, proxyAddr, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{RoutingRule: "undialable%$!@$"})
+	s, addrs := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{RoutingRule: "undialable%$!@$"})
 
 	// TODO(asubiotto): consider using datadriven for these, especially if the
 	// proxy becomes more complex.
 
-	_, p, err := addr.SplitHostPort(proxyAddr, "")
+	_, p, err := addr.SplitHostPort(addrs.listenAddr, "")
 	require.NoError(t, err)
 	u := fmt.Sprintf("postgres://unused:unused@localhost:%s/", p)
 
@@ -633,6 +705,7 @@ func TestFailedConnection(t *testing.T) {
 
 func TestUnexpectedError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -650,9 +723,9 @@ func TestUnexpectedError(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	_, addr, _ := newProxyServer(ctx, t, stopper, &ProxyOptions{})
+	_, addrs := newProxyServer(ctx, t, stopper, &ProxyOptions{})
 
-	u := fmt.Sprintf("postgres://root:admin@%s/?sslmode=disable&connect_timeout=5", addr)
+	u := fmt.Sprintf("postgres://root:admin@%s/?sslmode=disable&connect_timeout=5", addrs.listenAddr)
 
 	// Time how long it takes for pgx.Connect to return. If the proxy handles
 	// errors appropriately, pgx.Connect should return near immediately
@@ -670,13 +743,16 @@ func TestUnexpectedError(t *testing.T) {
 
 func TestProxyAgainstSecureCRDB(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 	defer sql.Stopper().Stop(ctx)
 
 	ts := sql.ApplicationLayer()
@@ -687,10 +763,10 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
 
-	s, addr, _ := newSecureProxyServer(
+	s, addrs := newSecureProxyServer(
 		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: ts.AdvSQLAddr(), SkipVerify: true},
 	)
-	_, port, err := net.SplitHostPort(addr)
+	_, port, err := net.SplitHostPort(addrs.listenAddr)
 	require.NoError(t, err)
 
 	for _, tc := range []struct {
@@ -703,7 +779,7 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 			name: "failed_SASL_auth_1",
 			url: fmt.Sprintf(
 				"postgres://bob:wrong@%s/tenant-cluster-28.defaultdb?sslmode=require",
-				addr,
+				addrs.listenAddr,
 			),
 			expErr: "failed SASL auth",
 		},
@@ -711,7 +787,7 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 			name: "failed_SASL_auth_2",
 			url: fmt.Sprintf(
 				"postgres://bob@%s/tenant-cluster-28.defaultdb?sslmode=require",
-				addr,
+				addrs.listenAddr,
 			),
 			expErr: "failed SASL auth",
 		},
@@ -736,7 +812,7 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 			name: "database_provides_tenant_ID",
 			url: fmt.Sprintf(
 				"postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require",
-				addr,
+				addrs.listenAddr,
 			),
 		},
 		{
@@ -775,7 +851,7 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 		})
 	}
 	require.Equal(t, int64(4), s.metrics.SuccessfulConnCount.Count())
-	count, _ := s.metrics.ConnectionLatency.Total()
+	count, _ := s.metrics.ConnectionLatency.CumulativeSnapshot().Total()
 	require.Equal(t, int64(4), count)
 	require.Equal(t, int64(2), s.metrics.AuthFailedCount.Count())
 	require.Equal(t, int64(1), s.metrics.RoutingErrCount.Count())
@@ -783,6 +859,7 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 
 func TestProxyTLSConf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	t.Run("insecure", func(t *testing.T) {
@@ -799,12 +876,12 @@ func TestProxyTLSConf(t *testing.T) {
 
 		stopper := stop.NewStopper()
 		defer stopper.Stop(ctx)
-		_, addr, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{
+		_, addrs := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{
 			Insecure:    true,
 			RoutingRule: "127.0.0.1:26257",
 		})
 
-		pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addr, "defaultdb")
+		pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr, "defaultdb")
 		_ = te.TestConnectErr(ctx, t, pgurl, codeParamsRoutingFailed, "boom")
 	})
 
@@ -822,13 +899,13 @@ func TestProxyTLSConf(t *testing.T) {
 
 		stopper := stop.NewStopper()
 		defer stopper.Stop(ctx)
-		_, addr, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{
+		_, addrs := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{
 			Insecure:    false,
 			SkipVerify:  true,
 			RoutingRule: "127.0.0.1:26257",
 		})
 
-		pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addr, "defaultdb")
+		pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr, "defaultdb")
 		_ = te.TestConnectErr(ctx, t, pgurl, codeParamsRoutingFailed, "boom")
 	})
 
@@ -850,13 +927,13 @@ func TestProxyTLSConf(t *testing.T) {
 
 		stopper := stop.NewStopper()
 		defer stopper.Stop(ctx)
-		_, addr, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{
+		_, addrs := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{
 			Insecure:    false,
 			SkipVerify:  false,
 			RoutingRule: "127.0.0.1:26257",
 		})
 
-		pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addr, "defaultdb")
+		pgurl := fmt.Sprintf("postgres://unused:unused@%s/%s?options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr, "defaultdb")
 		_ = te.TestConnectErr(ctx, t, pgurl, codeParamsRoutingFailed, "boom")
 	})
 
@@ -864,6 +941,7 @@ func TestProxyTLSConf(t *testing.T) {
 
 func TestProxyTLSClose(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 	// NB: The leaktest call is an important part of this test. We're
 	// verifying that no goroutines are leaked, despite calling Close an
@@ -873,7 +951,9 @@ func TestProxyTLSClose(t *testing.T) {
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 	defer sql.Stopper().Stop(ctx)
 
 	ts := sql.ApplicationLayer()
@@ -893,11 +973,11 @@ func TestProxyTLSClose(t *testing.T) {
 		return originalFrontendAdmit(conn, incomingTLSConfig)
 	})()
 
-	s, addr, _ := newSecureProxyServer(
+	s, addrs := newSecureProxyServer(
 		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: ts.AdvSQLAddr(), SkipVerify: true},
 	)
 
-	url := fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require", addr)
+	url := fmt.Sprintf("postgres://bob:builder@%s/tenant-cluster-28.defaultdb?sslmode=require", addrs.listenAddr)
 
 	conn, err := pgx.Connect(ctx, url)
 	require.NoError(t, err)
@@ -911,20 +991,23 @@ func TestProxyTLSClose(t *testing.T) {
 	_ = conn.Close(ctx)
 
 	require.Equal(t, int64(1), s.metrics.SuccessfulConnCount.Count())
-	count, _ := s.metrics.ConnectionLatency.Total()
+	count, _ := s.metrics.ConnectionLatency.CumulativeSnapshot().Total()
 	require.Equal(t, int64(1), count)
 	require.Equal(t, int64(0), s.metrics.AuthFailedCount.Count())
 }
 
 func TestProxyModifyRequestParams(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	te := newTester()
 	defer te.Close()
 
-	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 	defer sql.Stopper().Stop(ctx)
 
 	ts := sql.ApplicationLayer()
@@ -965,9 +1048,9 @@ func TestProxyModifyRequestParams(t *testing.T) {
 		return originalBackendDial(ctx, msg, ts.AdvSQLAddr(), proxyOutgoingTLSConfig)
 	})()
 
-	s, proxyAddr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), &ProxyOptions{})
+	s, addrs := newSecureProxyServer(ctx, t, sql.Stopper(), &ProxyOptions{})
 
-	u := fmt.Sprintf("postgres://bogususer:foo123@%s/?sslmode=require&authToken=abc123&options=--cluster=tenant-cluster-28&sslmode=require", proxyAddr)
+	u := fmt.Sprintf("postgres://bogususer:foo123@%s/?sslmode=require&authToken=abc123&options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 	te.TestConnect(ctx, t, u, func(conn *pgx.Conn) {
 		require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
 		require.NoError(t, runTestQuery(ctx, conn))
@@ -976,13 +1059,16 @@ func TestProxyModifyRequestParams(t *testing.T) {
 
 func TestInsecureProxy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	te := newTester()
 	defer te.Close()
 
-	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 	defer sql.Stopper().Stop(ctx)
 
 	ts := sql.ApplicationLayer()
@@ -993,14 +1079,14 @@ func TestInsecureProxy(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
 
-	s, addr, _ := newProxyServer(
+	s, addrs := newProxyServer(
 		ctx, t, sql.Stopper(), &ProxyOptions{RoutingRule: ts.AdvSQLAddr(), SkipVerify: true},
 	)
 
-	url := fmt.Sprintf("postgres://bob:wrong@%s?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addr)
+	url := fmt.Sprintf("postgres://bob:wrong@%s?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 	_ = te.TestConnectErr(ctx, t, url, 0, "failed SASL auth")
 
-	url = fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addr)
+	url = fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 		require.NoError(t, runTestQuery(ctx, conn))
 	})
@@ -1014,12 +1100,13 @@ func TestInsecureProxy(t *testing.T) {
 		}
 		return nil
 	})
-	count, _ := s.metrics.ConnectionLatency.Total()
+	count, _ := s.metrics.ConnectionLatency.CumulativeSnapshot().Total()
 	require.Equal(t, int64(1), count)
 }
 
 func TestErroneousFrontend(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1034,9 +1121,9 @@ func TestErroneousFrontend(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	_, addr, _ := newProxyServer(ctx, t, stopper, &ProxyOptions{})
+	_, addrs := newProxyServer(ctx, t, stopper, &ProxyOptions{})
 
-	url := fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addr)
+	url := fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 
 	// Generic message here as the Frontend's error is not codeError and
 	// by default we don't pass back error's text. The startup message doesn't
@@ -1046,6 +1133,7 @@ func TestErroneousFrontend(t *testing.T) {
 
 func TestErrorHint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1066,9 +1154,9 @@ func TestErrorHint(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	_, addr, _ := newProxyServer(ctx, t, stopper, &ProxyOptions{})
+	_, addrs := newProxyServer(ctx, t, stopper, &ProxyOptions{})
 
-	url := fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addr)
+	url := fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 
 	err := te.TestConnectErr(ctx, t, url, 0, "codeParamsRoutingFailed: Frontend error")
 	pgErr := (*pgconn.PgError)(nil)
@@ -1078,6 +1166,7 @@ func TestErrorHint(t *testing.T) {
 
 func TestErroneousBackend(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1092,9 +1181,9 @@ func TestErroneousBackend(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	_, addr, _ := newProxyServer(ctx, t, stopper, &ProxyOptions{})
+	_, addrs := newProxyServer(ctx, t, stopper, &ProxyOptions{})
 
-	url := fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addr)
+	url := fmt.Sprintf("postgres://bob:builder@%s/?sslmode=disable&options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 
 	// Generic message here as the Backend's error is not codeError and
 	// by default we don't pass back error's text. The startup message has
@@ -1104,6 +1193,7 @@ func TestErroneousBackend(t *testing.T) {
 
 func TestProxyRefuseConn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1118,19 +1208,20 @@ func TestProxyRefuseConn(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	s, addr, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{})
+	s, addrs := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{})
 
-	url := fmt.Sprintf("postgres://root:admin@%s?sslmode=require&options=--cluster=tenant-cluster-28&sslmode=require", addr)
+	url := fmt.Sprintf("postgres://root:admin@%s?sslmode=require&options=--cluster=tenant-cluster-28&sslmode=require", addrs.listenAddr)
 	_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "too many attempts")
 	require.Equal(t, int64(1), s.metrics.RefusedConnCount.Count())
 	require.Equal(t, int64(0), s.metrics.SuccessfulConnCount.Count())
-	count, _ := s.metrics.ConnectionLatency.Total()
+	count, _ := s.metrics.ConnectionLatency.CumulativeSnapshot().Total()
 	require.Equal(t, int64(0), count)
 	require.Equal(t, int64(0), s.metrics.AuthFailedCount.Count())
 }
 
 func TestProxyHandler_handle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1139,18 +1230,23 @@ func TestProxyHandler_handle(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	proxy, _, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{})
-
-	p1, p2 := net.Pipe()
-	require.NoError(t, p1.Close())
+	proxy, _ := newSecureProxyServer(ctx, t, stopper, &ProxyOptions{})
 
 	// Check that handle does not return any error if the incoming connection
 	// has no data packets.
-	require.Nil(t, proxy.handler.handle(ctx, p2))
+	p1, p2 := net.Pipe()
+	require.NoError(t, p1.Close())
+	require.Nil(t, proxy.handler.handle(ctx, p2, false /* requireProxyProtocol */))
+
+	p1, p2 = net.Pipe()
+	require.NoError(t, p1.Close())
+	p2 = proxyproto.NewConn(p2)
+	require.Nil(t, proxy.handler.handle(ctx, p2, true /* requireProxyProtocol */))
 }
 
 func TestDenylistUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1165,7 +1261,9 @@ func TestDenylistUpdate(t *testing.T) {
 	_, err = denyList.Write(bytes)
 	require.NoError(t, err)
 
-	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestRequiresExplicitSQLConnection,
+	})
 	defer sql.Stopper().Stop(ctx)
 
 	ts := sql.ApplicationLayer()
@@ -1214,10 +1312,10 @@ func TestDenylistUpdate(t *testing.T) {
 		PollConfigInterval: 10 * time.Millisecond,
 	}
 	opts.testingKnobs.directoryServer = tds
-	s, addr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), opts)
+	s, addrs := newSecureProxyServer(ctx, t, sql.Stopper(), opts)
 
 	// Establish a connection.
-	url := fmt.Sprintf("postgres://testuser:foo123@%s/defaultdb?sslmode=require&options=--cluster=tenant-cluster-%s&sslmode=require", addr, tenantID)
+	url := fmt.Sprintf("postgres://testuser:foo123@%s/defaultdb?sslmode=require&options=--cluster=tenant-cluster-%s&sslmode=require", addrs.listenAddr, tenantID)
 	db, err := gosql.Open("postgres", url)
 	db.SetMaxOpenConns(1)
 	defer db.Close()
@@ -1256,12 +1354,13 @@ func TestDenylistUpdate(t *testing.T) {
 		"Expected the connection to eventually fail",
 	)
 	require.Error(t, err)
-	require.Regexp(t, "closed|bad connection", err.Error())
+	require.Regexp(t, "(connection reset by peer|closed|bad connection)", err.Error())
 	require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
 }
 
 func TestDirectoryConnect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1297,11 +1396,11 @@ func TestDirectoryConnect(t *testing.T) {
 	// Start the proxy server using the static directory server.
 	opts := &ProxyOptions{SkipVerify: true}
 	opts.testingKnobs.directoryServer = tds
-	_, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
-	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
+	_, addrs := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addrs.listenAddr, tenantID)
 
 	t.Run("tenant not found", func(t *testing.T) {
-		url := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%d", addr, notFoundTenantID)
+		url := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%d", addrs.listenAddr, notFoundTenantID)
 		_ = te.TestConnectErr(ctx, t, url, codeParamsRoutingFailed, "cluster tenant-cluster-99 not found")
 	})
 
@@ -1381,6 +1480,7 @@ func TestDirectoryConnect(t *testing.T) {
 
 func TestConnectionRebalancingDisabled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	ctx := context.Background()
 	defer log.Scope(t).Close(t)
 
@@ -1414,8 +1514,8 @@ func TestConnectionRebalancingDisabled(t *testing.T) {
 
 	opts := &ProxyOptions{SkipVerify: true, DisableConnectionRebalancing: true}
 	opts.testingKnobs.directoryServer = tds
-	proxy, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
-	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
+	proxy, addrs := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addrs.listenAddr, tenantID)
 
 	// Open 12 connections to the first pod.
 	dist := map[string]int{}
@@ -1469,6 +1569,7 @@ func TestConnectionRebalancingDisabled(t *testing.T) {
 
 func TestCancelQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	ctx := context.Background()
 	defer log.Scope(t).Close(t)
 
@@ -1524,10 +1625,10 @@ func TestCancelQuery(t *testing.T) {
 		balancer.RebalanceRate(1),
 		balancer.RebalanceDelay(-1),
 	}
-	proxy, addr, httpAddr := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	proxy, addrs := newSecureProxyServer(ctx, t, s.Stopper(), opts)
 	connectionString := fmt.Sprintf(
 		"postgres://testuser:hunter2@%s/defaultdb?sslmode=require&sslrootcert=%s&options=--cluster=tenant-cluster-%s",
-		addr, datapathutils.TestDataPath(t, "testserver.crt"), tenantID,
+		addrs.listenAddr, datapathutils.TestDataPath(t, "testserver.crt"), tenantID,
 	)
 
 	// Open a connection to the first pod.
@@ -1543,6 +1644,28 @@ func TestCancelQuery(t *testing.T) {
 		StateTimestamp: timeSource.Now(),
 	})
 
+	snapshotMetrics := func() map[string]int64 {
+		return map[string]int64{
+			"QueryCancelSuccessful":     proxy.metrics.QueryCancelSuccessful.Count(),
+			"QueryCancelIgnored":        proxy.metrics.QueryCancelIgnored.Count(),
+			"QueryCancelForwarded":      proxy.metrics.QueryCancelForwarded.Count(),
+			"QueryCancelReceivedPGWire": proxy.metrics.QueryCancelReceivedPGWire.Count(),
+			"QueryCancelReceivedHTTP":   proxy.metrics.QueryCancelReceivedHTTP.Count(),
+		}
+	}
+
+	requireIncrease := func(t *testing.T, start map[string]int64, metrics ...string) {
+		testutils.SucceedsSoon(t, func() error {
+			now := snapshotMetrics()
+			for _, metric := range metrics {
+				if now[metric] <= start[metric] {
+					return errors.Newf("expected metric %s to increase (was %d is now %d)", metric, start[metric], now[metric])
+				}
+			}
+			return nil
+		})
+	}
+
 	// Wait until the update gets propagated to the directory cache.
 	testutils.SucceedsSoon(t, func() error {
 		pods, err := proxy.handler.directoryCache.TryLookupTenantPods(ctx, tenantID)
@@ -1555,33 +1678,9 @@ func TestCancelQuery(t *testing.T) {
 		return nil
 	})
 
-	clearMetrics := func(t *testing.T, metrics *metrics) {
-		metrics.QueryCancelSuccessful.Clear()
-		metrics.QueryCancelIgnored.Clear()
-		metrics.QueryCancelForwarded.Clear()
-		metrics.QueryCancelReceivedPGWire.Clear()
-		metrics.QueryCancelReceivedHTTP.Clear()
-
-		testutils.SucceedsSoon(t, func() error {
-			if metrics.QueryCancelSuccessful.Count() != 0 ||
-				metrics.QueryCancelIgnored.Count() != 0 ||
-				metrics.QueryCancelForwarded.Count() != 0 ||
-				metrics.QueryCancelReceivedPGWire.Count() != 0 ||
-				metrics.QueryCancelReceivedHTTP.Count() != 0 {
-				return errors.Newf("expected metrics to update, got: "+
-					"QueryCancelSuccessful=%d, QueryCancelIgnored=%d "+
-					"QueryCancelForwarded=%d QueryCancelReceivedPGWire=%d QueryCancelReceivedHTTP=%d",
-					metrics.QueryCancelSuccessful.Count(), metrics.QueryCancelIgnored.Count(),
-					metrics.QueryCancelForwarded.Count(), metrics.QueryCancelReceivedPGWire.Count(),
-					metrics.QueryCancelReceivedHTTP.Count(),
-				)
-			}
-			return nil
-		})
-	}
-
 	t.Run("cancel over sql", func(t *testing.T) {
-		clearMetrics(t, proxy.metrics)
+		metrics := snapshotMetrics()
+
 		cancelFn = func() {
 			_ = conn.PgConn().CancelRequest(ctx)
 		}
@@ -1589,30 +1688,18 @@ func TestCancelQuery(t *testing.T) {
 		err = conn.QueryRow(ctx, "SELECT pg_sleep(5) AS cancel_me").Scan(&b)
 		require.Error(t, err)
 		require.Regexp(t, "query execution canceled", err.Error())
-		testutils.SucceedsSoon(t, func() error {
-			if proxy.metrics.QueryCancelSuccessful.Count() != 1 ||
-				proxy.metrics.QueryCancelReceivedPGWire.Count() != 1 {
-				return errors.Newf("expected metrics to update, got: "+
-					"QueryCancelSuccessful=%d, QueryCancelIgnored=%d "+
-					"QueryCancelForwarded=%d QueryCancelReceivedPGWire=%d QueryCancelReceivedHTTP=%d",
-					proxy.metrics.QueryCancelSuccessful.Count(), proxy.metrics.QueryCancelIgnored.Count(),
-					proxy.metrics.QueryCancelForwarded.Count(), proxy.metrics.QueryCancelReceivedPGWire.Count(),
-					proxy.metrics.QueryCancelReceivedHTTP.Count(),
-				)
-			}
-			return nil
-		})
+		requireIncrease(t, metrics, "QueryCancelSuccessful", "QueryCancelReceivedPGWire")
 	})
 
 	t.Run("cancel over http", func(t *testing.T) {
-		clearMetrics(t, proxy.metrics)
+		metrics := snapshotMetrics()
 		cancelFn = func() {
 			cancelRequest := proxyCancelRequest{
 				ProxyIP:   net.IP{},
 				SecretKey: conn.PgConn().SecretKey(),
 				ClientIP:  net.IP{127, 0, 0, 1},
 			}
-			u := "http://" + httpAddr + "/_status/cancel/"
+			u := "http://" + addrs.httpAddr + "/_status/cancel/"
 			reqBody := bytes.NewReader(cancelRequest.Encode())
 			client := http.Client{
 				Timeout: 10 * time.Second,
@@ -1631,19 +1718,7 @@ func TestCancelQuery(t *testing.T) {
 		err = conn.QueryRow(ctx, "SELECT pg_sleep(5) AS cancel_me").Scan(&b)
 		require.Error(t, err)
 		require.Regexp(t, "query execution canceled", err.Error())
-		testutils.SucceedsSoon(t, func() error {
-			if proxy.metrics.QueryCancelSuccessful.Count() != 1 ||
-				proxy.metrics.QueryCancelReceivedHTTP.Count() != 1 {
-				return errors.Newf("expected metrics to update, got: "+
-					"QueryCancelSuccessful=%d, QueryCancelIgnored=%d "+
-					"QueryCancelForwarded=%d QueryCancelReceivedPGWire=%d QueryCancelReceivedHTTP=%d",
-					proxy.metrics.QueryCancelSuccessful.Count(), proxy.metrics.QueryCancelIgnored.Count(),
-					proxy.metrics.QueryCancelForwarded.Count(), proxy.metrics.QueryCancelReceivedPGWire.Count(),
-					proxy.metrics.QueryCancelReceivedHTTP.Count(),
-				)
-			}
-			return nil
-		})
+		requireIncrease(t, metrics, "QueryCancelSuccessful", "QueryCancelReceivedHTTP")
 	})
 
 	t.Run("cancel after migrating a session", func(t *testing.T) {
@@ -1693,13 +1768,13 @@ func TestCancelQuery(t *testing.T) {
 	})
 
 	t.Run("reject cancel from wrong client IP", func(t *testing.T) {
-		clearMetrics(t, proxy.metrics)
+		snapshot := snapshotMetrics()
 		cancelRequest := proxyCancelRequest{
 			ProxyIP:   net.IP{},
 			SecretKey: conn.PgConn().SecretKey(),
 			ClientIP:  net.IP{210, 1, 2, 3},
 		}
-		u := "http://" + httpAddr + "/_status/cancel/"
+		u := "http://" + addrs.httpAddr + "/_status/cancel/"
 		reqBody := bytes.NewReader(cancelRequest.Encode())
 		client := http.Client{
 			Timeout: 10 * time.Second,
@@ -1711,23 +1786,12 @@ func TestCancelQuery(t *testing.T) {
 		assert.Equal(t, "OK", string(respBytes))
 		require.Error(t, httpCancelErr)
 		require.Regexp(t, "mismatched client IP for cancel request", httpCancelErr.Error())
-		testutils.SucceedsSoon(t, func() error {
-			if proxy.metrics.QueryCancelIgnored.Count() != 1 ||
-				proxy.metrics.QueryCancelReceivedHTTP.Count() != 1 {
-				return errors.Newf("expected metrics to update, got: "+
-					"QueryCancelSuccessful=%d, QueryCancelIgnored=%d "+
-					"QueryCancelForwarded=%d QueryCancelReceivedPGWire=%d QueryCancelReceivedHTTP=%d",
-					proxy.metrics.QueryCancelSuccessful.Count(), proxy.metrics.QueryCancelIgnored.Count(),
-					proxy.metrics.QueryCancelForwarded.Count(), proxy.metrics.QueryCancelReceivedPGWire.Count(),
-					proxy.metrics.QueryCancelReceivedHTTP.Count(),
-				)
-			}
-			return nil
-		})
+
+		requireIncrease(t, snapshot, "QueryCancelIgnored", "QueryCancelReceivedHTTP")
 	})
 
 	t.Run("forward over http", func(t *testing.T) {
-		clearMetrics(t, proxy.metrics)
+		snapshot := snapshotMetrics()
 		var forwardedTo string
 		var forwardedReq proxyCancelRequest
 		var wg sync.WaitGroup
@@ -1746,7 +1810,8 @@ func TestCancelQuery(t *testing.T) {
 			ProcessID: 1,
 			SecretKey: conn.PgConn().SecretKey() + 1,
 		}
-		buf := crdbRequest.Encode(nil /* buf */)
+		buf, err := crdbRequest.Encode(nil /* buf */)
+		require.NoError(t, err)
 		proxyAddr := conn.PgConn().Conn().RemoteAddr()
 		cancelConn, err := net.Dial(proxyAddr.Network(), proxyAddr.String())
 		require.NoError(t, err)
@@ -1764,29 +1829,17 @@ func TestCancelQuery(t *testing.T) {
 			ClientIP:  net.IP{127, 0, 0, 1},
 		}
 		require.Equal(t, expectedReq, forwardedReq)
-		testutils.SucceedsSoon(t, func() error {
-			if proxy.metrics.QueryCancelForwarded.Count() != 1 ||
-				proxy.metrics.QueryCancelReceivedPGWire.Count() != 1 {
-				return errors.Newf("expected metrics to update, got: "+
-					"QueryCancelSuccessful=%d, QueryCancelIgnored=%d "+
-					"QueryCancelForwarded=%d QueryCancelReceivedPGWire=%d QueryCancelReceivedHTTP=%d",
-					proxy.metrics.QueryCancelSuccessful.Count(), proxy.metrics.QueryCancelIgnored.Count(),
-					proxy.metrics.QueryCancelForwarded.Count(), proxy.metrics.QueryCancelReceivedPGWire.Count(),
-					proxy.metrics.QueryCancelReceivedHTTP.Count(),
-				)
-			}
-			return nil
-		})
+		requireIncrease(t, snapshot, "QueryCancelForwarded", "QueryCancelReceivedPGWire")
 	})
 
 	t.Run("ignore unknown secret key", func(t *testing.T) {
-		clearMetrics(t, proxy.metrics)
+		snapshot := snapshotMetrics()
 		cancelRequest := proxyCancelRequest{
 			ProxyIP:   net.IP{},
 			SecretKey: conn.PgConn().SecretKey() + 1,
 			ClientIP:  net.IP{127, 0, 0, 1},
 		}
-		u := "http://" + httpAddr + "/_status/cancel/"
+		u := "http://" + addrs.httpAddr + "/_status/cancel/"
 		reqBody := bytes.NewReader(cancelRequest.Encode())
 		client := http.Client{
 			Timeout: 10 * time.Second,
@@ -1798,24 +1851,13 @@ func TestCancelQuery(t *testing.T) {
 		assert.Equal(t, "OK", string(respBytes))
 		require.Error(t, httpCancelErr)
 		require.Regexp(t, "ignoring cancel request with unfamiliar key", httpCancelErr.Error())
-		testutils.SucceedsSoon(t, func() error {
-			if proxy.metrics.QueryCancelIgnored.Count() != 1 ||
-				proxy.metrics.QueryCancelReceivedHTTP.Count() != 1 {
-				return errors.Newf("expected metrics to update, got: "+
-					"QueryCancelSuccessful=%d, QueryCancelIgnored=%d "+
-					"QueryCancelForwarded=%d QueryCancelReceivedPGWire=%d QueryCancelReceivedHTTP=%d",
-					proxy.metrics.QueryCancelSuccessful.Count(), proxy.metrics.QueryCancelIgnored.Count(),
-					proxy.metrics.QueryCancelForwarded.Count(), proxy.metrics.QueryCancelReceivedPGWire.Count(),
-					proxy.metrics.QueryCancelReceivedHTTP.Count(),
-				)
-			}
-			return nil
-		})
+		requireIncrease(t, snapshot, "QueryCancelIgnored", "QueryCancelReceivedHTTP")
 	})
 }
 
 func TestPodWatcher(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	ctx := context.Background()
 	defer log.Scope(t).Close(t)
 
@@ -1855,9 +1897,13 @@ func TestPodWatcher(t *testing.T) {
 	opts.testingKnobs.balancerOpts = []balancer.Option{
 		balancer.NoRebalanceLoop(),
 		balancer.RebalanceRate(1.0),
+		// Set a rebalance delay of zero. Rebalance is triggered on startup because
+		// the watch enumerates three existing pods. The delay of zero allows
+		// addition of the fourth pod to trigger rebalancing.
+		balancer.RebalanceDelay(0),
 	}
-	proxy, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
-	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
+	proxy, addrs := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addrs.listenAddr, tenantID)
 
 	// Open 12 connections to it. The balancer should distribute the connections
 	// evenly across 3 SQL pods (i.e. 4 connections each).
@@ -1915,6 +1961,7 @@ func TestPodWatcher(t *testing.T) {
 
 func TestConnectionMigration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	ctx := context.Background()
 	defer log.Scope(t).Close(t)
 
@@ -1930,7 +1977,7 @@ func TestConnectionMigration(t *testing.T) {
 	// Start first SQL pod.
 	tenant1, tenantDB1 := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: tenantID})
 	tenant1.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
-	defer tenant1.Stopper().Stop(ctx)
+	defer tenant1.AppStopper().Stop(ctx)
 	defer tenantDB1.Close()
 
 	// Start second SQL pod.
@@ -1939,7 +1986,7 @@ func TestConnectionMigration(t *testing.T) {
 		DisableCreateTenant: true,
 	})
 	tenant2.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
-	defer tenant2.Stopper().Stop(ctx)
+	defer tenant2.AppStopper().Stop(ctx)
 	defer tenantDB2.Close()
 
 	_, err = tenantDB1.Exec("CREATE USER testuser WITH PASSWORD 'hunter2'")
@@ -1952,9 +1999,9 @@ func TestConnectionMigration(t *testing.T) {
 	// loads. For this test, we will stub out lookupAddr in the connector. We
 	// will alternate between tenant1 and tenant2, starting with tenant1.
 	opts := &ProxyOptions{SkipVerify: true, RoutingRule: tenant1.SQLAddr()}
-	proxy, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	proxy, addrs := newSecureProxyServer(ctx, t, s.Stopper(), opts)
 
-	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
+	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addrs.listenAddr, tenantID)
 
 	// validateMiscMetrics ensures that our invariant of
 	// attempts = success + error_recoverable + error_fatal is valid, and all
@@ -1965,9 +2012,9 @@ func TestConnectionMigration(t *testing.T) {
 			proxy.metrics.ConnMigrationErrorRecoverableCount.Count() +
 			proxy.metrics.ConnMigrationErrorFatalCount.Count()
 		require.Equal(t, totalAttempts, proxy.metrics.ConnMigrationAttemptedCount.Count())
-		count, _ := proxy.metrics.ConnMigrationAttemptedLatency.Total()
+		count, _ := proxy.metrics.ConnMigrationAttemptedLatency.CumulativeSnapshot().Total()
 		require.Equal(t, totalAttempts, count)
-		count, _ = proxy.metrics.ConnMigrationTransferResponseMessageSize.Total()
+		count, _ = proxy.metrics.ConnMigrationTransferResponseMessageSize.CumulativeSnapshot().Total()
 		require.Equal(t, totalAttempts, count)
 	}
 
@@ -2279,7 +2326,7 @@ func TestConnectionMigration(t *testing.T) {
 			t.Fatalf("require that pg_sleep query terminates")
 		case err = <-errCh:
 			require.Error(t, err)
-			require.Regexp(t, "(closed|bad connection)", err.Error())
+			require.Regexp(t, "(connection reset by peer|closed|bad connection)", err.Error())
 		}
 
 		require.EqualError(t, f.ctx.Err(), context.Canceled.Error())
@@ -2291,11 +2338,11 @@ func TestConnectionMigration(t *testing.T) {
 			f.metrics.ConnMigrationErrorRecoverableCount.Count() +
 			f.metrics.ConnMigrationErrorFatalCount.Count()
 		require.Equal(t, totalAttempts, f.metrics.ConnMigrationAttemptedCount.Count())
-		count, _ := f.metrics.ConnMigrationAttemptedLatency.Total()
+		count, _ := f.metrics.ConnMigrationAttemptedLatency.CumulativeSnapshot().Total()
 		require.Equal(t, totalAttempts, count)
 		// Here, we get a transfer timeout in response, so the message size
 		// should not be recorded.
-		count, _ = f.metrics.ConnMigrationTransferResponseMessageSize.Total()
+		count, _ = f.metrics.ConnMigrationTransferResponseMessageSize.CumulativeSnapshot().Total()
 		require.Equal(t, totalAttempts-1, count)
 	})
 
@@ -2310,6 +2357,7 @@ func TestConnectionMigration(t *testing.T) {
 // (both failed and successful ones).
 func TestAcceptedConnCountMetric(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -2341,10 +2389,10 @@ func TestAcceptedConnCountMetric(t *testing.T) {
 
 	opts := &ProxyOptions{SkipVerify: true, DisableConnectionRebalancing: true}
 	opts.testingKnobs.directoryServer = tds
-	proxy, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	proxy, addrs := newSecureProxyServer(ctx, t, s.Stopper(), opts)
 
-	goodConnStr := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
-	badConnStr := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=nocluster", addr)
+	goodConnStr := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addrs.listenAddr, tenantID)
+	badConnStr := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=nocluster", addrs.listenAddr)
 
 	const (
 		numGood = 5
@@ -2379,7 +2427,7 @@ func TestAcceptedConnCountMetric(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			conn, err := net.DialTimeout("tcp", addrs.listenAddr, 3*time.Second)
 			defer func() {
 				if conn != nil {
 					_ = conn.Close()
@@ -2401,6 +2449,7 @@ func TestAcceptedConnCountMetric(t *testing.T) {
 // decremented whenever the connections were closed due to a goroutine leak.
 func TestCurConnCountMetric(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -2432,8 +2481,8 @@ func TestCurConnCountMetric(t *testing.T) {
 
 	opts := &ProxyOptions{SkipVerify: true, DisableConnectionRebalancing: true}
 	opts.testingKnobs.directoryServer = tds
-	proxy, addr, _ := newSecureProxyServer(ctx, t, s.Stopper(), opts)
-	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addr, tenantID)
+	proxy, addrs := newSecureProxyServer(ctx, t, s.Stopper(), opts)
+	connectionString := fmt.Sprintf("postgres://testuser:hunter2@%s/?sslmode=require&options=--cluster=tenant-cluster-%s", addrs.listenAddr, tenantID)
 
 	// Open 500 connections to the SQL pod.
 	const numConns = 500
@@ -2468,21 +2517,24 @@ func TestCurConnCountMetric(t *testing.T) {
 
 func TestClusterNameAndTenantFromParams(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 
 	testCases := []struct {
 		name                string
+		sniServerName       string
 		params              map[string]string
 		expectedClusterName string
 		expectedTenantID    uint64
 		expectedParams      map[string]string
 		expectedError       string
 		expectedHint        string
+		expectedMetrics     func(t *testing.T, m *metrics)
 	}{
 		{
-			name:          "empty params",
+			name:          "empty params and server name",
 			params:        map[string]string{},
 			expectedError: "missing cluster identifier",
 			expectedHint:  clusterIdentifierHint,
@@ -2598,6 +2650,32 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 			expectedHint:  "Tenant ID 0 is invalid.",
 		},
 		{
+			name:          "invalid sni format",
+			sniServerName: "foo-bar-baz",
+			params:        map[string]string{},
+			expectedError: "missing cluster identifier",
+			expectedHint:  clusterIdentifierHint,
+		},
+		{
+			name:          "invalid sni value",
+			sniServerName: "happy2koala-.abc.aws-ap-south-1.cockroachlabs.cloud",
+			params:        map[string]string{},
+			expectedError: "missing cluster identifier",
+			expectedHint:  clusterIdentifierHint,
+		},
+		{
+			name:                "valid sni value",
+			sniServerName:       "happy-seal-10.abc.gcp-us-central1.cockroachlabs.cloud",
+			params:              map[string]string{},
+			expectedClusterName: "happy-seal",
+			expectedTenantID:    10,
+			expectedParams:      map[string]string{},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.SNIRoutingMethodCount.Value())
+			},
+		},
+		{
 			name: "multiple similar cluster identifiers",
 			params: map[string]string{
 				"database": "happy-koala-7.defaultdb",
@@ -2606,6 +2684,11 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 			expectedClusterName: "happy-koala",
 			expectedTenantID:    7,
 			expectedParams:      map[string]string{"database": "defaultdb"},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(2), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.DatabaseRoutingMethodCount.Value())
+				require.Equal(t, int64(1), m.ClusterOptionRoutingMethodCount.Value())
+			},
 		},
 		{
 			name: "cluster identifier in database param",
@@ -2616,6 +2699,10 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 			expectedClusterName: strings.Repeat("a", 100),
 			expectedTenantID:    7,
 			expectedParams:      map[string]string{"database": "defaultdb", "foo": "bar"},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.DatabaseRoutingMethodCount.Value())
+			},
 		},
 		{
 			name: "valid cluster identifier with invalid arrangements",
@@ -2629,6 +2716,10 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 				"database": "defaultdb",
 				"options":  "-c  -c -c -c",
 			},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.ClusterOptionRoutingMethodCount.Value())
+			},
 		},
 		{
 			name: "short option: cluster identifier in options param",
@@ -2639,6 +2730,10 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 			expectedClusterName: "happy-koala",
 			expectedTenantID:    7,
 			expectedParams:      map[string]string{"database": "defaultdb"},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.ClusterOptionRoutingMethodCount.Value())
+			},
 		},
 		{
 			name: "short option with spaces: cluster identifier in options param",
@@ -2649,6 +2744,10 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 			expectedClusterName: "happy-koala",
 			expectedTenantID:    7,
 			expectedParams:      map[string]string{"database": "defaultdb"},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.ClusterOptionRoutingMethodCount.Value())
+			},
 		},
 		{
 			name: "long option: cluster identifier in options param",
@@ -2661,6 +2760,10 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 			expectedParams: map[string]string{
 				"database": "defaultdb",
 				"options":  "--foo=test",
+			},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.ClusterOptionRoutingMethodCount.Value())
 			},
 		},
 		{
@@ -2675,6 +2778,10 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 				"database": "defaultdb",
 				"options":  "-csearch_path=public \t--foo=test",
 			},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.ClusterOptionRoutingMethodCount.Value())
+			},
 		},
 		{
 			name:                "leading 0s are ok",
@@ -2682,19 +2789,24 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 			expectedClusterName: "happy-koala-0",
 			expectedTenantID:    7,
 			expectedParams:      map[string]string{"database": "defaultdb"},
+			expectedMetrics: func(t *testing.T, m *metrics) {
+				require.Equal(t, int64(1), m.RoutingMethodCount.Count())
+				require.Equal(t, int64(1), m.DatabaseRoutingMethodCount.Value())
+			},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			msg := &pgproto3.StartupMessage{Parameters: tc.params}
+			m := makeProxyMetrics()
 
 			originalParams := make(map[string]string)
 			for k, v := range msg.Parameters {
 				originalParams[k] = v
 			}
 
-			fe := &FrontendAdmitInfo{Msg: msg}
-			outMsg, clusterName, tenantID, err := clusterNameAndTenantFromParams(ctx, fe)
+			fe := &FrontendAdmitInfo{Msg: msg, SniServerName: tc.sniServerName}
+			outMsg, clusterName, tenantID, err := clusterNameAndTenantFromParams(ctx, fe, &m)
 			if tc.expectedError == "" {
 				require.NoErrorf(t, err, "failed test case\n%+v", tc)
 
@@ -2712,6 +2824,15 @@ func TestClusterNameAndTenantFromParams(t *testing.T) {
 
 			// Check that the original parameters were not modified.
 			require.Equal(t, originalParams, msg.Parameters)
+
+			if tc.expectedMetrics != nil {
+				tc.expectedMetrics(t, &m)
+			} else {
+				require.Zero(t, m.RoutingMethodCount.Count())
+				require.Zero(t, m.SNIRoutingMethodCount.Value())
+				require.Zero(t, m.DatabaseRoutingMethodCount.Value())
+				require.Zero(t, m.ClusterOptionRoutingMethodCount.Value())
+			}
 		})
 	}
 }
@@ -2874,7 +2995,7 @@ func (te *tester) TestConnectErrWithPGConfig(
 
 func newSecureProxyServer(
 	ctx context.Context, t *testing.T, stopper *stop.Stopper, opts *ProxyOptions,
-) (server *Server, addr, httpAddr string) {
+) (server *Server, addrs *serverAddresses) {
 	// Created via:
 	const _ = `
 openssl genrsa -out testdata/testserver.key 2048
@@ -2889,12 +3010,15 @@ openssl req -new -x509 -sha256 -key testdata/testserver.key -out testdata/testse
 
 func newProxyServer(
 	ctx context.Context, t *testing.T, stopper *stop.Stopper, opts *ProxyOptions,
-) (server *Server, addr, httpAddr string) {
+) (server *Server, addrs *serverAddresses) {
 	const listenAddress = "127.0.0.1:0"
 	ctx, _ = stopper.WithCancelOnQuiesce(ctx)
 	ln, err := net.Listen("tcp", listenAddress)
 	require.NoError(t, err)
 	stopper.AddCloser(stop.CloserFn(func() { _ = ln.Close() }))
+	proxyProtocolLn, err := net.Listen("tcp", listenAddress)
+	require.NoError(t, err)
+	stopper.AddCloser(stop.CloserFn(func() { _ = proxyProtocolLn.Close() }))
 	httpLn, err := net.Listen("tcp", listenAddress)
 	require.NoError(t, err)
 	stopper.AddCloser(stop.CloserFn(func() { _ = httpLn.Close() }))
@@ -2903,7 +3027,7 @@ func newProxyServer(
 	require.NoError(t, err)
 
 	err = server.Stopper.RunAsyncTask(ctx, "proxy-server-serve", func(ctx context.Context) {
-		_ = server.Serve(ctx, ln)
+		_ = server.ServeSQL(ctx, ln, proxyProtocolLn)
 	})
 	require.NoError(t, err)
 	err = server.Stopper.RunAsyncTask(ctx, "proxy-http-server-serve", func(ctx context.Context) {
@@ -2911,7 +3035,11 @@ func newProxyServer(
 	})
 	require.NoError(t, err)
 
-	return server, ln.Addr().String(), httpLn.Addr().String()
+	return server, &serverAddresses{
+		listenAddr:              ln.Addr().String(),
+		proxyProtocolListenAddr: proxyProtocolLn.Addr().String(),
+		httpAddr:                httpLn.Addr().String(),
+	}
 }
 
 func runTestQuery(ctx context.Context, conn *pgx.Conn) error {

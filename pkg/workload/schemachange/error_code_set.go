@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemachange
 
@@ -30,6 +25,11 @@ func (set errorCodeSet) merge(otherSet errorCodeSet) {
 }
 
 func (set errorCodeSet) add(code pgcode.Code) {
+	// For ergonomics, we allow the success code to be added to errorCodeSet. As
+	// it does not indicate an error, it won't actually be added.
+	if code == pgcode.SuccessfulCompletion {
+		return
+	}
 	set[code] = struct{}{}
 }
 

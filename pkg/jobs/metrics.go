@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -17,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/cidr"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 )
@@ -35,12 +31,16 @@ type Metrics struct {
 	// implementation of job specific metrics.
 	JobSpecificMetrics [jobspb.NumJobTypes]metric.Struct
 
+	// ResolvedMetrics are the per job type metrics for resolved timestamps.
+	ResolvedMetrics [jobspb.NumJobTypes]*metric.Gauge
+
 	// RunningNonIdleJobs is the total number of running jobs that are not idle.
 	RunningNonIdleJobs *metric.Gauge
 
 	RowLevelTTL  metric.Struct
 	Changefeed   metric.Struct
 	StreamIngest metric.Struct
+	Backup       metric.Struct
 
 	// AdoptIterations counts the number of adopt loops executed by Registry.
 	AdoptIterations *metric.Counter
@@ -248,16 +248,20 @@ var (
 func (Metrics) MetricStruct() {}
 
 // init initializes the metrics for job monitoring.
-func (m *Metrics) init(histogramWindowInterval time.Duration) {
+func (m *Metrics) init(histogramWindowInterval time.Duration, lookup *cidr.Lookup) {
 	if MakeRowLevelTTLMetricsHook != nil {
 		m.RowLevelTTL = MakeRowLevelTTLMetricsHook(histogramWindowInterval)
 	}
 	if MakeChangefeedMetricsHook != nil {
-		m.Changefeed = MakeChangefeedMetricsHook(histogramWindowInterval)
+		m.Changefeed = MakeChangefeedMetricsHook(histogramWindowInterval, lookup)
 	}
 	if MakeStreamIngestMetricsHook != nil {
 		m.StreamIngest = MakeStreamIngestMetricsHook(histogramWindowInterval)
 	}
+	if MakeBackupMetricsHook != nil {
+		m.Backup = MakeBackupMetricsHook(histogramWindowInterval)
+	}
+
 	m.AdoptIterations = metric.NewCounter(metaAdoptIterations)
 	m.ClaimedJobs = metric.NewCounter(metaClaimedJobs)
 	m.ResumedJobs = metric.NewCounter(metaResumedClaimedJobs)
@@ -282,15 +286,24 @@ func (m *Metrics) init(histogramWindowInterval time.Duration) {
 			ExpiredPTS:             metric.NewCounter(makeMetaExpiredPTS(typeStr)),
 			ProtectedAge:           metric.NewGauge(makeMetaProtectedAge(typeStr)),
 		}
-		if opts, ok := getRegisterOptions(jt); ok && opts.metrics != nil {
-			m.JobSpecificMetrics[jt] = opts.metrics
+		if opts, ok := getRegisterOptions(jt); ok {
+			if opts.metrics != nil {
+				m.JobSpecificMetrics[jt] = opts.metrics
+			}
+			if opts.resolvedMetric != nil {
+				m.ResolvedMetrics[jt] = opts.resolvedMetric
+			}
 		}
 	}
 }
 
 // MakeChangefeedMetricsHook allows for registration of changefeed metrics from
 // ccl code.
-var MakeChangefeedMetricsHook func(time.Duration) metric.Struct
+var MakeChangefeedMetricsHook func(time.Duration, *cidr.Lookup) metric.Struct
+
+// MakeChangefeedMemoryMetricsHook allows for registration of changefeed memory
+// metrics from ccl code.
+var MakeChangefeedMemoryMetricsHook func(time.Duration) (curCount *metric.Gauge, maxHist metric.IHistogram)
 
 // MakeStreamIngestMetricsHook allows for registration of streaming metrics from
 // ccl code.
@@ -298,6 +311,9 @@ var MakeStreamIngestMetricsHook func(duration time.Duration) metric.Struct
 
 // MakeRowLevelTTLMetricsHook allows for registration of row-level TTL metrics.
 var MakeRowLevelTTLMetricsHook func(time.Duration) metric.Struct
+
+// MakeBackupMetricsHook allows for registration of backup metrics.
+var MakeBackupMetricsHook func(time.Duration) metric.Struct
 
 // JobTelemetryMetrics is a telemetry metrics for individual job types.
 type JobTelemetryMetrics struct {
@@ -331,6 +347,11 @@ func getJobTelemetryMetricsArray() [jobspb.NumJobTypes]*JobTelemetryMetrics {
 	return metrics
 }
 
-// TelemetryMetrics contains telemetry metrics for different
-// job types.
-var TelemetryMetrics = getJobTelemetryMetricsArray()
+var (
+	// TelemetryMetrics contains telemetry metrics for different
+	// job types.
+	TelemetryMetrics = getJobTelemetryMetricsArray()
+	// AbandonedInfoRowsFound is how many times our cleanup
+	// routine found abandoned rows.
+	AbandonedInfoRowsFound = telemetry.GetCounterOnce("job.registry.cleanup_found_abandoned_rows")
+)

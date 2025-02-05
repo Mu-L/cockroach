@@ -1,24 +1,20 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { containAny } from "src/util/arrays";
+import { createSelector } from "@reduxjs/toolkit";
+
+import { SqlStatsResponse } from "src/api/statementsApi";
+import { Filters, getTimeValueInSeconds } from "src/queryFilter";
+import { AggregateStatistics } from "src/statementsTable";
 import {
   CollectedStatementStatistics,
   flattenStatementStats,
 } from "src/util/appStats/appStats";
+import { containAny } from "src/util/arrays";
+import { INTERNAL_APP_NAME_PREFIX, unset } from "src/util/constants";
 import { FixFingerprintHexValue } from "src/util/format";
-import { unset } from "src/util/constants";
-import { createSelector } from "@reduxjs/toolkit";
-import { SqlStatsResponse } from "src/api/statementsApi";
-import { Filters, getTimeValueInSeconds } from "src/queryFilter";
-import { AggregateStatistics } from "src/statementsTable";
 
 // filterBySearchQuery returns true if a search query matches the statement.
 export function filterBySearchQuery(
@@ -72,6 +68,8 @@ export function filterStatementsData(
     .map(app => app.trim())
     .filter(appName => !!appName);
 
+  const includeInternalApps = !!appNames?.includes(INTERNAL_APP_NAME_PREFIX);
+
   // Return statements filtered by the values selected on the filter and
   // the search text. A statement must match all selected filters to be
   // displayed on the table.
@@ -90,13 +88,18 @@ export function filterStatementsData(
         return databases.length === 0 || databases.includes(statement.database);
       }
     })
-    .filter(
-      statement =>
+    .filter(statement => {
+      const isInternal = statement.applicationName?.startsWith(
+        INTERNAL_APP_NAME_PREFIX,
+      );
+      return (
         !appNames?.length ||
-        appNames.includes(
+        (includeInternalApps && isInternal) ||
+        appNames?.includes(
           statement.applicationName ? statement.applicationName : unset,
-        ),
-    )
+        )
+      );
+    })
     .filter(statement => (filters.fullScan ? statement.fullScan : true))
     .filter(
       statement =>

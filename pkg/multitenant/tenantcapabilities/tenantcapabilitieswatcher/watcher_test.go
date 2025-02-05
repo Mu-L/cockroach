@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcapabilitieswatcher_test
 
@@ -27,10 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/datadriven"
@@ -74,14 +70,21 @@ func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
-		ctx := context.Background()
-		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-		defer tc.Stopper().Stop(ctx)
+		defer log.Scope(t).Close(t)
 
-		ts := tc.Server(0)
-		tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+		ctx := context.Background()
+		ts, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		})
+		defer ts.Stopper().Stop(ctx)
+
+		tdb := sqlutils.MakeSQLRunner(db)
 		tdb.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
-		tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
+		// Make test faster.
+		// TODO(knz): Remove this after #111753 is merged.
+		tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'`)
+		tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10ms'`)
+		tdb.Exec(t, `SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10ms'`)
 
 		const dummyTableName = "dummy_system_tenants"
 		tdb.Exec(t, fmt.Sprintf("CREATE TABLE %s (LIKE system.tenants INCLUDING ALL)", dummyTableName))
@@ -93,10 +96,9 @@ func TestDataDriven(t *testing.T) {
 
 		mu := struct {
 			syncutil.Mutex
-			lastFrontierTS     hlc.Timestamp // serializes updates and update-state
-			receivedUpdates    []tenantcapabilities.Update
-			receivedUpdateType rangefeedcache.UpdateType
-			rangeFeedRunning   bool
+			lastFrontierTS   hlc.Timestamp // serializes updates and update-state
+			receivedUpdates  []tenantcapabilities.Update
+			rangeFeedRunning bool
 		}{}
 
 		errorInjectionCh := make(chan error)
@@ -135,11 +137,10 @@ func TestDataDriven(t *testing.T) {
 							<-restartAfterErrCh
 						},
 					},
-					WatcherUpdatesInterceptor: func(UpdateType rangefeedcache.UpdateType, updates []tenantcapabilities.Update) {
+					WatcherUpdatesInterceptor: func(update tenantcapabilities.Update) {
 						mu.Lock()
 						defer mu.Unlock()
-						mu.receivedUpdates = append(mu.receivedUpdates, updates...)
-						mu.receivedUpdateType = UpdateType
+						mu.receivedUpdates = append(mu.receivedUpdates, update)
 					},
 				},
 			})
@@ -182,7 +183,6 @@ func TestDataDriven(t *testing.T) {
 				mu.Lock()
 				receivedUpdates := mu.receivedUpdates
 				mu.receivedUpdates = mu.receivedUpdates[:0] // clear out buffer
-				updateType := mu.receivedUpdateType
 				mu.Unlock()
 
 				// De-duplicate updates. We want a stable sort here because the
@@ -193,9 +193,6 @@ func TestDataDriven(t *testing.T) {
 				})
 				var output strings.Builder
 				for i := range receivedUpdates {
-					if i == 0 {
-						output.WriteString(fmt.Sprintf("%s\n", updateType))
-					}
 					if i+1 != len(receivedUpdates) && receivedUpdates[i+1].TenantID.Equal(receivedUpdates[i].TenantID) {
 						continue // de-duplicate
 					}
@@ -214,19 +211,19 @@ func TestDataDriven(t *testing.T) {
 
 			case "upsert":
 				t.Logf("%v: processing upsert", d.Pos)
-				tenID, caps, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
+				entry, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
 				require.NoError(t, err)
 				name, dataState, serviceMode, err := tenantcapabilitiestestutils.ParseTenantInfo(t, d)
 				require.NoError(t, err)
 				info := mtinfopb.ProtoInfo{
-					Capabilities: *caps,
+					Capabilities: *entry.TenantCapabilities,
 				}
 				buf, err := protoutil.Marshal(&info)
 				require.NoError(t, err)
 				tdb.Exec(
 					t,
 					fmt.Sprintf("UPSERT INTO %s (id, active, info, name, data_state, service_mode) VALUES ($1, $2, $3, $4, $5, $6)", dummyTableName),
-					tenID.ToUint64(),
+					entry.TenantID.ToUint64(),
 					true, /* active */
 					buf,
 					name, dataState, serviceMode,

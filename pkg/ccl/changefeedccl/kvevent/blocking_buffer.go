@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvevent
 
@@ -21,13 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // blockingBuffer is an implementation of Buffer which allocates memory
 // from a mon.BoundAccount and blocks if no resources are available.
 type blockingBuffer struct {
 	sv       *settings.Values
-	metrics  *Metrics
+	metrics  *PerBufferMetricsWithCompat
 	qp       allocPool     // Pool for memory allocations.
 	signalCh chan struct{} // Signal when new events are available.
 
@@ -51,7 +49,9 @@ type blockingBuffer struct {
 // It will grow the bound account to buffer more messages but will block if it
 // runs out of space. If ever any entry exceeds the allocatable size of the
 // account, an error will be returned when attempting to buffer it.
-func NewMemBuffer(acc mon.BoundAccount, sv *settings.Values, metrics *Metrics) Buffer {
+func NewMemBuffer(
+	acc mon.BoundAccount, sv *settings.Values, metrics *PerBufferMetricsWithCompat,
+) Buffer {
 	return newMemBuffer(acc, sv, metrics, nil)
 }
 
@@ -60,7 +60,7 @@ func NewMemBuffer(acc mon.BoundAccount, sv *settings.Values, metrics *Metrics) B
 func TestingNewMemBuffer(
 	acc mon.BoundAccount,
 	sv *settings.Values,
-	metrics *Metrics,
+	metrics *PerBufferMetricsWithCompat,
 	onWaitStart quotapool.OnWaitStartFunc,
 ) Buffer {
 	return newMemBuffer(acc, sv, metrics, onWaitStart)
@@ -69,7 +69,7 @@ func TestingNewMemBuffer(
 func newMemBuffer(
 	acc mon.BoundAccount,
 	sv *settings.Values,
-	metrics *Metrics,
+	metrics *PerBufferMetricsWithCompat,
 	onWaitStart quotapool.OnWaitStartFunc,
 ) Buffer {
 	const slowAcquisitionThreshold = 5 * time.Second
@@ -85,7 +85,7 @@ func newMemBuffer(
 	quota := &memQuota{acc: acc, notifyOutOfQuota: b.notifyOutOfQuota}
 
 	opts := []quotapool.Option{
-		quotapool.OnSlowAcquisition(slowAcquisitionThreshold, logSlowAcquisition(slowAcquisitionThreshold)),
+		quotapool.OnSlowAcquisition(slowAcquisitionThreshold, logSlowAcquisition(slowAcquisitionThreshold, metrics.BufferType)),
 		// OnWaitStart invoked once by quota pool when request cannot acquire quota.
 		quotapool.OnWaitStart(func(ctx context.Context, poolName string, r quotapool.Request) {
 			if onWaitStart != nil {
@@ -105,6 +105,7 @@ func newMemBuffer(
 
 	b.qp = allocPool{
 		AbstractPool: quotapool.New("changefeed", quota, opts...),
+		sv:           sv,
 		metrics:      metrics,
 	}
 
@@ -164,8 +165,8 @@ func (b *blockingBuffer) notifyOutOfQuota(canFlush bool) {
 // that producer is blocked.
 func (b *blockingBuffer) producerBlocked() {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.mu.numBlocked++
-	b.mu.Unlock()
 }
 
 // quotaAcquiredAfterWait is invoked by quota pool to notify blocking buffer
@@ -173,6 +174,7 @@ func (b *blockingBuffer) producerBlocked() {
 // NB: always called after producerBlocked
 func (b *blockingBuffer) quotaAcquiredAfterWait() {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.mu.numBlocked > 0 {
 		b.mu.numBlocked--
 	} else {
@@ -183,7 +185,6 @@ func (b *blockingBuffer) quotaAcquiredAfterWait() {
 		// Clear out canFlush since we know that producers no longer blocked.
 		b.mu.canFlush = false
 	}
-	b.mu.Unlock()
 }
 
 // Get implements kvevent.Reader interface.
@@ -218,6 +219,7 @@ func (b *blockingBuffer) enqueue(ctx context.Context, e Event) (err error) {
 	}
 
 	b.metrics.BufferEntriesIn.Inc(1)
+	b.metrics.BufferEntriesByType[e.et.Index()].Inc(1)
 	b.mu.queue.enqueue(e)
 
 	select {
@@ -246,6 +248,7 @@ func (b *blockingBuffer) AcquireMemory(ctx context.Context, n int64) (alloc Allo
 		return alloc, err
 	}
 	b.metrics.BufferEntriesMemAcquired.Inc(n)
+	b.metrics.AllocatedMem.Inc(n)
 	return alloc, nil
 }
 
@@ -324,6 +327,7 @@ func (b *blockingBuffer) CloseWithReason(ctx context.Context, reason error) erro
 		quota := r.(*memQuota)
 		quota.closed = true
 		quota.acc.Close(ctx)
+		b.metrics.AllocatedMem.Dec(quota.allocated)
 		return false
 	})
 
@@ -441,10 +445,15 @@ func (r *memRequest) ShouldWait() bool {
 
 type allocPool struct {
 	*quotapool.AbstractPool
-	metrics *Metrics
+	metrics *PerBufferMetricsWithCompat
+	sv      *settings.Values
 }
 
 func (ap allocPool) Release(ctx context.Context, bytes, entries int64) {
+	if bytes < 0 {
+		logcrash.ReportOrPanic(ctx, ap.sv, "attempt to release negative bytes (%d) into pool", bytes)
+	}
+
 	ap.AbstractPool.Update(func(r quotapool.Resource) (shouldNotify bool) {
 		quota := r.(*memQuota)
 		if quota.closed {
@@ -452,6 +461,7 @@ func (ap allocPool) Release(ctx context.Context, bytes, entries int64) {
 		}
 		quota.acc.Shrink(ctx, bytes)
 		quota.allocated -= bytes
+		ap.metrics.AllocatedMem.Dec(bytes)
 		ap.metrics.BufferEntriesMemReleased.Inc(bytes)
 		ap.metrics.BufferEntriesReleased.Inc(entries)
 		return true
@@ -461,19 +471,21 @@ func (ap allocPool) Release(ctx context.Context, bytes, entries int64) {
 // logSlowAcquisition is a function returning a quotapool.SlowAcquisitionFunction.
 // It differs from the quotapool.LogSlowAcquisition in that only some of slow acquisition
 // events are logged to reduce log spam.
-func logSlowAcquisition(slowAcquisitionThreshold time.Duration) quotapool.SlowAcquisitionFunc {
+func logSlowAcquisition(
+	slowAcquisitionThreshold time.Duration, bufType bufferType,
+) quotapool.SlowAcquisitionFunc {
 	logSlowAcquire := log.Every(slowAcquisitionThreshold)
 
 	return func(ctx context.Context, poolName string, r quotapool.Request, start time.Time) func() {
 		shouldLog := logSlowAcquire.ShouldLog()
 		if shouldLog {
-			log.Warningf(ctx, "have been waiting %s attempting to acquire changefeed quota",
+			log.Warningf(ctx, "have been waiting %s attempting to acquire changefeed quota (buffer=%s)", redact.SafeString(bufType),
 				timeutil.Since(start))
 		}
 
 		return func() {
 			if shouldLog {
-				log.Infof(ctx, "acquired changefeed quota after %s", timeutil.Since(start))
+				log.Infof(ctx, "acquired changefeed quota after %s (buffer=%s)", timeutil.Since(start), redact.SafeString(bufType))
 			}
 		}
 	}

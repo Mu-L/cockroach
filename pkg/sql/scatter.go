@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -21,11 +16,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
 type scatterNode struct {
+	zeroInputPlanNode
 	optColumnsSlot
 
 	run scatterRun
@@ -36,7 +33,7 @@ type scatterNode struct {
 // Privileges: INSERT on table.
 func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error) {
 
-	if err := p.ExecCfg().RequireSystemTenantOrClusterSetting(SecondaryTenantScatterEnabled); err != nil {
+	if err := sqlclustersettings.RequireSystemTenantOrClusterSetting(p.ExecCfg().Codec, p.ExecCfg().Settings, SecondaryTenantScatterEnabled); err != nil {
 		return nil, err
 	}
 
@@ -76,7 +73,7 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		fromVals := make([]tree.Datum, len(n.From))
 		for i, expr := range n.From {
 			typedExpr, err := p.analyzeExpr(
-				ctx, expr, nil, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
+				ctx, expr, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
 			)
 			if err != nil {
 				return nil, err
@@ -89,7 +86,7 @@ func (p *planner) Scatter(ctx context.Context, n *tree.Scatter) (planNode, error
 		toVals := make([]tree.Datum, len(n.From))
 		for i, expr := range n.To {
 			typedExpr, err := p.analyzeExpr(
-				ctx, expr, nil, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
+				ctx, expr, tree.IndexedVarHelper{}, desiredTypes[i], true, "SCATTER",
 			)
 			if err != nil {
 				return nil, err

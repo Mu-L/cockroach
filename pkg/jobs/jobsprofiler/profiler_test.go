@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobsprofiler_test
 
@@ -23,9 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler/profilerconstants"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -50,14 +47,39 @@ func TestProfilerStorePlanDiagram(t *testing.T) {
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
+	// First verify that directly calling StorePlanDiagram writes n times causes
+	// the expected number of persisted rows in job_info, respecting the limit.
+	db := s.ExecutorConfig().(sql.ExecutorConfig).InternalDB
+	const fakeJobID = 4567
+	plan := &sql.PhysicalPlan{PhysicalPlan: physicalplan.MakePhysicalPlan(&physicalplan.PhysicalInfrastructure{})}
+	for i := 1; i < 10; i++ {
+		jobsprofiler.StorePlanDiagram(ctx, s.ApplicationLayer().AppStopper(), plan, db, fakeJobID)
+		testutils.SucceedsSoon(t, func() error {
+			var count int
+			if err := sqlDB.QueryRow(
+				`SELECT count(*) FROM system.job_info WHERE job_id = $1`, fakeJobID,
+			).Scan(&count); err != nil {
+				return err
+			}
+			if expected := min(i, jobsprofiler.MaxRetainedDSPDiagramsPerJob); count != expected {
+				return errors.Errorf("expected %d rows, got %d", expected, count)
+			}
+			return nil
+		})
+	}
+
+	// Now run various jobs that have been extended to persist diagrams and make
+	// sure that they also create persisted diagram rows.
 	_, err := sqlDB.Exec(`CREATE DATABASE test`)
 	require.NoError(t, err)
 	_, err = sqlDB.Exec(`CREATE TABLE foo (id INT PRIMARY KEY)`)
 	require.NoError(t, err)
 	_, err = sqlDB.Exec(`INSERT INTO foo VALUES (1), (2)`)
 	require.NoError(t, err)
-	_, err = sqlDB.Exec(`SET CLUSTER SETTING kv.rangefeed.enabled = true`)
-	require.NoError(t, err)
+
+	for _, l := range []serverutils.ApplicationLayerInterface{s.ApplicationLayer(), s.SystemLayer()} {
+		kvserver.RangefeedEnabled.Override(ctx, &l.ClusterSettings().SV, true)
+	}
 
 	for _, tc := range []struct {
 		name string
@@ -122,7 +144,7 @@ func TestStorePerNodeProcessorProgressFraction(t *testing.T) {
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
-	randID := uuid.FastMakeV4()
+	randID := uuid.MakeV4()
 	componentID := execinfrapb.ComponentID{
 		FlowID: execinfrapb.FlowID{UUID: randID},
 		Type:   execinfrapb.ComponentID_PROCESSOR,
@@ -227,23 +249,25 @@ func TestTraceRecordingOnResumerCompletion(t *testing.T) {
 			}
 		}
 
-		for _, f := range traceFiles {
-			data, err := jobs.ReadExecutionDetailFile(ctx, f, execCfg.InternalDB, jobspb.JobID(jobID))
-			if err != nil {
-				return err
-			}
-			recordings = append(recordings, data)
-			if strings.HasSuffix(f, "binpb") {
-				td := jobspb.TraceData{}
-				if err := protoutil.Unmarshal(data, &td); err != nil {
+		return execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			for _, f := range traceFiles {
+				data, err := jobs.ReadExecutionDetailFile(ctx, f, txn, jobspb.JobID(jobID))
+				if err != nil {
 					return err
 				}
-				require.NotEmpty(t, td.CollectedSpans)
+				recordings = append(recordings, data)
+				if strings.HasSuffix(f, "binpb") {
+					td := jobspb.TraceData{}
+					if err := protoutil.Unmarshal(data, &td); err != nil {
+						return err
+					}
+					require.NotEmpty(t, td.CollectedSpans)
+				}
 			}
-		}
-		if len(recordings) != 4 {
-			return errors.Newf("expected 2 entries but found %d", len(recordings))
-		}
-		return nil
+			if len(recordings) != 4 {
+				return errors.Newf("expected 2 entries but found %d", len(recordings))
+			}
+			return nil
+		})
 	})
 }

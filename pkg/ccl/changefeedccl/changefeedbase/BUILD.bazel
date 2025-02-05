@@ -5,8 +5,10 @@ go_library(
     srcs = [
         "avro.go",
         "errors.go",
+        "name.go",
         "options.go",
         "settings.go",
+        "sink_url.go",
         "target.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase",
@@ -16,11 +18,13 @@ go_library(
         "//pkg/jobs/jobspb",
         "//pkg/kv/kvpb",
         "//pkg/settings",
+        "//pkg/settings/cluster",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/util",
         "//pkg/util/iterutil",
+        "//pkg/util/metamorphic",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
@@ -30,11 +34,10 @@ go_test(
     srcs = [
         "errors_test.go",
         "main_test.go",
+        "name_test.go",
         "options_test.go",
     ],
-    args = ["-test.timeout=295s"],
     embed = [":changefeedbase"],
-    tags = ["ccl_test"],
     deps = [
         "//pkg/ccl",
         "//pkg/jobs",

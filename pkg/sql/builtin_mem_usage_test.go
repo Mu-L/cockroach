@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -50,7 +45,7 @@ func TestAggregatesMonitorMemory(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &ExecutorTestingKnobs{
-				DistSQLReceiverPushCallbackFactory: func(query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) {
+				DistSQLReceiverPushCallbackFactory: func(_ context.Context, query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) (rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) {
 					var block bool
 					for _, testQuery := range statements {
 						block = block || query == testQuery
@@ -59,7 +54,7 @@ func TestAggregatesMonitorMemory(t *testing.T) {
 						return nil
 					}
 					var seenMeta bool
-					return func(_ rowenc.EncDatumRow, _ coldata.Batch, meta *execinfrapb.ProducerMetadata) {
+					return func(row rowenc.EncDatumRow, batch coldata.Batch, meta *execinfrapb.ProducerMetadata) (rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) {
 						if meta != nil && !seenMeta {
 							// If this is the first metadata object, then we
 							// know that the test query is almost done
@@ -69,6 +64,7 @@ func TestAggregatesMonitorMemory(t *testing.T) {
 							<-blockWorkerCh
 							seenMeta = true
 						}
+						return row, batch, meta
 					}
 				},
 			},
@@ -94,7 +90,7 @@ CREATE TABLE d.t (a STRING)
 	for _, statement := range statements {
 		errCh := make(chan error)
 		go func(statement string) {
-			dbConn, err := s.ApplicationLayer().SQLConnE("")
+			dbConn, err := s.ApplicationLayer().SQLConnE()
 			if err != nil {
 				errCh <- err
 				return

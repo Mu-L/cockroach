@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -25,11 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 var (
 	systemLogGCPeriod = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"server.log_gc.period",
 		"the period at which log-like system tables are checked for old entries",
 		time.Hour,
@@ -37,7 +33,7 @@ var (
 		settings.WithPublic)
 
 	systemLogGCLimit = settings.RegisterIntSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"server.log_gc.max_deletions_per_cycle",
 		"the maximum number of entries to delete on each purge of log-like system tables",
 		1000,
@@ -46,7 +42,7 @@ var (
 	// rangeLogTTL is the TTL for rows in system.rangelog. If non zero, range log
 	// entries are periodically garbage collected.
 	rangeLogTTL = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.SystemOnly,
 		"server.rangelog.ttl",
 		"if nonzero, entries in system.rangelog older than this duration are periodically purged",
 		30*24*time.Hour, // 30 days
@@ -55,14 +51,14 @@ var (
 	// eventLogTTL is the TTL for rows in system.eventlog. If non zero, event log
 	// entries are periodically garbage collected.
 	eventLogTTL = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"server.eventlog.ttl",
 		"if nonzero, entries in system.eventlog older than this duration are periodically purged",
 		90*24*time.Hour, // 90 days
 		settings.WithPublic)
 
 	webSessionPurgeTTL = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"server.web_session.purge.ttl",
 		"if nonzero, entries in system.web_sessions older than this duration are periodically purged",
 		time.Hour,
@@ -77,7 +73,8 @@ var (
 func gcSystemLog(
 	ctx context.Context,
 	sqlServer *SQLServer,
-	opName, table, tsCol string,
+	opName redact.RedactableString,
+	table, tsCol string,
 	timestampLowerBound, timestampUpperBound time.Time,
 	limit int64,
 ) (time.Time, int64, error) {
@@ -102,7 +99,7 @@ SELECT count(1), max(%[2]s) FROM d`,
 				ctx,
 				opName,
 				nil, /* txn */
-				sessiondata.RootUserSessionDataOverride,
+				sessiondata.NodeUserSessionDataOverride,
 				deleteStmt,
 				timestampLowerBound,
 				timestampUpperBound,
@@ -178,7 +175,7 @@ func runSystemLogGCForOneTable(
 		return 0, nil
 	}
 
-	opName := gcConfig.table + "-" + gcConfig.timestampCol + "-gc"
+	opName := redact.Sprintf("%s-%s-gc", gcConfig.table, gcConfig.timestampCol)
 	limit := systemLogGCLimit.Get(&st.SV)
 	timestampUpperBound := timeutil.Unix(0, sqlServer.execCfg.Clock.PhysicalNow()-int64(ttl))
 	newTimestampLowerBound, rowsAffected, err := gcSystemLog(
@@ -252,7 +249,7 @@ func startSystemLogsGC(ctx context.Context, sqlServer *SQLServer) error {
 			return period
 		}
 		period := getPeriod()
-		timer := timeutil.NewTimer()
+		var timer timeutil.Timer
 		defer timer.Stop()
 		// The very first period is 25% off the configured period, to
 		// avoid a thundering herd effect on the system table between

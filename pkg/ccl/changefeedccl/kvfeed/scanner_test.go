@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvfeed
 
@@ -15,7 +12,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -52,14 +48,6 @@ func (r *recordResolvedWriter) AcquireMemory(ctx context.Context, n int64) (kvev
 	return kvevent.Alloc{}, nil
 }
 
-func tenantOrSystemCodec(s serverutils.TestServerInterface) keys.SQLCodec {
-	var codec = s.Codec()
-	if len(s.TestTenants()) > 0 {
-		codec = s.TestTenants()[0].Codec()
-	}
-	return codec
-}
-
 var _ kvevent.Writer = (*recordResolvedWriter)(nil)
 
 func TestEmitsResolvedDuringScan(t *testing.T) {
@@ -67,8 +55,9 @@ func TestEmitsResolvedDuringScan(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, kvdb := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, db, kvdb := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `
@@ -76,7 +65,7 @@ CREATE TABLE t (a INT PRIMARY KEY);
 INSERT INTO t VALUES (1), (2), (3);
 `)
 
-	codec := tenantOrSystemCodec(s)
+	codec := s.Codec()
 	descr := desctestutils.TestingGetPublicTableDescriptor(kvdb, codec, "defaultdb", "t")
 	span := tableSpan(codec, uint32(descr.GetID()))
 

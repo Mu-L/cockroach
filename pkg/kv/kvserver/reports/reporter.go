@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -456,7 +451,7 @@ func visitAncestors(
 	if descVal == nil {
 		// Couldn't find a descriptor. This is not expected to happen.
 		// Let's just look at the default zone config.
-		return visitDefaultZone(ctx, cfg, visitor), nil
+		return visitDefaultZone(ctx, cfg, visitor)
 	}
 
 	// TODO(ajwerner): Reconsider how this zone config picking apart happens. This
@@ -467,7 +462,7 @@ func visitAncestors(
 	}
 	// If it's a database, the parent is the default zone.
 	if b == nil || b.DescriptorType() != catalog.Table {
-		return visitDefaultZone(ctx, cfg, visitor), nil
+		return visitDefaultZone(ctx, cfg, visitor)
 	}
 	tableDesc := b.BuildImmutable()
 	// If it's a table, the parent is a database.
@@ -481,22 +476,22 @@ func visitAncestors(
 		}
 	}
 	// The parent database did not have constraints. Its parent is the default zone.
-	return visitDefaultZone(ctx, cfg, visitor), nil
+	return visitDefaultZone(ctx, cfg, visitor)
 }
 
 func visitDefaultZone(
 	ctx context.Context,
 	cfg *config.SystemConfig,
 	visitor func(context.Context, *zonepb.ZoneConfig, ZoneKey) bool,
-) bool {
+) (bool, error) {
 	zone, err := getZoneByID(keys.RootNamespaceID, cfg)
 	if err != nil {
-		log.Fatalf(ctx, "failed to get default zone config: %s", err)
+		return false, errors.Wrapf(err, "failed to get default zone config from: %v", cfg)
 	}
 	if zone == nil {
-		log.Fatal(ctx, "default zone config missing unexpectedly")
+		return false, errors.AssertionFailedf("default zone config missing unexpectedly from: %v", cfg)
 	}
-	return visitor(ctx, zone, MakeZoneKey(keys.RootNamespaceID, NoSubzone))
+	return visitor(ctx, zone, MakeZoneKey(keys.RootNamespaceID, NoSubzone)), nil
 }
 
 // getZoneByID returns a zone given its id. Inheritance does not apply.
@@ -540,10 +535,6 @@ type rangeVisitor interface {
 	// The idea is that, if failed() returns true, the report that the visitor
 	// produces will be considered incomplete and not persisted.
 	failed() bool
-
-	// reset resets the visitor's state, preparing it for visit() calls starting
-	// at the first range. This is called on retriable errors during range iteration.
-	reset(ctx context.Context)
 }
 
 // visitorError is returned by visitRanges when one or more visitors failed.
@@ -579,27 +570,19 @@ func visitRanges(
 
 	// Iterate over all the ranges.
 	for {
+		// Check for context cancellation.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Grab the next range.
 		rd, err := rangeStore.Next(ctx)
 		if err != nil {
-			if errIsRetriable(err) {
-				visitors = origVisitors
-				for _, v := range visitors {
-					v.reset(ctx)
-				}
-				// The iterator has been positioned to the beginning.
-				continue
-			} else {
-				return err
-			}
+			return err
 		}
 		if rd.RangeID == 0 {
 			// We're done.
 			break
-		}
-
-		// Check for context cancellation.
-		if err := ctx.Err(); err != nil {
-			return err
 		}
 
 		newKey, err := resolver.resolveRange(ctx, &rd, cfg)
@@ -643,17 +626,13 @@ type RangeIterator interface {
 	// Returns an empty RangeDescriptor when all the ranges have been exhausted. In that case,
 	// the iterator is not to be used any more (except for calling Close(), which will be a no-op).
 	//
-	// The returned error can be a retriable one (i.e.
-	// *kvpb.TransactionRetryWithProtoRefreshError, possibly wrapped). In that case, the iterator
-	// is reset automatically; the next Next() call ( should there be one) will
-	// return the first descriptor.
-	// In case of any other error, the iterator is automatically closed.
+	// In case of an error, the iterator is automatically closed.
 	// It can't be used any more (except for calling Close(), which will be a noop).
 	Next(context.Context) (roachpb.RangeDescriptor, error)
 
 	// Close destroys the iterator, releasing resources. It does not need to be
 	// called after Next() indicates exhaustion by returning an empty descriptor,
-	// or after Next() returns non-retriable errors.
+	// or after Next() returns an error.
 	Close(context.Context)
 }
 
@@ -734,6 +713,15 @@ func (r *meta2RangeIter) readBatch(ctx context.Context) (retErr error) {
 	}
 	if r.txn == nil {
 		r.txn = r.db.NewTxn(ctx, "rangeStoreImpl")
+		// Set a fixed timestamp to disable uncertainty intervals. This forgoes
+		// linearizability (which isn't at all important for this use case) for the
+		// guarantee that no retryable errors will be returned, so we don't need to
+		// worry about handling them in order to maintain a consistent view across
+		// batches. Uncertainty errors are the only form of retryable error that can
+		// be returned for read-only transactions.
+		if err := r.txn.SetFixedTimestamp(ctx, r.txn.ReadTimestamp()); err != nil {
+			return err
+		}
 	}
 
 	b := r.txn.NewBatch()
@@ -759,14 +747,8 @@ func (r *meta2RangeIter) readBatch(ctx context.Context) (retErr error) {
 	return nil
 }
 
-func errIsRetriable(err error) bool {
-	return errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil))
-}
-
 // handleErr manipulates the iterator's state in response to an error.
-// In case of retriable error, the iterator is reset such that the next Next()
-// call returns the first range. In case of any other error, resources are
-// released and the iterator shouldn't be used any more.
+// Resources are released and the iterator shouldn't be used any more.
 // A nil error may be passed, in which case handleErr is a no-op.
 //
 // handleErr is idempotent.
@@ -774,20 +756,18 @@ func (r *meta2RangeIter) handleErr(ctx context.Context, err error) {
 	if err == nil {
 		return
 	}
-	if !errIsRetriable(err) {
-		if r.txn != nil {
-			log.Eventf(ctx, "non-retriable error: %s", err)
-			// On any non-retriable error, rollback.
-			if rollbackErr := r.txn.Rollback(ctx); rollbackErr != nil {
-				log.Eventf(ctx, "rollback failed: %s", rollbackErr)
-			}
-			r.txn = nil
-		}
-		r.reset()
-		r.readingDone = true
-	} else {
-		r.reset()
+	if errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil)) {
+		log.Warningf(ctx, "unexpected retryable error from "+
+			"read-only transaction with fixed read timestamp: %s", err)
 	}
+	if r.txn != nil {
+		if rollbackErr := r.txn.Rollback(ctx); rollbackErr != nil {
+			log.Eventf(ctx, "rollback failed: %s", rollbackErr)
+		}
+		r.txn = nil
+	}
+	r.reset()
+	r.readingDone = true
 }
 
 // reset the iterator. The next Next() call will return the first range.

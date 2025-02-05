@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package explain
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -114,7 +110,7 @@ func (ob *OutputBuilder) AddField(key, value string) {
 // AddFlakyField adds an information field under the current node, hiding the
 // value depending on the given deflake flags.
 func (ob *OutputBuilder) AddFlakyField(flags DeflakeFlags, key, value string) {
-	if ob.flags.Deflake.Has(flags) {
+	if ob.flags.Deflake.HasAny(flags) {
 		value = "<hidden>"
 	}
 	ob.AddField(key, value)
@@ -145,7 +141,7 @@ func (ob *OutputBuilder) Expr(key string, expr tree.TypedExpr, varColumns colinf
 	if expr == nil {
 		return
 	}
-	flags := tree.FmtSymbolicSubqueries
+	flags := tree.FmtSymbolicSubqueries | tree.FmtShortenConstants
 	if ob.flags.ShowTypes {
 		flags |= tree.FmtShowTypes
 	}
@@ -213,7 +209,13 @@ func (ob *OutputBuilder) BuildStringRows() []string {
 			child.AddLine(fmt.Sprintf("columns: %s", entry.columns))
 		}
 		if entry.ordering != "" {
-			child.AddLine(fmt.Sprintf("ordering: %s", entry.ordering))
+			// Do not print "ordering" redundantly  with "order" attribute of
+			// sort operators. Note that we choose to keep the latter so that
+			// "already ordered" and "K" attributes are printed right after the
+			// order.
+			if entry.node != nodeNames[sortOp] && entry.node != nodeNames[topKOp] {
+				child.AddLine(fmt.Sprintf("ordering: %s", entry.ordering))
+			}
 		}
 		// Add any fields for the node.
 		for entry = popField(); entry != nil; entry = popField() {
@@ -283,7 +285,7 @@ func (ob *OutputBuilder) AddTopLevelField(key, value string) {
 // AddFlakyTopLevelField adds a top-level field, hiding the value depending on
 // the given deflake flags.
 func (ob *OutputBuilder) AddFlakyTopLevelField(flags DeflakeFlags, key, value string) {
-	if ob.flags.Deflake.Has(flags) {
+	if ob.flags.Deflake.HasAny(flags) {
 		value = "<hidden>"
 	}
 	ob.AddTopLevelField(key, value)
@@ -301,10 +303,23 @@ func (ob *OutputBuilder) AddVectorized(value bool) {
 	ob.AddFlakyTopLevelField(DeflakeVectorized, "vectorized", fmt.Sprintf("%t", value))
 }
 
+// AddGeneric adds a top-level generic field, if value is true. Cannot be called
+// while inside a node.
+func (ob *OutputBuilder) AddPlanType(generic, optimized bool) {
+	switch {
+	case generic && optimized:
+		ob.AddTopLevelField("plan type", "generic, re-optimized")
+	case generic && !optimized:
+		ob.AddTopLevelField("plan type", "generic, reused")
+	default:
+		ob.AddTopLevelField("plan type", "custom")
+	}
+}
+
 // AddPlanningTime adds a top-level planning time field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddPlanningTime(delta time.Duration) {
-	if ob.flags.Deflake.Has(DeflakeVolatile) {
+	if ob.flags.Deflake.HasAny(DeflakeVolatile) {
 		delta = 10 * time.Microsecond
 	}
 	ob.AddTopLevelField("planning time", string(humanizeutil.Duration(delta)))
@@ -313,10 +328,19 @@ func (ob *OutputBuilder) AddPlanningTime(delta time.Duration) {
 // AddExecutionTime adds a top-level execution time field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddExecutionTime(delta time.Duration) {
-	if ob.flags.Deflake.Has(DeflakeVolatile) {
+	if ob.flags.Deflake.HasAny(DeflakeVolatile) {
 		delta = 100 * time.Microsecond
 	}
 	ob.AddTopLevelField("execution time", string(humanizeutil.Duration(delta)))
+}
+
+// AddClientTime adds a top-level client-level protocol time field. Cannot be
+// called while inside a node.
+func (ob *OutputBuilder) AddClientTime(delta time.Duration) {
+	if ob.flags.Deflake.HasAny(DeflakeVolatile) {
+		delta = time.Microsecond
+	}
+	ob.AddTopLevelField("client time", string(humanizeutil.Duration(delta)))
 }
 
 // AddKVReadStats adds a top-level field for the bytes/rows/KV pairs read from
@@ -372,7 +396,7 @@ func (ob *OutputBuilder) AddNetworkStats(messages, bytes int64) {
 // information entirely if we're redacting. Since disk spilling is rare we only
 // include this field is bytes is greater than zero.
 func (ob *OutputBuilder) AddMaxDiskUsage(bytes int64) {
-	if !ob.flags.Deflake.Has(DeflakeVolatile) && bytes > 0 {
+	if !ob.flags.Deflake.HasAny(DeflakeVolatile) && bytes > 0 {
 		ob.AddTopLevelField("max sql temp disk usage",
 			string(humanizeutil.IBytes(bytes)))
 	}
@@ -383,18 +407,18 @@ func (ob *OutputBuilder) AddMaxDiskUsage(bytes int64) {
 // independent of platform because the grunning library isn't currently
 // supported on all platforms.
 func (ob *OutputBuilder) AddCPUTime(cpuTime time.Duration) {
-	if !ob.flags.Deflake.Has(DeflakeVolatile) {
+	if !ob.flags.Deflake.HasAny(DeflakeVolatile) {
 		ob.AddTopLevelField("sql cpu time", string(humanizeutil.Duration(cpuTime)))
 	}
 }
 
 // AddRUEstimate adds a top-level field for the estimated number of RUs consumed
 // by the query.
-func (ob *OutputBuilder) AddRUEstimate(ru int64) {
+func (ob *OutputBuilder) AddRUEstimate(ru float64) {
 	ob.AddFlakyTopLevelField(
 		DeflakeVolatile,
 		"estimated RUs consumed",
-		string(humanizeutil.Count(uint64(ru))),
+		string(humanizeutil.Countf(ru)),
 	)
 }
 
@@ -410,11 +434,23 @@ func (ob *OutputBuilder) AddRegionsStats(regions []string) {
 // AddTxnInfo adds top-level fields for information about the query's
 // transaction.
 func (ob *OutputBuilder) AddTxnInfo(
-	txnIsoLevel isolation.Level, txnPriority roachpb.UserPriority, txnQoSLevel sessiondatapb.QoSLevel,
+	txnIsoLevel isolation.Level,
+	txnPriority roachpb.UserPriority,
+	txnQoSLevel sessiondatapb.QoSLevel,
+	asOfSystemTime *eval.AsOfSystemTime,
 ) {
 	ob.AddTopLevelField("isolation level", txnIsoLevel.StringLower())
 	ob.AddTopLevelField("priority", txnPriority.String())
 	ob.AddTopLevelField("quality of service", txnQoSLevel.String())
+	if asOfSystemTime != nil {
+		var boundedStaleness string
+		if asOfSystemTime.BoundedStaleness {
+			boundedStaleness = " (bounded staleness)"
+		}
+		ts := tree.PGWireFormatTimestamp(asOfSystemTime.Timestamp.GoTime(), nil /* offset */, nil /* tmp */)
+		msg := fmt.Sprintf("AS OF SYSTEM TIME %s%s", ts, boundedStaleness)
+		ob.AddTopLevelField("historical", msg)
+	}
 }
 
 // AddWarning adds the provided string to the list of warnings. Warnings will be

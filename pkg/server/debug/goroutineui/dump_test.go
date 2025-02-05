@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package goroutineui
 
@@ -25,6 +20,21 @@ func init() {
 	if bazel.BuiltWithBazel() {
 		bazel.SetGoEnv()
 	}
+}
+
+func TestDumpEmpty(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	dump := NewDump()
+	dump.agg = nil
+
+	assert.NotPanics(t, func() {
+		dump.SortWaitDesc()
+		dump.SortCountDesc()
+	})
+
+	act := dump.HTMLString()
+	assert.Contains(t, act, "goroutineui: empty goroutine dump")
 }
 
 func TestDumpHTML(t *testing.T) {

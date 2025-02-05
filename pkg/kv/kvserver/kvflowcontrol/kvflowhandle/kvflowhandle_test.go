@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvflowhandle_test
 
@@ -89,7 +84,7 @@ func TestHandleAdmit(t *testing.T) {
 			clock := hlc.NewClockForTesting(nil)
 			st := cluster.MakeTestingClusterSettings()
 			kvflowcontrol.Enabled.Override(ctx, &st.SV, true)
-			kvflowcontrol.Mode.Override(ctx, &st.SV, int64(kvflowcontrol.ApplyToAll))
+			kvflowcontrol.Mode.Override(ctx, &st.SV, kvflowcontrol.ApplyToAll)
 
 			controller := kvflowcontroller.New(registry, st, clock)
 			handle := kvflowhandle.New(
@@ -110,7 +105,9 @@ func TestHandleAdmit(t *testing.T) {
 			// the goroutine is blocked.
 			admitCh := make(chan struct{})
 			go func() {
-				require.NoError(t, handle.Admit(ctx, admissionpb.NormalPri, time.Time{}))
+				admitted, err := handle.Admit(ctx, admissionpb.NormalPri, time.Time{})
+				require.NoError(t, err)
+				require.True(t, admitted)
 				close(admitCh)
 			}()
 
@@ -171,7 +168,7 @@ func TestFlowControlMode(t *testing.T) {
 			clock := hlc.NewClockForTesting(nil)
 			st := cluster.MakeTestingClusterSettings()
 			kvflowcontrol.Enabled.Override(ctx, &st.SV, true)
-			kvflowcontrol.Mode.Override(ctx, &st.SV, int64(tc.mode))
+			kvflowcontrol.Mode.Override(ctx, &st.SV, tc.mode)
 
 			controller := kvflowcontroller.New(registry, st, clock)
 			handle := kvflowhandle.New(
@@ -189,16 +186,26 @@ func TestFlowControlMode(t *testing.T) {
 			handle.ConnectStream(ctx, pos(0), stream)
 			handle.DeductTokensFor(ctx, admissionpb.NormalPri, pos(1), kvflowcontrol.Tokens(16<<20 /* 16MiB */))
 
+			mode := tc.mode // copy to avoid nogo error
+
 			// Invoke .Admit() for {regular,elastic} work in a separate
 			// goroutines, and test below whether the goroutines are blocked.
 			regularAdmitCh := make(chan struct{})
 			elasticAdmitCh := make(chan struct{})
 			go func() {
-				require.NoError(t, handle.Admit(ctx, admissionpb.NormalPri, time.Time{}))
+				admitted, err := handle.Admit(ctx, admissionpb.NormalPri, time.Time{})
+				require.NoError(t, err)
+				if mode == kvflowcontrol.ApplyToElastic {
+					require.False(t, admitted)
+				} else {
+					require.True(t, admitted)
+				}
 				close(regularAdmitCh)
 			}()
 			go func() {
-				require.NoError(t, handle.Admit(ctx, admissionpb.BulkNormalPri, time.Time{}))
+				admitted, err := handle.Admit(ctx, admissionpb.BulkNormalPri, time.Time{})
+				require.NoError(t, err)
+				require.True(t, admitted)
 				close(elasticAdmitCh)
 			}()
 
@@ -241,7 +248,7 @@ func TestInspectHandle(t *testing.T) {
 	clock := hlc.NewClockForTesting(nil)
 	st := cluster.MakeTestingClusterSettings()
 	kvflowcontrol.Enabled.Override(ctx, &st.SV, true)
-	kvflowcontrol.Mode.Override(ctx, &st.SV, int64(kvflowcontrol.ApplyToAll))
+	kvflowcontrol.Mode.Override(ctx, &st.SV, kvflowcontrol.ApplyToAll)
 
 	pos := func(d uint64) kvflowcontrolpb.RaftLogPosition {
 		return kvflowcontrolpb.RaftLogPosition{Term: 1, Index: d}

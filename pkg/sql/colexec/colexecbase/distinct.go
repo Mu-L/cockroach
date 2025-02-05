@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecbase
 
@@ -29,6 +24,10 @@ import (
 func OrderedDistinctColsToOperators(
 	input colexecop.Operator, distinctCols []uint32, typs []*types.T, nullsAreDistinct bool,
 ) (colexecop.ResettableOperator, []bool) {
+	var inputToClose colexecop.Closer
+	if c, ok := input.(colexecop.Closer); ok {
+		inputToClose = c
+	}
 	distinctCol := make([]bool, coldata.BatchSize())
 	// zero the boolean column on every iteration.
 	input = &fnOp{
@@ -55,6 +54,7 @@ func OrderedDistinctColsToOperators(
 	}
 	distinctChain := &distinctChainOps{
 		ResettableOperator: r,
+		inputToClose:       inputToClose,
 	}
 	return distinctChain, distinctCol
 }
@@ -62,9 +62,18 @@ func OrderedDistinctColsToOperators(
 type distinctChainOps struct {
 	colexecop.ResettableOperator
 	colexecop.NonExplainable
+	inputToClose colexecop.Closer
 }
 
 var _ colexecop.ResettableOperator = &distinctChainOps{}
+var _ colexecop.ClosableOperator = &distinctChainOps{}
+
+func (d *distinctChainOps) Close(ctx context.Context) error {
+	if d.inputToClose != nil {
+		return d.inputToClose.Close(ctx)
+	}
+	return nil
+}
 
 // NewOrderedDistinct creates a new ordered distinct operator on the given
 // input columns with the given types.
@@ -104,6 +113,7 @@ type orderedDistinct struct {
 }
 
 var _ colexecop.ResettableOperator = &orderedDistinct{}
+var _ colexecop.ClosableOperator = &orderedDistinct{}
 
 // Init implements the colexecop.Operator interface.
 func (d *orderedDistinct) Init(ctx context.Context) {
@@ -138,6 +148,14 @@ func (d *orderedDistinct) Reset(ctx context.Context) {
 		r.Reset(ctx)
 	}
 	d.distinctChain.Reset(ctx)
+}
+
+// Close implements the colexecop.Closer interface.
+func (d *orderedDistinct) Close(ctx context.Context) error {
+	if c, ok := d.Input.(colexecop.Closer); ok {
+		return c.Close(ctx)
+	}
+	return nil
 }
 
 // UpsertDistinctHelper is a utility that helps distinct operators emit errors

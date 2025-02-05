@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests_test
 
@@ -108,13 +103,14 @@ func testMonotonicInserts(t *testing.T, distSQLMode sessiondatapb.DistSQLExecMod
 	defer tc.Stopper().Stop(ctx)
 
 	for _, server := range tc.Servers {
-		st := server.ClusterSettings()
+		st := server.ApplicationLayer().ClusterSettings()
 		st.Manual.Store(true)
-		sql.DistSQLClusterExecMode.Override(ctx, &st.SV, int64(distSQLMode))
+		sql.DistSQLClusterExecMode.Override(ctx, &st.SV, distSQLMode)
 		// Let transactions push immediately to detect deadlocks. The test creates a
 		// large amount of contention and dependency cycles, and could take a long
 		// time to complete without this.
-		concurrency.LockTableDeadlockDetectionPushDelay.Override(ctx, &st.SV, 0)
+		concurrency.LockTableDeadlockOrLivenessDetectionPushDelay.Override(ctx,
+			&server.SystemLayer().ClusterSettings().SV, 0)
 	}
 
 	var clients []mtClient

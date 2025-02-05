@@ -1,30 +1,29 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"bytes"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
+
+// partitionKey is used to group a partition's name and its index ID for
+// indexing into a map.
+type partitionKey struct {
+	indexID descpb.IndexID
+	name    string
+}
 
 // GenerateSubzoneSpans constructs from a TableDescriptor the entries mapping
 // zone config spans to subzones for use in the SubzoneSpans field of
@@ -70,21 +69,8 @@ import (
 // TODO(benesch): remove the hasNewSubzones parameter when a statement to clear
 // all subzones at once is introduced.
 func GenerateSubzoneSpans(
-	st *cluster.Settings,
-	logicalClusterID uuid.UUID,
-	codec keys.SQLCodec,
-	tableDesc catalog.TableDescriptor,
-	subzones []zonepb.Subzone,
-	hasNewSubzones bool,
+	codec keys.SQLCodec, tableDesc catalog.TableDescriptor, subzones []zonepb.Subzone,
 ) ([]zonepb.SubzoneSpan, error) {
-	// Removing zone configs does not require a valid license.
-	if hasNewSubzones {
-		if err := base.CheckEnterpriseEnabled(st, logicalClusterID,
-			"replication zones on indexes or partitions"); err != nil {
-			return nil, err
-		}
-	}
-
 	// We already completely avoid creating subzone spans for dropped indexes.
 	// Whether this was intentional is a different story, but it turns out to be
 	// pretty sane. Dropped elements may refer to dropped types and we aren't
@@ -97,10 +83,11 @@ func GenerateSubzoneSpans(
 	a := &tree.DatumAlloc{}
 
 	subzoneIndexByIndexID := make(map[descpb.IndexID]int32)
-	subzoneIndexByPartition := make(map[string]int32)
+	subzoneIndexByPartition := make(map[partitionKey]int32)
 	for i, subzone := range subzones {
 		if len(subzone.PartitionName) > 0 {
-			subzoneIndexByPartition[subzone.PartitionName] = int32(i)
+			partKey := partitionKey{indexID: descpb.IndexID(subzone.IndexID), name: subzone.PartitionName}
+			subzoneIndexByPartition[partKey] = int32(i)
 		} else {
 			subzoneIndexByIndexID[descpb.IndexID(subzone.IndexID)] = int32(i)
 		}
@@ -161,7 +148,8 @@ func GenerateSubzoneSpans(
 		}
 		var ok bool
 		if subzone := payloads[0].(zonepb.Subzone); len(subzone.PartitionName) > 0 {
-			subzoneSpan.SubzoneIndex, ok = subzoneIndexByPartition[subzone.PartitionName]
+			partKey := partitionKey{indexID: descpb.IndexID(subzone.IndexID), name: subzone.PartitionName}
+			subzoneSpan.SubzoneIndex, ok = subzoneIndexByPartition[partKey]
 		} else {
 			subzoneSpan.SubzoneIndex, ok = subzoneIndexByIndexID[descpb.IndexID(subzone.IndexID)]
 		}
@@ -186,7 +174,7 @@ func indexCoveringsForPartitioning(
 	tableDesc catalog.TableDescriptor,
 	idx catalog.Index,
 	part catalog.Partitioning,
-	relevantPartitions map[string]int32,
+	relevantPartitions map[partitionKey]int32,
 	prefixDatums []tree.Datum,
 ) ([]covering.Covering, error) {
 	if part.NumColumns() == 0 {
@@ -212,10 +200,11 @@ func indexCoveringsForPartitioning(
 				if err != nil {
 					return err
 				}
-				if _, ok := relevantPartitions[name]; ok {
+				partKey := partitionKey{indexID: idx.GetID(), name: name}
+				if _, ok := relevantPartitions[partKey]; ok {
 					listCoverings[len(t.Datums)] = append(listCoverings[len(t.Datums)], covering.Range{
 						Start: keyPrefix, End: roachpb.Key(keyPrefix).PrefixEnd(),
-						Payload: zonepb.Subzone{PartitionName: name},
+						Payload: zonepb.Subzone{IndexID: uint32(idx.GetID()), PartitionName: name},
 					})
 				}
 				newPrefixDatums := append(prefixDatums, t.Datums...)
@@ -240,7 +229,8 @@ func indexCoveringsForPartitioning(
 
 	if part.NumRanges() > 0 {
 		err := part.ForEachRange(func(name string, from, to []byte) error {
-			if _, ok := relevantPartitions[name]; !ok {
+			partKey := partitionKey{indexID: idx.GetID(), name: name}
+			if _, ok := relevantPartitions[partKey]; !ok {
 				return nil
 			}
 			_, fromKey, err := rowenc.DecodePartitionTuple(
@@ -253,10 +243,10 @@ func indexCoveringsForPartitioning(
 			if err != nil {
 				return err
 			}
-			if _, ok := relevantPartitions[name]; ok {
+			if _, ok := relevantPartitions[partKey]; ok {
 				coverings = append(coverings, covering.Covering{{
 					Start: fromKey, End: toKey,
-					Payload: zonepb.Subzone{PartitionName: name},
+					Payload: zonepb.Subzone{IndexID: uint32(idx.GetID()), PartitionName: name},
 				}})
 			}
 			return nil

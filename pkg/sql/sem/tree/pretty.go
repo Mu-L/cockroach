@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -16,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -62,6 +58,8 @@ type PrettyCfg struct {
 	JSONFmt bool
 	// ValueRedaction, when set, surrounds literal values with redaction markers.
 	ValueRedaction bool
+	// FmtFlags specifies FmtFlags to use when formatting expressions.
+	FmtFlags FmtFlags
 }
 
 // DefaultPrettyCfg returns a PrettyCfg with the default
@@ -157,13 +155,13 @@ func (p *PrettyCfg) bracketKeyword(
 }
 
 // Pretty pretty prints stmt with default options.
-func Pretty(stmt NodeFormatter) string {
+func Pretty(stmt NodeFormatter) (string, error) {
 	cfg := DefaultPrettyCfg()
 	return cfg.Pretty(stmt)
 }
 
 // Pretty pretty prints stmt with specified options.
-func (p *PrettyCfg) Pretty(stmt NodeFormatter) string {
+func (p *PrettyCfg) Pretty(stmt NodeFormatter) (string, error) {
 	doc := p.Doc(stmt)
 	return pretty.Pretty(doc, p.LineWidth, p.UseTabs, p.TabWidth, p.Case)
 }
@@ -184,7 +182,11 @@ func (p *PrettyCfg) docAsString(f NodeFormatter) pretty.Doc {
 }
 
 func (p *PrettyCfg) fmtFlags() FmtFlags {
-	prettyFlags := FmtShowPasswords | FmtParsable | FmtTagDollarQuotes
+	if p.FmtFlags != FmtFlags(0) {
+		return p.FmtFlags
+	}
+
+	prettyFlags := FmtShowPasswords | FmtParsable
 	if p.ValueRedaction {
 		prettyFlags |= FmtMarkRedactionNode | FmtOmitNameRedaction
 	}
@@ -1627,7 +1629,7 @@ func (node *ShardedIndexDef) doc(p *PrettyCfg) pretty.Doc {
 
 func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	// Final layout:
-	// CREATE [UNIQUE] [INVERTED] INDEX [name]
+	// CREATE [UNIQUE] [INVERTED | VECTOR] INDEX [name]
 	//    ON tbl (cols...)
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
@@ -1641,8 +1643,11 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	if node.Unique {
 		title = append(title, pretty.Keyword("UNIQUE"))
 	}
-	if node.Inverted {
+	switch node.Type {
+	case idxtype.INVERTED:
 		title = append(title, pretty.Keyword("INVERTED"))
+	case idxtype.VECTOR:
+		title = append(title, pretty.Keyword("VECTOR"))
 	}
 	title = append(title, pretty.Keyword("INDEX"))
 	if node.Concurrently {
@@ -1684,12 +1689,12 @@ func (node *CreateIndex) doc(p *PrettyCfg) pretty.Doc {
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
-	if invisibility := node.Invisibility; invisibility != 0.0 {
-		if invisibility == 1.0 {
-			clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
-		} else {
-			clauses = append(clauses, pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-invisibility)))
-		}
+	switch {
+	case node.Invisibility.FloatProvided:
+		clauses = append(clauses,
+			pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-node.Invisibility.Value)))
+	case node.Invisibility.Value == 1.0:
+		clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
 	}
 	return p.nestUnder(
 		pretty.Fold(pretty.ConcatSpace, title...),
@@ -1723,7 +1728,7 @@ func (node *LikeTableDef) doc(p *PrettyCfg) pretty.Doc {
 
 func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	// Final layout:
-	// [INVERTED] INDEX [name] (columns...)
+	// [INVERTED | VECTOR] INDEX [name] (columns...)
 	//    [STORING ( ... )]
 	//    [INTERLEAVE ...]
 	//    [PARTITION BY ...]
@@ -1734,8 +1739,11 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Name != "" {
 		title = pretty.ConcatSpace(title, p.Doc(&node.Name))
 	}
-	if node.Inverted {
+	switch node.Type {
+	case idxtype.INVERTED:
 		title = pretty.ConcatSpace(pretty.Keyword("INVERTED"), title)
+	case idxtype.VECTOR:
+		title = pretty.ConcatSpace(pretty.Keyword("VECTOR"), title)
 	}
 	title = pretty.ConcatSpace(title, p.bracket("(", p.Doc(&node.Columns), ")"))
 
@@ -1761,14 +1769,13 @@ func (node *IndexTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
-	if invisibility := node.Invisibility; invisibility != 0.0 {
-		if invisibility == 1.0 {
-			clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
-		} else {
-			clauses = append(clauses, pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-invisibility)))
-		}
+	switch {
+	case node.Invisibility.FloatProvided:
+		clauses = append(clauses,
+			pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-node.Invisibility.Value)))
+	case node.Invisibility.Value == 1.0:
+		clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
 	}
-
 	if len(clauses) == 0 {
 		return title
 	}
@@ -1825,15 +1832,13 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 	if node.Predicate != nil {
 		clauses = append(clauses, p.nestUnder(pretty.Keyword("WHERE"), p.Doc(node.Predicate)))
 	}
-
-	if invisibility := node.Invisibility; invisibility != 0.0 {
-		if invisibility == 1.0 {
-			clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
-		} else {
-			clauses = append(clauses, pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-invisibility)))
-		}
+	switch {
+	case node.Invisibility.FloatProvided:
+		clauses = append(clauses,
+			pretty.Keyword(" VISIBILITY "+fmt.Sprintf("%.2f", 1-node.Invisibility.Value)))
+	case node.Invisibility.Value == 1.0:
+		clauses = append(clauses, pretty.Keyword(" NOT VISIBLE"))
 	}
-
 	if node.StorageParams != nil {
 		clauses = append(clauses, p.bracketKeyword(
 			"WITH", "(",
@@ -2157,24 +2162,17 @@ func (node *Backup) doc(p *PrettyCfg) pretty.Doc {
 	if node.Targets != nil {
 		items = append(items, node.Targets.docRow(p))
 	}
-	if node.Nested {
-		if node.Subdir != nil {
-			items = append(items, p.row("INTO ", p.Doc(node.Subdir)))
-			items = append(items, p.row(" IN ", p.Doc(&node.To)))
-		} else if node.AppendToLatest {
-			items = append(items, p.row("INTO LATEST IN", p.Doc(&node.To)))
-		} else {
-			items = append(items, p.row("INTO", p.Doc(&node.To)))
-		}
+	if node.Subdir != nil {
+		items = append(items, p.row("INTO ", p.Doc(node.Subdir)))
+		items = append(items, p.row(" IN ", p.Doc(&node.To)))
+	} else if node.AppendToLatest {
+		items = append(items, p.row("INTO LATEST IN", p.Doc(&node.To)))
 	} else {
-		items = append(items, p.row("TO", p.Doc(&node.To)))
+		items = append(items, p.row("INTO", p.Doc(&node.To)))
 	}
 
 	if node.AsOf.Expr != nil {
 		items = append(items, node.AsOf.docRow(p))
-	}
-	if node.IncrementalFrom != nil {
-		items = append(items, p.row("INCREMENTAL FROM", p.Doc(&node.IncrementalFrom)))
 	}
 	if !node.Options.IsDefault() {
 		items = append(items, p.row("WITH", p.Doc(&node.Options)))
@@ -2189,16 +2187,9 @@ func (node *Restore) doc(p *PrettyCfg) pretty.Doc {
 	if node.DescriptorCoverage == RequestedDescriptors {
 		items = append(items, node.Targets.docRow(p))
 	}
-	from := make([]pretty.Doc, len(node.From))
-	for i := range node.From {
-		from[i] = p.Doc(&node.From[i])
-	}
-	if node.Subdir != nil {
-		items = append(items, p.row("FROM", p.Doc(node.Subdir)))
-		items = append(items, p.row("IN", p.commaSeparated(from...)))
-	} else {
-		items = append(items, p.row("FROM", p.commaSeparated(from...)))
-	}
+	from := p.Doc(&node.From)
+	items = append(items, p.row("FROM", p.Doc(node.Subdir)))
+	items = append(items, p.row("IN", from))
 
 	if node.AsOf.Expr != nil {
 		items = append(items, node.AsOf.docRow(p))

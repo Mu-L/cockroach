@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package interceptor
 
@@ -17,6 +14,7 @@ import (
 	"testing/iotest"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/errors"
@@ -26,6 +24,7 @@ import (
 
 func TestNewPgInterceptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	reader, _ := io.Pipe()
 
@@ -47,6 +46,7 @@ func TestNewPgInterceptor(t *testing.T) {
 
 func TestPGInterceptor_PeekMsg(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	t.Run("read_error", func(t *testing.T) {
 		r := iotest.ErrReader(errors.New("read error"))
@@ -147,6 +147,7 @@ func TestPGInterceptor_PeekMsg(t *testing.T) {
 
 func TestPGInterceptor_ReadMsg(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	t.Run("read_error/msg_fits", func(t *testing.T) {
 		buf := buildSrc(t, 1)
@@ -262,6 +263,7 @@ func TestPGInterceptor_ReadMsg(t *testing.T) {
 
 func TestPGInterceptor_ForwardMsg(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	t.Run("write_error/fully_buffered", func(t *testing.T) {
 		src := buildSrc(t, 1)
@@ -352,6 +354,7 @@ func TestPGInterceptor_ForwardMsg(t *testing.T) {
 
 func TestPGInterceptor_readSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	buf := bytes.NewBufferString("foobarbazz")
 	pgi := newPgInterceptor(iotest.OneByteReader(buf), 10 /* bufSize */)
@@ -370,6 +373,7 @@ func TestPGInterceptor_readSize(t *testing.T) {
 
 func TestPGInterceptor_writeSize(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	buf := bytes.NewBufferString("foobarbazz")
 	pgi := newPgInterceptor(iotest.OneByteReader(buf), 10 /* bufSize */)
@@ -388,6 +392,7 @@ func TestPGInterceptor_writeSize(t *testing.T) {
 
 func TestPGInterceptor_ensureNextNBytes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
 	t.Run("invalid n", func(t *testing.T) {
 		pgi := newPgInterceptor(nil /* src */, 8 /* bufSize */)
@@ -490,12 +495,16 @@ func (rw *errReadWriter) Write(p []byte) (int, error) {
 
 // testSelect1Bytes represents the bytes for a SELECT 1 query. This will always
 // be 14 bytes (5 (header) + 8 (query) + 1 (null terminator)).
-var testSelect1Bytes = (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+var testSelect1Bytes []byte
 
 // buildSrc generates a buffer with count test queries which alternates between
 // SELECT 1 and SELECT 2.
 func buildSrc(t *testing.T, count int) *bytes.Buffer {
 	t.Helper()
+
+	var err error
+	testSelect1Bytes, err = (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+	require.NoError(t, err)
 
 	// Reset bytes back to SELECT 1.
 	defer func() {

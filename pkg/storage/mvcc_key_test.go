@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -99,8 +94,8 @@ func TestMVCCKeyCompare(t *testing.T) {
 
 			// Comparators on encoded keys should be identical.
 			aEnc, bEnc := EncodeMVCCKey(tc.a), EncodeMVCCKey(tc.b)
-			require.Equal(t, tc.expect, EngineKeyCompare(aEnc, bEnc))
-			require.Equal(t, tc.expect == 0, EngineKeyEqual(aEnc, bEnc))
+			require.Equal(t, tc.expect, EngineComparer.Compare(aEnc, bEnc))
+			require.Equal(t, tc.expect == 0, EngineComparer.Equal(aEnc, bEnc))
 		})
 	}
 }
@@ -113,9 +108,9 @@ func TestMVCCKeyCompareRandom(t *testing.T) {
 		aEnc, bEnc := EncodeMVCCKey(a), EncodeMVCCKey(b)
 
 		cmp := a.Compare(b)
-		cmpEnc := EngineKeyCompare(aEnc, bEnc)
+		cmpEnc := EngineComparer.Compare(aEnc, bEnc)
 		eq := a.Equal(b)
-		eqEnc := EngineKeyEqual(aEnc, bEnc)
+		eqEnc := EngineComparer.Equal(aEnc, bEnc)
 		lessAB := a.Less(b)
 		lessBA := b.Less(a)
 
@@ -296,8 +291,8 @@ func TestDecodeUnnormalizedMVCCKey(t *testing.T) {
 			// Re-encode the key into its normal form.
 			reencoded := EncodeMVCCKey(decoded)
 			require.NotEqual(t, encoded, reencoded)
-			require.Equal(t, tc.equalToNormal, EngineKeyEqual(encoded, reencoded))
-			require.Equal(t, tc.equalToNormal, EngineKeyCompare(encoded, reencoded) == 0)
+			require.Equal(t, tc.equalToNormal, EngineComparer.Equal(encoded, reencoded))
+			require.Equal(t, tc.equalToNormal, EngineComparer.Compare(encoded, reencoded) == 0)
 		})
 	}
 }
@@ -361,6 +356,11 @@ func BenchmarkEncodeMVCCKey(b *testing.B) {
 		"walltime":         {WallTime: 1643550788737652545},
 		"walltime+logical": {WallTime: 1643550788737652545, Logical: 4096},
 	}
+	if testing.Short() {
+		// Reduce the number of configurations under -short.
+		delete(keys, "empty")
+		delete(timestamps, "walltime")
+	}
 	buf := make([]byte, 0, 65536)
 	for keyDesc, key := range keys {
 		for tsDesc, ts := range timestamps {
@@ -388,6 +388,11 @@ func BenchmarkDecodeMVCCKey(b *testing.B) {
 		"walltime":         {WallTime: 1643550788737652545},
 		"walltime+logical": {WallTime: 1643550788737652545, Logical: 4096},
 	}
+	if testing.Short() {
+		// Reduce the number of configurations under -short.
+		delete(keys, "empty")
+		delete(timestamps, "walltime")
+	}
 	var mvccKey MVCCKey
 	var err error
 	for keyDesc, key := range keys {
@@ -412,6 +417,8 @@ func TestMVCCRangeKeyClone(t *testing.T) {
 	orig := MVCCRangeKeyStack{
 		Bounds: roachpb.Span{Key: roachpb.Key("abc"), EndKey: roachpb.Key("def")},
 		Versions: MVCCRangeKeyVersions{
+			{Timestamp: hlc.Timestamp{WallTime: 5, Logical: 1}, Value: nil,
+				EncodedTimestampSuffix: EncodeMVCCTimestampSuffix(hlc.Timestamp{WallTime: 5, Logical: 1})},
 			{Timestamp: hlc.Timestamp{WallTime: 3, Logical: 4}, Value: []byte{1, 2, 3}},
 			{Timestamp: hlc.Timestamp{WallTime: 1, Logical: 2}, Value: nil},
 		},
@@ -428,6 +435,10 @@ func TestMVCCRangeKeyClone(t *testing.T) {
 		if len(orig.Versions[i].Value) > 0 {
 			require.NotSame(t, &orig.Versions[i].Value[0], &clone.Versions[i].Value[0])
 		}
+		if len(orig.Versions[i].EncodedTimestampSuffix) > 0 {
+			require.NotSame(t, &orig.Versions[i].EncodedTimestampSuffix[0],
+				&clone.Versions[i].EncodedTimestampSuffix[0])
+		}
 	}
 }
 
@@ -438,7 +449,8 @@ func TestMVCCRangeKeyCloneInto(t *testing.T) {
 		Bounds: roachpb.Span{Key: roachpb.Key("abc"), EndKey: roachpb.Key("def")},
 		Versions: MVCCRangeKeyVersions{
 			{Timestamp: hlc.Timestamp{WallTime: 3, Logical: 4}, Value: []byte{1, 2, 3}},
-			{Timestamp: hlc.Timestamp{WallTime: 1, Logical: 2}, Value: nil},
+			{Timestamp: hlc.Timestamp{WallTime: 1, Logical: 2}, Value: nil,
+				EncodedTimestampSuffix: EncodeMVCCTimestampSuffix(hlc.Timestamp{WallTime: 1, Logical: 2})},
 		},
 	}
 
@@ -465,7 +477,7 @@ func TestMVCCRangeKeyCloneInto(t *testing.T) {
 		Versions: MVCCRangeKeyVersions{
 			{Value: make([]byte, len(orig.Versions[0].Value)+1)},
 			{Value: make([]byte, len(orig.Versions[1].Value)+1)},
-			{Value: make([]byte, 100)},
+			{Value: make([]byte, 100), EncodedTimestampSuffix: make([]byte, 10)},
 		},
 	}
 
@@ -514,6 +526,7 @@ func TestMVCCRangeKeyCloneInto(t *testing.T) {
 				requireSliceIdentity(t, orig.Bounds.EndKey, clone.Bounds.EndKey, false)
 				for i := range orig.Versions {
 					requireSliceIdentity(t, orig.Versions[i].Value, clone.Versions[i].Value, false)
+					requireSliceIdentity(t, orig.Versions[i].EncodedTimestampSuffix, clone.Versions[i].EncodedTimestampSuffix, false)
 				}
 
 				// Assert whether the clone is reusing byte slices from the target.
@@ -522,6 +535,7 @@ func TestMVCCRangeKeyCloneInto(t *testing.T) {
 				for i := range tc.target.Versions {
 					if i < len(clone.Versions) {
 						requireSliceIdentity(t, tc.target.Versions[i].Value, clone.Versions[i].Value, tc.expectReused)
+						requireSliceIdentity(t, tc.target.Versions[i].EncodedTimestampSuffix, clone.Versions[i].EncodedTimestampSuffix, tc.expectReused)
 					}
 				}
 			})
@@ -554,13 +568,14 @@ func TestMVCCRangeKeyString(t *testing.T) {
 func TestMVCCRangeKeyCompare(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ab1 := MVCCRangeKey{roachpb.Key("a"), roachpb.Key("b"), hlc.Timestamp{Logical: 1}}
-	ac1 := MVCCRangeKey{roachpb.Key("a"), roachpb.Key("c"), hlc.Timestamp{Logical: 1}}
-	ac2 := MVCCRangeKey{roachpb.Key("a"), roachpb.Key("c"), hlc.Timestamp{Logical: 2}}
-	bc0 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("c"), hlc.Timestamp{Logical: 0}}
-	bc1 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("c"), hlc.Timestamp{Logical: 1}}
-	bc3 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("c"), hlc.Timestamp{Logical: 3}}
-	bd4 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("d"), hlc.Timestamp{Logical: 4}}
+	ab1 := MVCCRangeKey{roachpb.Key("a"), roachpb.Key("b"), hlc.Timestamp{Logical: 1}, nil}
+	ac1 := MVCCRangeKey{roachpb.Key("a"), roachpb.Key("c"), hlc.Timestamp{Logical: 1}, nil}
+	ac2 := MVCCRangeKey{roachpb.Key("a"), roachpb.Key("c"), hlc.Timestamp{Logical: 2}, nil}
+	bc0 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("c"), hlc.Timestamp{Logical: 0}, nil}
+	bc1 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("c"), hlc.Timestamp{Logical: 1}, nil}
+	bc3 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("c"), hlc.Timestamp{Logical: 3}, nil}
+	bd4 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("d"), hlc.Timestamp{Logical: 4}, nil}
+	bd5 := MVCCRangeKey{roachpb.Key("b"), roachpb.Key("d"), hlc.Timestamp{Logical: 4}, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 14}}
 
 	testcases := map[string]struct {
 		a      MVCCRangeKey
@@ -578,6 +593,7 @@ func TestMVCCRangeKeyCompare(t *testing.T) {
 		"set time gt empty":     {bc1, bc0, 1},  // empty MVCC timestamps sort before non-empty
 		"start time precedence": {ac2, bc3, -1}, // a before b, but 3 before 2; key takes precedence
 		"time end precedence":   {bd4, bc3, -1}, // c before d, but 4 before 3; time takes precedence
+		"ignore encoded ts":     {bd4, bd5, 0},  // encoded timestamp is ignored
 	}
 	for name, tc := range testcases {
 		t.Run(name, func(t *testing.T) {
@@ -967,27 +983,51 @@ func BenchmarkMVCCRangeKeyStack_Clone(b *testing.B) {
 		return stack
 	}
 
+	type testCase struct {
+		keySize     int
+		numVersions int
+		withValues  int
+	}
+	var testCases []testCase
+
 	for _, keySize := range []int{16} {
-		b.Run(fmt.Sprintf("keySize=%d", keySize), func(b *testing.B) {
-			for _, numVersions := range []int{1, 3, 10, 100} {
-				b.Run(fmt.Sprintf("numVersions=%d", numVersions), func(b *testing.B) {
-					for _, withValues := range []int{0, 1} {
-						b.Run(fmt.Sprintf("withValues=%d", withValues), func(b *testing.B) {
-							stack := makeStack(keySize, numVersions, withValues)
-							b.Run("Clone", func(b *testing.B) {
-								for i := 0; i < b.N; i++ {
-									mvccRangeKeyStackClone = stack.Clone()
-								}
-							})
-							b.Run("CloneInto", func(b *testing.B) {
-								for i := 0; i < b.N; i++ {
-									stack.CloneInto(&mvccRangeKeyStackClone)
-								}
-							})
-						})
-					}
+		for _, numVersions := range []int{1, 3, 10, 100} {
+			for _, withValues := range []int{0, 1} {
+				testCases = append(testCases, testCase{
+					keySize:     keySize,
+					numVersions: numVersions,
+					withValues:  withValues,
 				})
 			}
+		}
+	}
+
+	if testing.Short() {
+		// Choose a few configurations for the short version.
+		testCases = []testCase{
+			{keySize: 16, numVersions: 1, withValues: 0},
+			{keySize: 16, numVersions: 3, withValues: 1},
+			{keySize: 16, numVersions: 100, withValues: 1},
+		}
+	}
+
+	for _, tc := range testCases {
+		name := fmt.Sprintf(
+			"keySize=%d/numVersions=%d/withValues=%d",
+			tc.keySize, tc.numVersions, tc.withValues,
+		)
+		b.Run(name, func(b *testing.B) {
+			stack := makeStack(tc.keySize, tc.numVersions, tc.withValues)
+			b.Run("Clone", func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					mvccRangeKeyStackClone = stack.Clone()
+				}
+			})
+			b.Run("CloneInto", func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					stack.CloneInto(&mvccRangeKeyStackClone)
+				}
+			})
 		})
 	}
 }
@@ -1007,9 +1047,10 @@ func pointKV(key string, ts int, value string) MVCCKeyValue {
 
 func rangeKey(start, end string, ts int) MVCCRangeKey {
 	return MVCCRangeKey{
-		StartKey:  roachpb.Key(start),
-		EndKey:    roachpb.Key(end),
-		Timestamp: wallTS(ts),
+		StartKey:               roachpb.Key(start),
+		EndKey:                 roachpb.Key(end),
+		Timestamp:              wallTS(ts),
+		EncodedTimestampSuffix: EncodeMVCCTimestampSuffix(wallTS(ts)),
 	}
 }
 

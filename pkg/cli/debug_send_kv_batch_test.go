@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -37,7 +32,7 @@ func TestSendKVBatchExample(t *testing.T) {
 
 	var ba kvpb.BatchRequest
 	ba.Add(kvpb.NewPut(roachpb.Key("foo"), roachpb.MakeValueFromString("bar")))
-	ba.Add(kvpb.NewGet(roachpb.Key("foo"), false /* forUpdate */))
+	ba.Add(kvpb.NewGet(roachpb.Key("foo")))
 
 	// NOTE: This cannot be marshaled using the standard Go JSON marshaler,
 	// since it does not correctly (un)marshal the JSON as mandated by the
@@ -72,7 +67,7 @@ func TestSendKVBatch(t *testing.T) {
 	// Protobuf spec. Instead, use the JSON marshaler shipped with Protobuf.
 	var ba kvpb.BatchRequest
 	ba.Add(kvpb.NewPut(roachpb.Key("foo"), roachpb.MakeValueFromString("bar")))
-	ba.Add(kvpb.NewGet(roachpb.Key("foo"), false /* forUpdate */))
+	ba.Add(kvpb.NewGet(roachpb.Key("foo")))
 
 	jsonpb := protoutil.JSONPb{}
 	jsonProto, err := jsonpb.Marshal(&ba)
@@ -123,7 +118,7 @@ func TestSendKVBatch(t *testing.T) {
 		require.JSONEq(t, jsonResponse, output)
 
 		// Check that a structured log event was emitted.
-		log.Flush()
+		log.FlushFiles()
 		entries, err := log.FetchEntriesFromFiles(start.UnixNano(), timeutil.Now().UnixNano(), 1,
 			regexp.MustCompile("debug_send_kv_batch"), log.WithFlattenedSensitiveData)
 		require.NoError(t, err)

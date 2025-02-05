@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,7 +9,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
@@ -32,9 +26,9 @@ import (
 func (p *planner) DropTenantByID(
 	ctx context.Context, tenID uint64, synchronousImmediateDrop, ignoreServiceMode bool,
 ) error {
-	if p.SessionData().DisableDropVirtualCluster || p.SessionData().SafeUpdates {
+	if p.SessionData().SafeUpdates {
 		err := errors.Newf("DROP VIRTUAL CLUSTER causes irreversible data loss")
-		err = errors.WithMessage(err, "rejected (via sql_safe_updates or disable_drop_virtual_cluster)")
+		err = errors.WithMessage(err, "rejected (via sql_safe_updates)")
 		err = pgerror.WithCandidateCode(err, pgcode.Warning)
 		return err
 	}
@@ -43,7 +37,7 @@ func (p *planner) DropTenantByID(
 		return readOnlyError("DROP VIRTUAL CLUSTER")
 	}
 
-	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "drop"); err != nil {
+	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "drop", p.execCfg.Settings); err != nil {
 		return err
 	}
 
@@ -86,21 +80,19 @@ func dropTenantInternal(
 		return err
 	}
 
-	if settings.Version.IsActive(ctx, clusterversion.V23_1TenantNamesStateAndServiceMode) {
-		if ignoreServiceMode {
-			// Compatibility with CC serverless use of
-			// crdb_internal.destroy_tenant(): we want to disable the check
-			// immediately below, as well as the additional check performed
-			// inside UpdateTenantRecord() (via validateTenantInfo).
-			info.ServiceMode = mtinfopb.ServiceModeNone
-		}
-		// We can only check the service mode after upgrading to a version
-		// that supports the service mode column.
-		if info.ServiceMode != mtinfopb.ServiceModeNone {
-			return errors.WithHint(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-				"cannot drop tenant %q (%d) in service mode %v", info.Name, tenID, info.ServiceMode),
-				"Use ALTER VIRTUAL CLUSTER STOP SERVICE before DROP VIRTUAL CLUSTER.")
-		}
+	if ignoreServiceMode {
+		// Compatibility with CC serverless use of
+		// crdb_internal.destroy_tenant(): we want to disable the check
+		// immediately below, as well as the additional check performed
+		// inside UpdateTenantRecord() (via validateTenantInfo).
+		info.ServiceMode = mtinfopb.ServiceModeNone
+	}
+	// We can only check the service mode after upgrading to a version
+	// that supports the service mode column.
+	if info.ServiceMode != mtinfopb.ServiceModeNone {
+		return errors.WithHint(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"cannot drop tenant %q (%d) in service mode %v", info.Name, tenID, info.ServiceMode),
+			"Use ALTER VIRTUAL CLUSTER STOP SERVICE before DROP VIRTUAL CLUSTER.")
 	}
 
 	if info.DataState == mtinfopb.DataStateDrop {
@@ -111,13 +103,13 @@ func dropTenantInternal(
 	//
 	// Cancel any running replication job on this tenant record.
 	// The GCJob will wait for this job to enter a terminal state.
-	if info.TenantReplicationJobID != 0 {
-		job, err := jobRegistry.LoadJobWithTxn(ctx, info.TenantReplicationJobID, txn)
+	if info.PhysicalReplicationConsumerJobID != 0 {
+		job, err := jobRegistry.LoadJobWithTxn(ctx, info.PhysicalReplicationConsumerJobID, txn)
 		if err != nil {
 			return errors.Wrap(err, "loading tenant replication job for cancelation")
 		}
 		if err := job.WithTxn(txn).CancelRequested(ctx); err != nil {
-			return errors.Wrapf(err, "canceling tenant replication job %d", info.TenantReplicationJobID)
+			return errors.Wrapf(err, "canceling tenant replication job %d", info.PhysicalReplicationConsumerJobID)
 		}
 	}
 

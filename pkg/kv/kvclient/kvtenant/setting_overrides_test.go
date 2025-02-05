@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvtenant
 
@@ -39,7 +34,7 @@ func newTestConnector(
 	cleanup := func() { stopper.Stop(ctx) }
 	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
-	s, err := rpc.NewServer(rpcContext)
+	s, err := rpc.NewServer(ctx, rpcContext)
 	require.NoError(t, err)
 
 	tenantID := roachpb.MustMakeTenantID(5)
@@ -327,7 +322,7 @@ func TestCrossVersionMetadataSupport(t *testing.T) {
 
 			clock := hlc.NewClockForTesting(nil)
 			rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
-			s, err := rpc.NewServer(rpcContext)
+			s, err := rpc.NewServer(ctx, rpcContext)
 			require.NoError(t, err)
 
 			gossipSubFn := func(req *kvpb.GossipSubscriptionRequest, stream kvpb.Internal_GossipSubscriptionServer) error {

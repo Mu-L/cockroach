@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package debug_test
 
@@ -14,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	"net/http"
-	"net/url"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -23,12 +17,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
 )
 
 // debugURL returns the root debug URL.
-func debugURL(s serverutils.ApplicationLayerInterface) string {
-	return s.AdminURL().WithPath(debug.Endpoint).String()
+func debugURL(s serverutils.ApplicationLayerInterface, path string) *serverutils.TestURL {
+	return s.AdminURL().WithPath(debug.Endpoint).WithPath(path)
 }
 
 // TestAdminDebugExpVar verifies that cmdline and memstats variables are
@@ -36,12 +29,16 @@ func debugURL(s serverutils.ApplicationLayerInterface) string {
 func TestAdminDebugExpVar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSharedProcessModeButDoesntYet(
+			base.TestTenantProbabilistic, 113187,
+		),
+	})
 	defer s.Stopper().Stop(context.Background())
 
 	ts := s.ApplicationLayer()
 
-	jI, err := srvtestutils.GetJSON(ts, debugURL(ts)+"vars")
+	jI, err := srvtestutils.GetJSON(ts, debugURL(ts, "vars").String())
 	if err != nil {
 		t.Fatalf("failed to fetch JSON: %v", err)
 	}
@@ -59,12 +56,16 @@ func TestAdminDebugExpVar(t *testing.T) {
 func TestAdminDebugMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSharedProcessModeButDoesntYet(
+			base.TestTenantProbabilistic, 113187,
+		),
+	})
 	defer s.Stopper().Stop(context.Background())
 
 	ts := s.ApplicationLayer()
 
-	jI, err := srvtestutils.GetJSON(ts, debugURL(ts)+"metrics")
+	jI, err := srvtestutils.GetJSON(ts, debugURL(ts, "metrics").String())
 	if err != nil {
 		t.Fatalf("failed to fetch JSON: %v", err)
 	}
@@ -82,12 +83,16 @@ func TestAdminDebugMetrics(t *testing.T) {
 func TestAdminDebugPprof(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSharedProcessModeButDoesntYet(
+			base.TestTenantProbabilistic, 113187,
+		),
+	})
 	defer s.Stopper().Stop(context.Background())
 
 	ts := s.ApplicationLayer()
 
-	body, err := srvtestutils.GetText(ts, debugURL(ts)+"pprof/block?debug=1")
+	body, err := srvtestutils.GetText(ts, debugURL(ts, "pprof/block?debug=1").String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +101,16 @@ func TestAdminDebugPprof(t *testing.T) {
 	}
 }
 
-// TestAdminDebugTrace verifies that the net/trace endpoints are available
-// via /debug/{requests,events}.
+// TestAdminDebugTrace verifies that the net/trace endpoints are available via
+// /debug/requests.
 func TestAdminDebugTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSharedProcessModeButDoesntYet(
+			base.TestTenantProbabilistic, 113187,
+		),
+	})
 	defer s.Stopper().Stop(context.Background())
 
 	ts := s.ApplicationLayer()
@@ -110,11 +119,10 @@ func TestAdminDebugTrace(t *testing.T) {
 		segment, search string
 	}{
 		{"requests", "<title>/debug/requests</title>"},
-		{"events", "<title>events</title>"},
 	}
 
 	for _, c := range tc {
-		body, err := srvtestutils.GetText(ts, debugURL(ts)+c.segment)
+		body, err := srvtestutils.GetText(ts, debugURL(ts, c.segment).String())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -132,7 +140,7 @@ func TestAdminDebugAuth(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	ts := s.ApplicationLayer()
 
-	url := debugURL(ts)
+	url := debugURL(ts, "").String()
 
 	// Unauthenticated.
 	client, err := ts.GetUnauthenticatedHTTPClient()
@@ -182,12 +190,16 @@ func TestAdminDebugAuth(t *testing.T) {
 func TestAdminDebugRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.ApplicationLayer()
 
-	expURL := debugURL(ts)
-	origURL := expURL + "incorrect"
+	expURL := debugURL(ts, "/")
+	// Drops the `?cluster=` query param if present.
+	expURL.RawQuery = ""
+
+	origURL := debugURL(ts, "/incorrect")
 
 	// Must be admin to access debug endpoints
 	client, err := ts.GetAdminHTTPClient()
@@ -195,29 +207,24 @@ func TestAdminDebugRedirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Don't follow redirects automatically.
-	redirectAttemptedError := errors.New("redirect")
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return redirectAttemptedError
+		// Don't follow redirects automatically. This error is a special
+		// case in the `CheckRedirect` docs that forwards the last response
+		// instead of following the redirect.
+		return http.ErrUseLastResponse
 	}
 
-	resp, err := client.Get(origURL)
-	if urlError := (*url.Error)(nil); errors.As(err, &urlError) &&
-		errors.Is(urlError.Err, redirectAttemptedError) {
-		// Ignore the redirectAttemptedError.
-		err = nil
-	}
+	resp, err := client.Get(origURL.String())
 	if err != nil {
 		t.Fatal(err)
-	} else {
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusMovedPermanently {
-			t.Errorf("expected status code %d; got %d", http.StatusMovedPermanently, resp.StatusCode)
-		}
-		if redirectURL, err := resp.Location(); err != nil {
-			t.Error(err)
-		} else if foundURL := redirectURL.String(); foundURL != expURL {
-			t.Errorf("expected location %s; got %s", expURL, foundURL)
-		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Errorf("expected status code %d; got %d", http.StatusMovedPermanently, resp.StatusCode)
+	}
+	if redirectURL, err := resp.Location(); err != nil {
+		t.Error(err)
+	} else if foundURL := redirectURL.String(); foundURL != expURL.String() {
+		t.Errorf("expected location %s; got %s", expURL, foundURL)
 	}
 }

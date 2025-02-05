@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -20,8 +15,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 )
 
@@ -30,11 +27,11 @@ func registerExportParquet(r registry.Registry) {
 	// the TPC-C database containing 250 warehouses. Then, it executes 30 `EXPORT
 	// INTO PARQUET` statements concurrently, repeatedly for 10 minutes.
 	r.Add(registry.TestSpec{
-		Name:            "export/parquet/bench",
-		Owner:           registry.OwnerCDC,
-		Tags:            registry.Tags("manual"),
-		Cluster:         r.MakeClusterSpec(4, spec.CPU(8)),
-		RequiresLicense: false,
+		Name:             "export/parquet/bench",
+		Owner:            registry.OwnerCDC,
+		CompatibleClouds: registry.AllClouds,
+		Suites:           registry.ManualOnly,
+		Cluster:          r.MakeClusterSpec(4, spec.CPU(8)),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if c.Spec().NodeCount < 4 {
 				t.Fatalf("expected at least 4 nodes, found %d", c.Spec().NodeCount)
@@ -75,7 +72,7 @@ func registerExportParquet(r registry.Registry) {
 				ExtraSetupArgs:                "--checks=false",
 				DisableDefaultScheduledBackup: true,
 			}
-			setupTPCC(ctx, t, c, tpccOpts)
+			setupTPCC(ctx, t, t.L(), c, tpccOpts)
 			t.Status("finished initializing tpcc database")
 
 			// Add padding to let the cluster metrics settle after initializing tpcc.
@@ -93,7 +90,8 @@ func registerExportParquet(r registry.Registry) {
 			wg := sync.WaitGroup{}
 			for i := 0; i < numConcurrentExports; i++ {
 				wg.Add(1)
-				go func(i int, target string) {
+				target := allTpccTargets[i%len(allTpccTargets)]
+				t.Go(func(context.Context, *logger.Logger) error {
 					t.Status(fmt.Sprintf("worker %d/%d starting export of target %s", i+1, numConcurrentExports, target))
 					fileNum := 0
 					db := c.Conn(ctx, t.L(), 1)
@@ -102,12 +100,13 @@ func registerExportParquet(r registry.Registry) {
 							fmt.Sprintf("EXPORT INTO PARQUET 'nodelocal://1/outputfile%d' FROM SELECT * FROM %s", fileNum, target))
 						fileNum += 1
 						if err != nil {
-							t.Fatalf(err.Error())
+							t.Fatal(err.Error())
 						}
 					}
 					t.Status(fmt.Sprintf("worker %d/%d terminated", i+1, numConcurrentExports))
 					wg.Done()
-				}(i, allTpccTargets[i%len(allTpccTargets)])
+					return nil
+				})
 			}
 			wg.Wait()
 
@@ -120,11 +119,11 @@ func registerExportParquet(r registry.Registry) {
 	// the TPC-C database containing 100 warehouses. Then, it executes concurrent
 	// exports until the entire database is exported.
 	r.Add(registry.TestSpec{
-		Name:            "export/parquet/tpcc-100",
-		Owner:           registry.OwnerCDC,
-		Tags:            registry.Tags("daily"),
-		Cluster:         r.MakeClusterSpec(4, spec.CPU(8)),
-		RequiresLicense: false,
+		Name:             "export/parquet/tpcc-100",
+		Owner:            registry.OwnerCDC,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Cluster:          r.MakeClusterSpec(4, spec.CPU(8)),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if c.Spec().NodeCount < 4 {
 				t.Fatalf("expected at least 4 nodes, found %d", c.Spec().NodeCount)
@@ -142,7 +141,7 @@ func registerExportParquet(r registry.Registry) {
 				ExtraSetupArgs:                "--checks=false",
 				DisableDefaultScheduledBackup: true,
 			}
-			setupTPCC(ctx, t, c, tpccOpts)
+			setupTPCC(ctx, t, t.L(), c, tpccOpts)
 			t.Status("finished initializing tpcc database")
 
 			// Add padding to let the cluster metrics settle after initializing tpcc.
@@ -153,17 +152,19 @@ func registerExportParquet(r registry.Registry) {
 			wg := sync.WaitGroup{}
 			for i := 0; i < numWorkers; i++ {
 				wg.Add(1)
-				go func(i int, target string) {
+				target := allTpccTargets[i]
+				t.Go(func(taskCtx context.Context, l *logger.Logger) error {
 					t.Status(fmt.Sprintf("worker %d/%d starting export of target %s", i+1, numWorkers, target))
-					db := c.Conn(ctx, t.L(), 1)
+					db := c.Conn(taskCtx, l, 1)
 					_, err := db.Exec(
 						fmt.Sprintf("EXPORT INTO PARQUET 'nodelocal://1/outputfile%d' FROM SELECT * FROM %s", i, target))
 					if err != nil {
-						t.Fatalf(err.Error())
+						t.Fatal(err.Error())
 					}
 					t.Status(fmt.Sprintf("worker %d/%d terminated", i+1, numWorkers))
 					wg.Done()
-				}(i, allTpccTargets[i])
+					return nil
+				}, task.Name(fmt.Sprintf("parquet-export-worker-%d", i+1)))
 			}
 			wg.Wait()
 		},

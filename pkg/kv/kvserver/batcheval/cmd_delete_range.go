@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
@@ -38,12 +34,17 @@ func declareKeysDeleteRange(
 	latchSpans *spanset.SpanSet,
 	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
-) {
+) error {
 	args := req.(*kvpb.DeleteRangeRequest)
 	if args.Inline {
-		DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+		if err := DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans, maxOffset); err != nil {
+			return err
+		}
 	} else {
-		DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+		err := DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+		if err != nil {
+			return err
+		}
 	}
 
 	// When writing range tombstones, we must look for adjacent range tombstones
@@ -77,6 +78,7 @@ func declareKeysDeleteRange(
 			})
 		}
 	}
+	return nil
 }
 
 const maxDeleteRangeBatchBytes = 32 << 20
@@ -84,6 +86,110 @@ const maxDeleteRangeBatchBytes = 32 << 20
 // DeleteRange deletes the range of key/value pairs specified by
 // start and end keys.
 func DeleteRange(
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
+) (result.Result, error) {
+	args := cArgs.Args.(*kvpb.DeleteRangeRequest)
+	reply := resp.(*kvpb.DeleteRangeResponse)
+
+	if args.UpdateRangeDeleteGCHint && !args.UseRangeTombstone {
+		// Check for prerequisite for gc hint. If it doesn't hold, this is incorrect
+		// usage of hint.
+		return result.Result{}, errors.AssertionFailedf(
+			"GCRangeHint must only be used together with UseRangeTombstone")
+	}
+
+	if args.UseRangeTombstone {
+		if cArgs.Header.Txn != nil {
+			return result.Result{}, ErrTransactionUnsupported
+		}
+		if args.Inline {
+			return result.Result{}, errors.AssertionFailedf("Inline can't be used with range tombstones")
+		}
+		if args.ReturnKeys {
+			return result.Result{}, errors.AssertionFailedf(
+				"ReturnKeys can't be used with range tombstones")
+		}
+	}
+
+	hasPredicate := args.Predicates != (kvpb.DeleteRangePredicates{})
+	if hasPredicate && args.IdempotentTombstone {
+		return result.Result{}, errors.AssertionFailedf("IdempotentTombstone not compatible with Predicates")
+	}
+
+	switch {
+	case hasPredicate:
+		return deleteRangeWithPredicate(ctx, readWriter, cArgs, reply)
+	case args.UseRangeTombstone:
+		return deleteRangeUsingTombstone(ctx, readWriter, cArgs)
+	default:
+		return deleteRangeTransactional(ctx, readWriter, cArgs, reply)
+	}
+}
+
+func deleteRangeUsingTombstone(
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs,
+) (result.Result, error) {
+	args := cArgs.Args.(*kvpb.DeleteRangeRequest)
+	h := cArgs.Header
+	desc := cArgs.EvalCtx.Desc()
+
+	maybeUpdateGCHint := func(res *result.Result) error {
+		if !args.UpdateRangeDeleteGCHint {
+			return nil
+		}
+		sl := MakeStateLoader(cArgs.EvalCtx)
+		hint, err := sl.LoadGCHint(ctx, readWriter)
+		if err != nil {
+			return err
+		}
+
+		updated := hint.ScheduleGCFor(h.Timestamp)
+		// If the range tombstone covers the whole Range key span, update the
+		// corresponding timestamp in GCHint to enable ClearRange optimization.
+		if args.Key.Equal(desc.StartKey.AsRawKey()) && args.EndKey.Equal(desc.EndKey.AsRawKey()) {
+			// NB: don't swap the order, we want to call the method unconditionally.
+			updated = hint.ForwardLatestRangeDeleteTimestamp(h.Timestamp) || updated
+		}
+		if !updated {
+			return nil
+		}
+
+		if err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint); err != nil {
+			return err
+		}
+		res.Replicated.State = &kvserverpb.ReplicaState{
+			GCHint: hint,
+		}
+		return nil
+	}
+
+	leftPeekBound, rightPeekBound := rangeTombstonePeekBounds(
+		args.Key, args.EndKey, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey())
+	maxLockConflicts := storage.MaxConflictsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+	targetLockConflictBytes := storage.TargetBytesPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+
+	// If no predicate parameters are passed, use the fast path. If we're
+	// deleting the entire Raft range, use an even faster path that avoids a
+	// point key scan to update MVCC stats.
+	var statsCovered *enginepb.MVCCStats
+	if args.Key.Equal(desc.StartKey.AsRawKey()) && args.EndKey.Equal(desc.EndKey.AsRawKey()) {
+		// NB: We take the fast path even if stats are estimates, because the
+		// slow path will likely end up with similarly poor stats anyway.
+		s := cArgs.EvalCtx.GetMVCCStats()
+		statsCovered = &s
+	}
+	if err := storage.MVCCDeleteRangeUsingTombstone(ctx, readWriter, cArgs.Stats,
+		args.Key, args.EndKey, h.Timestamp, cArgs.Now, leftPeekBound, rightPeekBound,
+		args.IdempotentTombstone, maxLockConflicts, targetLockConflictBytes, statsCovered); err != nil {
+		return result.Result{}, err
+	}
+
+	var res result.Result
+	err := maybeUpdateGCHint(&res)
+	return res, err
+}
+
+func deleteRangeWithPredicate(
 	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
 	args := cArgs.Args.(*kvpb.DeleteRangeRequest)
@@ -97,141 +203,90 @@ func DeleteRange(
 			"UseRangeTombstones must be passed with predicate based Delete Range")
 	}
 
-	if args.UpdateRangeDeleteGCHint && !args.UseRangeTombstone {
-		// Check for prerequisite for gc hint. If it doesn't hold, this is incorrect
-		// usage of hint.
+	if h.MaxSpanRequestKeys == 0 {
+		// In production, MaxSpanRequestKeys must be greater than zero to ensure
+		// the DistSender serializes predicate based DeleteRange requests across
+		// ranges. This ensures that only one resumeSpan gets returned to the
+		// client.
+		//
+		// Also, note that DeleteRangeUsingTombstone requests pass the isAlone
+		// flag in roachpb.api.proto, ensuring the requests do not intermingle with
+		// other types of requests, preventing further resume span muddling.
 		return result.Result{}, errors.AssertionFailedf(
-			"GCRangeHint must only be used together with UseRangeTombstone")
+			"MaxSpanRequestKeys must be greater than zero when using predicated based DeleteRange")
+	}
+	if args.Predicates.ImportEpoch > 0 && !args.Predicates.StartTime.IsEmpty() {
+		return result.Result{}, errors.AssertionFailedf(
+			"DeleteRangePredicate should not have both non-zero ImportEpoch and non-empty StartTime")
 	}
 
-	// Use MVCC range tombstone if requested.
-	if args.UseRangeTombstone {
-		if cArgs.Header.Txn != nil {
-			return result.Result{}, ErrTransactionUnsupported
-		}
-		if args.Inline {
-			return result.Result{}, errors.AssertionFailedf("Inline can't be used with range tombstones")
-		}
-		if args.ReturnKeys {
-			return result.Result{}, errors.AssertionFailedf(
-				"ReturnKeys can't be used with range tombstones")
-		}
+	desc := cArgs.EvalCtx.Desc()
 
-		desc := cArgs.EvalCtx.Desc()
+	leftPeekBound, rightPeekBound := rangeTombstonePeekBounds(
+		args.Key, args.EndKey, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey())
+	maxLockConflicts := storage.MaxConflictsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+	targetLockConflictBytes := storage.TargetBytesPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
 
-		maybeUpdateGCHint := func(res *result.Result) error {
-			if !args.UpdateRangeDeleteGCHint {
-				return nil
-			}
-			// If GCHint was provided, then we need to check if this request meets
-			// range gc criteria of removing all data. This is not an error as range
-			// might have merged since request was sent and we don't want to fail
-			// deletion.
-			if !args.Key.Equal(desc.StartKey.AsRawKey()) || !args.EndKey.Equal(desc.EndKey.AsRawKey()) {
-				return nil
-			}
-			sl := MakeStateLoader(cArgs.EvalCtx)
-			hint, err := sl.LoadGCHint(ctx, readWriter)
-			if err != nil {
-				return err
-			}
-			if !hint.ForwardLatestRangeDeleteTimestamp(h.Timestamp) {
-				return nil
-			}
-			if updated, err := sl.SetGCHint(ctx, readWriter, cArgs.Stats, hint); err != nil || !updated {
-				return err
-			}
-			res.Replicated.State = &kvserverpb.ReplicaState{
-				GCHint: hint,
-			}
-			return nil
-		}
-
-		leftPeekBound, rightPeekBound := rangeTombstonePeekBounds(
-			args.Key, args.EndKey, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey())
-		maxIntents := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
-
-		// If no predicate parameters are passed, use the fast path. If we're
-		// deleting the entire Raft range, use an even faster path that avoids a
-		// point key scan to update MVCC stats.
-		if args.Predicates == (kvpb.DeleteRangePredicates{}) {
-			var statsCovered *enginepb.MVCCStats
-			if args.Key.Equal(desc.StartKey.AsRawKey()) && args.EndKey.Equal(desc.EndKey.AsRawKey()) {
-				// NB: We take the fast path even if stats are estimates, because the
-				// slow path will likely end up with similarly poor stats anyway.
-				s := cArgs.EvalCtx.GetMVCCStats()
-				statsCovered = &s
-			}
-			if err := storage.MVCCDeleteRangeUsingTombstone(ctx, readWriter, cArgs.Stats,
-				args.Key, args.EndKey, h.Timestamp, cArgs.Now, leftPeekBound, rightPeekBound,
-				args.IdempotentTombstone, maxIntents, statsCovered); err != nil {
-				return result.Result{}, err
-			}
-			var res result.Result
-			err := maybeUpdateGCHint(&res)
-			return res, err
-		}
-
-		if h.MaxSpanRequestKeys == 0 {
-			// In production, MaxSpanRequestKeys must be greater than zero to ensure
-			// the DistSender serializes predicate based DeleteRange requests across
-			// ranges. This ensures that only one resumeSpan gets returned to the
-			// client.
-			//
-			// Also, note that DeleteRangeUsingTombstone requests pass the isAlone
-			// flag in roachpb.api.proto, ensuring the requests do not intermingle with
-			// other types of requests, preventing further resume span muddling.
-			return result.Result{}, errors.AssertionFailedf(
-				"MaxSpanRequestKeys must be greater than zero when using predicated based DeleteRange")
-		}
-		if args.IdempotentTombstone {
-			return result.Result{}, errors.AssertionFailedf(
-				"IdempotentTombstone not compatible with Predicates")
-		}
-		// TODO (msbutler): Tune the threshold once DeleteRange and DeleteRangeUsingTombstone have
-		// been further optimized.
-		defaultRangeTombstoneThreshold := int64(64)
-		resumeSpan, err := storage.MVCCPredicateDeleteRange(ctx, readWriter, cArgs.Stats,
-			args.Key, args.EndKey, h.Timestamp, cArgs.Now, leftPeekBound, rightPeekBound,
-			args.Predicates, h.MaxSpanRequestKeys, maxDeleteRangeBatchBytes,
-			defaultRangeTombstoneThreshold, maxIntents)
-		if err != nil {
-			return result.Result{}, err
-		}
-
-		if resumeSpan != nil {
-			reply.ResumeSpan = resumeSpan
-			reply.ResumeReason = kvpb.RESUME_KEY_LIMIT
-
-			// Note: While MVCCPredicateDeleteRange _could_ return reply.NumKeys, as
-			// the number of keys iterated through, doing so could lead to a
-			// significant performance drawback. The DistSender would have used
-			// NumKeys to subtract the number of keys processed by one range from the
-			// MaxSpanRequestKeys limit given to the next range. In this case, that's
-			// specifically not what we want, because this request does not use the
-			// normal meaning of MaxSpanRequestKeys (i.e. number of keys to return).
-			// Here, MaxSpanRequest keys is used to limit the number of tombstones
-			// written. Thus, setting NumKeys would just reduce the limit available to
-			// the next range for no good reason.
-		}
-		// Return result is always empty, since the reply is populated into the
-		// passed in resp pointer.
-		return result.Result{}, nil
+	// TODO (msbutler): Tune the threshold once DeleteRange and DeleteRangeUsingTombstone have
+	// been further optimized.
+	defaultRangeTombstoneThreshold := int64(64)
+	resumeSpan, err := storage.MVCCPredicateDeleteRange(ctx, readWriter, cArgs.Stats,
+		args.Key, args.EndKey, h.Timestamp, cArgs.Now, leftPeekBound, rightPeekBound,
+		args.Predicates, h.MaxSpanRequestKeys, maxDeleteRangeBatchBytes,
+		defaultRangeTombstoneThreshold, maxLockConflicts, targetLockConflictBytes)
+	if err != nil {
+		return result.Result{}, err
 	}
 
+	if resumeSpan != nil {
+		// Note: While MVCCPredicateDeleteRange _could_ return reply.NumKeys, as
+		// the number of keys iterated through, doing so could lead to a
+		// significant performance drawback. The DistSender would have used
+		// NumKeys to subtract the number of keys processed by one range from the
+		// MaxSpanRequestKeys limit given to the next range. In this case, that's
+		// specifically not what we want, because this request does not use the
+		// normal meaning of MaxSpanRequestKeys (i.e. number of keys to return).
+		// Here, MaxSpanRequest keys is used to limit the number of tombstones
+		// written. Thus, setting NumKeys would just reduce the limit available to
+		// the next range for no good reason.
+		reply.ResumeSpan = resumeSpan
+		reply.ResumeReason = kvpb.RESUME_KEY_LIMIT
+	}
+	return result.Result{}, nil
+}
+
+func deleteRangeTransactional(
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
+) (result.Result, error) {
+	args := cArgs.Args.(*kvpb.DeleteRangeRequest)
+	h := cArgs.Header
+	reply := resp.(*kvpb.DeleteRangeResponse)
 	var timestamp hlc.Timestamp
 	if !args.Inline {
 		timestamp = h.Timestamp
 	}
+
+	opts := storage.MVCCWriteOptions{
+		Txn:                            h.Txn,
+		LocalTimestamp:                 cArgs.Now,
+		Stats:                          cArgs.Stats,
+		ReplayWriteTimestampProtection: h.AmbiguousReplayProtection,
+		OmitInRangefeeds:               cArgs.OmitInRangefeeds,
+		OriginID:                       h.WriteOptions.GetOriginID(),
+		OriginTimestamp:                h.WriteOptions.GetOriginTimestamp(),
+		MaxLockConflicts:               storage.MaxConflictsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
+		TargetLockConflictBytes:        storage.TargetBytesPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
+		Category:                       fs.BatchEvalReadCategory,
+	}
+
 	// NB: Even if args.ReturnKeys is false, we want to know which intents were
 	// written if we're evaluating the DeleteRange for a transaction so that we
 	// can update the Result's AcquiredLocks field.
 	returnKeys := args.ReturnKeys || h.Txn != nil
-	deleted, resumeSpan, num, err := storage.MVCCDeleteRange(
+	deleted, resumeSpan, num, acqs, err := storage.MVCCDeleteRange(
 		ctx, readWriter, args.Key, args.EndKey,
 		h.MaxSpanRequestKeys, timestamp,
-		storage.MVCCWriteOptions{Txn: h.Txn, LocalTimestamp: cArgs.Now, Stats: cArgs.Stats},
-		returnKeys)
+		opts, returnKeys)
 	if err != nil {
 		return result.Result{}, err
 	}
@@ -253,5 +308,5 @@ func DeleteRange(
 		}
 	}
 
-	return result.FromAcquiredLocks(h.Txn, deleted...), nil
+	return result.WithAcquiredLocks(acqs...), nil
 }

@@ -1,18 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package constraint
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -22,23 +19,26 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConstraintUnion(t *testing.T) {
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	data := newConstraintTestData(&evalCtx)
+
 	test := func(t *testing.T, evalCtx *eval.Context, left, right *Constraint, expected string) {
 		t.Helper()
 		clone := *left
-		clone.UnionWith(evalCtx, right)
+		clone.UnionWith(ctx, evalCtx, right)
 
 		if actual := clone.String(); actual != expected {
 			format := "left: %s, right: %s, expected: %v, actual: %v"
 			t.Errorf(format, left.String(), right.String(), expected, actual)
 		}
 	}
-
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
-	data := newConstraintTestData(&evalCtx)
 
 	// Union constraint with itself.
 	test(t, &evalCtx, &data.c1to10, &data.c1to10, "/1: [/1 - /10]")
@@ -58,21 +58,21 @@ func TestConstraintUnion(t *testing.T) {
 	// Merge multiple spans down to single span.
 	var left, right Constraint
 	left = data.c1to10
-	left.UnionWith(&evalCtx, &data.c20to30)
-	left.UnionWith(&evalCtx, &data.c40to50)
+	left.UnionWith(ctx, &evalCtx, &data.c20to30)
+	left.UnionWith(ctx, &evalCtx, &data.c40to50)
 
 	right = data.c5to25
-	right.UnionWith(&evalCtx, &data.c30to40)
+	right.UnionWith(ctx, &evalCtx, &data.c30to40)
 
 	test(t, &evalCtx, &left, &right, "/1: [/1 - /50]")
 	test(t, &evalCtx, &right, &left, "/1: [/1 - /50]")
 
 	// Multiple disjoint spans on each side.
 	left = data.c1to10
-	left.UnionWith(&evalCtx, &data.c20to30)
+	left.UnionWith(ctx, &evalCtx, &data.c20to30)
 
 	right = data.c40to50
-	right.UnionWith(&evalCtx, &data.c60to70)
+	right.UnionWith(ctx, &evalCtx, &data.c60to70)
 
 	test(t, &evalCtx, &left, &right, "/1: [/1 - /10] [/20 - /30) [/40 - /50] (/60 - /70)")
 	test(t, &evalCtx, &right, &left, "/1: [/1 - /10] [/20 - /30) [/40 - /50] (/60 - /70)")
@@ -80,7 +80,7 @@ func TestConstraintUnion(t *testing.T) {
 	// Multiple spans that yield the unconstrained span.
 	left = data.cLt10
 	right = data.c5to25
-	right.UnionWith(&evalCtx, &data.cGt20)
+	right.UnionWith(ctx, &evalCtx, &data.cGt20)
 
 	test(t, &evalCtx, &left, &right, "/1: unconstrained")
 	test(t, &evalCtx, &right, &left, "/1: unconstrained")
@@ -99,19 +99,19 @@ func TestConstraintUnion(t *testing.T) {
 }
 
 func TestConstraintIntersect(t *testing.T) {
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	data := newConstraintTestData(&evalCtx)
+
 	test := func(t *testing.T, evalCtx *eval.Context, left, right *Constraint, expected string) {
 		t.Helper()
 		clone := *left
-		clone.IntersectWith(evalCtx, right)
+		clone.IntersectWith(ctx, evalCtx, right)
 		if actual := clone.String(); actual != expected {
 			format := "left: %s, right: %s, expected: %v, actual: %v"
 			t.Errorf(format, left.String(), right.String(), expected, actual)
 		}
 	}
-
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
-	data := newConstraintTestData(&evalCtx)
 
 	// Intersect constraint with itself.
 	test(t, &evalCtx, &data.c1to10, &data.c1to10, "/1: [/1 - /10]")
@@ -127,21 +127,21 @@ func TestConstraintIntersect(t *testing.T) {
 	// Intersect multiple spans.
 	var left, right Constraint
 	left = data.c1to10
-	left.UnionWith(&evalCtx, &data.c20to30)
-	left.UnionWith(&evalCtx, &data.c40to50)
+	left.UnionWith(ctx, &evalCtx, &data.c20to30)
+	left.UnionWith(ctx, &evalCtx, &data.c40to50)
 
 	right = data.c5to25
-	right.UnionWith(&evalCtx, &data.c30to40)
+	right.UnionWith(ctx, &evalCtx, &data.c30to40)
 
 	test(t, &evalCtx, &right, &left, "/1: (/5 - /10] [/20 - /25) [/40 - /40]")
 	test(t, &evalCtx, &left, &right, "/1: (/5 - /10] [/20 - /25) [/40 - /40]")
 
 	// Intersect multiple disjoint spans.
 	left = data.c1to10
-	left.UnionWith(&evalCtx, &data.c20to30)
+	left.UnionWith(ctx, &evalCtx, &data.c20to30)
 
 	right = data.c40to50
-	right.UnionWith(&evalCtx, &data.c60to70)
+	right.UnionWith(ctx, &evalCtx, &data.c60to70)
 
 	test(t, &evalCtx, &left, &right, "/1: contradiction")
 	test(t, &evalCtx, &right, &left, "/1: contradiction")
@@ -160,8 +160,8 @@ func TestConstraintIntersect(t *testing.T) {
 }
 
 func TestConstraintContains(t *testing.T) {
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	testData := []struct {
 		a        string
@@ -190,14 +190,14 @@ func TestConstraintContains(t *testing.T) {
 			expected: true,
 		},
 		{
-			"/1: [/1 - /1]",
-			"/1: contradiction",
-			true,
+			a:        "/1: [/1 - /1]",
+			b:        "/1: contradiction",
+			expected: true,
 		},
 		{
-			"/1: [/1 - /1]",
-			"/1: [/1 - /1]",
-			true,
+			a:        "/1: [/1 - /1]",
+			b:        "/1: [/1 - /1]",
+			expected: true,
 		},
 		{
 			a:        "/1: [/1 - /5]",
@@ -232,6 +232,78 @@ func TestConstraintContains(t *testing.T) {
 		{
 			a:        "/1: [/0 - /0] [/1 - /100] [/150 - /200]",
 			b:        "/1: [/2 - /2] [/4 - /5] [/20 - /30]",
+			expected: true,
+		},
+		// Positive tests with more than one column.
+		{
+			a:        "/1/2: [/1/0 - /5/5]",
+			b:        "/1/2: [/1/1 - /4/5]",
+			expected: true,
+		},
+		{
+			a:        "/1/2: [/0/1 - /1/10] [/3/10 - /6]",
+			b:        "/1/2: [/4/1 - /5/11]",
+			expected: true,
+		},
+		{
+			a:        "/1/2: [/1/100 - /100/1]",
+			b:        "/1/2: [/2 - /2/3] [/4/4 - /5] [/20/20 - /30/30]",
+			expected: true,
+		},
+		{
+			a:        "/1/2: [/0 - /0] [/1/100 - /100] [/150/6 - /200]",
+			b:        "/1/2: [/2/22 - /2/22] [/4/40 - /5/50] [/20 - /30/30]",
+			expected: true,
+		},
+		// Positive tests with different columns.
+		{
+			a:        "/1/2: unconstrained",
+			b:        "/1: [/1 - /1]",
+			expected: true,
+		},
+		{
+			a:        "/1: [/1 - /1]",
+			b:        "/1/3: contradiction",
+			expected: true,
+		},
+		{
+			a:        "/1/4: [/1 - /1]",
+			b:        "/1: [/1 - /1]",
+			expected: true,
+		},
+		{
+			a:        "/1: [/1 - /5]",
+			b:        "/1/5: [/1 - /4]",
+			expected: true,
+		},
+		{
+			a:        "/1/6: [/0 - /1] [/3 - /3]",
+			b:        "/1: [/3 - /3]",
+			expected: true,
+		},
+		{
+			a:        "/1: [/0 - /0] [/1 - /100] [/150 - /200]",
+			b:        "/1/7: [/2 - /2] [/4 - /5] [/20 - /30]",
+			expected: true,
+		},
+		{
+			a:        "/1/2/3: [/1/0 - /5/5]",
+			b:        "/1/2: [/1/1 - /4/5]",
+			expected: true,
+		},
+		{
+			a:        "/1/2: [/0/1 - /1/10] [/3/10 - /6]",
+			b:        "/1/2/4: [/4/1 - /5/11]",
+			expected: true,
+		},
+		{
+			a:        "/1/2/5: [/1/100 - /100/1]",
+			b:        "/1/2: [/2 - /2/3] [/4/4 - /5] [/20/20 - /30/30]",
+			expected: true,
+		},
+		{
+			a:        "/1/2: [/0 - /0] [/1/100 - /100] [/150/6 - /200]",
+			b:        "/1/2/6: [/2/22 - /2/22] [/4/40 - /5/50] [/20 - /30/30]",
 			expected: true,
 		},
 		// Negative tests.
@@ -290,6 +362,83 @@ func TestConstraintContains(t *testing.T) {
 			b:        "/1: [/2 - /2] [/4 - /5] [/90 - /110]",
 			expected: false,
 		},
+		// Negative tests with more than one column.
+		{
+			a:        "/1/2: [/0/1 - /2]",
+			b:        "/1/2: [/0 - /2]",
+			expected: false,
+		},
+		{
+			a:        "/1/2: [/0 - /2/1]",
+			b:        "/1/2: [/0 - /2]",
+			expected: false,
+		},
+		{
+			a:        "/1/2: [/1/1 - /4/5]",
+			b:        "/1/2: [/1/0 - /5/5]",
+			expected: false,
+		},
+		{
+			a:        "/1/2: [/1 - /100/10]",
+			b:        "/1/2: [/2/20 - /2/20] [/4 - /5/50] [/90 - /110]",
+			expected: false,
+		},
+		{
+			a:        "/1/2: [/0/1 - /1/10] [/4/10 - /6/10]",
+			b:        "/1/2: [/4/1 - /6/11]",
+			expected: false,
+		},
+		// Negative tests with different columns.
+		{
+			a:        "/2/1: unconstrained",
+			b:        "/1: [/1 - /1]",
+			expected: false,
+		},
+		{
+			a:        "/1: [/1 - /1]",
+			b:        "/3/1: contradiction",
+			expected: false,
+		},
+		{
+			a:        "/4/1: [/1 - /1]",
+			b:        "/1: [/1 - /1]",
+			expected: false,
+		},
+		{
+			a:        "/1: [/1 - /5]",
+			b:        "/5/1: [/1 - /4]",
+			expected: false,
+		},
+		{
+			a:        "/6/1: [/0 - /1] [/3 - /3]",
+			b:        "/1: [/3 - /3]",
+			expected: false,
+		},
+		{
+			a:        "/1: [/0 - /0] [/1 - /100] [/150 - /200]",
+			b:        "/7/1: [/2 - /2] [/4 - /5] [/20 - /30]",
+			expected: false,
+		},
+		{
+			a:        "/3/2: [/1/0 - /5/5]",
+			b:        "/1/2: [/1/1 - /4/5]",
+			expected: false,
+		},
+		{
+			a:        "/1/2: [/0/1 - /1/10] [/3/10 - /6]",
+			b:        "/4/2: [/4/1 - /5/11]",
+			expected: false,
+		},
+		{
+			a:        "/5/2: [/1/100 - /100/1]",
+			b:        "/1/2: [/2 - /2/3] [/4/4 - /5] [/20/20 - /30/30]",
+			expected: false,
+		},
+		{
+			a:        "/1/2: [/0 - /0] [/1/100 - /100] [/150/6 - /200]",
+			b:        "/6/2: [/2/22 - /2/22] [/4/40 - /5/50] [/20 - /30/30]",
+			expected: false,
+		},
 	}
 
 	for i, tc := range testData {
@@ -297,7 +446,7 @@ func TestConstraintContains(t *testing.T) {
 			ac := ParseConstraint(&evalCtx, tc.a)
 			bc := ParseConstraint(&evalCtx, tc.b)
 
-			res := ac.Contains(&evalCtx, &bc)
+			res := ac.Contains(ctx, &evalCtx, &bc)
 			if res == tc.expected {
 				return
 			}
@@ -311,8 +460,8 @@ func TestConstraintContains(t *testing.T) {
 }
 
 func TestConstraintContainsSpan(t *testing.T) {
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	// Each test case has a bunch of spans that are expected to be contained, and
 	// a bunch of spans that are expected not to be contained.
@@ -346,13 +495,13 @@ func TestConstraintContainsSpan(t *testing.T) {
 
 			spans := parseSpans(&evalCtx, tc.containedSpans)
 			for i := 0; i < spans.Count(); i++ {
-				if sp := spans.Get(i); !c.ContainsSpan(&evalCtx, sp) {
+				if sp := spans.Get(i); !c.ContainsSpan(ctx, &evalCtx, sp) {
 					t.Errorf("%s should contain span %s", c, sp)
 				}
 			}
 			spans = parseSpans(&evalCtx, tc.notContainedSpans)
 			for i := 0; i < spans.Count(); i++ {
-				if sp := spans.Get(i); c.ContainsSpan(&evalCtx, sp) {
+				if sp := spans.Get(i); c.ContainsSpan(ctx, &evalCtx, sp) {
 					t.Errorf("%s should not contain span %s", c, sp)
 				}
 			}
@@ -361,8 +510,8 @@ func TestConstraintContainsSpan(t *testing.T) {
 }
 
 func TestConstraintIntersectsSpan(t *testing.T) {
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	// Each test case has a bunch of spans that are expected to intersect the
 	// constraint, and a bunch of spans that are expected not to.
@@ -395,13 +544,13 @@ func TestConstraintIntersectsSpan(t *testing.T) {
 
 			spans := parseSpans(&evalCtx, tc.intersectingSpans)
 			for i := 0; i < spans.Count(); i++ {
-				if sp := spans.Get(i); !c.IntersectsSpan(&evalCtx, sp) {
+				if sp := spans.Get(i); !c.IntersectsSpan(ctx, &evalCtx, sp) {
 					t.Errorf("%s should intersect span %s", c, sp)
 				}
 			}
 			spans = parseSpans(&evalCtx, tc.notIntersectingSpans)
 			for i := 0; i < spans.Count(); i++ {
-				if sp := spans.Get(i); c.IntersectsSpan(&evalCtx, sp) {
+				if sp := spans.Get(i); c.IntersectsSpan(ctx, &evalCtx, sp) {
 					t.Errorf("%s should not intersect span %s", c, sp)
 				}
 			}
@@ -410,8 +559,8 @@ func TestConstraintIntersectsSpan(t *testing.T) {
 }
 
 func TestConstraintCombine(t *testing.T) {
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	testData := []struct {
 		a, b, e string
@@ -452,10 +601,92 @@ func TestConstraintCombine(t *testing.T) {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			a := ParseConstraint(&evalCtx, tc.a)
 			b := ParseConstraint(&evalCtx, tc.b)
-			a.Combine(&evalCtx, &b)
+			a.Combine(ctx, &evalCtx, &b, nil /* checkCancellation */)
 			if res := a.String(); res != tc.e {
 				t.Errorf("expected\n  %s; got\n  %s", tc.e, res)
 			}
+		})
+	}
+}
+
+// TestCancelLargeConstraintCombine tests that combining constraints can be
+// successfully cancelled with a cancel function.
+func TestCancelLargeConstraintCombine(t *testing.T) {
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+
+	testData := []struct {
+		a, b, c, d, e, f, g, h, j, k, l, m, n, o, p, q string
+	}{
+		{
+			a: "/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			b: "/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			c: "/3/4/5/6/7/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			d: "/4/5/6/7/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			e: "/5/6/7/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			f: "/6/7/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			g: "/7/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			h: "/8/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			j: "/9/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			k: "/10/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			l: "/11/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			m: "/12/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			n: "/13/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			o: "/14/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			p: "/15/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+			q: "/16: [/10 - /10] [/20 - /20] [/30 - /30] [/40 - /40] [/50 - /50] [/60 - /60] [/70 - /70] [/80 - /80] [/90 - /90]",
+		},
+	}
+
+	for i, tc := range testData {
+		iterations := 0
+		cancelFunc := func() {
+			iterations++
+			if iterations > 2000 {
+				panic(errors.AssertionFailedf("We successfully cancelled the operation!"))
+			}
+		}
+		testFunc := func(constraint1, constraint2 *Constraint) {
+			ts := timeutil.Now()
+			constraint1.Combine(ctx, &evalCtx, constraint2, cancelFunc)
+			if d := timeutil.Since(ts); d > time.Second {
+				t.Errorf("expected cancellation to occur in under 1 second, but took %v", d)
+			}
+		}
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			a := ParseConstraint(&evalCtx, tc.a)
+			b := ParseConstraint(&evalCtx, tc.b)
+			c := ParseConstraint(&evalCtx, tc.c)
+			d := ParseConstraint(&evalCtx, tc.d)
+			e := ParseConstraint(&evalCtx, tc.e)
+			f := ParseConstraint(&evalCtx, tc.f)
+			g := ParseConstraint(&evalCtx, tc.g)
+			h := ParseConstraint(&evalCtx, tc.h)
+			j := ParseConstraint(&evalCtx, tc.j)
+			k := ParseConstraint(&evalCtx, tc.k)
+			l := ParseConstraint(&evalCtx, tc.l)
+			m := ParseConstraint(&evalCtx, tc.m)
+			n := ParseConstraint(&evalCtx, tc.n)
+			o := ParseConstraint(&evalCtx, tc.o)
+			p := ParseConstraint(&evalCtx, tc.p)
+			q := ParseConstraint(&evalCtx, tc.q)
+			testFunc(&a, &b)
+			testFunc(&c, &d)
+			testFunc(&e, &f)
+			testFunc(&g, &h)
+			testFunc(&j, &k)
+			testFunc(&l, &m)
+			testFunc(&n, &o)
+			testFunc(&p, &q)
+			testFunc(&a, &c)
+			testFunc(&e, &g)
+			testFunc(&j, &l)
+			testFunc(&n, &p)
+			// The next Combine call will panic within a second or two.
+			require.Panics(t, func() { testFunc(&a, &e) })
+			// This Combine call panics right away since the iterations target has
+			// already been reached.
+			require.Panics(t, func() { testFunc(&j, &n) })
 		})
 	}
 }
@@ -516,7 +747,7 @@ func TestConsolidateSpans(t *testing.T) {
 			spans := parseSpans(&evalCtx, tc.s)
 			var c Constraint
 			c.Init(kc, &spans)
-			c.ConsolidateSpans(kc.EvalCtx, partition.PrefixSorter{})
+			c.ConsolidateSpans(kc.Ctx, kc.EvalCtx, partition.PrefixSorter{})
 			if res := c.Spans.String(); res != tc.e {
 				t.Errorf("expected  %s  got  %s", tc.e, res)
 			}
@@ -526,8 +757,8 @@ func TestConsolidateSpans(t *testing.T) {
 
 func TestConsolidateLocalAndRemoteSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	testData := []struct {
 		spanInputs string
@@ -617,13 +848,13 @@ func TestConsolidateLocalAndRemoteSpans(t *testing.T) {
 			index := &testcat.Index{}
 			index.SetPartitions(partitions)
 			// Make the PrefixSorter.
-			ps := partition.GetSortedPrefixes(index, localPartitions, &evalCtx)
+			ps := partition.GetSortedPrefixes(ctx, index, localPartitions, &evalCtx)
 
 			// Run the test.
 			spans := parseSpans(&evalCtx, tc.spanInputs)
 			var c Constraint
 			c.Init(kc, &spans)
-			c.ConsolidateSpans(kc.EvalCtx, ps)
+			c.ConsolidateSpans(kc.Ctx, kc.EvalCtx, ps)
 			if res := c.Spans.String(); res != tc.expected {
 				t.Errorf("expected  %s  got  %s", tc.expected, res)
 			}
@@ -634,8 +865,8 @@ func TestConsolidateLocalAndRemoteSpans(t *testing.T) {
 
 func TestExactPrefix(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	testData := []struct {
 		s string
@@ -690,7 +921,7 @@ func TestExactPrefix(t *testing.T) {
 			spans := parseSpans(&evalCtx, tc.s)
 			var c Constraint
 			c.Init(kc, &spans)
-			if res := c.ExactPrefix(kc.EvalCtx); res != tc.e {
+			if res := c.ExactPrefix(ctx, kc.EvalCtx); res != tc.e {
 				t.Errorf("expected  %d  got  %d", tc.e, res)
 			}
 		})
@@ -699,8 +930,8 @@ func TestExactPrefix(t *testing.T) {
 
 func TestPrefix(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	testData := []struct {
 		s string
@@ -755,7 +986,7 @@ func TestPrefix(t *testing.T) {
 			spans := parseSpans(&evalCtx, tc.s)
 			var c Constraint
 			c.Init(kc, &spans)
-			if res := c.Prefix(kc.EvalCtx); res != tc.e {
+			if res := c.Prefix(ctx, kc.EvalCtx); res != tc.e {
 				t.Errorf("expected  %d  got  %d", tc.e, res)
 			}
 		})
@@ -843,8 +1074,8 @@ func newConstraintTestData(evalCtx *eval.Context) *constraintTestData {
 }
 
 func TestExtractConstCols(t *testing.T) {
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	testData := []struct {
 		c string
@@ -916,7 +1147,7 @@ func TestExtractConstCols(t *testing.T) {
 	for i, tc := range testData {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			c := ParseConstraint(&evalCtx, tc.c)
-			cols := c.ExtractConstCols(&evalCtx)
+			cols := c.ExtractConstCols(ctx, &evalCtx)
 			if exp := opt.MakeColSet(tc.e...); !cols.Equals(exp) {
 				t.Errorf("expected %s; got %s", exp, cols)
 			}
@@ -925,8 +1156,8 @@ func TestExtractConstCols(t *testing.T) {
 }
 
 func TestExtractNotNullCols(t *testing.T) {
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	testData := []struct {
 		c string
@@ -998,7 +1229,7 @@ func TestExtractNotNullCols(t *testing.T) {
 	for i, tc := range testData {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			c := ParseConstraint(&evalCtx, tc.c)
-			cols := c.ExtractNotNullCols(&evalCtx)
+			cols := c.ExtractNotNullCols(ctx, &evalCtx)
 			if exp := opt.MakeColSet(tc.e...); !cols.Equals(exp) {
 				t.Errorf("expected %s; got %s", exp, cols)
 			}
@@ -1007,12 +1238,14 @@ func TestExtractNotNullCols(t *testing.T) {
 }
 
 func TestCollectFirstColumnValues(t *testing.T) {
-	test := func(t *testing.T, evalCtx *eval.Context, testConstraint *Constraint, expected string, hasNull bool) {
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	test := func(t *testing.T, testConstraint *Constraint, expected string, hasNull bool) {
 		t.Helper()
 
 		var values tree.Datums
 		var hasNullValue, ok bool
-		values, hasNullValue, ok = testConstraint.CollectFirstColumnValues(evalCtx)
+		values, hasNullValue, ok = testConstraint.CollectFirstColumnValues(ctx, &evalCtx)
 		if !ok {
 			if expected != "()" {
 				format := "Failed to collect values from constraint: %s  Expected values: %v"
@@ -1031,8 +1264,6 @@ func TestCollectFirstColumnValues(t *testing.T) {
 			t.Errorf(format, testConstraint.String(), expected, actual)
 		}
 	}
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := eval.MakeTestingEvalContext(st)
 
 	testData := []struct {
 		spans          string
@@ -1104,7 +1335,7 @@ func TestCollectFirstColumnValues(t *testing.T) {
 	for i, tc := range testData {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			c := ParseConstraint(&evalCtx, tc.spans)
-			test(t, &evalCtx, &c, tc.expectedValues, tc.hasNull)
+			test(t, &c, tc.expectedValues, tc.hasNull)
 		})
 	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package randgen
 
@@ -16,6 +11,7 @@ import (
 	"math"
 	"math/bits"
 	"math/rand"
+	"strings"
 	"time"
 	"unicode"
 
@@ -25,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgrepl/lsn"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
@@ -35,8 +32,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tsearch"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
+	"github.com/twpayne/go-geom"
 )
 
 // RandDatum generates a random Datum of the given type.
@@ -128,6 +127,12 @@ func RandDatumWithNullChance(
 		return tree.NewDBox2D(*b)
 	case types.PGLSNFamily:
 		return tree.NewDPGLSN(lsn.LSN(rng.Uint64()))
+	case types.RefCursorFamily:
+		p := make([]byte, rng.Intn(10))
+		for i := range p {
+			p[i] = byte(1 + rng.Intn(127))
+		}
+		return tree.NewDRefCursor(string(p))
 	case types.GeographyFamily:
 		gm, err := typ.GeoMetadata()
 		if err != nil {
@@ -137,13 +142,47 @@ func RandDatumWithNullChance(
 		if srid == 0 {
 			srid = geopb.DefaultGeographySRID
 		}
-		return tree.NewDGeography(geogen.RandomGeography(rng, srid))
+		// Limit the maximum geometry size to 16 megabytes.
+		const maxSize = uintptr(1024 * 1024 * 16)
+		maxRetries := 5
+		// Retry until we get a geography below the target size.
+		for maxRetries > 0 {
+			newGeo := tree.NewDGeography(geogen.RandomGeography(rng, srid))
+			if newGeo.Size() < maxSize {
+				return newGeo
+			}
+			maxRetries -= 1
+		}
+		// Otherwise, pick a simple random polygon.
+		geog, err := geo.MakeGeographyFromGeomT(geogen.RandomPolygon(rng, geogen.MakeRandomGeomBoundsForGeography(), gm.SRID, geom.NoLayout))
+		if err != nil {
+			panic(err)
+		}
+		dgm := tree.NewDGeography(geog)
+		return dgm
 	case types.GeometryFamily:
 		gm, err := typ.GeoMetadata()
 		if err != nil {
 			panic(err)
 		}
-		return tree.NewDGeometry(geogen.RandomGeometry(rng, gm.SRID))
+		// Limit the maximum geometry size to 16 megabytes.
+		const maxSize = uintptr(1024 * 1024 * 16)
+		maxRetries := 5
+		// Retry until we get a geography below the target size.
+		for maxRetries > 0 {
+			newGeom := tree.NewDGeometry(geogen.RandomGeometry(rng, gm.SRID))
+			if newGeom.Size() < maxSize {
+				return newGeom
+			}
+			maxRetries -= 1
+		}
+		// Otherwise, pick a simple random polygon.
+		geom, err := geo.MakeGeometryFromGeomT(geogen.RandomPolygon(rng, geogen.MakeRandomGeomBounds(), gm.SRID, geom.NoLayout))
+		if err != nil {
+			panic(err)
+		}
+		dgm := tree.NewDGeometry(geom)
+		return dgm
 	case types.DecimalFamily:
 		d := &tree.DDecimal{}
 		// int64(rng.Uint64()) to get negative numbers, too
@@ -178,8 +217,8 @@ func RandDatumWithNullChance(
 			sign*rng.Int63n(1000),
 		)}
 	case types.UuidFamily:
-		gen := uuid.NewGenWithReader(rng)
-		return tree.NewDUuid(tree.DUuid{UUID: uuid.Must(gen.NewV4())})
+		gen := uuid.NewGenWithRand(rng.Uint64)
+		return tree.NewDUuid(tree.DUuid{UUID: gen.NewV4()})
 	case types.INetFamily:
 		ipAddr := ipaddr.RandIPAddr(rng)
 		return tree.NewDIPAddr(tree.DIPAddr{IPAddr: ipAddr})
@@ -225,6 +264,9 @@ func RandDatumWithNullChance(
 		if typ.Oid() == oid.T_name {
 			return tree.NewDName(string(p))
 		}
+		if typ.Oid() == oid.T_bpchar {
+			return tree.NewDString(strings.TrimRight(string(p), " "))
+		}
 		return tree.NewDString(string(p))
 	case types.BytesFamily:
 		p := make([]byte, rng.Intn(10))
@@ -255,7 +297,7 @@ func RandDatumWithNullChance(
 		}
 		return d
 	case types.OidFamily:
-		return tree.NewDOid(oid.Oid(rng.Uint32()))
+		return tree.NewDOidWithType(oid.Oid(rng.Uint32()), typ)
 	case types.UnknownFamily:
 		return tree.DNull
 	case types.ArrayFamily:
@@ -287,6 +329,14 @@ func RandDatumWithNullChance(
 		return tree.NewDTSVector(tsearch.RandomTSVector(rng))
 	case types.TSQueryFamily:
 		return tree.NewDTSQuery(tsearch.RandomTSQuery(rng))
+	case types.PGVectorFamily:
+		var maxDim = 1000
+		if util.RaceEnabled {
+			// Some tests might be significantly slower under race, so we reduce
+			// the dimensionality.
+			maxDim = 50
+		}
+		return tree.NewDPGVector(vector.Random(rng, maxDim))
 	default:
 		panic(errors.AssertionFailedf("invalid type %v", typ.DebugString()))
 	}
@@ -462,7 +512,7 @@ func RandDatumSimple(rng *rand.Rand, typ *types.T) tree.Datum {
 	case types.JsonFamily:
 		datum = tree.NewDJSON(randJSONSimple(rng))
 	case types.OidFamily:
-		datum = tree.NewDOid(oid.Oid(rng.Intn(simpleRange)))
+		datum = tree.NewDOidWithType(oid.Oid(rng.Intn(simpleRange)), typ)
 	case types.StringFamily:
 		datum = tree.NewDString(randStringSimple(rng))
 	case types.TimeFamily:
@@ -547,6 +597,7 @@ var (
 		},
 		types.FloatFamily: {
 			tree.NewDFloat(tree.DFloat(0)),
+			tree.NewDFloat(tree.DFloat(math.Copysign(0, -1))), // -0
 			tree.NewDFloat(tree.DFloat(1)),
 			tree.NewDFloat(tree.DFloat(-1)),
 			tree.NewDFloat(tree.DFloat(math.SmallestNonzeroFloat32)),
@@ -560,9 +611,12 @@ var (
 		types.DecimalFamily: func() []tree.Datum {
 			var res []tree.Datum
 			for _, s := range []string{
+				"-0",
 				"0",
 				"1",
+				"1.0",
 				"-1",
+				"-1.0",
 				"Inf",
 				"-Inf",
 				"NaN",
@@ -718,6 +772,14 @@ var (
 			tree.NewDPGLSN(math.MaxInt64),
 			tree.NewDPGLSN(math.MaxInt64 + 1),
 			tree.NewDPGLSN(math.MaxUint64),
+		},
+		types.RefCursorFamily: {
+			tree.NewDRefCursor(""),
+			tree.NewDRefCursor("X"),
+			tree.NewDRefCursor(`"`),
+			tree.NewDRefCursor(`'`),
+			tree.NewDRefCursor("\x00"),
+			tree.NewDRefCursor("\u2603"), // unicode snowman
 		},
 		types.JsonFamily: func() []tree.Datum {
 			var res []tree.Datum
@@ -887,6 +949,26 @@ var (
 		}(),
 		types.PGLSNFamily: {
 			tree.NewDPGLSN(0x1000),
+		},
+		types.RefCursorFamily: {
+			tree.NewDRefCursor("a"),
+			tree.NewDRefCursor("a\n"),
+			tree.NewDRefCursor("aa"),
+			tree.NewDRefCursor(`Aa`),
+			tree.NewDRefCursor(`aab`),
+			tree.NewDRefCursor(`aaaaaa`),
+			tree.NewDRefCursor("a "),
+			tree.NewDRefCursor(" a"),
+			tree.NewDRefCursor("	a"),
+			tree.NewDRefCursor("a	"),
+			tree.NewDRefCursor("a	"),
+			tree.NewDRefCursor("\u0001"),
+			tree.NewDRefCursor("\ufffd"),
+			tree.NewDRefCursor("\u00e1"),
+			tree.NewDRefCursor("À"),
+			tree.NewDRefCursor("à"),
+			tree.NewDRefCursor("àá"),
+			tree.NewDRefCursor("À1                à\n"),
 		},
 		types.IntervalFamily: func() []tree.Datum {
 			var res []tree.Datum

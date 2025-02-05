@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package descpb exposes the "Descriptor" type and related utilities.
 package descpb
@@ -87,8 +82,14 @@ func GetDescriptors(
 // field must be set to the given MVCC timestamp. An error is returned if the
 // argument values are inconsistent.
 func MustSetModificationTime(
-	modTime hlc.Timestamp, mvccTimestamp hlc.Timestamp, version DescriptorVersion,
+	modTime hlc.Timestamp,
+	mvccTimestamp hlc.Timestamp,
+	version DescriptorVersion,
+	state DescriptorState,
 ) (bool, error) {
+	if state == DescriptorState_OFFLINE {
+		return false, nil
+	}
 	// Set the ModificationTime based on the passed mvccTimestamp if we should.
 	// Table descriptors can be updated in place after their version has been
 	// incremented (e.g. to include a schema change lease).

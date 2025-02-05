@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -247,9 +242,9 @@ func TestDebugMergeLogs(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Run the test for each possible log format.
-	format := []interface{}{"crdb-v2", "crdb-v1"}
-	testutils.RunValues(t, "format", format, func(t *testing.T, format interface{}) {
-		cases := getCases(format.(string))
+	format := []string{"crdb-v2", "crdb-v1"}
+	testutils.RunValues(t, "format", format, func(t *testing.T, format string) {
+		cases := getCases(format)
 		for _, c := range cases {
 			t.Run(c.name, c.run)
 		}

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -83,6 +78,7 @@ const (
 type orderedAggregator struct {
 	colexecop.OneInputNode
 	colexecop.InitHelper
+	colexecop.CloserHelper
 
 	state orderedAggregatorState
 
@@ -156,7 +152,8 @@ func NewOrderedAggregator(
 	// We will be reusing the same aggregate functions, so we use 1 as the
 	// allocation size.
 	funcsAlloc, inputArgsConverter, toClose, err := colexecagg.NewAggregateFuncsAlloc(
-		ctx, args, args.Spec.Aggregations, 1 /* allocSize */, colexecagg.OrderedAggKind,
+		ctx, args, args.Spec.Aggregations, 1, /* initialAllocSize */
+		1 /* maxAllocSize */, colexecagg.OrderedAggKind,
 	)
 	if err != nil {
 		colexecerror.InternalError(err)
@@ -415,5 +412,14 @@ func (a *orderedAggregator) Reset(ctx context.Context) {
 }
 
 func (a *orderedAggregator) Close(ctx context.Context) error {
-	return a.toClose.Close(ctx)
+	if !a.CloserHelper.Close() {
+		return nil
+	}
+	retErr := a.toClose.Close(ctx)
+	if c, ok := a.Input.(colexecop.Closer); ok {
+		if err := c.Close(ctx); err != nil {
+			retErr = err
+		}
+	}
+	return retErr
 }

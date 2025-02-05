@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcapabilitiesauthorizer
 
@@ -75,7 +70,7 @@ func TestDataDriven(t *testing.T) {
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		clusterSettings := cluster.MakeTestingClusterSettings()
 		ctx := context.Background()
-		mockReader := mockReader(make(map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities))
+		mockReader := mockReader(make(map[roachpb.TenantID]*tenantcapabilities.Entry))
 		authorizer := New(clusterSettings, nil /* TestingKnobs */)
 		authorizer.BindReader(mockReader)
 
@@ -86,17 +81,12 @@ func TestDataDriven(t *testing.T) {
 			}
 			switch d.Cmd {
 			case "upsert":
-				_, caps, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
+				entry, err := tenantcapabilitiestestutils.ParseTenantCapabilityUpsert(t, d)
 				if err != nil {
 					return err.Error()
 				}
 				mockReader.updateState([]*tenantcapabilities.Update{
-					{
-						Entry: tenantcapabilities.Entry{
-							TenantID:           tenID,
-							TenantCapabilities: caps,
-						},
-					},
+					{Entry: entry},
 				})
 			case "delete":
 				update := tenantcapabilitiestestutils.ParseTenantCapabilityDelete(t, d)
@@ -120,6 +110,12 @@ func TestDataDriven(t *testing.T) {
 					return "ok"
 				}
 				return err.Error()
+			case "has-tsdb-all-capability":
+				err := authorizer.HasTSDBAllMetricsCapability(context.Background(), tenID)
+				if err == nil {
+					return "ok"
+				}
+				return err.Error()
 			case "set-authorizer-mode":
 				var valStr string
 				d.ScanArgs(t, "value", &valStr)
@@ -127,7 +123,7 @@ func TestDataDriven(t *testing.T) {
 				if !ok {
 					t.Fatalf("unknown authorizer mode %s", valStr)
 				}
-				authorizerMode.Override(ctx, &clusterSettings.SV, val)
+				authorizerMode.Override(ctx, &clusterSettings.SV, authorizerModeType(val))
 			case "is-exempt-from-rate-limiting":
 				return fmt.Sprintf("%t", authorizer.IsExemptFromRateLimiting(context.Background(), tenID))
 			default:
@@ -138,7 +134,7 @@ func TestDataDriven(t *testing.T) {
 	})
 }
 
-type mockReader map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities
+type mockReader map[roachpb.TenantID]*tenantcapabilities.Entry
 
 var _ tenantcapabilities.Reader = mockReader{}
 
@@ -147,33 +143,73 @@ func (m mockReader) updateState(updates []*tenantcapabilities.Update) {
 		if update.Deleted {
 			delete(m, update.TenantID)
 		} else {
-			m[update.TenantID] = update.TenantCapabilities
+			m[update.TenantID] = &update.Entry
 		}
 	}
+}
+
+var unused = make(<-chan struct{})
+
+// GetInfo implements the tenantcapabilities.Reader interface.
+func (m mockReader) GetInfo(id roachpb.TenantID) (tenantcapabilities.Entry, <-chan struct{}, bool) {
+	entry, found := m[id]
+	if found {
+		return *entry, unused, found
+	}
+	return tenantcapabilities.Entry{}, unused, found
 }
 
 // GetCapabilities implements the tenantcapabilities.Reader interface.
 func (m mockReader) GetCapabilities(
 	id roachpb.TenantID,
 ) (*tenantcapabilitiespb.TenantCapabilities, bool) {
-	cp, found := m[id]
-	return cp, found
+	entry, found := m[id]
+	return entry.TenantCapabilities, found
 }
 
 // GetGlobalCapabilityState implements the tenantcapabilities.Reader interface.
 func (m mockReader) GetGlobalCapabilityState() map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities {
-	return m
+	ret := make(map[roachpb.TenantID]*tenantcapabilitiespb.TenantCapabilities, len(m))
+	for id, entry := range m {
+		ret[id] = entry.TenantCapabilities
+	}
+	return ret
 }
 
 func TestAllBatchCapsAreBoolean(t *testing.T) {
-	for _, capID := range reqMethodToCap {
+	checkCap := func(t *testing.T, capID tenantcapabilities.ID) {
 		if capID >= tenantcapabilities.MaxCapabilityID {
 			// One of the special values.
-			continue
+			return
 		}
 		caps := &tenantcapabilitiespb.TenantCapabilities{}
 		var v *tenantcapabilities.BoolValue
 		require.Implements(t, v, tenantcapabilities.MustGetValueByID(caps, capID))
+	}
+
+	for m, mc := range reqMethodToCap {
+		if mc.capFn != nil {
+			switch m {
+			case kvpb.EndTxn:
+				// Handled below.
+			default:
+				t.Fatalf("unexpected capability function for %s", m)
+			}
+		} else {
+			checkCap(t, mc.capID)
+		}
+	}
+
+	{
+		const method = kvpb.EndTxn
+		mc := reqMethodToCap[method]
+		capIDs := []tenantcapabilities.ID{
+			mc.get(&kvpb.EndTxnRequest{}),
+			mc.get(&kvpb.EndTxnRequest{Prepare: true}),
+		}
+		for _, capID := range capIDs {
+			checkCap(t, capID)
+		}
 	}
 }
 

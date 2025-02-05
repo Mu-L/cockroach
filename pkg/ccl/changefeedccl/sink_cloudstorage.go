@@ -1,10 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -70,14 +67,33 @@ func cloudStorageFormatTime(ts hlc.Timestamp) string {
 
 type cloudStorageSinkFile struct {
 	cloudStorageSinkKey
-	created      time.Time
-	codec        io.WriteCloser
-	rawSize      int
-	numMessages  int
-	buf          bytes.Buffer
-	alloc        kvevent.Alloc
-	oldestMVCC   hlc.Timestamp
-	parquetCodec *parquetWriter
+	created       time.Time
+	codec         io.WriteCloser
+	rawSize       int
+	numMessages   int
+	buf           bytes.Buffer
+	alloc         kvevent.Alloc
+	oldestMVCC    hlc.Timestamp
+	parquetCodec  *parquetWriter
+	allocCallback func(delta int64)
+}
+
+func (f *cloudStorageSinkFile) mergeAlloc(other *kvevent.Alloc) {
+	prev := f.alloc.Bytes()
+	f.alloc.Merge(other)
+	f.allocCallback(f.alloc.Bytes() - prev)
+}
+
+func (f *cloudStorageSinkFile) releaseAlloc(ctx context.Context) {
+	prev := f.alloc.Bytes()
+	f.alloc.Release(ctx)
+	f.allocCallback(-prev)
+}
+
+func (f *cloudStorageSinkFile) adjustBytesToTarget(ctx context.Context, targetBytes int64) {
+	prev := f.alloc.Bytes()
+	f.alloc.AdjustBytesToTarget(ctx, targetBytes)
+	f.allocCallback(f.alloc.Bytes() - prev)
 }
 
 var _ io.Writer = &cloudStorageSinkFile{}
@@ -361,7 +377,7 @@ const flushQueueDepth = 256
 
 func makeCloudStorageSink(
 	ctx context.Context,
-	u sinkURL,
+	u *changefeedbase.SinkURL,
 	srcID base.SQLInstanceID,
 	settings *cluster.Settings,
 	encodingOpts changefeedbase.EncodingOptions,
@@ -372,7 +388,7 @@ func makeCloudStorageSink(
 	testingKnobs *TestingKnobs,
 ) (Sink, error) {
 	var targetMaxFileSize int64 = 16 << 20 // 16MB
-	if fileSizeParam := u.consumeParam(changefeedbase.SinkParamFileSize); fileSizeParam != `` {
+	if fileSizeParam := u.ConsumeParam(changefeedbase.SinkParamFileSize); fileSizeParam != `` {
 		var err error
 		if targetMaxFileSize, err = humanizeutil.ParseBytes(fileSizeParam); err != nil {
 			return nil, pgerror.Wrapf(err, pgcode.Syntax, `parsing %s`, fileSizeParam)
@@ -415,7 +431,7 @@ func makeCloudStorageSink(
 	}
 	s.flushGroup.GoCtx(s.asyncFlusher)
 
-	if partitionFormat := u.consumeParam(changefeedbase.SinkParamPartitionFormat); partitionFormat != "" {
+	if partitionFormat := u.ConsumeParam(changefeedbase.SinkParamPartitionFormat); partitionFormat != "" {
 		dateFormat, ok := partitionDateFormats[partitionFormat]
 		if !ok {
 			return nil, errors.Errorf("invalid partition_format of %s", partitionFormat)
@@ -471,7 +487,8 @@ func makeCloudStorageSink(
 
 	// We make the external storage with a nil IOAccountingInterceptor since we
 	// record usage metrics via s.metrics.
-	if s.es, err = makeExternalStorageFromURI(ctx, u.String(), user, cloud.WithIOAccountingInterceptor(nil)); err != nil {
+	s.es, err = makeExternalStorageFromURI(ctx, u.String(), user, cloud.WithIOAccountingInterceptor(nil), cloud.WithClientName("cdc"))
+	if err != nil {
 		return nil, err
 	}
 	if mb != nil && s.es != nil {
@@ -510,6 +527,7 @@ func (s *cloudStorageSink) getOrCreateFile(
 		created:             timeutil.Now(),
 		cloudStorageSinkKey: key,
 		oldestMVCC:          eventMVCC,
+		allocCallback:       s.metrics.makeCloudstorageFileAllocCallback(),
 	}
 
 	if s.compression.enabled() {
@@ -557,7 +575,7 @@ func (s *cloudStorageSink) EmitRow(
 	if err != nil {
 		return err
 	}
-	file.alloc.Merge(&alloc)
+	file.mergeAlloc(&alloc)
 
 	if _, err := file.Write(value); err != nil {
 		return err
@@ -639,6 +657,27 @@ func (s *cloudStorageSink) flushTopicVersions(
 		}
 		return err == nil
 	})
+	if err != nil {
+		return err
+	}
+
+	// Allow synchronization with the async flusher to happen.
+	if s.testingKnobs != nil && s.testingKnobs.AsyncFlushSync != nil {
+		s.testingKnobs.AsyncFlushSync()
+	}
+
+	// Wait for the async flush to complete before clearing files.
+	// Note that if waitAsyncFlush returns an error some successfully
+	// flushed files may not be removed from s.files. This is ok, since
+	// the error will trigger the sink to be closed, and we will only use
+	// s.files to ensure that the codecs are closed before deallocating it.
+	err = s.waitAsyncFlush(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Files need to be cleared after the flush completes, otherwise file
+	// resources may be leaked.
 	for _, v := range toRemove {
 		s.files.Delete(cloudStorageSinkKey{topic: topic, schemaID: v})
 	}
@@ -661,9 +700,24 @@ func (s *cloudStorageSink) Flush(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.files.Clear(true /* addNodesToFreeList */)
+	// Allow synchronization with the async flusher to happen.
+	if s.testingKnobs != nil && s.testingKnobs.AsyncFlushSync != nil {
+		s.testingKnobs.AsyncFlushSync()
+	}
 	s.setDataFileTimestamp()
-	return s.waitAsyncFlush(ctx)
+
+	// Note that if waitAsyncFlush returns an error some successfully
+	// flushed files may not be removed from s.files. This is ok, since
+	// the error will trigger the sink to be closed, and we will only use
+	// s.files to ensure that the codecs are closed before deallocating it.
+	err = s.waitAsyncFlush(ctx)
+	if err != nil {
+		return err
+	}
+	// Files need to be cleared after the flush completes, otherwise file resources
+	// may not be released properly when closing the sink.
+	s.files.Clear(true /* addNodesToFreeList */)
+	return nil
 }
 
 func (s *cloudStorageSink) setDataFileTimestamp() {
@@ -677,7 +731,7 @@ func (s *cloudStorageSink) setDataFileTimestamp() {
 
 // enableAsyncFlush controls async flushing behavior for this sink.
 var enableAsyncFlush = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"changefeed.cloudstorage.async_flush.enabled",
 	"enable async flushing",
 	true,
@@ -796,6 +850,12 @@ func (s *cloudStorageSink) asyncFlusher(ctx context.Context) error {
 				continue
 			}
 
+			// Allow synchronization with the flushing routine to happen between getting
+			// the flush request from the channel and completing the flush.
+			if s.testingKnobs != nil && s.testingKnobs.AsyncFlushSync != nil {
+				s.testingKnobs.AsyncFlushSync()
+			}
+
 			// flush file to storage.
 			flushDone := s.metrics.recordFlushRequestCallback()
 			err := req.file.flushToStorage(ctx, s.es, req.dest, s.metrics)
@@ -814,7 +874,8 @@ func (s *cloudStorageSink) asyncFlusher(ctx context.Context) error {
 func (f *cloudStorageSinkFile) flushToStorage(
 	ctx context.Context, es cloud.ExternalStorage, dest string, m metricsRecorder,
 ) error {
-	defer f.alloc.Release(ctx)
+	defer f.releaseAlloc(ctx)
+	defer m.timers().DownstreamClientSend.Start()()
 
 	if f.rawSize == 0 {
 		// This method shouldn't be called with an empty file, but be defensive

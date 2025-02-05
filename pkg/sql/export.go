@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -24,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -34,9 +30,8 @@ import (
 )
 
 type exportNode struct {
+	singleInputPlanNode
 	optColumnsSlot
-
-	source planNode
 
 	// destination represents the destination URI for the export,
 	// typically a directory
@@ -63,7 +58,7 @@ func (e *exportNode) Values() tree.Datums {
 }
 
 func (e *exportNode) Close(ctx context.Context) {
-	e.source.Close(ctx)
+	e.input.Close(ctx)
 }
 
 const (
@@ -95,7 +90,7 @@ var exportOptionExpectValues = map[string]exprutil.KVStringOptValidate{
 
 // featureExportEnabled is used to enable and disable the EXPORT feature.
 var featureExportEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"feature.export.enabled",
 	"set to true to enable exports, false to disable; default is true",
 	featureflag.FeatureFlagEnabledDefault,
@@ -109,14 +104,16 @@ func (ef *execFactory) ConstructExport(
 	options []exec.KVOption,
 	notNullCols exec.NodeColumnOrdinalSet,
 ) (exec.Node, error) {
-	fileSuffix = strings.ToLower(fileSuffix)
-
+	ef.planner.BufferClientNotice(ef.ctx, pgnotice.Newf("EXPORT is not the recommended way to move data out "+
+		"of CockroachDB and may be deprecated in the future. Please consider exporting data with changefeeds instead: "+
+		"https://www.cockroachlabs.com/docs/stable/export-data-with-changefeeds"))
 	if !featureExportEnabled.Get(&ef.planner.ExecCfg().Settings.SV) {
 		return nil, pgerror.Newf(
 			pgcode.OperatorIntervention,
 			"feature EXPORT was disabled by the database administrator",
 		)
 	}
+	fileSuffix = strings.ToLower(fileSuffix)
 
 	if err := featureflag.CheckEnabled(
 		ef.ctx,
@@ -149,7 +146,7 @@ func (ef *execFactory) ConstructExport(
 		panic(err)
 	}
 	// TODO(adityamaru): Ideally we'd use
-	// `cloudprivilege.CheckDestinationPrivileges privileges here, but because of
+	// `sql.CheckDestinationPrivileges privileges here, but because of
 	// a ciruclar dependancy with `pkg/sql` this is not possible. Consider moving
 	// this file into `pkg/sql/importer` to get around this.
 	hasExternalIOImplicitAccess := ef.planner.CheckPrivilege(
@@ -252,12 +249,12 @@ func (ef *execFactory) ConstructExport(
 	exportFilePattern := exportFilePatternPart + "." + fileSuffix
 	namePattern := fmt.Sprintf("export%s-%s", exportID, exportFilePattern)
 	return &exportNode{
-		source:          input.(planNode),
-		destination:     string(*destination),
-		fileNamePattern: namePattern,
-		format:          format,
-		chunkRows:       chunkRows,
-		chunkSize:       chunkSize,
-		colNames:        colNames,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		destination:         string(*destination),
+		fileNamePattern:     namePattern,
+		format:              format,
+		chunkRows:           chunkRows,
+		chunkSize:           chunkSize,
+		colNames:            colNames,
 	}, nil
 }

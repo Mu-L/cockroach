@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catformat
 
@@ -20,6 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -27,7 +24,7 @@ import (
 
 func TestIndexForDisplay(t *testing.T) {
 	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
 
 	database := tree.Name("foo")
 	table := tree.Name("bar")
@@ -85,7 +82,7 @@ func TestIndexForDisplay(t *testing.T) {
 
 	// JSONB INVERTED INDEX baz (a)
 	jsonbInvertedIndex := baseIndex
-	jsonbInvertedIndex.Type = descpb.IndexDescriptor_INVERTED
+	jsonbInvertedIndex.Type = idxtype.INVERTED
 	jsonbInvertedIndex.KeyColumnNames = []string{"a"}
 	jsonbInvertedIndex.KeyColumnIDs = descpb.ColumnIDs{1}
 
@@ -114,6 +111,12 @@ func TestIndexForDisplay(t *testing.T) {
 		ShardBuckets: 8,
 		ColumnNames:  []string{"a"},
 	}
+
+	// VECTOR INDEX baz (a)
+	vectorIndex := baseIndex
+	vectorIndex.Type = idxtype.VECTOR
+	vectorIndex.KeyColumnNames = []string{"a"}
+	vectorIndex.KeyColumnIDs = descpb.ColumnIDs{1}
 
 	testData := []struct {
 		index       descpb.IndexDescriptor
@@ -269,6 +272,22 @@ func TestIndexForDisplay(t *testing.T) {
 			expected:    "CREATE INDEX baz ON foo.public.bar (a DESC) USING HASH WITH (bucket_count=8)",
 			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING btree (a DESC) USING HASH WITH (bucket_count=8)",
 		},
+		{
+			index:       vectorIndex,
+			tableName:   descpb.AnonymousTable,
+			partition:   "",
+			displayMode: IndexDisplayDefOnly,
+			expected:    "VECTOR INDEX baz (a)",
+			pgExpected:  "INDEX baz USING cspann (a)",
+		},
+		{
+			index:       vectorIndex,
+			tableName:   tableName,
+			partition:   "",
+			displayMode: IndexDisplayShowCreate,
+			expected:    "CREATE VECTOR INDEX baz ON foo.public.bar (a)",
+			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING cspann (a)",
+		},
 	}
 
 	sd := &sessiondata.SessionData{}
@@ -282,6 +301,7 @@ func TestIndexForDisplay(t *testing.T) {
 				false, /* isPrimary */
 				tc.partition,
 				tree.FmtSimple,
+				&eval.Context{},
 				&semaCtx,
 				sd,
 				tc.displayMode,
@@ -305,6 +325,7 @@ func TestIndexForDisplay(t *testing.T) {
 				false, /* isPrimary */
 				tc.partition,
 				tree.FmtPGCatalog,
+				&eval.Context{},
 				&semaCtx,
 				sd,
 				tc.displayMode,

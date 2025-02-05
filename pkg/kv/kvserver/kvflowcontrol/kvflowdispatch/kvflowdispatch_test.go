@@ -1,18 +1,14 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvflowdispatch
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,12 +17,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowinspectpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
 )
@@ -130,7 +128,7 @@ func TestDispatch(t *testing.T) {
 				ni, err := strconv.Atoi(strings.TrimPrefix(arg, "n"))
 				require.NoError(t, err)
 				var buf strings.Builder
-				es := dispatch.PendingDispatchFor(roachpb.NodeID(ni))
+				es, _ := dispatch.PendingDispatchFor(roachpb.NodeID(ni), math.MaxInt)
 				sort.Slice(es, func(i, j int) bool { // for determinism
 					if es[i].RangeID != es[j].RangeID {
 						return es[i].RangeID < es[j].RangeID
@@ -166,6 +164,23 @@ func TestDispatch(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestDispatchSize is used to estimate the size of a marshalled
+// kvflowcontrolpb.AdmittedRaftLogEntries object. It provides an approximation
+// to use as an upper limit for kvadmission.flow_control.dispatch.max_bytes.
+func TestDispatchSize(t *testing.T) {
+	entry, err := protoutil.Marshal(&kvflowcontrolpb.AdmittedRaftLogEntries{
+		RangeID:           math.MaxInt64,
+		AdmissionPriority: math.MaxInt32,
+		UpToRaftLogPosition: kvflowcontrolpb.RaftLogPosition{
+			Term:  math.MaxUint64,
+			Index: math.MaxUint64,
+		},
+		StoreID: math.MaxInt32,
+	})
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(entry), AdmittedRaftLogEntriesBytes, "consider adjusting kvadmission.flow_control.dispatch.max_bytes")
 }
 
 func parseLogPosition(t *testing.T, input string) kvflowcontrolpb.RaftLogPosition {
@@ -207,10 +222,20 @@ func (d dummyHandles) Lookup(id roachpb.RangeID) (kvflowcontrol.Handle, bool) {
 	return nil, false
 }
 
+func (d dummyHandles) LookupReplicationAdmissionHandle(
+	rangeID roachpb.RangeID,
+) (kvflowcontrol.ReplicationAdmissionHandle, bool) {
+	return d.Lookup(rangeID)
+}
+
 func (d dummyHandles) ResetStreams(ctx context.Context) {}
 
 func (d dummyHandles) Inspect() []roachpb.RangeID {
 	return nil
+}
+
+func (d dummyHandles) LookupInspect(id roachpb.RangeID) (kvflowinspectpb.Handle, bool) {
+	return kvflowinspectpb.Handle{}, false
 }
 
 var _ kvflowcontrol.Handles = dummyHandles{}

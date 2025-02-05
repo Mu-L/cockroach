@@ -1,23 +1,20 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import Long from "long";
+
+import { mockStmtStats, Stmt } from "src/api/testUtils";
+import { Filters } from "src/queryFilter/filter";
 import {
   convertRawStmtsToAggregateStatistics,
   filterStatementsData,
   getAppsFromStmtsResponse,
 } from "src/sqlActivity/util";
-import { mockStmtStats, Stmt } from "src/api/testUtils";
-import { Filters } from "src/queryFilter/filter";
-import Long from "long";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { unset } from "../util";
+
+import { INTERNAL_APP_NAME_PREFIX, unset } from "../util";
 
 describe("filterStatementsData", () => {
   function filterAndCheckStmts(
@@ -69,6 +66,25 @@ describe("filterStatementsData", () => {
 
     const expectedIDs = [2, 3];
     filterAndCheckStmts(stmtsRaw, {}, "giraffe", expectedIDs);
+  });
+
+  it("should show internal statements when no app filters are applied", () => {
+    const stmtsRaw = [
+      { id: 1, app: "hello" },
+      { id: 2, app: "$ internal hello" },
+      { id: 3, app: "$ internal app" },
+      { id: 4, app: "world" },
+      { id: 5, app: "great" },
+    ].map(stmt =>
+      mockStmtStats({
+        id: Long.fromInt(stmt.id),
+        key: { key_data: { app: stmt.app } },
+      }),
+    );
+
+    const filters: Filters = {};
+    const expected = [1, 2, 3, 4, 5];
+    filterAndCheckStmts(stmtsRaw, filters, null, expected);
   });
 
   it.each([
@@ -188,9 +204,39 @@ describe("filterStatementsData", () => {
           id: 7,
           app: "elephants cannot jump", // Should not match.
         },
+        {
+          id: 8,
+          app: "$ internal-my-app", // Should not match.
+        },
       ],
       appName: "aaaaaaaaaaaaaaaaaaaaaaaa",
       expectedIDs: [],
+    },
+    {
+      stmts: [
+        {
+          id: 1,
+          // Should match because it starts with INTERNAL_APP_NAME_PREFIX.
+          app: INTERNAL_APP_NAME_PREFIX + "-my-app",
+        },
+        {
+          id: 2,
+          // Should match because it starts with INTERNAL_APP_NAME_PREFIX.
+          app: INTERNAL_APP_NAME_PREFIX,
+        },
+        {
+          id: 3,
+          // Should not match.
+          app: "myApp" + INTERNAL_APP_NAME_PREFIX,
+        },
+        {
+          id: 4,
+          // Should match because it starts with INTERNAL_APP_NAME_PREFIX.
+          app: INTERNAL_APP_NAME_PREFIX + "myApp",
+        },
+      ],
+      appName: INTERNAL_APP_NAME_PREFIX + ",aaaaaaaaaaaaa",
+      expectedIDs: [1, 2, 4],
     },
   ])("should filter out statements not matching filter apps", tc => {
     const stmtsRaw = tc.stmts.map(stmt =>
@@ -321,7 +367,7 @@ describe("filterStatementsData", () => {
   it("should filter out statements not matching ALL filters", () => {
     const filters: Filters = {
       database: "coolestDB",
-      app: "coolestApp",
+      app: "coolestApp, " + INTERNAL_APP_NAME_PREFIX,
       timeNumber: "1",
       timeUnit: "seconds",
     };
@@ -364,6 +410,13 @@ describe("filterStatementsData", () => {
         svcLatSecs: 1,
         query: `select ${searchTerm}`,
       },
+      {
+        id: 6,
+        db: "coolestDB",
+        app: INTERNAL_APP_NAME_PREFIX + "-cool-app",
+        svcLatSecs: 1,
+        query: `select * from ${searchTerm} where a = 1`,
+      },
     ].map(stmt =>
       mockStmtStats({
         id: Long.fromInt(stmt.id),
@@ -379,7 +432,7 @@ describe("filterStatementsData", () => {
       }),
     );
 
-    const expectedIDs = [5];
+    const expectedIDs = [5, 6];
 
     filterAndCheckStmts(stmtsRaw, filters, searchTerm, expectedIDs);
   });

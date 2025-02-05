@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
@@ -16,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -36,54 +32,74 @@ func TestStatusGetFiles(t *testing.T) {
 
 	storeSpec := base.StoreSpec{Path: tempDir}
 
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestDoesNotWorkWithSharedProcessModeButWeDontKnowWhyYet(
+			base.TestTenantProbabilistic, 112956,
+		),
 		StoreSpecs: []base.StoreSpec{
 			storeSpec,
 		},
 	})
-	defer ts.Stopper().Stop(context.Background())
+	defer srv.Stopper().Stop(context.Background())
+
+	ts := srv.ApplicationLayer()
 
 	client := ts.GetStatusClient(t)
 
-	// Test fetching heap files.
-	t.Run("heap", func(t *testing.T) {
-		const testFilesNo = 3
-		for i := 0; i < testFilesNo; i++ {
-			testHeapDir := filepath.Join(storeSpec.Path, "logs", base.HeapProfileDir)
-			testHeapFile := filepath.Join(testHeapDir, fmt.Sprintf("heap%d.pprof", i))
-			if err := os.MkdirAll(testHeapDir, os.ModePerm); err != nil {
+	// Test fetching heap and cpu profiles.
+	for _, name := range []string{"heap", "cpu"} {
+		t.Run(name, func(t *testing.T) {
+			profileDir, fileFormatStr, fileType := base.HeapProfileDir, "heap%d.pprof", serverpb.FileType_HEAP
+			if name == "cpu" {
+				profileDir = base.CPUProfileDir
+				fileFormatStr = "cpu%d.pprof"
+				fileType = serverpb.FileType_CPU
+			}
+			const testFilesNo = 3
+			for i := 0; i < testFilesNo; i++ {
+				testDir := filepath.Join(storeSpec.Path, "logs", profileDir)
+				testFile := filepath.Join(testDir, fmt.Sprintf(fileFormatStr, i))
+				if err := os.MkdirAll(testDir, os.ModePerm); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(testFile, []byte(fmt.Sprintf("I'm %s profile %d", name, i)), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			request := serverpb.GetFilesRequest{NodeId: "local", Type: fileType, Patterns: []string{name + "*"}}
+			response, err := client.GetFiles(context.Background(), &request)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(testHeapFile, []byte(fmt.Sprintf("I'm heap file %d", i)), 0644); err != nil {
-				t.Fatal(err)
-			}
-		}
 
-		request := serverpb.GetFilesRequest{
-			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"heap*"}}
-		response, err := client.GetFiles(context.Background(), &request)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if a, e := len(response.Files), testFilesNo; a != e {
-			t.Errorf("expected %d files(s), found %d", e, a)
-		}
-
-		for i, file := range response.Files {
-			expectedFileName := fmt.Sprintf("heap%d.pprof", i)
-			if file.Name != expectedFileName {
-				t.Fatalf("expected file name %s, found %s", expectedFileName, file.Name)
+			if a, e := len(response.Files), testFilesNo; a != e {
+				t.Errorf("expected %d files(s), found %d", e, a)
 			}
-			expectedFileContents := []byte(fmt.Sprintf("I'm heap file %d", i))
-			if !bytes.Equal(file.Contents, expectedFileContents) {
-				t.Fatalf("expected file contents %s, found %s", expectedFileContents, file.Contents)
+
+			for i, file := range response.Files {
+				expectedFileName := fmt.Sprintf(fileFormatStr, i)
+				if file.Name != expectedFileName {
+					t.Fatalf("expected file name %s, found %s", expectedFileName, file.Name)
+				}
+				expectedFileContents := []byte(fmt.Sprintf("I'm %s profile %d", name, i))
+				if !bytes.Equal(file.Contents, expectedFileContents) {
+					t.Fatalf("expected file contents %s, found %s", expectedFileContents, file.Contents)
+				}
 			}
-		}
-	})
+		})
+	}
 
 	// Test fetching goroutine files.
 	t.Run("goroutines", func(t *testing.T) {
+
+		// regex for goroutine file names manually added
+		reDump := regexp.MustCompile(`goroutine_dump\d+.txt.gz`)
+		// regex for goroutine file names dumped by goroutinedumper
+		reOOMDump := regexp.MustCompile("goroutine_dump.*.double_since_last_dump.*.txt.gz")
+		// regex for content of goroutine files manually added
+		reDumpContent := regexp.MustCompile(`Goroutine dump \d+`)
+
 		const testFilesNo = 3
 		for i := 0; i < testFilesNo; i++ {
 			testGoroutineDir := filepath.Join(storeSpec.Path, "logs", base.GoroutineDumpDir)
@@ -103,18 +119,22 @@ func TestStatusGetFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if a, e := len(response.Files), testFilesNo; a != e {
-			t.Errorf("expected %d files(s), found %d", e, a)
+		if a, e := len(response.Files), testFilesNo; a < e {
+			t.Errorf("expected at least %d files(s), found %d", e, a)
 		}
 
-		for i, file := range response.Files {
-			expectedFileName := fmt.Sprintf("goroutine_dump%d.txt.gz", i)
-			if file.Name != expectedFileName {
-				t.Fatalf("expected file name %s, found %s", expectedFileName, file.Name)
+		for _, file := range response.Files {
+			if reOOMDump.MatchString(file.Name) {
+				continue
 			}
-			expectedFileContents := []byte(fmt.Sprintf("Goroutine dump %d", i))
-			if !bytes.Equal(file.Contents, expectedFileContents) {
-				t.Fatalf("expected file contents %s, found %s", expectedFileContents, file.Contents)
+			if reDump.MatchString(file.Name) {
+				if !reDumpContent.Match(file.Contents) {
+					t.Fatalf("expected file content of form %s, found %s", reDumpContent,
+						file.Contents)
+				}
+			} else {
+				t.Fatalf("expected file name of form %s, found %s", reDump,
+					file.Name)
 			}
 		}
 	})

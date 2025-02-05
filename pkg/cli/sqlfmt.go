@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -76,7 +71,11 @@ func runSQLFmt(cmd *cobra.Command, args []string) error {
 	}
 
 	for i := range sl {
-		fmt.Print(cfg.Pretty(sl[i].AST))
+		p, err := cfg.Pretty(sl[i].AST)
+		if err != nil {
+			return err
+		}
+		fmt.Print(p)
 		if len(sl) > 1 {
 			fmt.Print(";")
 		}

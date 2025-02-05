@@ -1,16 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -19,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/spf13/cobra"
 )
 
@@ -29,6 +26,7 @@ const (
 	configsFlag   = "config"
 	showSQLFlag   = "show-sql"
 	noGenFlag     = "no-gen"
+	forceGenFlag  = "force-gen"
 	flexTypesFlag = "flex-types"
 	workmemFlag   = "default-workmem"
 )
@@ -58,6 +56,7 @@ func makeTestLogicCmd(runE func(cmd *cobra.Command, args []string) error) *cobra
 	testLogicCmd.Flags().Bool(showSQLFlag, false, "show SQL statements/queries immediately before they are tested")
 	testLogicCmd.Flags().Bool(rewriteFlag, false, "rewrite test files using results from test run")
 	testLogicCmd.Flags().Bool(noGenFlag, false, "skip generating logic test files before running logic tests")
+	testLogicCmd.Flags().Bool(forceGenFlag, false, "force generating logic test files before running logic tests")
 	testLogicCmd.Flags().Bool(streamOutputFlag, false, "stream test output during run")
 	testLogicCmd.Flags().Bool(stressFlag, false, "run tests under stress")
 	testLogicCmd.Flags().String(testArgsFlag, "", "additional arguments to pass to go test binary")
@@ -85,6 +84,7 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 		timeout        = mustGetFlagDuration(cmd, timeoutFlag)
 		verbose        = mustGetFlagBool(cmd, vFlag)
 		noGen          = mustGetFlagBool(cmd, noGenFlag)
+		forceGen       = mustGetFlagBool(cmd, forceGenFlag)
 		showSQL        = mustGetFlagBool(cmd, showSQLFlag)
 		count          = mustGetFlagInt(cmd, countFlag)
 		stress         = mustGetFlagBool(cmd, stressFlag)
@@ -127,7 +127,7 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 		return err
 	}
 
-	if !noGen {
+	if !noGen && (forceGen || d.shouldGenerateLogicTests(ctx)) {
 		err := d.generateLogicTest(cmd)
 		if err != nil {
 			return err
@@ -183,13 +183,17 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 		}
 
 		if rewrite {
+			writeablePathArg := func(dir string) string {
+				return fmt.Sprintf("--sandbox_writable_path=%s", filepath.Join(workspace, dir))
+			}
+
 			dir := filepath.Join(filepath.Dir(baseTestsDir), "testdata")
-			args = append(args, fmt.Sprintf("--sandbox_writable_path=%s", filepath.Join(workspace, dir)))
+			args = append(args, writeablePathArg(dir))
 			if choice == "ccl" {
 				// The ccl logictest target shares the testdata directory with the base
 				// logictest target -- make an allowance explicitly for that.
-				args = append(args, fmt.Sprintf("--sandbox_writable_path=%s",
-					filepath.Join(workspace, "pkg/sql/logictest")))
+				args = append(args, writeablePathArg("pkg/sql/logictest"))
+				args = append(args, writeablePathArg("pkg/sql/opt/exec/execbuilder/testdata/"))
 			}
 		}
 	}
@@ -200,9 +204,7 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 	}
 	args = append(args, targets...)
 	args = append(args, "--test_env=GOTRACEBACK=all")
-	if numCPUs != 0 {
-		args = append(args, fmt.Sprintf("--local_cpu_resources=%d", numCPUs))
-	}
+	addCommonBazelArguments(&args)
 	if ignoreCache {
 		args = append(args, "--nocache_test_results")
 	}
@@ -247,15 +249,7 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 		args = append(args, "--test_arg", "-show-diff")
 	}
 	if timeout > 0 {
-		// The bazel timeout should be higher than the timeout passed to the
-		// test binary (giving it ample time to clean up, 5 seconds is probably
-		// enough).
-		args = append(args, fmt.Sprintf("--test_timeout=%d", 5+int(timeout.Seconds())))
-		args = append(args, "--test_arg", fmt.Sprintf("-test.timeout=%s", timeout.String()))
-
-		// If --test-args '-test.timeout=X' is specified as well, or
-		// -- --test_arg '-test.timeout=X', that'll take precedence further
-		// below.
+		args = append(args, fmt.Sprintf("--test_timeout=%d", int(timeout.Seconds())))
 	}
 	if stress {
 		if count == 1 {
@@ -295,6 +289,21 @@ func (d *dev) testlogic(cmd *cobra.Command, commandLine []string) error {
 		return err
 	}
 	return nil
+}
+
+// This function determines if any test_logic or execbuilder/testdata files were
+// modified in the current branch, and if so, determines if we should re-generate logic tests.
+func (d *dev) shouldGenerateLogicTests(ctx context.Context) bool {
+	if buildutil.CrdbTestBuild {
+		return true
+	}
+	base, _ := d.getMergeBaseHash(ctx)
+	// Generate logic tests if the merge base hash isn't found
+	if base == "" {
+		return true
+	}
+	changedFiles, _ := d.exec.CommandContextSilent(ctx, "git", "diff", "--no-ext-diff", "--name-only", base, "--", "pkg/sql/logictest/logictestbase/** ", "pkg/sql/logictest/testdata/**", "pkg/sql/sqlitelogictest/BUILD.bazel", "pkg/sql/sqlitelogictest/sqlitelogictest.go", "pkg/ccl/logictestccl/testdata/**", "pkg/sql/opt/exec/execbuilder/testdata/**")
+	return strings.TrimSpace(string(changedFiles)) != ""
 }
 
 // We know that the regular expressions for files should not contain whitespace

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/stretchr/testify/require"
@@ -24,17 +20,18 @@ import (
 
 func registerInconsistency(r registry.Registry) {
 	r.Add(registry.TestSpec{
-		Name:    "inconsistency",
-		Owner:   registry.OwnerReplication,
-		Cluster: r.MakeClusterSpec(3),
-		Leases:  registry.MetamorphicLeases,
-		Run:     runInconsistency,
+		Name:             "inconsistency",
+		Owner:            registry.OwnerKV,
+		Cluster:          r.MakeClusterSpec(3),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
+		Run:              runInconsistency,
 	})
 }
 
 func runInconsistency(ctx context.Context, t test.Test, c cluster.Cluster) {
 	nodes := c.Range(1, 3)
-	c.Put(ctx, t.Cockroach(), "./cockroach", nodes)
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), nodes)
 
 	{
@@ -44,7 +41,7 @@ func runInconsistency(ctx context.Context, t test.Test, c cluster.Cluster) {
 		// to expect it.
 		_, err := db.ExecContext(ctx, `SET CLUSTER SETTING server.consistency_check.interval = '0'`)
 		require.NoError(t, err)
-		require.NoError(t, WaitFor3XReplication(ctx, t, db))
+		require.NoError(t, roachtestutil.WaitFor3XReplication(ctx, t.L(), db))
 		require.NoError(t, db.Close())
 	}
 
@@ -85,7 +82,7 @@ func runInconsistency(ctx context.Context, t test.Test, c cluster.Cluster) {
 	//     t.Error(fmt.Sprintf("hex:%x", data))
 	//   }
 	// }
-	c.Run(ctx, c.Node(1), "./cockroach debug pebble db set {store-dir} "+
+	c.Run(ctx, option.WithNodes(c.Node(1)), "./cockroach debug pebble db set {store-dir} "+
 		"hex:016b1202000174786e2d0000000000000000000000000000000000 "+
 		"hex:120408001000180020002800322a0a10000000000000000000000000000000001a1266616b65207472616e73616374696f6e20302a004a00")
 
@@ -133,21 +130,21 @@ func runInconsistency(ctx context.Context, t test.Test, c cluster.Cluster) {
 	require.Len(t, ids, 1, "expected one dead NodeID")
 
 	const expr = "This.node.is.terminating.because.a.replica.inconsistency.was.detected"
-	c.Run(ctx, c.Node(1), "grep "+expr+" {log-dir}/cockroach.log")
+	c.Run(ctx, option.WithNodes(c.Node(1)), "grep "+expr+" {log-dir}/cockroach.log")
 
 	// Make sure that every node creates a checkpoint.
 	for n := 1; n <= 3; n++ {
 		// Notes it in the log.
 		const expr = "creating.checkpoint.*with.spans"
-		c.Run(ctx, c.Node(n), "grep "+expr+" {log-dir}/cockroach.log")
+		c.Run(ctx, option.WithNodes(c.Node(n)), "grep "+expr+" {log-dir}/cockroach.log")
 		// Creates at least one checkpoint directory (in rare cases it can be
 		// multiple if multiple consistency checks fail in close succession), and
 		// puts spans information into the checkpoint.txt file in it.
-		c.Run(ctx, c.Node(n), "find {store-dir}/auxiliary/checkpoints -name checkpoint.txt")
+		c.Run(ctx, option.WithNodes(c.Node(n)), "find {store-dir}/auxiliary/checkpoints -name checkpoint.txt")
 		// The checkpoint can be inspected by the tooling.
-		c.Run(ctx, c.Node(n), "./cockroach debug range-descriptors "+
+		c.Run(ctx, option.WithNodes(c.Node(n)), "./cockroach debug range-descriptors "+
 			"$(find {store-dir}/auxiliary/checkpoints/* -maxdepth 0 -type d | head -n1)")
-		c.Run(ctx, c.Node(n), "./cockroach debug range-data --limit 10 "+
+		c.Run(ctx, option.WithNodes(c.Node(n)), "./cockroach debug range-data --limit 10 "+
 			"$(find {store-dir}/auxiliary/checkpoints/* -maxdepth 0 -type d | head -n1) 1")
 	}
 
@@ -160,5 +157,5 @@ func runInconsistency(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// roachtest checks that no nodes are down when the test finishes, but in this
 	// case we have a down node that we can't restart. Remove the data dir, which
 	// tells roachtest to ignore this node.
-	c.Wipe(ctx, false /* preserveCerts */, c.Node(1))
+	c.Wipe(ctx, c.Node(1))
 }

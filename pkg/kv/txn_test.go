@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
@@ -19,7 +14,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -132,27 +129,6 @@ func newTestTxnFactory(
 		})
 }
 
-func TestInitPut(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	// This test is mostly an excuse to exercise otherwise unused code.
-	// TODO(vivekmenezes): update test or remove when InitPut is being
-	// considered sufficiently tested and this path exercised.
-	clock := hlc.NewClockForTesting(nil)
-	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
-		br := ba.CreateReply()
-		return br, nil
-	}), clock, stopper)
-
-	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
-	if pErr := txn.InitPut(ctx, "a", "b", false); pErr != nil {
-		t.Fatal(pErr)
-	}
-}
-
 // TestTransactionConfig verifies the proper unwrapping and re-wrapping of the
 // client's sender when starting a transaction. Also verifies that the
 // UserPriority is propagated to the transactional client and that the admission
@@ -163,8 +139,9 @@ func TestTransactionConfig(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
+	st := cluster.MakeTestingClusterSettings()
 	clock := hlc.NewClockForTesting(nil)
-	dbCtx := DefaultDBContext(stopper)
+	dbCtx := DefaultDBContext(st, stopper)
 	dbCtx.UserPriority = 101
 	db := NewDBWithContext(
 		log.MakeTestingAmbientCtxWithNewTracer(),
@@ -573,7 +550,7 @@ func TestTxnNegotiateAndSend(t *testing.T) {
 			MinTimestampBound: ts10,
 		}
 		ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
-		ba.Add(kvpb.NewGet(roachpb.Key("a"), false))
+		ba.Add(kvpb.NewGet(roachpb.Key("a")))
 		br, pErr := txn.NegotiateAndSend(ctx, ba)
 
 		if fastPath {
@@ -684,7 +661,7 @@ func TestTxnNegotiateAndSendWithDeadline(t *testing.T) {
 				MaxTimestampBound: test.maxTSBound,
 			}
 			ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
-			ba.Add(kvpb.NewGet(roachpb.Key("a"), false))
+			ba.Add(kvpb.NewGet(roachpb.Key("a")))
 			br, pErr := txn.NegotiateAndSend(ctx, ba)
 
 			if test.expErr == "" {
@@ -754,7 +731,7 @@ func TestTxnNegotiateAndSendWithResumeSpan(t *testing.T) {
 		}
 		ba.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
 		ba.MaxSpanRequestKeys = 2
-		ba.Add(kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d"), false /* forUpdate */))
+		ba.Add(kvpb.NewScan(roachpb.Key("a"), roachpb.Key("d")))
 		br, pErr := txn.NegotiateAndSend(ctx, ba)
 
 		if fastPath {
@@ -834,4 +811,43 @@ func TestTxnCommitTriggers(t *testing.T) {
 			require.Equal(t, test.expTrigger, triggerVal)
 		})
 	}
+}
+
+type txnSenderLockingOverrideWrapper struct {
+	TxnSender
+}
+
+func (t txnSenderLockingOverrideWrapper) IsLocking() bool {
+	return true
+}
+
+func TestTransactionAdmissionHeader(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	clock := hlc.NewClockForTesting(nil)
+	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(),
+		newTestTxnFactory(func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+			br := ba.CreateReply()
+			return br, nil
+		}), clock, stopper)
+
+	txn := NewTxnWithAdmissionControl(
+		ctx, db, 0 /* gatewayNodeID */, kvpb.AdmissionHeader_FROM_SQL, admissionpb.NormalPri)
+	header := txn.AdmissionHeader()
+	expectedHeader := kvpb.AdmissionHeader{
+		Priority:   int32(admissionpb.NormalPri),
+		CreateTime: header.CreateTime,
+		Source:     kvpb.AdmissionHeader_FROM_SQL,
+	}
+	require.Equal(t, expectedHeader, header)
+	// MockTransactionalSender always return false from IsLocking, so wrap it to
+	// return true.
+	txn.mu.sender = txnSenderLockingOverrideWrapper{txn.mu.sender}
+	header = txn.AdmissionHeader()
+	expectedHeader.Priority = int32(admissionpb.LockingNormalPri)
+	require.Equal(t, expectedHeader, header)
 }

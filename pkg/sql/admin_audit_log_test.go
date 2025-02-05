@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -44,7 +39,7 @@ func installSensitiveAccessLogFileSink(sc *log.TestLogScope, t *testing.T) func(
 	if err := cfg.Validate(&dir); err != nil {
 		t.Fatal(err)
 	}
-	cleanup, err := log.ApplyConfig(cfg)
+	cleanup, err := log.ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +66,7 @@ func TestAdminAuditLogBasic(t *testing.T) {
 	db.Exec(t, `SELECT 1;`)
 
 	var selectAdminRe = regexp.MustCompile(`"EventType":"admin_query","Statement":"SELECT ‹1›","Tag":"SELECT","User":"root"`)
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 10000, selectAdminRe,
 		log.WithMarkedSensitiveData)
@@ -104,7 +99,7 @@ func TestAdminAuditLogRegularUser(t *testing.T) {
 
 	db.Exec(t, `CREATE USER testuser`)
 
-	testuser := s.ApplicationLayer().SQLConnForUser(t, "testuser", "")
+	testuser := s.ApplicationLayer().SQLConn(t, serverutils.User("testuser"))
 
 	if _, err := testuser.Exec(`SELECT 1`); err != nil {
 		t.Fatal(err)
@@ -112,7 +107,7 @@ func TestAdminAuditLogRegularUser(t *testing.T) {
 
 	var selectRe = regexp.MustCompile(`SELECT 1`)
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 10000, selectRe,
 		log.WithMarkedSensitiveData)
@@ -144,7 +139,7 @@ func TestAdminAuditLogTransaction(t *testing.T) {
 	db.Exec(t, `SET CLUSTER SETTING sql.log.admin_audit.enabled = true;`)
 	db.Exec(t, `
 BEGIN;
-CREATE TABLE t();
+CREATE TABLE t(a INT8 PRIMARY KEY DEFAULT 2);
 SELECT * FROM t;
 SELECT 1;
 COMMIT;
@@ -160,15 +155,15 @@ COMMIT;
 		},
 		{
 			"select-*-from-table-query",
-			`"EventType":"admin_query","Statement":"SELECT * FROM ‹\"\"›.‹\"\"›.‹t›"`,
+			`"EventType":"admin_query","Statement":"SELECT * FROM \"\".\"\".t"`,
 		},
 		{
 			"create-table-query",
-			`"EventType":"admin_query","Statement":"CREATE TABLE ‹defaultdb›.public.‹t› ()"`,
+			`"EventType":"admin_query","Statement":"CREATE TABLE defaultdb.public.t (a INT8 PRIMARY KEY DEFAULT ‹2›)"`,
 		},
 	}
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err := log.FetchEntriesFromFiles(
 		0,
@@ -221,13 +216,13 @@ func TestAdminAuditLogMultipleTransactions(t *testing.T) {
 
 	db.Exec(t, `CREATE USER testuser`)
 
-	testuser := s.ApplicationLayer().SQLConnForUser(t, "testuser", "")
+	testuser := s.ApplicationLayer().SQLConn(t, serverutils.User("testuser"))
 
 	db.Exec(t, `GRANT admin TO testuser`)
 
 	if _, err := testuser.Exec(`
 BEGIN;
-CREATE TABLE t();
+CREATE TABLE t(a INT8 PRIMARY KEY DEFAULT 2);
 SELECT * FROM t;
 SELECT 1;
 COMMIT;
@@ -245,15 +240,15 @@ COMMIT;
 		},
 		{
 			"select-*-from-table-query",
-			`"EventType":"admin_query","Statement":"SELECT * FROM ‹\"\"›.‹\"\"›.‹t›"`,
+			`"EventType":"admin_query","Statement":"SELECT * FROM \"\".\"\".t"`,
 		},
 		{
 			"create-table-query",
-			`"EventType":"admin_query","Statement":"CREATE TABLE ‹defaultdb›.public.‹t› ()"`,
+			`"EventType":"admin_query","Statement":"CREATE TABLE defaultdb.public.t (a INT8 PRIMARY KEY DEFAULT ‹2›)"`,
 		},
 	}
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err := log.FetchEntriesFromFiles(
 		0,
@@ -297,7 +292,7 @@ COMMIT;
 		t.Fatal(err)
 	}
 
-	log.Flush()
+	log.FlushFiles()
 
 	entries, err = log.FetchEntriesFromFiles(
 		0,

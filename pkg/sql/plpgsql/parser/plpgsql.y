@@ -2,9 +2,14 @@
 package parser
 
 import (
+  "strings"
+
+  "github.com/cockroachdb/cockroach/pkg/build"
+  "github.com/cockroachdb/cockroach/pkg/sql/parser"
   "github.com/cockroachdb/cockroach/pkg/sql/scanner"
   "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
   "github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree"
+  "github.com/cockroachdb/cockroach/pkg/sql/types"
   "github.com/cockroachdb/errors"
   "github.com/cockroachdb/redact"
 )
@@ -13,6 +18,11 @@ import (
 %{
 func setErr(plpgsqllex plpgsqlLexer, err error) int {
     plpgsqllex.(*lexer).setErr(err)
+    return 1
+}
+
+func setErrNoDetails(plpgsqllex plpgsqlLexer, err error) int {
+    plpgsqllex.(*lexer).setErrNoDetails(err)
     return 1
 }
 
@@ -124,21 +134,13 @@ func (u *plpgsqlSymUnion) open() *plpgsqltree.Open {
 
 func (u *plpgsqlSymUnion) expr() plpgsqltree.Expr {
     if u.val == nil {
-      return nil
+        return nil
     }
     return u.val.(plpgsqltree.Expr)
 }
 
 func (u *plpgsqlSymUnion) exprs() []plpgsqltree.Expr {
     return u.val.([]plpgsqltree.Expr)
-}
-
-func (u *plpgsqlSymUnion) declaration() *plpgsqltree.Declaration {
-    return u.val.(*plpgsqltree.Declaration)
-}
-
-func (u *plpgsqlSymUnion) declarations() []plpgsqltree.Declaration {
-    return u.val.([]plpgsqltree.Declaration)
 }
 
 func (u *plpgsqlSymUnion) raiseOption() *plpgsqltree.RaiseOption {
@@ -164,6 +166,30 @@ func (u *plpgsqlSymUnion) condition() *plpgsqltree.Condition {
 
 func (u *plpgsqlSymUnion) conditions() []plpgsqltree.Condition {
     return u.val.([]plpgsqltree.Condition)
+}
+
+func (u *plpgsqlSymUnion) cursorScrollOption() tree.CursorScrollOption {
+    return u.val.(tree.CursorScrollOption)
+}
+
+func (u *plpgsqlSymUnion) sqlStatement() tree.Statement {
+    return u.val.(tree.Statement)
+}
+
+func (u *plpgsqlSymUnion) variables() []plpgsqltree.Variable {
+		return u.val.([]plpgsqltree.Variable)
+}
+
+func (u *plpgsqlSymUnion) forLoopControl() plpgsqltree.ForLoopControl {
+		return u.val.(plpgsqltree.ForLoopControl)
+}
+
+func (u *plpgsqlSymUnion) doBlockOptions() tree.DoBlockOptions {
+    return u.val.(tree.DoBlockOptions)
+}
+
+func (u *plpgsqlSymUnion) doBlockOption() tree.DoBlockOption {
+    return u.val.(tree.DoBlockOption)
 }
 
 %}
@@ -246,6 +272,7 @@ func (u *plpgsqlSymUnion) conditions() []plpgsqltree.Condition {
 %token <str>  INSERT
 %token <str>  INTO
 %token <str>  IS
+%token <str>  LANGUAGE
 %token <str>  LAST
 %token <str>  LOG
 %token <str>  LOOP
@@ -293,6 +320,7 @@ func (u *plpgsqlSymUnion) conditions() []plpgsqltree.Condition {
 %token <str>  THEN
 %token <str>  TO
 %token <str>  TYPE
+%token <str>  UPSERT
 %token <str>  USE_COLUMN
 %token <str>  USE_VARIABLE
 %token <str>  USING
@@ -315,33 +343,34 @@ func (u *plpgsqlSymUnion) conditions() []plpgsqltree.Condition {
 %type <tree.ResolvableTypeReference>	decl_datatype
 %type <str>		decl_collate
 
-%type <*plpgsqltree.Open> open_stmt_processor
-%type <str>	expr_until_semi expr_until_paren
+%type <str>	expr_until_semi expr_until_paren stmt_until_semi return_expr
 %type <str>	expr_until_then expr_until_loop opt_expr_until_when
 %type <plpgsqltree.Expr>	opt_exitcond
 
-%type <forvariable>	for_variable
-%type <plpgsqltree.Expr>	return_variable
-%type <*tree.NumVal>	foreach_slice
-%type <plpgsqltree.Statement>	for_control
+%type <[]plpgsqltree.Variable> for_target
+%type <*tree.NumVal> foreach_slice
+%type <plpgsqltree.ForLoopControl> for_control
 
 %type <str> any_identifier opt_block_label opt_loop_label opt_label query_options
 %type <str> opt_error_level option_type
 
+%type <tree.DoBlockOptions> do_stmt_opt_list
+%type <tree.DoBlockOption> do_stmt_opt_item
+
 %type <[]plpgsqltree.Statement> proc_sect
 %type <[]plpgsqltree.ElseIf> stmt_elsifs
-%type <[]plpgsqltree.Statement> stmt_else loop_body // TODO is this a list of statement?
+%type <[]plpgsqltree.Statement> stmt_else loop_body
 %type <plpgsqltree.Statement>  pl_block
 %type <plpgsqltree.Statement>	proc_stmt
 %type <plpgsqltree.Statement>	stmt_assign stmt_if stmt_loop stmt_while stmt_exit stmt_continue
 %type <plpgsqltree.Statement>	stmt_return stmt_raise stmt_assert stmt_execsql
-%type <plpgsqltree.Statement>	stmt_dynexecute stmt_for stmt_perform stmt_call stmt_getdiag
+%type <plpgsqltree.Statement>	stmt_dynexecute stmt_for stmt_perform stmt_call stmt_do stmt_getdiag
 %type <plpgsqltree.Statement>	stmt_open stmt_fetch stmt_move stmt_close stmt_null
 %type <plpgsqltree.Statement>	stmt_commit stmt_rollback
 %type <plpgsqltree.Statement>	stmt_case stmt_foreach_a
 
-%type <*plpgsqltree.Declaration> decl_stmt decl_statement
-%type <[]plpgsqltree.Declaration> decl_sect opt_decl_stmts decl_stmts
+%type <plpgsqltree.Statement> decl_statement
+%type <[]plpgsqltree.Statement> decl_sect opt_decl_stmts decl_stmts
 
 %type <[]plpgsqltree.Exception> exception_sect proc_exceptions
 %type <*plpgsqltree.Exception>	proc_exception
@@ -353,8 +382,8 @@ func (u *plpgsqlSymUnion) conditions() []plpgsqltree.Condition {
 %type <[]plpgsqltree.Statement> opt_case_else
 
 %type <bool>	getdiag_area_opt
-%type <plpgsqltree.GetDiagnosticsItemList>	getdiag_list // TODO don't know what this is
-%type <*plpgsqltree.GetDiagnosticsItem> getdiag_list_item // TODO don't know what this is
+%type <plpgsqltree.GetDiagnosticsItemList>	getdiag_list
+%type <*plpgsqltree.GetDiagnosticsItem> getdiag_list_item
 %type <int32> getdiag_item
 
 %type <*plpgsqltree.RaiseOption> option_expr
@@ -362,11 +391,9 @@ func (u *plpgsqlSymUnion) conditions() []plpgsqltree.Condition {
 %type <plpgsqltree.Expr> format_expr
 %type <[]plpgsqltree.Expr> opt_format_exprs format_exprs
 
-%type <uint32>	opt_scrollable
+%type <tree.CursorScrollOption>	opt_scrollable
 
-%type <*plpgsqltree.Fetch>	opt_fetch_direction
-
-%type <*tree.NumVal>	opt_transaction_chain
+%type <bool>	opt_transaction_chain
 
 %type <str>	unreserved_keyword
 %%
@@ -383,9 +410,13 @@ opt_semi:
 
 pl_block: opt_block_label decl_sect BEGIN proc_sect exception_sect END opt_label
   {
+    blockLabel, blockEndLabel := $1, $7
+    if err := checkLoopLabels(blockLabel, blockEndLabel); err != nil {
+      return setErr(plpgsqllex, err)
+    }
     $$.val = &plpgsqltree.Block{
       Label: $1,
-      Decls: $2.declarations(),
+      Decls: $2.statements(),
       Body: $4.statements(),
       Exceptions: $5.exceptions(),
     }
@@ -394,61 +425,40 @@ pl_block: opt_block_label decl_sect BEGIN proc_sect exception_sect END opt_label
 
 decl_sect: DECLARE opt_decl_stmts
   {
-    $$.val = $2.declarations()
+    $$.val = $2.statements()
   }
 | /* EMPTY */
   {
     // Use a nil slice to indicate DECLARE was not used.
-    $$.val = []plpgsqltree.Declaration(nil)
+    $$.val = []plpgsqltree.Statement(nil)
   }
 ;
 
 opt_decl_stmts: decl_stmts
   {
-    $$.val = $1.declarations()
+    $$.val = $1.statements()
   }
 | /* EMPTY */
   {
-    $$.val = []plpgsqltree.Declaration{}
+    $$.val = []plpgsqltree.Statement{}
   }
 ;
 
-decl_stmts: decl_stmts decl_stmt
+opt_declare: DECLARE {}
+| {}
+;
+
+decl_stmts: decl_stmts opt_declare decl_statement
   {
-    decs := $1.declarations()
-    dec := $2.declaration()
-    if dec == nil {
-      $$.val = decs
-    } else {
-      $$.val = append(decs, *dec)
-    }
+    decs := $1.statements()
+    dec := $3.statement()
+    $$.val = append(decs, dec)
   }
-| decl_stmt
+| decl_statement
   {
-    dec := $1.declaration()
-    if dec == nil {
-      $$.val = []plpgsqltree.Declaration{}
-    } else {
-      $$.val = []plpgsqltree.Declaration{*dec}
-    }
+    dec := $1.statement()
+    $$.val = []plpgsqltree.Statement{dec}
 	}
-;
-
-decl_stmt	: decl_statement
-  {
-    $$.val = $1.declaration()
-  }
-| DECLARE
-  {
-    // This is to allow useless extra "DECLARE" keywords in the declare section.
-    $$.val = (*plpgsqltree.Declaration)(nil)
-  }
-// TODO(chengxiong): turn this block on and throw useful error if user
-// tries to put the block label just before BEGIN instead of before
-// DECLARE.
-//| LESS_LESS any_identifier GREATER_GREATER
-//  {
-//  }
 ;
 
 decl_statement: decl_varname decl_const decl_datatype decl_collate decl_notnull decl_defval
@@ -466,36 +476,48 @@ decl_statement: decl_varname decl_const decl_datatype decl_collate decl_notnull 
   {
     return unimplemented(plpgsqllex, "alias for")
   }
-| decl_varname opt_scrollable CURSOR decl_cursor_args decl_is_for decl_cursor_query ';'
+| decl_varname opt_scrollable CURSOR decl_cursor_args decl_is_for decl_cursor_query
   {
-    return unimplemented(plpgsqllex, "cursor")
+    $$.val = &plpgsqltree.CursorDeclaration{
+      Name: plpgsqltree.Variable($1),
+      Scroll: $2.cursorScrollOption(),
+      Query: $6.sqlStatement(),
+    }
   }
 ;
 
 opt_scrollable:
   {
-    return unimplemented(plpgsqllex, "cursor")
+    $$.val = tree.UnspecifiedScroll
   }
 | NO_SCROLL SCROLL
   {
-    return unimplemented(plpgsqllex, "cursor")
+    $$.val = tree.NoScroll
   }
 | SCROLL
   {
-    return unimplemented(plpgsqllex, "cursor")
+    $$.val = tree.Scroll
   }
 ;
 
-decl_cursor_query:
+decl_cursor_query: stmt_until_semi ';'
   {
-    plpgsqllex.(*lexer).ReadSqlExpressionStr(';')
+    stmts, err := parser.Parse($1)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    if len(stmts) != 1 {
+      return setErr(plpgsqllex, errors.New("expected exactly one SQL statement for cursor"))
+    }
+    $$.val = stmts[0].AST
   }
 ;
 
-decl_cursor_args:
+decl_cursor_args: '('
   {
+    return unimplemented(plpgsqllex, "cursor arguments")
   }
-| '(' decl_cursor_arglist ')'
+| /* EMPTY */
   {
   }
 ;
@@ -543,15 +565,32 @@ decl_datatype:
   {
     // Read until reaching one of the tokens that can follow a declaration
     // data type.
-    sqlStr, _ := plpgsqllex.(*lexer).ReadSqlConstruct(
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(
       ';', COLLATE, NOT, '=', COLON_EQUALS, DECLARE,
     )
-    // TODO(drewk): need to ensure the syntax for the type is correct.
-    typ, err := plpgsqllex.(*lexer).GetTypeFromValidSQLSyntax(sqlStr)
     if err != nil {
-      setErr(plpgsqllex, err)
+      return setErr(plpgsqllex, err)
     }
-    $$.val = typ
+    // This is an inlined version of GetTypeFromValidSQLSyntax which doesn't
+    // return an assertion failure.
+    castExpr, err := plpgsqllex.(*lexer).ParseExpr("1::" + sqlStr)
+    if err != nil {
+      return setErr(plpgsqllex, errors.New("unable to parse type of variable declaration"))
+    }
+    switch t := castExpr.(type) {
+    case *tree.CollateExpr:
+      $$.val = types.MakeCollatedString(types.String, t.Locale)
+    case *tree.CastExpr:
+      $$.val = t.Type
+    default:
+      err := errors.New("unable to parse type of variable declaration")
+      if strings.Contains(sqlStr, "%") {
+        err = errors.WithIssueLink(errors.WithHint(err,
+          "you may have attempted to use %TYPE or %ROWTYPE syntax, which is unsupported.",
+        ), errors.IssueLink{IssueURL: build.MakeIssueURL(114676)})
+      }
+      return setErr(plpgsqllex, err)
+    }
   }
 ;
 
@@ -595,11 +634,19 @@ decl_defval: ';'
 
 decl_defkey: assign_operator
   {
-    $$ = plpgsqllex.(*lexer).ReadSqlExpressionStr(';')
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$ = sqlStr
   }
 | DEFAULT
   {
-    $$ = plpgsqllex.(*lexer).ReadSqlExpressionStr(';')
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$ = sqlStr
   }
 ;
 
@@ -645,7 +692,9 @@ proc_stmt:pl_block ';'
     $$.val = $1.statement()
   }
 | stmt_while
-  { }
+  {
+    $$.val = $1.statement()
+  }
 | stmt_for
   { }
 | stmt_foreach_a
@@ -684,45 +733,100 @@ proc_stmt:pl_block ';'
   {
     $$.val = $1.statement()
   }
+| stmt_do
+  {
+    $$.val = $1.statement()
+  }
 | stmt_getdiag
   { }
 | stmt_open
-  { }
+  {
+    $$.val = $1.statement()
+  }
 | stmt_fetch
-  { }
+  {
+    $$.val = $1.statement()
+  }
 | stmt_move
-  { }
+  {
+    $$.val = $1.statement()
+  }
 | stmt_close
   {
     $$.val = $1.statement()
   }
 | stmt_null
-  { }
+  {
+    $$.val = $1.statement()
+  }
 | stmt_commit
-  { }
+  {
+    $$.val = $1.statement()
+  }
 | stmt_rollback
-  { }
+  {
+    $$.val = $1.statement()
+  }
 ;
 
-stmt_perform: PERFORM expr_until_semi ';'
+stmt_perform: PERFORM stmt_until_semi ';'
   {
     return unimplemented(plpgsqllex, "perform")
   }
 ;
 
-stmt_call: CALL call_cmd ';'
+stmt_call: CALL expr_until_semi ';'
   {
-    $$.val = &plpgsqltree.Call{IsCall: true}
-  }
-| DO call_cmd ';'
-  {
-    $$.val = &plpgsqltree.Call{IsCall: false}
+    expr, err := plpgsqllex.(*lexer).ParseExpr($2)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    proc, ok := expr.(*tree.FuncExpr)
+    if !ok {
+      return setErr(plpgsqllex,
+        errors.New("CALL statement target must be a stored procedure"),
+      )
+    }
+    // Set the InCall flag to true to indicate that this is a CALL statement.
+    proc.InCall = true
+    $$.val = &plpgsqltree.Call{Proc: proc}
   }
 ;
 
-call_cmd:
+stmt_do:
+  DO do_stmt_opt_list ';'
   {
-    plpgsqllex.(*lexer).ReadSqlExpressionStr(';')
+    doBlock, err := makeDoStmt($2.doBlockOptions())
+    if err != nil {
+      return setErrNoDetails(plpgsqllex, err)
+    }
+    $$.val = doBlock
+  }
+;
+
+do_stmt_opt_list:
+  do_stmt_opt_item
+  {
+    $$.val = tree.DoBlockOptions{$1.doBlockOption()}
+  }
+| do_stmt_opt_list do_stmt_opt_item
+  {
+    $$.val = append($1.doBlockOptions(), $2.doBlockOption())
+  }
+;
+
+do_stmt_opt_item:
+  SCONST
+  {
+    $$.val = tree.RoutineBodyStr($1)
+  }
+| LANGUAGE any_identifier
+  {
+    lang, err := tree.AsRoutineLanguage($2)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = lang
   }
 ;
 
@@ -737,6 +841,19 @@ stmt_assign: IDENT assign_operator expr_until_semi ';'
       Value: expr,
     }
   }
+| IDENT '.' IDENT assign_operator expr_until_semi ';'
+  {
+    // TODO(#91779, #122322): allow arbitrary nesting of indirection.
+    expr, err := plpgsqllex.(*lexer).ParseExpr($5)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = &plpgsqltree.Assignment{
+      Var: plpgsqltree.Variable($1),
+      Value: expr,
+      Indirection: tree.Name($3),
+    }
+  }
 ;
 
 stmt_getdiag: GET getdiag_area_opt DIAGNOSTICS getdiag_list ';'
@@ -745,7 +862,7 @@ stmt_getdiag: GET getdiag_area_opt DIAGNOSTICS getdiag_list ';'
     IsStacked: $2.bool(),
     DiagItems: $4.getDiagnosticsItemList(),
   }
-  // TODO(jane): Check information items are valid for area option.
+  // TODO(drewk): Check information items are valid for area option.
   }
 ;
 
@@ -778,7 +895,7 @@ getdiag_list_item: IDENT assign_operator getdiag_item
     $$.val = &plpgsqltree.GetDiagnosticsItem{
       Kind : $3.getDiagnosticsKind(),
       TargetName: $1,
-      // TODO(jane): set the target from $1.
+      // TODO(drewk): set the target from $1.
     }
   }
 ;
@@ -810,14 +927,14 @@ getdiag_item: unreserved_keyword {
     case "returned_sqlstate":
       $$.val = plpgsqltree.GetDiagnosticsReturnedSQLState;
     default:
-      // TODO(jane): Should this use an unimplemented error instead?
-      setErr(plpgsqllex, errors.Newf("unrecognized GET DIAGNOSTICS item: %s", redact.Safe($1)))
+      // TODO(drewk): Should this use an unimplemented error instead?
+      return setErr(plpgsqllex, errors.Newf("unrecognized GET DIAGNOSTICS item: %s", redact.Safe($1)))
   }
 }
 ;
 
 getdiag_target:
-// TODO(jane): remove ident.
+// TODO(drewk): remove ident.
 IDENT
   {
   }
@@ -882,12 +999,15 @@ stmt_case: CASE opt_expr_until_when case_when_list opt_case_else END_CASE CASE '
 
 opt_expr_until_when:
   {
-    expr := ""
-    tok := plpgsqllex.(*lexer).Peek()
-    if tok.id != WHEN {
-      expr = plpgsqllex.(*lexer).ReadSqlExpressionStr(WHEN)
+    if plpgsqllex.(*lexer).Peek().id != WHEN {
+      sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(WHEN)
+      if err != nil {
+        return setErr(plpgsqllex, err)
+      }
+      $$ = sqlStr
+    } else {
+      $$ = ""
     }
-    $$ = expr
   }
 ;
 
@@ -927,59 +1047,83 @@ opt_case_else:
 
 stmt_loop: opt_loop_label LOOP loop_body opt_label ';'
   {
-    // TODO(drewk): does the second usage of the label actually
-    // do anything?
+    loopLabel, loopEndLabel := $1, $4
+    if err := checkLoopLabels(loopLabel, loopEndLabel); err != nil {
+      return setErr(plpgsqllex, err)
+    }
     $$.val = &plpgsqltree.Loop{
-      Label: $1,
+      Label: loopLabel,
       Body: $3.statements(),
     }
   }
 ;
 
-stmt_while: opt_loop_label WHILE expr_until_loop loop_body
+stmt_while: opt_loop_label WHILE expr_until_loop LOOP loop_body opt_label ';'
   {
-    return unimplemented(plpgsqllex, "while loop")
+    loopLabel, loopEndLabel := $1, $6
+    if err := checkLoopLabels(loopLabel, loopEndLabel); err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    cond, err := plpgsqllex.(*lexer).ParseExpr($3)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = &plpgsqltree.While{
+      Label: loopLabel,
+      Condition: cond,
+      Body: $5.statements(),
+    }
   }
 ;
 
-stmt_for: opt_loop_label FOR for_control loop_body
+stmt_for: opt_loop_label FOR for_target IN for_control loop_body opt_label ';'
   {
-    return unimplemented(plpgsqllex, "for loop")
+    loopLabel, loopEndLabel := $1, $7
+    if err := checkLoopLabels(loopLabel, loopEndLabel); err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = &plpgsqltree.ForLoop{
+			Label: loopLabel,
+			Target: $3.variables(),
+			Control: $5.forLoopControl(),
+			Body: $6.statements(),
+		}
   }
 ;
 
-for_control: for_variable IN
-  // TODO need to parse the sql expression here.
+for_control:
   {
-    return unimplemented(plpgsqllex, "for loop")
+	  foundToken, err := plpgsqllex.(*lexer).findFirstOccurrence(DOT_DOT, LOOP)
+	  if err != nil {
+	    return setErr(plpgsqllex, err)
+	  }
+	  switch foundToken {
+	  case DOT_DOT:
+	    // This is an iteration over an integer range.
+	    forLoopControl, err := plpgsqllex.(*lexer).ReadIntegerForLoopControl()
+	    if err != nil {
+	      return setErr(plpgsqllex, err)
+	    }
+	    $$.val = forLoopControl
+	  case LOOP:
+	    return unimplemented(plpgsqllex, "for loop over query or cursor")
+	  default:
+	    return setErr(plpgsqllex, errors.New("unterminated FOR loop definition"))
+	  }
   }
 ;
 
-/*
- * Processing the for_variable is tricky because we don't yet know if the
- * FOR is an integer FOR loop or a loop over query results.  In the former
- * case, the variable is just a name that we must instantiate as a loop
- * local variable, regardless of any other definition it might have.
- * Therefore, we always save the actual identifier into $$.name where it
- * can be used for that case.  We also save the outer-variable definition,
- * if any, because that's what we need for the loop-over-query case.  Note
- * that we must NOT apply check_assignable() or any other semantic check
- * until we know what's what.
- *
- * However, if we see a comma-separated list of names, we know that it
- * can't be an integer FOR loop and so it's OK to check the variables
- * immediately.  In particular, for T_WORD followed by comma, we should
- * complain that the name is not known rather than say it's a syntax error.
- * Note that the non-error result of this case sets *both* $$.scalar and
- * $$.row; see the for_control production.
- */
-for_variable: any_identifier
+for_target:
   {
-    return unimplemented(plpgsqllex, "for loop")
+    target, err := plpgsqllex.(*lexer).ReadTarget()
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = target
   }
 ;
 
-stmt_foreach_a: opt_loop_label FOREACH for_variable foreach_slice IN ARRAY expr_until_loop loop_body
+stmt_foreach_a: opt_loop_label FOREACH
   {
     return unimplemented(plpgsqllex, "for each loop")
   }
@@ -1011,47 +1155,51 @@ stmt_continue: CONTINUE opt_label opt_exitcond
   }
 ;
 
-  // TODO handle variable names
-  // 1. verify if the first token is a variable (this means that we need to track variable scope during parsing)
-  // 2. if yes, check next token is ';'
-  // 3. if no, expecting a sql expression "read_sql_expression"
-  //    we can just read until a ';', then do the sql expression validation during compile time.
-
-stmt_return: RETURN return_variable ';'
+stmt_return: RETURN return_expr ';'
   {
-    $$.val = &plpgsqltree.Return{
-      Expr: $2.expr(),
+    var expr plpgsqltree.Expr
+    if $2 != "" {
+      var err error
+      expr, err = plpgsqllex.(*lexer).ParseExpr($2)
+      if err != nil {
+        return setErr(plpgsqllex, err)
+      }
     }
+    $$.val = &plpgsqltree.Return{Expr: expr}
   }
-| RETURN_NEXT NEXT return_variable ';'
+| RETURN_NEXT NEXT
   {
     return unimplemented(plpgsqllex, "return next")
   }
-| RETURN_QUERY QUERY query_options ';'
+| RETURN_QUERY QUERY
  {
    return unimplemented (plpgsqllex, "return query")
  }
 ;
 
-
-query_options:
+return_expr:
   {
-    _, terminator := plpgsqllex.(*lexer).ReadSqlExpressionStr2(EXECUTE, ';')
-    if terminator == EXECUTE {
-      return unimplemented (plpgsqllex, "return dynamic sql query")
-    }
-    plpgsqllex.(*lexer).ReadSqlExpressionStr(';')
-  }
-;
-
-
-return_variable: expr_until_semi
-  {
-    expr, err := plpgsqllex.(*lexer).ParseExpr($1)
+    sqlStr, err := plpgsqllex.(*lexer).ReadReturnExpr()
     if err != nil {
       return setErr(plpgsqllex, err)
     }
-    $$.val = expr
+    $$ = sqlStr
+  }
+;
+
+query_options:
+  {
+    _, terminator, err := plpgsqllex.(*lexer).ReadSqlExpr(EXECUTE, ';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    if terminator == EXECUTE {
+      return unimplemented (plpgsqllex, "return dynamic sql query")
+    }
+    _, _, err = plpgsqllex.(*lexer).ReadSqlExpr(';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
   }
 ;
 
@@ -1135,7 +1283,10 @@ option_expr:
   option_type assign_operator
   {
     // Read until reaching one of the tokens that can follow a raise option.
-    sqlStr, _ := plpgsqllex.(*lexer).ReadSqlConstruct(',', ';')
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(',', ';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
     optionExpr, err := plpgsqllex.(*lexer).ParseExpr(sqlStr)
     if err != nil {
       return setErr(plpgsqllex, err)
@@ -1184,7 +1335,10 @@ format_exprs:
 format_expr: ','
   {
     // Read until reaching a token that can follow a raise format parameter.
-    sqlStr, _ := plpgsqllex.(*lexer).ReadSqlConstruct(',', ';', USING)
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(',', ';', USING)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
     param, err := plpgsqllex.(*lexer).ParseExpr(sqlStr)
     if err != nil {
       return setErr(plpgsqllex, err)
@@ -1201,9 +1355,15 @@ stmt_assert: ASSERT assert_cond ';'
 
 assert_cond:
   {
-    _, terminator := plpgsqllex.(*lexer).ReadSqlExpressionStr2(',', ';')
+    _, terminator, err := plpgsqllex.(*lexer).ReadSqlExpr(',', ';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
     if terminator == ',' {
-      plpgsqllex.(*lexer).ReadSqlExpressionStr(';')
+      _, _, err = plpgsqllex.(*lexer).ReadSqlExpr(';')
+      if err != nil {
+        return setErr(plpgsqllex, err)
+      }
     }
   }
 ;
@@ -1227,79 +1387,103 @@ stmt_execsql: stmt_execsql_start
 stmt_execsql_start:
   IMPORT
 | INSERT
+| UPSERT
 | MERGE
 | IDENT
 ;
 
 stmt_dynexecute: EXECUTE
   {
-    $$.val = plpgsqllex.(*lexer).MakeDynamicExecuteStmt()
+    stmt, err := plpgsqllex.(*lexer).MakeDynamicExecuteStmt()
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = stmt
   }
 ;
 
-// TODO: change expr_until_semi to process_cursor_before_semi
-stmt_open: OPEN IDENT open_stmt_processor ';'
+stmt_open: OPEN IDENT ';'
   {
-    openCursorStmt := $3.open()
-    openCursorStmt.CursorName = $2
-    $$.val = openCursorStmt
+    $$.val = &plpgsqltree.Open{CurVar: plpgsqltree.Variable($2)}
+  }
+| OPEN IDENT opt_scrollable FOR EXECUTE 
+  {
+    return unimplemented(plpgsqllex, "cursor for execute")
+  }
+| OPEN IDENT opt_scrollable FOR stmt_until_semi ';'
+  {
+    stmts, err := parser.Parse($5)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    if len(stmts) != 1 {
+      return setErr(plpgsqllex, errors.New("expected exactly one SQL statement for cursor"))
+    }
+    $$.val = &plpgsqltree.Open{
+      CurVar: plpgsqltree.Variable($2),
+      Scroll: $3.cursorScrollOption(),
+      Query: stmts[0].AST,
+    }
   }
 ;
 
-stmt_fetch: FETCH opt_fetch_direction IDENT INTO
+stmt_fetch: FETCH
   {
-    return unimplemented(plpgsqllex, "fetch")
+    fetch, err := plpgsqllex.(*lexer).MakeFetchOrMoveStmt(false)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = fetch
   }
 ;
 
-stmt_move: MOVE opt_fetch_direction IDENT ';'
+stmt_move: MOVE
   {
-    return unimplemented(plpgsqllex, "move")
+    move, err := plpgsqllex.(*lexer).MakeFetchOrMoveStmt(true)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = move
   }
 ;
 
-opt_fetch_direction:
+stmt_close: CLOSE IDENT ';'
   {
-      return unimplemented(plpgsqllex, "fetch direction")
-  }
-
-stmt_close: CLOSE cursor_variable ';'
-  {
-    $$.val = &plpgsqltree.Close{}
+    $$.val = &plpgsqltree.Close{CurVar: plpgsqltree.Variable($2)}
   }
 ;
 
 stmt_null: NULL ';'
   {
-  $$.val = &plpgsqltree.Null{};
+    $$.val = &plpgsqltree.Null{};
   }
 ;
 
 stmt_commit: COMMIT opt_transaction_chain ';'
   {
-    return unimplemented(plpgsqllex, "commit")
+    $$.val = &plpgsqltree.TransactionControl{Chain: $2.bool()}
   }
 ;
 
 stmt_rollback: ROLLBACK opt_transaction_chain ';'
   {
-    return unimplemented(plpgsqllex, "rollback")
+    $$.val = &plpgsqltree.TransactionControl{Chain: $2.bool(), Rollback: true}
   }
 ;
 
 opt_transaction_chain:
 AND CHAIN
-  { }
-| AND NO CHAIN
-  { }
-| /* EMPTY */
-  { }
-
-cursor_variable: IDENT
   {
-    unimplemented(plpgsqllex, "cursor variable")
+    $$.val = true
   }
-;
+| AND NO CHAIN
+  {
+    $$.val = false
+  }
+| /* EMPTY */
+  {
+    $$.val = false
+  }
 
 exception_sect: /* EMPTY */
   {
@@ -1354,32 +1538,53 @@ proc_condition: any_identifier
   }
 ;
 
-open_stmt_processor:
-  {
-	  $$.val = plpgsqllex.(*lexer).ProcessForOpenCursor(true)
-  }
-
 expr_until_semi:
   {
-    $$ = plpgsqllex.(*lexer).ReadSqlExpressionStr(';')
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$ = sqlStr
+  }
+;
+
+stmt_until_semi:
+  {
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlStatement(';')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$ = sqlStr
   }
 ;
 
 expr_until_then:
   {
-    $$ = plpgsqllex.(*lexer).ReadSqlExpressionStr(THEN)
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(THEN)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$ = sqlStr
   }
 ;
 
 expr_until_loop:
   {
-    return unimplemented(plpgsqllex, "loop expr")
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(LOOP)
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$ = sqlStr
   }
 ;
 
 expr_until_paren :
   {
-    $$ = plpgsqllex.(*lexer).ReadSqlExpressionStr(')')
+    sqlStr, _, err := plpgsqllex.(*lexer).ReadSqlExpr(')')
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$ = sqlStr
   }
 ;
 
@@ -1408,6 +1613,9 @@ opt_label:
     $$ = ""
   }
 | any_identifier
+  {
+    $$ = $1
+  }
 ;
 
 opt_exitcond: ';'
@@ -1422,11 +1630,8 @@ opt_exitcond: ';'
   }
 ;
 
-/*
- * need to allow DATUM because scanner will have tried to resolve as variable
- */
 any_identifier:
-IDENT
+  IDENT
 | unreserved_keyword
 ;
 
@@ -1471,6 +1676,7 @@ unreserved_keyword:
 | INFO
 | INSERT
 | IS
+| LANGUAGE
 | LAST
 | LOG
 | MERGE
@@ -1511,6 +1717,7 @@ unreserved_keyword:
 | TABLE
 | TABLE_NAME
 | TYPE
+| UPSERT
 | USE_COLUMN
 | USE_VARIABLE
 | VARIABLE_CONFLICT

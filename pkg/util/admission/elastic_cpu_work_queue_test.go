@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package admission
 
@@ -18,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/datadriven"
@@ -64,7 +60,7 @@ func TestElasticCPUWorkQueue(t *testing.T) {
 					d.ScanArgs(t, "disabled", &elasticCPUInternalWorkQueue.disabled)
 				}
 
-				handle, err := elasticWorkQ.Admit(ctx, duration, WorkInfo{})
+				handle, err := elasticWorkQ.Admit(ctx, duration, WorkInfo{TenantID: roachpb.SystemTenantID})
 				require.NoError(t, err)
 
 				var buf strings.Builder
@@ -97,7 +93,7 @@ func TestElasticCPUWorkQueue(t *testing.T) {
 				allotted, err := time.ParseDuration(allottedStr)
 				require.NoError(t, err)
 
-				handle := &ElasticCPUWorkHandle{}
+				handle := &ElasticCPUWorkHandle{tenantID: roachpb.SystemTenantID}
 				handle.testingOverrideRunningTime = func() time.Duration {
 					return running
 				}
@@ -168,6 +164,15 @@ func (t *testElasticCPUInternalWorkQueue) Admit(
 
 func (t *testElasticCPUInternalWorkQueue) SetTenantWeights(tenantWeights map[uint64]uint32) {
 	panic("unimplemented")
+}
+
+func (t *testElasticCPUInternalWorkQueue) adjustTenantUsed(
+	tenantID roachpb.TenantID, additionalUsed int64,
+) {
+	if !t.disabled {
+		fmt.Fprintf(&t.buf, "adjust-tenant-used: tenant=%s additional-used=%s",
+			tenantID.String(), time.Duration(additionalUsed).String())
+	}
 }
 
 func (t *testElasticCPUInternalWorkQueue) hasWaitingRequests() bool {

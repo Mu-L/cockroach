@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descmetadata
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -21,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
@@ -60,10 +57,10 @@ func (mu metadataUpdater) DeleteDatabaseRoleSettings(ctx context.Context, dbID d
 	rowsDeleted, err := mu.txn.ExecEx(ctx,
 		"delete-db-role-setting",
 		mu.txn.KV(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf(
-			`DELETE FROM %s WHERE database_id = $1`,
-			sessioninit.DatabaseRoleSettingsTableName,
+			`DELETE FROM system.public.%s WHERE database_id = $1`,
+			catconstants.DatabaseRoleSettingsTableName,
 		),
 		dbID,
 	)
@@ -85,12 +82,12 @@ func (mu metadataUpdater) DeleteDatabaseRoleSettings(ctx context.Context, dbID d
 }
 
 // DeleteSchedule implement scexec.DescriptorMetadataUpdater.
-func (mu metadataUpdater) DeleteSchedule(ctx context.Context, scheduleID int64) error {
+func (mu metadataUpdater) DeleteSchedule(ctx context.Context, scheduleID jobspb.ScheduleID) error {
 	_, err := mu.txn.ExecEx(
 		ctx,
 		"delete-schedule",
 		mu.txn.KV(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		"DELETE FROM system.scheduled_jobs WHERE schedule_id = $1",
 		scheduleID,
 	)
@@ -109,7 +106,7 @@ func (mu metadataUpdater) UpdateTTLScheduleLabel(
 		ctx,
 		"update-ttl-schedule-label",
 		mu.txn.KV(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		"UPDATE system.scheduled_jobs SET schedule_name = $1 WHERE schedule_id = $2",
 		ttlbase.BuildScheduleLabel(tbl),
 		tbl.RowLevelTTL.ScheduleID,

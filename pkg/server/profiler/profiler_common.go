@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package profiler
 
@@ -86,10 +81,12 @@ func (o *profiler) now() time.Time {
 	return timeutil.Now()
 }
 
+// args is optional and will be passed as is into takeProfileFn.
 func (o *profiler) maybeTakeProfile(
 	ctx context.Context,
 	thresholdValue int64,
-	takeProfileFn func(ctx context.Context, path string) bool,
+	takeProfileFn func(ctx context.Context, path string, args ...interface{}) bool,
+	args ...interface{},
 ) {
 	if o.resetInterval() == 0 {
 		// Instruction to disable.
@@ -118,7 +115,7 @@ func (o *profiler) maybeTakeProfile(
 	if o.knobs.dontWriteProfiles {
 		return
 	}
-	success := takeProfileFn(ctx, o.store.makeNewFileName(now, thresholdValue))
+	success := takeProfileFn(ctx, o.store.makeNewFileName(now, thresholdValue), args...)
 	if success {
 		// We only remove old files if the current dump was
 		// successful. Otherwise, the GC may remove "interesting" files

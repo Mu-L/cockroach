@@ -1,19 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
+import map from "lodash/map";
 import React from "react";
-import _ from "lodash";
 
 import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
-import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 import { GraphDashboardProps, nodeDisplayName } from "./dashboardUtils";
 
@@ -25,6 +20,7 @@ export default function (props: GraphDashboardProps) {
       title="Batches"
       sources={nodeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis label="batches">
         <Metric
@@ -40,7 +36,12 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="RPCs" sources={nodeSources} tenantSource={tenantSource}>
+    <LineGraph
+      title="RPCs"
+      sources={nodeSources}
+      tenantSource={tenantSource}
+      showMetricsInTooltip={true}
+    >
       <Axis label="rpcs">
         <Metric
           name="cr.node.distsender.rpc.sent"
@@ -59,6 +60,7 @@ export default function (props: GraphDashboardProps) {
       title="RPC Errors"
       sources={nodeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis label="errors">
         <Metric
@@ -83,6 +85,7 @@ export default function (props: GraphDashboardProps) {
       title="KV Transactions"
       sources={nodeSources}
       tenantSource={tenantSource}
+      showMetricsInTooltip={true}
     >
       <Axis label="transactions">
         <Metric name="cr.node.txn.commits" title="Committed" nonNegativeRate />
@@ -99,10 +102,11 @@ export default function (props: GraphDashboardProps) {
       title="KV Transaction Durations: 99th percentile"
       tenantSource={tenantSource}
       tooltip={`The 99th percentile of transaction durations over a 1 minute period.
-                              Values are displayed individually for each node.`}
+          Values are displayed individually for each node.`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="transaction duration">
-        {_.map(nodeIDs, node => (
+        {map(nodeIDs, node => (
           <Metric
             key={node}
             name="cr.node.txn.durations-p99"
@@ -118,10 +122,11 @@ export default function (props: GraphDashboardProps) {
       title="KV Transaction Durations: 90th percentile"
       tenantSource={tenantSource}
       tooltip={`The 90th percentile of transaction durations over a 1 minute period.
-                              Values are displayed individually for each node.`}
+          Values are displayed individually for each node.`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="transaction duration">
-        {_.map(nodeIDs, node => (
+        {map(nodeIDs, node => (
           <Metric
             key={node}
             name="cr.node.txn.durations-p90"
@@ -136,11 +141,13 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Node Heartbeat Latency: 99th percentile"
       tenantSource={tenantSource}
-      tooltip={`The 99th percentile of latency to heartbeat a node's internal liveness record over a 1 minute period.
-                              Values are displayed individually for each node.`}
+      tooltip={`The 99th percentile of latency to heartbeat a node's internal liveness
+          record over a 1 minute period. Values are displayed individually for
+          each node.`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="heartbeat latency">
-        {_.map(nodeIDs, node => (
+        {map(nodeIDs, node => (
           <Metric
             key={node}
             name="cr.node.liveness.heartbeatlatency-p99"
@@ -155,11 +162,13 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Node Heartbeat Latency: 90th percentile"
       tenantSource={tenantSource}
-      tooltip={`The 90th percentile of latency to heartbeat a node's internal liveness record over a 1 minute period.
-                              Values are displayed individually for each node.`}
+      tooltip={`The 90th percentile of latency to heartbeat a node's internal liveness
+          record over a 1 minute period. Values are displayed individually for
+          each node.`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="heartbeat latency">
-        {_.map(nodeIDs, node => (
+        {map(nodeIDs, node => (
           <Metric
             key={node}
             name="cr.node.liveness.heartbeatlatency-p90"

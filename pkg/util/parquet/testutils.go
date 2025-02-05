@@ -1,19 +1,13 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parquet
 
 import (
 	"bytes"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -24,36 +18,45 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 	"github.com/stretchr/testify/require"
 )
 
+// includeParquestReaderMetadata configures the parquet writer to write metadata
+// required for reading parquet files in tests.
+var includeParquestReaderMetadata = buildutil.CrdbTestBuild ||
+	envutil.EnvOrDefaultBool("COCKROACH_CHANGEFEED_TESTING_INCLUDE_PARQUET_READER_METADATA",
+		false)
+
 // ReadFileAndVerifyDatums asserts that a parquet file's metadata matches the
 // metadata from the writer and its data matches writtenDatums.
+//
+// It returns a ReadDatumsMetadata struct with metadata about the file.
+// This function will assert the number of rows and columns in the metadata
+// match, but the remaining fields are left for the caller to assert.
 func ReadFileAndVerifyDatums(
 	t *testing.T,
 	parquetFile string,
 	expectedNumRows int,
 	expectedNumCols int,
-	writer *Writer,
 	writtenDatums [][]tree.Datum,
-) {
+) ReadDatumsMetadata {
 	meta, readDatums, err := ReadFile(parquetFile)
 
 	require.NoError(t, err)
 	require.Equal(t, expectedNumRows, meta.NumRows)
 	require.Equal(t, expectedNumCols, meta.NumCols)
 
-	expectedNumRowGroups := int(math.Ceil(float64(expectedNumRows) / float64(writer.cfg.maxRowGroupLength)))
-	require.EqualValues(t, expectedNumRowGroups, meta.NumRowGroups)
-
 	for i := 0; i < expectedNumRows; i++ {
 		for j := 0; j < expectedNumCols; j++ {
 			ValidateDatum(t, writtenDatums[i][j], readDatums[i][j])
 		}
 	}
+	return meta
 }
 
 // ReadFile reads a parquet file and returns the contained metadata and datums.
@@ -382,6 +385,7 @@ func ValidateDatum(t *testing.T, expected tree.Datum, actual tree.Datum) {
 	// we should unwrap them. We unwrap at this stage as opposed to when
 	// generating datums to test that the writer can handle wrapped datums.
 	expected = unwrapDatum(expected)
+	actual = unwrapDatum(actual)
 
 	switch expected.ResolvedType().Family() {
 	case types.JsonFamily:
@@ -422,6 +426,8 @@ func ValidateDatum(t *testing.T, expected tree.Datum, actual tree.Datum) {
 		require.Equal(t, expected.(*tree.DEnum).LogicalRep, actual.(*tree.DEnum).LogicalRep)
 	case types.CollatedStringFamily:
 		require.Equal(t, expected.(*tree.DCollatedString).Contents, actual.(*tree.DCollatedString).Contents)
+	case types.OidFamily:
+		require.Equal(t, expected.(*tree.DOid).Oid, actual.(*tree.DOid).Oid)
 	default:
 		require.Equal(t, expected, actual)
 	}

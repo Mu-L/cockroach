@@ -1,17 +1,13 @@
 # Test token bucket that has gone into debt.
 
-# Wait for initial 10K RUs to be granted.
-wait-for-event
-token-bucket-response
-----
-
-# Set up throttling at 1000 RU/s.
+# Set up throttling at 1000 tokens/s.
 configure
 throttle: 1000
 ----
 
-# Issue 6K write that triggers fetch of more RU and also sets throttle rate.
-write bytes=6141952
+# Issue 2K RU write that triggers fetch of more tokens and also sets throttle
+# rate.
+write bytes=2045945
 ----
 
 wait-for-event
@@ -20,11 +16,11 @@ token-bucket-response
 
 token-bucket
 ----
-4000.00 RU filling @ 1000.00 RU/s
+3000.00 tokens filling @ 1000.00 tokens/s (limited to 15000.00 tokens)
 
-# Consume 6K RUs that causes bucket to go into debt.
+# Consume 5K RUs that causes bucket to go into debt.
 cpu
-18s
+15s
 ----
 
 advance wait=true
@@ -34,11 +30,11 @@ advance wait=true
 
 token-bucket
 ----
-0.00 RU filling @ 1000.00 RU/s (996.67 waiting debt @ 498.33 RU/s)
+0.00 tokens filling @ 1000.00 tokens/s (limited to 15000.00 tokens) (996.67 waiting debt @ 498.33 tokens/s)
 
 # Verify that a small write doesn't have to wait a second for the entire debt
 # to be paid.
-write bytes=1024 label=w1
+write bytes=1020 label=w1
 ----
 
 timers
@@ -56,9 +52,9 @@ await label=w1
 
 token-bucket
 ----
-47.17 RU filling @ 1000.00 RU/s (946.83 waiting debt @ 498.33 RU/s)
+47.17 tokens filling @ 1000.00 tokens/s (limited to 15000.00 tokens) (946.83 waiting debt @ 498.33 tokens/s)
 
-# Consume enough RUs that the debt cannot be paid within debtApplySecs.
+# Consume enough tokens that the debt cannot be paid within debtApplySecs.
 pgwire-egress
 4096000
 ----
@@ -70,7 +66,7 @@ advance wait=true
 
 token-bucket
 ----
--1399.67 RU filling @ 1000.00 RU/s (2000.00 waiting debt @ 1000.00 RU/s)
+-1399.67 tokens filling @ 1000.00 tokens/s (limited to 15000.00 tokens) (2000.00 waiting debt @ 1000.00 tokens/s)
 
 # Advance and ensure that waiting debt is reduced.
 advance
@@ -80,7 +76,7 @@ advance
 
 token-bucket
 ----
--1399.67 RU filling @ 1000.00 RU/s (1600.00 waiting debt @ 1000.00 RU/s)
+-1399.67 tokens filling @ 1000.00 tokens/s (limited to 15000.00 tokens) (1600.00 waiting debt @ 1000.00 tokens/s)
 
 advance wait=true
 1s
@@ -89,9 +85,10 @@ advance wait=true
 
 token-bucket
 ----
--1399.67 RU filling @ 1000.00 RU/s (600.00 waiting debt @ 300.00 RU/s)
+-1399.67 tokens filling @ 1000.00 tokens/s (limited to 15000.00 tokens) (600.00 waiting debt @ 300.00 tokens/s)
 
-# Advance again and ensure that both available RUs and waiting debt are reduced.
+# Advance again and ensure that both available tokens and waiting debt are
+# reduced.
 advance wait=true
 1s
 ----
@@ -99,4 +96,4 @@ advance wait=true
 
 token-bucket
 ----
--699.67 RU filling @ 1000.00 RU/s (300.00 waiting debt @ 150.00 RU/s)
+-699.67 tokens filling @ 1000.00 tokens/s (limited to 15000.00 tokens) (300.00 waiting debt @ 150.00 tokens/s)

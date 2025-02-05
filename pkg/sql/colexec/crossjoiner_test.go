@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -383,6 +378,8 @@ func TestCrossJoiner(t *testing.T) {
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	defer closerRegistry.Close(ctx)
 
 	for _, spillForced := range []bool{false, true} {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
@@ -392,18 +389,15 @@ func TestCrossJoiner(t *testing.T) {
 				runHashJoinTestCase(t, tc, nil /* rng */, func(sources []colexecop.Operator) (colexecop.Operator, error) {
 					spec := createSpecForHashJoiner(tc)
 					args := &colexecargs.NewColOperatorArgs{
-						Spec:                spec,
-						Inputs:              colexectestutils.MakeInputs(sources),
-						StreamingMemAccount: testMemAcc,
-						DiskQueueCfg:        queueCfg,
-						FDSemaphore:         colexecop.NewTestingSemaphore(colexecop.ExternalHJMinPartitions),
-						MonitorRegistry:     &monitorRegistry,
+						Spec:            spec,
+						Inputs:          colexectestutils.MakeInputs(sources),
+						DiskQueueCfg:    queueCfg,
+						FDSemaphore:     colexecop.NewTestingSemaphore(colexecop.ExternalHJMinPartitions),
+						MonitorRegistry: &monitorRegistry,
+						CloserRegistry:  &closerRegistry,
 					}
 					result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
-					if err != nil {
-						return nil, err
-					}
-					return result.Root, nil
+					return result.Root, err
 				})
 			}
 		}
@@ -433,7 +427,11 @@ func BenchmarkCrossJoiner(b *testing.B) {
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
-	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	afterEachRun := func() {
+		closerRegistry.BenchmarkReset(ctx)
+		monitorRegistry.BenchmarkReset(ctx)
+	}
 
 	for _, spillForced := range []bool{false, true} {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
@@ -456,11 +454,11 @@ func BenchmarkCrossJoiner(b *testing.B) {
 				args := &colexecargs.NewColOperatorArgs{
 					Spec: spec,
 					// Inputs will be set below.
-					Inputs:              []colexecargs.OpWithMetaInfo{{}, {}},
-					StreamingMemAccount: testMemAcc,
-					DiskQueueCfg:        queueCfg,
-					FDSemaphore:         colexecop.NewTestingSemaphore(VecMaxOpenFDsLimit),
-					MonitorRegistry:     &monitorRegistry,
+					Inputs:          []colexecargs.OpWithMetaInfo{{}, {}},
+					DiskQueueCfg:    queueCfg,
+					FDSemaphore:     colexecop.NewTestingSemaphore(VecMaxOpenFDsLimit),
+					MonitorRegistry: &monitorRegistry,
+					CloserRegistry:  &closerRegistry,
 				}
 				b.Run(fmt.Sprintf("spillForced=%t/type=%s/rows=%d", spillForced, joinType, nRows), func(b *testing.B) {
 					var nOutputRows int
@@ -480,6 +478,7 @@ func BenchmarkCrossJoiner(b *testing.B) {
 						cj.Init(ctx)
 						for b := cj.Next(); b.Length() > 0; b = cj.Next() {
 						}
+						afterEachRun()
 					}
 				})
 			}

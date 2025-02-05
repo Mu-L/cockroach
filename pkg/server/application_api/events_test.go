@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package application_api_test
 
@@ -42,7 +37,7 @@ func TestAdminAPIEvents(t *testing.T) {
 		"CREATE TABLE api_test.tbl3 (a INT)",
 		"DROP TABLE api_test.tbl1",
 		"DROP TABLE api_test.tbl2",
-		"SET CLUSTER SETTING cluster.organization = 'somestring';",
+		"SET CLUSTER SETTING cluster.label = 'somestring';",
 	}
 	for _, q := range setupQueries {
 		if _, err := db.Exec(q); err != nil {
@@ -135,7 +130,7 @@ func TestAdminAPIEvents(t *testing.T) {
 				if len(e.Info) == 0 {
 					t.Errorf("%d: missing/empty Info", i)
 				}
-				if isSettingChange && strings.Contains(e.Info, "cluster.organization") {
+				if isSettingChange && strings.Contains(e.Info, "cluster.label") {
 					if tc.unredacted {
 						if !strings.Contains(e.Info, "somestring") {
 							t.Errorf("%d: require 'somestring' in Info", i)

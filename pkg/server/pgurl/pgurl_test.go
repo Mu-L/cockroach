@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgurl
 
@@ -137,6 +132,27 @@ func TestOptions(t *testing.T) {
 	err = u.SetOption("application_name", "baz")
 	require.NoError(t, err)
 	require.Equal(t, u.extraOptions["application_name"], []string{"baz"})
+}
+
+func TestClone(t *testing.T) {
+	u := New()
+	require.NoError(t, u.SetOption("user", "testuser"))
+	require.Equal(t, u.GetUsername(), "testuser")
+	require.NoError(t, u.SetOption("application_name", "testapp"))
+	require.Equal(t, []string{"testapp"}, u.extraOptions["application_name"])
+
+	u2 := u.Clone()
+	// u2 has initial values from u.
+	require.Equal(t, u2.GetUsername(), "testuser")
+	require.Equal(t, []string{"testapp"}, u2.extraOptions["application_name"])
+
+	// Modifications to u2 only impact u2.
+	require.NoError(t, u2.SetOption("user", "testuser2"))
+	require.NoError(t, u2.SetOption("application_name", "testapp2"))
+	require.Equal(t, u2.GetUsername(), "testuser2")
+	require.Equal(t, u.GetUsername(), "testuser")
+	require.Equal(t, []string{"testapp"}, u.extraOptions["application_name"])
+	require.Equal(t, []string{"testapp2"}, u2.extraOptions["application_name"])
 }
 
 // Silence the unused linter

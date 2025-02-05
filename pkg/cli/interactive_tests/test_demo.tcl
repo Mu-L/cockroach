@@ -36,7 +36,9 @@ eexpect "http://127.0.0.1:8080"
 eexpect "(sql)"
 eexpect "root"
 eexpect ":26257/movr"
-eexpect "movr>"
+# Check that the system tenant's name is not printed in the prompt since we
+# don't have any application tenants.
+eexpect ":26257/movr>"
 send_eof
 eexpect eof
 end_test
@@ -44,7 +46,7 @@ end_test
 start_test "Check that demo insecure, env var, says hello properly"
 # With env var.
 set ::env(COCKROACH_INSECURE) "true"
-spawn $argv demo --no-line-editor --no-example-database --log-dir=logs
+spawn $argv demo --no-line-editor --no-example-database --log-dir=logs --multitenant=true
 eexpect "Welcome"
 eexpect "defaultdb>"
 end_test
@@ -103,7 +105,7 @@ start_test "Check that demo secure says hello properly"
 
 # With env var.
 set ::env(COCKROACH_INSECURE) "false"
-spawn $argv demo --no-line-editor --no-example-database --log-dir=logs
+spawn $argv demo --no-line-editor --no-example-database --log-dir=logs --multitenant=true
 eexpect "Welcome"
 
 eexpect "(webui)"
@@ -266,7 +268,7 @@ eexpect "defaultdb>"
 send_eof
 eexpect eof
 
-spawn $argv demo --no-line-editor --no-example-database --nodes 3 --sql-port 23000 --log-dir=logs
+spawn $argv demo --no-line-editor --no-example-database --nodes 3 --sql-port 23000 --log-dir=logs --multitenant=true
 eexpect "Welcome"
 eexpect "defaultdb>"
 

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -26,10 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
@@ -255,8 +250,8 @@ func populateRoleHierarchy(
 	if err != nil {
 		return err
 	}
-	return forEachRoleMembership(ctx, p.InternalSQLTxn(), func(
-		role, member username.SQLUsername, isAdmin bool,
+	return forEachRoleMembershipAtCacheReadTS(ctx, p, func(
+		ctx context.Context, role, member username.SQLUsername, isAdmin bool,
 	) error {
 		// The ADMIN OPTION is inherited through the role hierarchy, and grantee
 		// is supposed to be the role that has the ADMIN OPTION. The current user
@@ -277,6 +272,46 @@ func populateRoleHierarchy(
 	)
 }
 
+var informationSchemaAttributesTable = virtualSchemaView{
+	comment: `attributes of composite data types in the current database` +
+		docs.URL("information-schema.html#attributes") + `
+    https://www.postgresql.org/docs/16/infoschema-attributes.html`,
+	schema: vtable.InformationSchemaAttributes,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "udt_catalog", Typ: types.String},
+		{Name: "udt_schema", Typ: types.String},
+		{Name: "udt_name", Typ: types.String},
+		{Name: "attribute_name", Typ: types.String},
+		{Name: "ordinal_position", Typ: types.Int},
+		{Name: "attribute_default", Typ: types.String},
+		{Name: "is_nullable", Typ: types.String},
+		{Name: "data_type", Typ: types.String},
+		{Name: "character_maximum_length", Typ: types.Int},
+		{Name: "character_octet_length", Typ: types.Int},
+		{Name: "character_set_catalog", Typ: types.String},
+		{Name: "character_set_schema", Typ: types.String},
+		{Name: "character_set_name", Typ: types.String},
+		{Name: "collation_catalog", Typ: types.String},
+		{Name: "collation_schema", Typ: types.String},
+		{Name: "collation_name", Typ: types.String},
+		{Name: "numeric_precision", Typ: types.Int},
+		{Name: "numeric_precision_radix", Typ: types.Int},
+		{Name: "numeric_scale", Typ: types.Int},
+		{Name: "datetime_precision", Typ: types.Int},
+		{Name: "interval_type", Typ: types.String},
+		{Name: "interval_precision", Typ: types.Int},
+		{Name: "attribute_udt_catalog", Typ: types.String},
+		{Name: "attribute_udt_schema", Typ: types.String},
+		{Name: "attribute_udt_name", Typ: types.String},
+		{Name: "scope_catalog", Typ: types.String},
+		{Name: "scope_schema", Typ: types.String},
+		{Name: "scope_name", Typ: types.String},
+		{Name: "maximum_cardinality", Typ: types.Int},
+		{Name: "dtd_identifier", Typ: types.String},
+		{Name: "is_derived_reference_attribute", Typ: types.String},
+	},
+}
+
 var informationSchemaCharacterSets = virtualSchemaTable{
 	comment: `character sets available in the current database
 ` + docs.URL("information-schema.html#character_sets") + `
@@ -284,7 +319,7 @@ https://www.postgresql.org/docs/9.5/infoschema-character-sets.html`,
 	schema: vtable.InformationSchemaCharacterSets,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
-			func(db catalog.DatabaseDescriptor) error {
+			func(ctx context.Context, db catalog.DatabaseDescriptor) error {
 				return addRow(
 					tree.DNull,                    // character_set_catalog
 					tree.DNull,                    // character_set_schema
@@ -305,12 +340,10 @@ var informationSchemaCheckConstraints = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-check-constraints.html`,
 	schema: vtable.InformationSchemaCheckConstraints,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /* no constraints in virtual tables */, func(
-			db catalog.DatabaseDescriptor,
-			sc catalog.SchemaDescriptor,
-			table catalog.TableDescriptor,
-			tableLookup tableLookupFn,
-		) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /* no constraints in virtual tables */
+		return forEachTableDesc(ctx, p, dbContext, opts, func(
+			ctx context.Context, descCtx tableDescContext) error {
+			db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(sc.GetName())
 			for _, ck := range table.EnforcedCheckConstraints() {
@@ -367,9 +400,10 @@ var informationSchemaColumnPrivileges = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-column-privileges.html`,
 	schema: vtable.InformationSchemaColumnPrivileges,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(
-			db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor,
-		) error {
+		opts := forEachTableDescOptions{virtualOpts: virtualMany}
+		return forEachTableDesc(ctx, p, dbContext, opts, func(
+			ctx context.Context, descCtx tableDescContext) error {
+			db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(sc.GetName())
 			columndata := privilege.List{privilege.SELECT, privilege.INSERT, privilege.UPDATE} // privileges for column level granularity
@@ -382,14 +416,14 @@ https://www.postgresql.org/docs/9.5/infoschema-column-privileges.html`,
 					if priv.Mask()&u.Privileges != 0 {
 						for _, cd := range table.PublicColumns() {
 							if err := addRow(
-								tree.DNull,                             // grantor
-								tree.NewDString(u.User().Normalized()), // grantee
-								dbNameStr,                              // table_catalog
-								scNameStr,                              // table_schema
-								tree.NewDString(table.GetName()),       // table_name
-								tree.NewDString(cd.GetName()),          // column_name
-								tree.NewDString(priv.String()),         // privilege_type
-								tree.DNull,                             // is_grantable
+								tree.DNull,                                  // grantor
+								tree.NewDString(u.User().Normalized()),      // grantee
+								dbNameStr,                                   // table_catalog
+								scNameStr,                                   // table_schema
+								tree.NewDString(table.GetName()),            // table_name
+								tree.NewDString(cd.GetName()),               // column_name
+								tree.NewDString(string(priv.DisplayName())), // privilege_type
+								tree.DNull,                                  // is_grantable
 							); err != nil {
 								return err
 							}
@@ -408,14 +442,18 @@ var informationSchemaColumnsTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 	schema: vtable.InformationSchemaColumns,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		allComments, err := p.Descriptors().GetAllComments(ctx, p.Txn())
+		allComments, err := p.Descriptors().GetAllComments(ctx, p.Txn(), dbContext)
 		if err != nil {
 			return err
 		}
-		// Get the collations for all comments of current database.
-		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(
-			db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor,
-		) error {
+		opts := forEachTableDescOptions{virtualOpts: virtualMany}
+		return forEachTableDesc(ctx, p, dbContext, opts, func(
+			ctx context.Context, descCtx tableDescContext) error {
+			db, sc, table := descCtx.database, descCtx.schema, descCtx.table
+			// Get the collations for all comments of current database.
+			if table.IsSequence() {
+				return nil
+			}
 			// Push all comments of columns into map.
 			commentMap := make(map[descpb.PGAttributeNum]string)
 			if err := allComments.ForEachCommentOnDescriptor(
@@ -445,7 +483,7 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 				colDefault := tree.DNull
 				if column.HasDefault() {
 					colExpr, err := schemaexpr.FormatExprForDisplay(
-						ctx, table, column.GetDefaultExpr(), &p.semaCtx, p.SessionData(), tree.FmtParsableNumerics,
+						ctx, table, column.GetDefaultExpr(), p.EvalContext(), &p.semaCtx, p.SessionData(), tree.FmtParsableNumerics,
 					)
 					if err != nil {
 						return err
@@ -455,7 +493,7 @@ https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 				colComputed := emptyString
 				if column.IsComputed() {
 					colExpr, err := schemaexpr.FormatExprForDisplay(
-						ctx, table, column.GetComputeExpr(), &p.semaCtx, p.SessionData(), tree.FmtSimple,
+						ctx, table, column.GetComputeExpr(), p.EvalContext(), &p.semaCtx, p.SessionData(), tree.FmtSimple,
 					)
 					if err != nil {
 						return err
@@ -575,8 +613,10 @@ var informationSchemaColumnUDTUsage = virtualSchemaTable{
 https://www.postgresql.org/docs/current/infoschema-column-udt-usage.html`,
 	schema: vtable.InformationSchemaColumnUDTUsage,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, dbContext, hideVirtual,
-			func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual}
+		return forEachTableDesc(ctx, p, dbContext, opts,
+			func(ctx context.Context, descCtx tableDescContext) error {
+				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 				dbNameStr := tree.NewDString(db.GetName())
 				scNameStr := tree.NewDString(sc.GetName())
 				tbNameStr := tree.NewDString(table.GetName())
@@ -748,12 +788,10 @@ var informationSchemaConstraintColumnUsageTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-constraint-column-usage.html`,
 	schema: vtable.InformationSchemaConstraintColumnUsage,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /* no constraints in virtual tables */, func(
-			db catalog.DatabaseDescriptor,
-			sc catalog.SchemaDescriptor,
-			table catalog.TableDescriptor,
-			tableLookup tableLookupFn,
-		) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /* no constraints in virtual tables */
+		return forEachTableDesc(ctx, p, dbContext, opts, func(
+			ctx context.Context, descCtx tableDescContext) error {
+			db, sc, table, tableLookup := descCtx.database, descCtx.schema, descCtx.table, descCtx.tableLookup
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(sc.GetName())
 			for _, c := range table.AllConstraints() {
@@ -809,12 +847,10 @@ var informationSchemaKeyColumnUsageTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-key-column-usage.html`,
 	schema: vtable.InformationSchemaKeyColumnUsage,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /* no constraints in virtual tables */, func(
-			db catalog.DatabaseDescriptor,
-			sc catalog.SchemaDescriptor,
-			table catalog.TableDescriptor,
-			tableLookup tableLookupFn,
-		) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /* no constraints in virtual tables */
+		return forEachTableDesc(ctx, p, dbContext, opts, func(
+			ctx context.Context, descCtx tableDescContext) error {
+			db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(sc.GetName())
 			tbNameStr := tree.NewDString(table.GetName())
@@ -938,17 +974,15 @@ var informationSchemaReferentialConstraintsTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-referential-constraints.html`,
 	schema: vtable.InformationSchemaReferentialConstraints,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual /* no constraints in virtual tables */, func(
-			db catalog.DatabaseDescriptor,
-			sc catalog.SchemaDescriptor,
-			table catalog.TableDescriptor,
-			tableLookup tableLookupFn,
-		) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /* no constraints in virtual tables */
+		return forEachTableDesc(ctx, p, dbContext, opts, func(
+			ctx context.Context, descCtx tableDescContext) error {
+			db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(sc.GetName())
 			tbNameStr := tree.NewDString(table.GetName())
 			for _, fk := range table.OutboundForeignKeys() {
-				refTable, err := tableLookup.getTableByID(fk.GetReferencedTableID())
+				refTable, err := descCtx.tableLookup.getTableByID(fk.GetReferencedTableID())
 				if err != nil {
 					return err
 				}
@@ -960,12 +994,22 @@ https://www.postgresql.org/docs/9.5/infoschema-referential-constraints.html`,
 				if err != nil {
 					return err
 				}
+				// Note: Cross DB references are deprecated, but this should be
+				// a cached look up when they don't exist.
+				refDB, err := p.Descriptors().ByIDWithoutLeased(p.Txn()).Get().Database(ctx, refTable.GetParentID())
+				if err != nil {
+					return err
+				}
+				refSchema, err := p.Descriptors().ByIDWithoutLeased(p.Txn()).Get().Schema(ctx, refTable.GetParentSchemaID())
+				if err != nil {
+					return err
+				}
 				if err := addRow(
 					dbNameStr,                                // constraint_catalog
 					scNameStr,                                // constraint_schema
 					tree.NewDString(fk.GetName()),            // constraint_name
-					dbNameStr,                                // unique_constraint_catalog
-					scNameStr,                                // unique_constraint_schema
+					tree.NewDString(refDB.GetName()),         // unique_constraint_catalog
+					tree.NewDString(refSchema.GetName()),     // unique_constraint_schema
 					tree.NewDString(refConstraint.GetName()), // unique_constraint_name
 					matchType,                                // match_option
 					dStringForFKAction(fk.OnUpdate()),        // update_rule
@@ -1093,8 +1137,8 @@ https://www.postgresql.org/docs/9.5/infoschema-schemata.html`,
 	schema: vtable.InformationSchemaSchemata,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
-			func(db catalog.DatabaseDescriptor) error {
-				return forEachSchema(ctx, p, db, true /* requiresPrivileges */, func(sc catalog.SchemaDescriptor) error {
+			func(ctx context.Context, db catalog.DatabaseDescriptor) error {
+				return forEachSchema(ctx, p, db, true /* requiresPrivileges */, func(ctx context.Context, sc catalog.SchemaDescriptor) error {
 					return addRow(
 						tree.NewDString(db.GetName()), // catalog_name
 						tree.NewDString(sc.GetName()), // schema_name
@@ -1111,9 +1155,9 @@ var builtinTypePrivileges = []struct {
 	grantee *tree.DString
 	kind    *tree.DString
 }{
-	{tree.NewDString(username.RootUser), tree.NewDString(privilege.ALL.String())},
-	{tree.NewDString(username.AdminRole), tree.NewDString(privilege.ALL.String())},
-	{tree.NewDString(username.PublicRole), tree.NewDString(privilege.USAGE.String())},
+	{tree.NewDString(username.RootUser), tree.NewDString(string(privilege.ALL.DisplayName()))},
+	{tree.NewDString(username.AdminRole), tree.NewDString(string(privilege.ALL.DisplayName()))},
+	{tree.NewDString(username.PublicRole), tree.NewDString(string(privilege.USAGE.DisplayName()))},
 }
 
 // Custom; PostgreSQL has data_type_privileges, which only shows one row per type,
@@ -1125,7 +1169,7 @@ var informationSchemaTypePrivilegesTable = virtualSchemaTable{
 	schema: vtable.InformationSchemaTypePrivileges,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
-			func(db catalog.DatabaseDescriptor) error {
+			func(ctx context.Context, db catalog.DatabaseDescriptor) error {
 				dbNameStr := tree.NewDString(db.GetName())
 				pgCatalogStr := tree.NewDString("pg_catalog")
 				// Generate one for each existing type.
@@ -1146,7 +1190,7 @@ var informationSchemaTypePrivilegesTable = virtualSchemaTable{
 				}
 
 				// And for all user defined types.
-				return forEachTypeDesc(ctx, p, db, func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, typeDesc catalog.TypeDescriptor) error {
+				return forEachTypeDesc(ctx, p, db, func(ctx context.Context, db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, typeDesc catalog.TypeDescriptor) error {
 					scNameStr := tree.NewDString(sc.GetName())
 					typeNameStr := tree.NewDString(typeDesc.GetName())
 					// TODO(knz): This should filter for the current user, see
@@ -1167,12 +1211,12 @@ var informationSchemaTypePrivilegesTable = virtualSchemaTable{
 								return err
 							}
 							if err := addRow(
-								userNameStr,                         // grantee
-								dbNameStr,                           // type_catalog
-								scNameStr,                           // type_schema
-								typeNameStr,                         // type_name
-								tree.NewDString(priv.Kind.String()), // privilege_type
-								yesOrNoDatum(isGrantable),           // is_grantable
+								userNameStr, // grantee
+								dbNameStr,   // type_catalog
+								scNameStr,   // type_schema
+								typeNameStr, // type_name
+								tree.NewDString(string(priv.Kind.DisplayName())), // privilege_type
+								yesOrNoDatum(isGrantable),                        // is_grantable
 							); err != nil {
 								return err
 							}
@@ -1191,8 +1235,8 @@ var informationSchemaSchemataTablePrivileges = virtualSchemaTable{
 	schema: vtable.InformationSchemaSchemaPrivileges,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
-			func(db catalog.DatabaseDescriptor) error {
-				return forEachSchema(ctx, p, db, true /* requiresPrivileges */, func(sc catalog.SchemaDescriptor) error {
+			func(ctx context.Context, db catalog.DatabaseDescriptor) error {
+				return forEachSchema(ctx, p, db, true /* requiresPrivileges */, func(ctx context.Context, sc catalog.SchemaDescriptor) error {
 					privs, err := sc.GetPrivileges().Show(privilege.Schema, true /* showImplicitOwnerPrivs */)
 					if err != nil {
 						return err
@@ -1213,11 +1257,11 @@ var informationSchemaSchemataTablePrivileges = virtualSchemaTable{
 								return err
 							}
 							if err := addRow(
-								userNameStr,                         // grantee
-								dbNameStr,                           // table_catalog
-								scNameStr,                           // table_schema
-								tree.NewDString(priv.Kind.String()), // privilege_type
-								yesOrNoDatum(isGrantable),           // is_grantable
+								userNameStr, // grantee
+								dbNameStr,   // table_catalog
+								scNameStr,   // table_schema
+								tree.NewDString(string(priv.Kind.DisplayName())), // privilege_type
+								yesOrNoDatum(isGrantable),                        // is_grantable
 							); err != nil {
 								return err
 							}
@@ -1251,19 +1295,31 @@ var informationSchemaSequences = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-sequences.html`,
 	schema: vtable.InformationSchemaSequences,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* no sequences in virtual schemas */
-			func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
+		return forEachTableDesc(ctx, p, dbContext,
+			forEachTableDescOptions{virtualOpts: hideVirtual}, /* no sequences in virtual schemas */
+			func(ctx context.Context, descCtx tableDescContext) error {
+				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 				if !table.IsSequence() {
 					return nil
 				}
+				typ := "INT8"
+				precision := 64
+				switch table.GetSequenceOpts().AsIntegerType {
+				case "INT2":
+					precision = 16
+					typ = "INT2"
+				case "INT4":
+					precision = 32
+					typ = "INT4"
+				}
 				return addRow(
-					tree.NewDString(db.GetName()),    // catalog
-					tree.NewDString(sc.GetName()),    // schema
-					tree.NewDString(table.GetName()), // name
-					tree.NewDString("bigint"),        // type
-					tree.NewDInt(64),                 // numeric precision
-					tree.NewDInt(2),                  // numeric precision radix
-					tree.NewDInt(0),                  // numeric scale
+					tree.NewDString(db.GetName()),      // catalog
+					tree.NewDString(sc.GetName()),      // schema
+					tree.NewDString(table.GetName()),   // name
+					tree.NewDString(typ),               // integer type, one of ["INT2", "INT4", "INT8"]
+					tree.NewDInt(tree.DInt(precision)), // numeric precision
+					tree.NewDInt(2),                    // numeric precision radix
+					tree.NewDInt(0),                    // numeric scale
 					tree.NewDString(strconv.FormatInt(table.GetSequenceOpts().Start, 10)),     // start value
 					tree.NewDString(strconv.FormatInt(table.GetSequenceOpts().MinValue, 10)),  // min value
 					tree.NewDString(strconv.FormatInt(table.GetSequenceOpts().MaxValue, 10)),  // max value
@@ -1281,8 +1337,10 @@ var informationSchemaStatisticsTable = virtualSchemaTable{
 ` + docs.URL("information-schema.html#statistics"),
 	schema: vtable.InformationSchemaStatistics,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual tables have no indexes */
-			func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
+		return forEachTableDesc(ctx, p, dbContext,
+			forEachTableDescOptions{virtualOpts: hideVirtual}, /* virtual tables have no indexes */
+			func(ctx context.Context, descCtx tableDescContext) error {
+				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 				dbNameStr := tree.NewDString(db.GetName())
 				scNameStr := tree.NewDString(sc.GetName())
 				tbNameStr := tree.NewDString(table.GetName())
@@ -1391,13 +1449,10 @@ var informationSchemaTableConstraintTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-table-constraints.html`,
 	schema: vtable.InformationSchemaTableConstraint,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDescWithTableLookup(ctx, p, dbContext, hideVirtual, /* virtual tables have no constraints */
-			func(
-				db catalog.DatabaseDescriptor,
-				sc catalog.SchemaDescriptor,
-				table catalog.TableDescriptor,
-				tableLookup tableLookupFn,
-			) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /* virtual tables have no constraints */
+		return forEachTableDesc(ctx, p, dbContext, opts,
+			func(ctx context.Context, descCtx tableDescContext) error {
+				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 				dbNameStr := tree.NewDString(db.GetName())
 				scNameStr := tree.NewDString(sc.GetName())
 				tbNameStr := tree.NewDString(table.GetName())
@@ -1458,6 +1513,44 @@ https://www.postgresql.org/docs/9.5/infoschema-table-constraints.html`,
 	},
 }
 
+var informationSchemaUserDefinedTypesTable = virtualSchemaView{
+	comment: `user-defined types` +
+		docs.URL("information-schema.html#user-defined-types") + `
+    https://www.postgresql.org/docs/16/infoschema-user-defined-types.html`,
+	schema: vtable.InformationSchemaUserDefinedTypes,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "user_defined_type_catalog", Typ: types.String},
+		{Name: "user_defined_type_schema", Typ: types.String},
+		{Name: "user_defined_type_name", Typ: types.String},
+		{Name: "user_defined_type_category", Typ: types.String},
+		{Name: "is_instantiable", Typ: types.String},
+		{Name: "is_final", Typ: types.String},
+		{Name: "ordering_form", Typ: types.String},
+		{Name: "ordering_category", Typ: types.String},
+		{Name: "ordering_routine_catalog", Typ: types.String},
+		{Name: "ordering_routine_schema", Typ: types.String},
+		{Name: "ordering_routine_name", Typ: types.String},
+		{Name: "reference_type", Typ: types.String},
+		{Name: "data_type", Typ: types.String},
+		{Name: "character_maximum_length", Typ: types.Int},
+		{Name: "character_octet_length", Typ: types.Int},
+		{Name: "character_set_catalog", Typ: types.String},
+		{Name: "character_set_schema", Typ: types.String},
+		{Name: "character_set_name", Typ: types.String},
+		{Name: "collation_catalog", Typ: types.String},
+		{Name: "collation_schema", Typ: types.String},
+		{Name: "collation_name", Typ: types.String},
+		{Name: "numeric_precision", Typ: types.Int},
+		{Name: "numeric_precision_radix", Typ: types.Int},
+		{Name: "numeric_scale", Typ: types.Int},
+		{Name: "datetime_precision", Typ: types.Int},
+		{Name: "interval_type", Typ: types.String},
+		{Name: "interval_precision", Typ: types.Int},
+		{Name: "source_dtd_identifier", Typ: types.String},
+		{Name: "ref_dtd_identifier", Typ: types.String},
+	},
+}
+
 // Postgres: not provided
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/user-privileges-table.html
 // TODO(knz): this introspection facility is of dubious utility.
@@ -1466,7 +1559,7 @@ var informationSchemaUserPrivileges = virtualSchemaTable{
 	schema:  vtable.InformationSchemaUserPrivileges,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, dbContext, true, /* requiresPrivileges */
-			func(dbDesc catalog.DatabaseDescriptor) error {
+			func(ctx context.Context, dbDesc catalog.DatabaseDescriptor) error {
 				dbNameStr := tree.NewDString(dbDesc.GetName())
 				for _, u := range []string{username.RootUser, username.AdminRole} {
 					grantee := tree.NewDString(u)
@@ -1474,7 +1567,7 @@ var informationSchemaUserPrivileges = virtualSchemaTable{
 					if err != nil {
 						return err
 					}
-					for _, p := range validPrivs.SortedNames() {
+					for _, p := range validPrivs.SortedDisplayNames() {
 						if err := addRow(
 							grantee,            // grantee
 							dbNameStr,          // table_catalog
@@ -1506,8 +1599,10 @@ func populateTablePrivileges(
 	dbContext catalog.DatabaseDescriptor,
 	addRow func(...tree.Datum) error,
 ) error {
-	return forEachTableDesc(ctx, p, dbContext, virtualMany,
-		func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
+	opts := forEachTableDescOptions{virtualOpts: virtualMany}
+	return forEachTableDesc(ctx, p, dbContext, opts,
+		func(ctx context.Context, descCtx tableDescContext) error {
+			db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 			dbNameStr := tree.NewDString(db.GetName())
 			scNameStr := tree.NewDString(sc.GetName())
 			tbNameStr := tree.NewDString(table.GetName())
@@ -1538,14 +1633,14 @@ func populateTablePrivileges(
 						return err
 					}
 					if err := addRow(
-						tree.DNull,                          // grantor
-						granteeNameStr,                      // grantee
-						dbNameStr,                           // table_catalog
-						scNameStr,                           // table_schema
-						tbNameStr,                           // table_name
-						tree.NewDString(priv.Kind.String()), // privilege_type
-						yesOrNoDatum(isGrantable),           // is_grantable
-						yesOrNoDatum(priv.Kind == privilege.SELECT), // with_hierarchy
+						tree.DNull,     // grantor
+						granteeNameStr, // grantee
+						dbNameStr,      // table_catalog
+						scNameStr,      // table_schema
+						tbNameStr,      // table_name
+						tree.NewDString(string(priv.Kind.DisplayName())), // privilege_type
+						yesOrNoDatum(isGrantable),                        // is_grantable
+						yesOrNoDatum(priv.Kind == privilege.SELECT),      // with_hierarchy
 					); err != nil {
 						return err
 					}
@@ -1568,44 +1663,38 @@ var informationSchemaTablesTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-tables.html`,
 	schema: vtable.InformationSchemaTables,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, dbContext, virtualMany, addTablesTableRow(addRow))
+		opts := forEachTableDescOptions{virtualOpts: virtualMany}
+		return forEachTableDesc(ctx, p, dbContext, opts,
+			func(
+				ctx context.Context, descCtx tableDescContext) error {
+				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
+				if table.IsSequence() {
+					return nil
+				}
+				tableType := tableTypeBaseTable
+				insertable := yesString
+				if table.IsVirtualTable() {
+					tableType = tableTypeSystemView
+					insertable = noString
+				} else if table.IsView() {
+					tableType = tableTypeView
+					insertable = noString
+				} else if table.IsTemporary() {
+					tableType = tableTypeTemporary
+				}
+				dbNameStr := tree.NewDString(db.GetName())
+				scNameStr := tree.NewDString(sc.GetName())
+				tbNameStr := tree.NewDString(table.GetName())
+				return addRow(
+					dbNameStr,  // table_catalog
+					scNameStr,  // table_schema
+					tbNameStr,  // table_name
+					tableType,  // table_type
+					insertable, // is_insertable_into
+					tree.NewDInt(tree.DInt(table.GetVersion())), // version
+				)
+			})
 	},
-}
-
-func addTablesTableRow(
-	addRow func(...tree.Datum) error,
-) func(
-	db catalog.DatabaseDescriptor,
-	sc catalog.SchemaDescriptor,
-	table catalog.TableDescriptor,
-) error {
-	return func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
-		if table.IsSequence() {
-			return nil
-		}
-		tableType := tableTypeBaseTable
-		insertable := yesString
-		if table.IsVirtualTable() {
-			tableType = tableTypeSystemView
-			insertable = noString
-		} else if table.IsView() {
-			tableType = tableTypeView
-			insertable = noString
-		} else if table.IsTemporary() {
-			tableType = tableTypeTemporary
-		}
-		dbNameStr := tree.NewDString(db.GetName())
-		scNameStr := tree.NewDString(sc.GetName())
-		tbNameStr := tree.NewDString(table.GetName())
-		return addRow(
-			dbNameStr,  // table_catalog
-			scNameStr,  // table_schema
-			tbNameStr,  // table_name
-			tableType,  // table_type
-			insertable, // is_insertable_into
-			tree.NewDInt(tree.DInt(table.GetVersion())), // version
-		)
-	}
 }
 
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-views.html
@@ -1616,8 +1705,10 @@ var informationSchemaViewsTable = virtualSchemaTable{
 https://www.postgresql.org/docs/9.5/infoschema-views.html`,
 	schema: vtable.InformationSchemaViews,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual schemas have no views */
-			func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, table catalog.TableDescriptor) error {
+		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /* virtual schemas have no views */
+		return forEachTableDesc(ctx, p, dbContext, opts,
+			func(ctx context.Context, descCtx tableDescContext) error {
+				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
 				if !table.IsView() {
 					return nil
 				}
@@ -1674,7 +1765,7 @@ https://www.postgresql.org/docs/current/infoschema-collations.html`,
 // Postgres: https://www.postgresql.org/docs/current/infoschema-collation-character-set-applicab.html
 // MySQL:    https://dev.mysql.com/doc/refman/8.0/en/information-schema-collation-character-set-applicability-table.html
 var informationSchemaCollationCharacterSetApplicability = virtualSchemaTable{
-	comment: `identifies which character set the available collations are 
+	comment: `identifies which character set the available collations are
 applicable to. As UTF-8 is the only available encoding this table does not
 provide much useful information.
 https://www.postgresql.org/docs/current/infoschema-collation-character-set-applicab.html`,
@@ -1706,6 +1797,9 @@ var informationSchemaSessionVariables = virtualSchemaTable{
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		for _, vName := range varNames {
 			gen := varGen[vName]
+			if gen.Hidden {
+				continue
+			}
 			value, err := gen.Get(&p.extendedEvalCtx, p.Txn())
 			if err != nil {
 				return err
@@ -1746,7 +1840,7 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 		}
 		for _, db := range dbDescs {
 			dbNameStr := tree.NewDString(db.GetName())
-			exPriv := tree.NewDString(privilege.EXECUTE.String())
+			exPriv := tree.NewDString(string(privilege.EXECUTE.DisplayName()))
 			roleNameForBuiltins := []*tree.DString{
 				tree.NewDString(username.AdminRole),
 				tree.NewDString(username.RootUser),
@@ -1804,14 +1898,15 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 					if err != nil {
 						return err
 					}
-					canSeeDescriptor, err := userCanSeeDescriptor(ctx, p, fn, db, false /* allowAdding */)
+					canSeeDescriptor, err := userCanSeeDescriptor(
+						ctx, p, fn, db, false /* allowAdding */, false /* includeDropped */)
 					if err != nil {
 						return err
 					}
 					if !canSeeDescriptor {
 						return nil
 					}
-					privs, err := fn.GetPrivileges().Show(privilege.Function, true /* showImplicitOwnerPrivs */)
+					privs, err := fn.GetPrivileges().Show(privilege.Routine, true /* showImplicitOwnerPrivs */)
 					if err != nil {
 						return err
 					}
@@ -1831,16 +1926,16 @@ var informationSchemaRoleRoutineGrantsTable = virtualSchemaTable{
 								return err
 							}
 							if err := addRow(
-								tree.DNull,                          // grantor
-								userNameStr,                         // grantee
-								dbNameStr,                           // specific_catalog
-								scNameStr,                           // specific_schema
-								fnSpecificName,                      // specific_name
-								dbNameStr,                           // routine_catalog
-								scNameStr,                           // routine_schema
-								fnName,                              // routine_name
-								tree.NewDString(priv.Kind.String()), // privilege_type
-								yesOrNoDatum(isGrantable),           // is_grantable
+								tree.DNull,     // grantor
+								userNameStr,    // grantee
+								dbNameStr,      // specific_catalog
+								scNameStr,      // specific_schema
+								fnSpecificName, // specific_name
+								dbNameStr,      // routine_catalog
+								scNameStr,      // routine_schema
+								fnName,         // routine_name
+								tree.NewDString(string(priv.Kind.DisplayName())), // privilege_type
+								yesOrNoDatum(isGrantable),                        // is_grantable
 							); err != nil {
 								return err
 							}
@@ -1941,15 +2036,6 @@ var informationSchemaViewRoutineUsageTable = virtualSchemaTable{
 var informationSchemaRoleColumnGrantsTable = virtualSchemaTable{
 	comment: "role_column_grants was created for compatibility and is currently unimplemented",
 	schema:  vtable.InformationSchemaRoleColumnGrants,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
-var informationSchemaAttributesTable = virtualSchemaTable{
-	comment: "attributes was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaAttributes,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -2244,15 +2330,6 @@ var informationSchemaColumnsExtensionsTable = virtualSchemaTable{
 	unimplemented: true,
 }
 
-var informationSchemaUserDefinedTypesTable = virtualSchemaTable{
-	comment: "user_defined_types was created for compatibility and is currently unimplemented",
-	schema:  vtable.InformationSchemaUserDefinedTypes,
-	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		return nil
-	},
-	unimplemented: true,
-}
-
 var informationSchemaSQLFeaturesTable = virtualSchemaTable{
 	comment: "sql_features was created for compatibility and is currently unimplemented",
 	schema:  vtable.InformationSchemaSQLFeatures,
@@ -2376,7 +2453,7 @@ func forEachSchema(
 	p *planner,
 	dbContext catalog.DatabaseDescriptor,
 	requiresPrivileges bool,
-	fn func(sc catalog.SchemaDescriptor) error,
+	fn func(ctx context.Context, sc catalog.SchemaDescriptor) error,
 ) error {
 	forEachDatabase := func(db catalog.DatabaseDescriptor) error {
 		c, err := p.Descriptors().GetAllSchemasInDatabase(ctx, p.txn, db)
@@ -2386,7 +2463,8 @@ func forEachSchema(
 		var schemas []catalog.SchemaDescriptor
 		if err := c.ForEachDescriptor(func(desc catalog.Descriptor) error {
 			if requiresPrivileges {
-				canSeeDescriptor, err := userCanSeeDescriptor(ctx, p, desc, db, false /* allowAdding */)
+				canSeeDescriptor, err := userCanSeeDescriptor(
+					ctx, p, desc, db, false /* allowAdding */, false /* includeDropped */)
 				if err != nil {
 					return err
 				}
@@ -2404,7 +2482,7 @@ func forEachSchema(
 			return schemas[i].GetName() < schemas[j].GetName()
 		})
 		for _, sc := range schemas {
-			if err := fn(sc); err != nil {
+			if err := fn(ctx, sc); err != nil {
 				return err
 			}
 		}
@@ -2436,7 +2514,7 @@ func forEachDatabaseDesc(
 	p *planner,
 	dbContext catalog.DatabaseDescriptor,
 	requiresPrivileges bool,
-	fn func(descriptor catalog.DatabaseDescriptor) error,
+	fn func(ctx context.Context, descriptor catalog.DatabaseDescriptor) error,
 ) error {
 	var dbDescs []catalog.DatabaseDescriptor
 	if dbContext == nil {
@@ -2458,14 +2536,14 @@ func forEachDatabaseDesc(
 	for _, dbDesc := range dbDescs {
 		canSeeDescriptor := !requiresPrivileges
 		if requiresPrivileges {
-			hasPriv, err := userCanSeeDescriptor(ctx, p, dbDesc, nil /* parentDBDesc */, false /* allowAdding */)
+			hasPriv, err := userCanSeeDescriptor(ctx, p, dbDesc, nil /* parentDBDesc */, false /* allowAdding */, false /* includeDropped */)
 			if err != nil {
 				return err
 			}
 			canSeeDescriptor = hasPriv || p.CurrentDatabase() == dbDesc.GetName()
 		}
 		if canSeeDescriptor {
-			if err := fn(dbDesc); err != nil {
+			if err := fn(ctx, dbDesc); err != nil {
 				return err
 			}
 		}
@@ -2481,7 +2559,7 @@ func forEachTypeDesc(
 	ctx context.Context,
 	p *planner,
 	dbContext catalog.DatabaseDescriptor,
-	fn func(db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, typ catalog.TypeDescriptor) error,
+	fn func(ctx context.Context, db catalog.DatabaseDescriptor, sc catalog.SchemaDescriptor, typ catalog.TypeDescriptor) error,
 ) (err error) {
 	var all nstree.Catalog
 	if dbContext != nil &&
@@ -2504,18 +2582,47 @@ func forEachTypeDesc(
 		if err != nil {
 			return err
 		}
-		canSeeDescriptor, err := userCanSeeDescriptor(ctx, p, typ, dbDesc, false /* allowAdding */)
+		canSeeDescriptor, err := userCanSeeDescriptor(
+			ctx, p, typ, dbDesc, false /* allowAdding */, false /* includeDropped */)
 		if err != nil {
 			return err
 		}
 		if !canSeeDescriptor {
 			continue
 		}
-		if err := fn(dbDesc, sc, typ); err != nil {
+		if err := fn(ctx, dbDesc, sc, typ); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+type virtualOpts int
+
+const (
+	// virtualMany iterates over virtual schemas in every catalog/database.
+	virtualMany virtualOpts = iota
+	// virtualCurrentDB iterates over virtual schemas in the current database.
+	virtualCurrentDB
+	// hideVirtual completely hides virtual schemas during iteration.
+	hideVirtual
+)
+
+type forEachTableDescOptions struct {
+	virtualOpts virtualOpts
+	allowAdding bool
+	// Include dropped tables (but not garbage collected) when run at the cluster
+	// level (i.e., when database = ""). This only works when the scope is at the
+	// cluster level because `GetAllDescriptorsForDatabase` doesn't include such
+	// tables.
+	includeDropped bool
+}
+
+type tableDescContext struct {
+	database    catalog.DatabaseDescriptor
+	schema      catalog.SchemaDescriptor
+	table       catalog.TableDescriptor
+	tableLookup tableLookupFn
 }
 
 // forEachTableDesc retrieves all table descriptors from the current
@@ -2534,100 +2641,8 @@ func forEachTableDesc(
 	ctx context.Context,
 	p *planner,
 	dbContext catalog.DatabaseDescriptor,
-	virtualOpts virtualOpts,
-	fn func(catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TableDescriptor) error,
-) error {
-	return forEachTableDescWithTableLookup(ctx, p, dbContext, virtualOpts, func(
-		db catalog.DatabaseDescriptor,
-		sc catalog.SchemaDescriptor,
-		table catalog.TableDescriptor,
-		_ tableLookupFn,
-	) error {
-		return fn(db, sc, table)
-	})
-}
-
-type virtualOpts int
-
-const (
-	// virtualMany iterates over virtual schemas in every catalog/database.
-	virtualMany virtualOpts = iota
-	// virtualCurrentDB iterates over virtual schemas in the current database.
-	virtualCurrentDB
-	// hideVirtual completely hides virtual schemas during iteration.
-	hideVirtual
-)
-
-// forEachTableDescAll does the same as forEachTableDesc but also
-// includes newly added non-public descriptors.
-func forEachTableDescAll(
-	ctx context.Context,
-	p *planner,
-	dbContext catalog.DatabaseDescriptor,
-	virtualOpts virtualOpts,
-	fn func(catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TableDescriptor) error,
-) error {
-	return forEachTableDescAllWithTableLookup(ctx, p, dbContext, virtualOpts, func(
-		db catalog.DatabaseDescriptor,
-		sc catalog.SchemaDescriptor,
-		table catalog.TableDescriptor,
-		_ tableLookupFn,
-	) error {
-		return fn(db, sc, table)
-	})
-}
-
-// forEachTableDescAllWithTableLookup is like forEachTableDescAll, but it also
-// provides a tableLookupFn like forEachTableDescWithTableLookup. If validate is
-// set to false descriptors will not be validated for existence or consistency
-// hence fn should be able to handle nil-s.
-func forEachTableDescAllWithTableLookup(
-	ctx context.Context,
-	p *planner,
-	dbContext catalog.DatabaseDescriptor,
-	virtualOpts virtualOpts,
-	fn func(catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TableDescriptor, tableLookupFn) error,
-) error {
-	return forEachTableDescWithTableLookupInternal(
-		ctx, p, dbContext, virtualOpts, true /* allowAdding */, fn,
-	)
-}
-
-// forEachTableDescWithTableLookup acts like forEachTableDesc, except it also provides a
-// tableLookupFn when calling fn to allow callers to lookup fetched table descriptors
-// on demand. This is important for callers dealing with objects like foreign keys, where
-// the metadata for each object must be augmented by looking at the referenced table.
-//
-// The dbContext argument specifies in which database context we are
-// requesting the descriptors.  In context "" all descriptors are
-// visible, in non-empty contexts only the descriptors of that
-// database are visible.
-func forEachTableDescWithTableLookup(
-	ctx context.Context,
-	p *planner,
-	dbContext catalog.DatabaseDescriptor,
-	virtualOpts virtualOpts,
-	fn func(catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TableDescriptor, tableLookupFn) error,
-) error {
-	return forEachTableDescWithTableLookupInternal(
-		ctx, p, dbContext, virtualOpts, false /* allowAdding */, fn,
-	)
-}
-
-// forEachTableDescWithTableLookupInternal is the logic that supports
-// forEachTableDescWithTableLookup.
-//
-// The allowAdding argument if true includes newly added tables that
-// are not yet public.
-// The validate argument if false turns off checking if the descriptor ids exist
-// and if they are valid.
-func forEachTableDescWithTableLookupInternal(
-	ctx context.Context,
-	p *planner,
-	dbContext catalog.DatabaseDescriptor,
-	virtualOpts virtualOpts,
-	allowAdding bool,
-	fn func(catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TableDescriptor, tableLookupFn) error,
+	opts forEachTableDescOptions,
+	fn func(context.Context, tableDescContext) error,
 ) (err error) {
 	var all nstree.Catalog
 	if dbContext != nil && useIndexLookupForDescriptorsInDatabase.Get(&p.EvalContext().Settings.SV) {
@@ -2638,59 +2653,22 @@ func forEachTableDescWithTableLookupInternal(
 	if err != nil {
 		return err
 	}
-	return forEachTableDescWithTableLookupInternalFromDescriptors(
-		ctx, p, dbContext, virtualOpts, allowAdding, all, fn)
+	return forEachTableDescFromDescriptors(
+		ctx, p, dbContext, all, opts, fn)
 }
 
-func forEachTypeDescWithTableLookupInternalFromDescriptors(
+func forEachTableDescFromDescriptors(
 	ctx context.Context,
 	p *planner,
 	dbContext catalog.DatabaseDescriptor,
-	allowAdding bool,
 	c nstree.Catalog,
-	fn func(catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TypeDescriptor, tableLookupFn) error,
+	opts forEachTableDescOptions,
+	fn func(context.Context, tableDescContext) error,
 ) error {
 	lCtx := newInternalLookupCtx(c.OrderedDescriptors(), dbContext)
 
-	for _, typID := range lCtx.typIDs {
-		typDesc := lCtx.typDescs[typID]
-		if typDesc.Dropped() {
-			continue
-		}
-		dbDesc, err := lCtx.getDatabaseByID(typDesc.GetParentID())
-		if err != nil {
-			return err
-		}
-		canSeeDescriptor, err := userCanSeeDescriptor(ctx, p, typDesc, dbDesc, allowAdding)
-		if err != nil {
-			return err
-		}
-		if !canSeeDescriptor {
-			continue
-		}
-		sc, err := lCtx.getSchemaByID(typDesc.GetParentSchemaID())
-		if err != nil {
-			return err
-		}
-		if err := fn(dbDesc, sc, typDesc, lCtx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func forEachTableDescWithTableLookupInternalFromDescriptors(
-	ctx context.Context,
-	p *planner,
-	dbContext catalog.DatabaseDescriptor,
-	virtualOpts virtualOpts,
-	allowAdding bool,
-	c nstree.Catalog,
-	fn func(catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TableDescriptor, tableLookupFn) error,
-) error {
-	lCtx := newInternalLookupCtx(c.OrderedDescriptors(), dbContext)
-
-	if virtualOpts == virtualMany || virtualOpts == virtualCurrentDB {
+	vOpts := opts.virtualOpts
+	if vOpts == virtualMany || vOpts == virtualCurrentDB {
 		// Virtual descriptors first.
 		vt := p.getVirtualTabler()
 		vEntries := vt.getSchemas()
@@ -2700,7 +2678,8 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 				virtSchemaEntry := vEntries[virtSchemaName]
 				for _, tName := range virtSchemaEntry.orderedDefNames {
 					te := virtSchemaEntry.defs[tName]
-					if err := fn(dbDesc, virtSchemaEntry.desc, te.desc, lCtx); err != nil {
+					if err := fn(ctx, tableDescContext{
+						dbDesc, virtSchemaEntry.desc, te.desc, lCtx}); err != nil {
 						return err
 					}
 				}
@@ -2708,7 +2687,7 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 			return nil
 		}
 
-		switch virtualOpts {
+		switch vOpts {
 		case virtualCurrentDB:
 			if err := iterate(dbContext); err != nil {
 				return err
@@ -2727,11 +2706,12 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 	for _, tbID := range lCtx.tbIDs {
 		table := lCtx.tbDescs[tbID]
 		dbDesc, parentExists := lCtx.dbDescs[table.GetParentID()]
-		canSeeDescriptor, err := userCanSeeDescriptor(ctx, p, table, dbDesc, allowAdding)
+		canSeeDescriptor, err := userCanSeeDescriptor(
+			ctx, p, table, dbDesc, opts.allowAdding, opts.includeDropped)
 		if err != nil {
 			return err
 		}
-		if table.Dropped() || !canSeeDescriptor {
+		if !canSeeDescriptor {
 			continue
 		}
 		var sc catalog.SchemaDescriptor
@@ -2744,7 +2724,7 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 				// missing temporary schema name. Temporary schemas have namespace
 				// entries. The below code will go and lookup schema names from the
 				// namespace table if needed to qualify the name of a temporary table.
-				if err := forEachSchema(ctx, p, dbDesc, false /* requiresPrivileges*/, func(schema catalog.SchemaDescriptor) error {
+				if err := forEachSchema(ctx, p, dbDesc, false /* requiresPrivileges*/, func(ctx context.Context, schema catalog.SchemaDescriptor) error {
 					if schema.GetID() != table.GetParentSchemaID() {
 						return nil
 					}
@@ -2765,7 +2745,45 @@ func forEachTableDescWithTableLookupInternalFromDescriptors(
 				}
 			}
 		}
-		if err := fn(dbDesc, sc, table, lCtx); err != nil {
+		if err := fn(ctx, tableDescContext{dbDesc, sc, table, lCtx}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func forEachTypeDescWithTableLookupInternalFromDescriptors(
+	ctx context.Context,
+	p *planner,
+	dbContext catalog.DatabaseDescriptor,
+	allowAdding bool,
+	c nstree.Catalog,
+	fn func(context.Context, catalog.DatabaseDescriptor, catalog.SchemaDescriptor, catalog.TypeDescriptor, tableLookupFn) error,
+) error {
+	lCtx := newInternalLookupCtx(c.OrderedDescriptors(), dbContext)
+
+	for _, typID := range lCtx.typIDs {
+		typDesc := lCtx.typDescs[typID]
+		if typDesc.Dropped() {
+			continue
+		}
+		dbDesc, err := lCtx.getDatabaseByID(typDesc.GetParentID())
+		if err != nil {
+			return err
+		}
+		canSeeDescriptor, err := userCanSeeDescriptor(
+			ctx, p, typDesc, dbDesc, allowAdding, false /* includeDropped */)
+		if err != nil {
+			return err
+		}
+		if !canSeeDescriptor {
+			continue
+		}
+		sc, err := lCtx.getSchemaByID(typDesc.GetParentSchemaID())
+		if err != nil {
+			return err
+		}
+		if err := fn(ctx, dbDesc, sc, typDesc, lCtx); err != nil {
 			return err
 		}
 	}
@@ -2801,6 +2819,7 @@ func (r roleOptions) validUntil(p *planner) (tree.Datum, error) {
 		p.EvalContext().GetRelativeParseTime(),
 		pgdate.DefaultDateStyle(),
 		*validUntilText,
+		nil, /* h */
 	)
 	if err != nil {
 		return nil, errors.Errorf("rolValidUntil string %s could not be parsed with datestyle %s", *validUntilText, p.EvalContext().GetDateStyle())
@@ -2818,8 +2837,14 @@ func (r roleOptions) createRole() (tree.DBool, error) {
 	return tree.DBool(createRole), err
 }
 
-func forEachRoleQuery(ctx context.Context, p *planner) string {
-	return `
+// forEachRoleAtCacheReadTS reads from system.users and related tables using a
+// timestamp based on when the role membership cache was refreshed.
+func forEachRoleAtCacheReadTS(
+	ctx context.Context,
+	p *planner,
+	fn func(ctx context.Context, userName username.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error,
+) error {
+	const query = `
 SELECT
 	u.username,
 	"isRole",
@@ -2829,30 +2854,31 @@ FROM
 	system.users AS u
 	LEFT JOIN system.role_options AS ro ON
 			ro.username = u.username
-  LEFT JOIN system.database_role_settings AS drs ON 
+  LEFT JOIN system.database_role_settings AS drs ON
 			drs.role_name = u.username AND drs.database_id = 0
 GROUP BY
-	u.username, "isRole", drs.settings;
-`
-}
+	u.username, "isRole", drs.settings;`
 
-func forEachRole(
-	ctx context.Context,
-	p *planner,
-	fn func(userName username.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error,
-) error {
-	query := forEachRoleQuery(ctx, p)
-
-	// For some reason, using the iterator API here causes privilege_builtins
-	// logic test fail in 3node-tenant config with 'txn already encountered an
-	// error' (because of the context cancellation), so we buffer all roles
-	// first.
-	rows, err := p.InternalSQLTxn().QueryBufferedEx(
-		ctx, "read-roles", p.txn,
-		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
-		query,
-	)
-	if err != nil {
+	var rows []tree.Datums
+	if err := p.ExecCfg().RoleMemberCache.RunAtCacheReadTS(
+		ctx, p.ExecCfg().InternalDB, p.InternalSQLTxn(),
+		func(ctx context.Context, txn descs.Txn) error {
+			// For some reason, using the iterator API here causes privilege_builtins
+			// logic test fail in 3node-tenant config with 'txn already encountered an
+			// error' (because of the context cancellation), so we buffer all roles
+			// first.
+			var err error
+			rows, err = txn.QueryBufferedEx(
+				ctx, "read-roles", txn.KV(),
+				sessiondata.NodeUserSessionDataOverride,
+				query,
+			)
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+	); err != nil {
 		return err
 	}
 
@@ -2872,7 +2898,7 @@ func forEachRole(
 
 		// system tables already contain normalized usernames.
 		userName := username.MakeSQLUsernameFromPreNormalizedString(string(usernameS))
-		if err := fn(userName, bool(*isRole), options, defaultSettings); err != nil {
+		if err := fn(ctx, userName, bool(*isRole), options, defaultSettings); err != nil {
 			return err
 		}
 	}
@@ -2885,76 +2911,103 @@ func forEachRole(
 		return err
 	}
 	nodeOptions := roleOptions{tree.NewDJSON(nodeOptionsJSON)}
-	if err := fn(username.NodeUserName(), false /* isRole */, nodeOptions, tree.DNull /* settings */); err != nil {
+	if err := fn(ctx, username.NodeUserName(), false /* isRole */, nodeOptions, tree.DNull /* settings */); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func forEachRoleMembership(
-	ctx context.Context, txn isql.Txn, fn func(role, member username.SQLUsername, isAdmin bool) error,
-) (retErr error) {
+// forEachRoleMembershipAtCacheReadTS reads from system.role_members using a
+// timestamp based on when the role membership cache was refreshed.
+func forEachRoleMembershipAtCacheReadTS(
+	ctx context.Context,
+	p *planner,
+	fn func(ctx context.Context, role, member username.SQLUsername, isAdmin bool) error,
+) error {
 	const query = `SELECT "role", "member", "isAdmin" FROM system.role_members`
-	it, err := txn.QueryIteratorEx(ctx, "read-members", txn.KV(), sessiondata.InternalExecutorOverride{
-		User: username.NodeUserName(),
-	}, query)
-	if err != nil {
+
+	if err := p.ExecCfg().RoleMemberCache.RunAtCacheReadTS(
+		ctx, p.ExecCfg().InternalDB, p.InternalSQLTxn(),
+		func(ctx context.Context, txn descs.Txn) (retErr error) {
+			it, err := txn.QueryIteratorEx(ctx, "read-members", txn.KV(),
+				sessiondata.NodeUserSessionDataOverride, query)
+			if err != nil {
+				return err
+			}
+			// We have to make sure to close the iterator since we might return from the
+			// for loop early (before Next() returns false).
+			defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
+
+			var ok bool
+			var loopErr error
+			for ok, loopErr = it.Next(ctx); ok; ok, loopErr = it.Next(ctx) {
+				row := it.Cur()
+				roleName := tree.MustBeDString(row[0])
+				memberName := tree.MustBeDString(row[1])
+				isAdmin := row[2].(*tree.DBool)
+
+				// The names in the system tables are already normalized.
+				if err := fn(
+					ctx,
+					username.MakeSQLUsernameFromPreNormalizedString(string(roleName)),
+					username.MakeSQLUsernameFromPreNormalizedString(string(memberName)),
+					bool(*isAdmin)); err != nil {
+					return err
+				}
+			}
+			if loopErr != nil {
+				return loopErr
+			}
+			return nil
+		},
+	); err != nil {
 		return err
 	}
-	// We have to make sure to close the iterator since we might return from the
-	// for loop early (before Next() returns false).
-	defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
-
-	var ok bool
-	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
-		row := it.Cur()
-		roleName := tree.MustBeDString(row[0])
-		memberName := tree.MustBeDString(row[1])
-		isAdmin := row[2].(*tree.DBool)
-
-		// The names in the system tables are already normalized.
-		if err := fn(
-			username.MakeSQLUsernameFromPreNormalizedString(string(roleName)),
-			username.MakeSQLUsernameFromPreNormalizedString(string(memberName)),
-			bool(*isAdmin)); err != nil {
-			return err
-		}
-	}
-	return err
+	return nil
 }
 
 func userCanSeeDescriptor(
-	ctx context.Context, p *planner, desc, parentDBDesc catalog.Descriptor, allowAdding bool,
+	ctx context.Context,
+	p *planner,
+	desc, parentDBDesc catalog.Descriptor,
+	allowAdding bool,
+	includeDropped bool,
 ) (bool, error) {
-	if !descriptorIsVisible(desc, allowAdding) {
+	if !descriptorIsVisible(desc, allowAdding, includeDropped) {
 		return false, nil
+	}
+
+	// Short-circuit for virtual tables, so that we avoid fetching the synthetic
+	// privileges for virtual tables in a thundering herd while populating a table
+	// like pg_class, which has a row for every table, including virtual tables.
+	if tab, ok := desc.(catalog.TableDescriptor); ok && tab.IsVirtualTable() {
+		return true, nil
 	}
 
 	// TODO(richardjcai): We may possibly want to remove the ability to view
 	// the descriptor if they have any privilege on the descriptor and only
 	// allow the descriptor to be viewed if they have CONNECT on the DB. #59827.
-	canSeeDescriptor := false
 	if ok, err := p.HasAnyPrivilege(ctx, desc); err != nil {
 		return false, err
-	} else {
-		canSeeDescriptor = ok
+	} else if ok {
+		return true, nil
 	}
+
 	// Users can see objects in the database if they have connect privilege.
 	if parentDBDesc != nil {
-		if !canSeeDescriptor {
-			if ok, err := p.HasPrivilege(ctx, parentDBDesc, privilege.CONNECT, p.User()); err != nil {
-				return false, err
-			} else {
-				canSeeDescriptor = ok
-			}
+		if ok, err := p.HasPrivilege(ctx, parentDBDesc, privilege.CONNECT, p.User()); err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
 		}
 	}
-	return canSeeDescriptor, nil
+
+	return false, nil
 }
 
-func descriptorIsVisible(desc catalog.Descriptor, allowAdding bool) bool {
-	return desc.Public() || (allowAdding && desc.Adding())
+func descriptorIsVisible(desc catalog.Descriptor, allowAdding bool, includeDropped bool) bool {
+	return desc.Public() || (allowAdding && desc.Adding()) || (includeDropped && desc.Dropped())
 }
 
 // nameConcatOid is a Go version of the nameconcatoid builtin function. The

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
@@ -15,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -26,7 +22,7 @@ import (
 )
 
 var parallelCommitsEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"kv.transaction.parallel_commits_enabled",
 	"if enabled, transactional commits will be parallelized with transactional writes",
 	true,
@@ -129,17 +125,19 @@ var parallelCommitsEnabled = settings.RegisterBoolSetting(
 // In all cases, the interceptor abstracts away the details of this from all
 // interceptors above it in the coordinator interceptor stack.
 type txnCommitter struct {
-	st      *cluster.Settings
-	stopper *stop.Stopper
-	wrapped lockedSender
-	metrics *TxnMetrics
-	mu      sync.Locker
+	st         *cluster.Settings
+	stopper    *stop.Stopper
+	wrapped    lockedSender
+	metrics    *TxnMetrics
+	mu         sync.Locker
+	disable1PC bool
 }
 
 // SendLocked implements the lockedSender interface.
 func (tc *txnCommitter) SendLocked(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchResponse, *kvpb.Error) {
+	tc.maybeDisable1PC(ba)
 	// If the batch does not include an EndTxn request, pass it through.
 	rArgs, hasET := ba.GetArg(kvpb.EndTxn)
 	if !hasET {
@@ -150,7 +148,6 @@ func (tc *txnCommitter) SendLocked(
 	if err := tc.validateEndTxnBatch(ba); err != nil {
 		return nil, kvpb.NewError(err)
 	}
-
 	// Determine whether we can elide the EndTxn entirely. We can do so if the
 	// transaction is read-only, which we determine based on whether the EndTxn
 	// request contains any writes.
@@ -163,6 +160,7 @@ func (tc *txnCommitter) SendLocked(
 		return nil, kvpb.NewError(errors.AssertionFailedf("client must not assign Key to EndTxn"))
 	}
 	et.Key = ba.Txn.Key
+	et.Disable1PC = tc.disable1PC // disable the 1PC optimization, if necessary
 
 	// Determine whether the commit request can be run in parallel with the rest
 	// of the requests in the batch. If not, move the in-flight writes currently
@@ -196,9 +194,7 @@ func (tc *txnCommitter) SendLocked(
 		// of STAGING, we know that the transaction failed to implicitly commit,
 		// so interceptors above the txnCommitter in the stack don't need to be
 		// made aware that the record is staging.
-		if txn := pErr.GetTxn(); txn != nil && txn.Status == roachpb.STAGING {
-			pErr.SetTxn(cloneWithStatus(txn, roachpb.PENDING))
-		}
+		pErr = maybeRemoveStagingStatusInErr(pErr)
 		return nil, pErr
 	}
 
@@ -206,6 +202,9 @@ func (tc *txnCommitter) SendLocked(
 	switch br.Txn.Status {
 	case roachpb.STAGING:
 		// Continue with STAGING-specific validation and cleanup.
+	case roachpb.PREPARED:
+		// The transaction is prepared.
+		return br, nil
 	case roachpb.COMMITTED:
 		// The transaction is explicitly committed. This is possible if all
 		// in-flight writes were sent to the same range as the EndTxn request,
@@ -277,6 +276,13 @@ func (tc *txnCommitter) validateEndTxnBatch(ba *kvpb.BatchRequest) error {
 	if delRange && endTxn && !e.(*kvpb.EndTxnRequest).Require1PC {
 		return errors.Errorf("possible 1PC batch cannot contain EndTxn without setting Require1PC; see #37457")
 	}
+	// Check that the EndTxn request doesn't require a 1PC when we've previously
+	// determined 1PC should be disabled.
+	if e.(*kvpb.EndTxnRequest).Require1PC && tc.disable1PC {
+		return errors.AssertionFailedf(
+			"cannot require 1PC when for transactions that acquire replicated locks",
+		)
+	}
 	return nil
 }
 
@@ -345,6 +351,11 @@ func (tc *txnCommitter) canCommitInParallel(ba *kvpb.BatchRequest, et *kvpb.EndT
 		return false
 	}
 
+	// We don't support a parallel prepare.
+	if et.Prepare {
+		return false
+	}
+
 	// If the transaction has a commit trigger, we don't allow it to commit in
 	// parallel with writes. There's no fundamental reason for this restriction,
 	// but for now it's not worth the complication.
@@ -358,31 +369,21 @@ func (tc *txnCommitter) canCommitInParallel(ba *kvpb.BatchRequest, et *kvpb.EndT
 	for _, ru := range ba.Requests[:len(ba.Requests)-1] {
 		req := ru.GetInner()
 		switch {
-		case kvpb.IsIntentWrite(req):
-			if kvpb.IsRange(req) {
-				// Similar to how we can't pipeline ranged writes, we also can't
-				// commit in parallel with them. The reason for this is that the
-				// status resolution process for STAGING transactions wouldn't
-				// know where to look for the corresponding intents.
-				return false
-			}
-			// All other point writes are included in the EndTxn request's
-			// InFlightWrites set and are visible to the status resolution
-			// process for STAGING transactions. Populating InFlightWrites
-			// has already been done by the txnPipeliner.
+		case kvpb.CanParallelCommit(req):
+			//  The request can be part of a batch that is committed in parallel.
 
 		case req.Method() == kvpb.QueryIntent:
-			// QueryIntent requests are compatable with parallel commits. The
+			// QueryIntent requests are compatible with parallel commits. The
 			// intents being queried are also attached to the EndTxn request's
 			// InFlightWrites set and are visible to the status resolution
 			// process for STAGING transactions. Populating InFlightWrites has
 			// already been done by the txnPipeliner.
 
 		default:
-			// All other request types, notably Get and Scan requests, are
-			// incompatible with parallel commits because their outcome is
-			// not taken into consideration by the status resolution process
-			// for STAGING transactions.
+			// All other request types, notably Get, Scan and DeleteRange requests,
+			// are incompatible with parallel commits because their outcome is not
+			// taken into consideration by the status resolution process for STAGING
+			// transactions.
 			return false
 		}
 	}
@@ -457,6 +458,13 @@ func (tc *txnCommitter) retryTxnCommitAfterFailedParallelCommit(
 	}
 	brSuffix, pErr := tc.wrapped.SendLocked(ctx, baSuffix)
 	if pErr != nil {
+		// If the request determined that the transaction record had been staging,
+		// but then fails to commit the transaction, downgrade the status back to
+		// PENDING. We issued the request with a PENDING status, so we typically
+		// don't expect this to happen. However, it can happen if the error is
+		// constructed using the proto from the transaction record, as is the case
+		// for TransactionRetryErrors returned from request evaluation.
+		pErr = maybeRemoveStagingStatusInErr(pErr)
 		return nil, pErr
 	}
 
@@ -464,6 +472,10 @@ func (tc *txnCommitter) retryTxnCommitAfterFailedParallelCommit(
 	br.Responses[etIdx] = kvpb.ResponseUnion{}
 	if err := br.Combine(ctx, brSuffix, []int{etIdx}, ba); err != nil {
 		return nil, kvpb.NewError(err)
+	}
+	if br.Txn == nil || !br.Txn.Status.IsFinalized() {
+		return nil, kvpb.NewError(errors.AssertionFailedf(
+			"txn status not finalized after successful retried EndTxn: %v", br.Txn))
 	}
 	return br, nil
 }
@@ -535,6 +547,53 @@ func makeTxnCommitExplicitLocked(
 	return nil
 }
 
+// maybeDisable1PC checks if the supplied batch would require us to disable 1PC
+// when it's time to commit the transaction. A transaction that has acquired one
+// or more replicated locks is not allowed to commit using 1PC; everyone else,
+// if they're able to (determined on the server), is.
+//
+// Replicated locks must be held until and provide protection up till their
+// transaction's commit timestamp[1]. We ensure this by bumping the timestamp
+// cache to the transaction's commit timestamp for all locked keys when
+// resolving locks. Let's consider external and local replicated locks
+// separately:
+//
+// - External locks: 1PC transactions do not write a transaction record. This
+// means if any of its external locks are resolved by another transaction
+// they'll be resolved as if the transaction were aborted, thus not providing us
+// protection until the transaction's commit timestamp.
+// - Local locks: we have all the information to locally resolve replicated
+// locks and bump the timestamp cache correctly if we're only dealing with local
+// replicated locks. However, the mechanics of 1PC transactions prevent us from
+// hitting it in the common case, where we're acquiring a replicated lock and
+// writing to the same key. 1PC transactions work by stripping the batch of its
+// EndTxnRequest and running it as a non-transactional batch. This means that
+// without some elbow grease, 1PC is bound to fail when it discovers its own
+// replicated lock. For now, we disable 1PC on the client for local locks as
+// well -- this can be optimized in the future.
+// TODO(arul): file an issue about improving things for local locks.
+//
+// [1] This distinction is currently moot for serializable transactions, as they
+// refresh all their reads (locked and unlocked) before committing. Doing so
+// bumps the timestamp cache. However, one can imagine a world where
+// serializable transactions do not need to refresh keys they acquired
+// replicated locks on. In such a world, we would be relying on lock resolution
+// to bump the timestamp cache to the commit timestamp of the transaction.
+func (tc *txnCommitter) maybeDisable1PC(ba *kvpb.BatchRequest) {
+	if tc.disable1PC {
+		return // already disabled; early return
+	}
+	for _, req := range ba.Requests {
+		if readOnlyReq, ok := req.GetInner().(kvpb.LockingReadRequest); ok {
+			_, dur := readOnlyReq.KeyLocking()
+			if dur == lock.Replicated {
+				tc.disable1PC = true
+				return
+			}
+		}
+	}
+}
+
 // setWrapped implements the txnInterceptor interface.
 func (tc *txnCommitter) setWrapped(wrapped lockedSender) { tc.wrapped = wrapped }
 
@@ -565,4 +624,11 @@ func cloneWithStatus(txn *roachpb.Transaction, s roachpb.TransactionStatus) *roa
 	clone := txn.Clone()
 	clone.Status = s
 	return clone
+}
+
+func maybeRemoveStagingStatusInErr(pErr *kvpb.Error) *kvpb.Error {
+	if txn := pErr.GetTxn(); txn != nil && txn.Status == roachpb.STAGING {
+		pErr.SetTxn(cloneWithStatus(txn, roachpb.PENDING))
+	}
+	return pErr
 }

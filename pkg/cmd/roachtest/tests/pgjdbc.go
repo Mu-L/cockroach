@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -23,7 +18,10 @@ import (
 )
 
 var pgjdbcReleaseTagRegex = regexp.MustCompile(`^REL(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedPGJDBCTag = "REL42.3.3"
+
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
+var supportedPGJDBCTag = "REL42.7.3"
 
 // This test runs pgjdbc's full test suite against a single cockroach node.
 
@@ -38,8 +36,7 @@ func registerPgjdbc(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(install.SecureOption(true)), c.All())
+		c.Start(ctx, t.L(), option.NewStartOpts(sqlClientsInMemoryDB), install.MakeClusterSettings(), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
@@ -48,25 +45,6 @@ func registerPgjdbc(r registry.Registry) {
 
 		if err := alterZoneConfigAndClusterSettings(ctx, t, version, c, node[0]); err != nil {
 			t.Fatal(err)
-		}
-
-		t.Status("create admin user for tests")
-		db, err := c.ConnE(ctx, t.L(), node[0])
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
-		stmts := []string{
-			"CREATE USER test_admin WITH PASSWORD 'testpw'",
-			"GRANT admin TO test_admin",
-			"ALTER ROLE ALL SET serial_normalization = 'sql_sequence_cached'",
-			"ALTER ROLE ALL SET statement_timeout = '60s'",
-		}
-		for _, stmt := range stmts {
-			_, err = db.ExecContext(ctx, stmt)
-			if err != nil {
-				t.Fatal(err)
-			}
 		}
 
 		t.Status("cloning pgjdbc and installing prerequisites")
@@ -87,14 +65,13 @@ func registerPgjdbc(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		// TODO(rafi): use openjdk-11-jdk-headless once we are off of Ubuntu 16.
 		if err := repeatRunE(
 			ctx,
 			t,
 			c,
 			node,
 			"install dependencies",
-			`sudo apt-get -qq install default-jre openjdk-8-jdk-headless gradle`,
+			`sudo apt-get -qq install default-jre openjdk-17-jdk-headless gradle`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -132,6 +109,21 @@ func registerPgjdbc(r registry.Registry) {
 			t.Fatal(err)
 		}
 
+		// Remove an unsupported deferrable qualifier (#31632) from the XA test
+		// suite setup. This prevents XADataSourceTest.mappingOfConstraintViolations
+		// from running properly (it fails either way), but it allows the rest of
+		// the XA tests to run.
+		if err := repeatRunE(
+			ctx,
+			t,
+			c,
+			node,
+			"removing unsupported deferrable qualifier from test",
+			"sed -i 's/ deferrable//' /mnt/data1/pgjdbc/pgjdbc/src/test/java/org/postgresql/test/xa/XADataSourceTest.java",
+		); err != nil {
+			t.Fatal(err)
+		}
+
 		t.Status("building pgjdbc (without tests)")
 		// Build pgjdbc and run a single test, this step involves some
 		// downloading, so it needs a retry loop as well. Just building was not
@@ -148,7 +140,7 @@ func registerPgjdbc(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		const blocklistName = "pgjdbcBlocklist"
+		const blocklistName = "pgjdbcBlockList"
 		const ignorelistName = "pgjdbcIgnorelist"
 		expectedFailures := pgjdbcBlockList
 		ignorelist := pgjdbcIgnoreList
@@ -161,11 +153,11 @@ func registerPgjdbc(r registry.Registry) {
 		t.Status("running pgjdbc test suite")
 		// Note that this is expected to return an error, since the test suite
 		// will fail. And it is safe to swallow it here.
-		_ = c.RunE(ctx, node,
+		_ = c.RunE(ctx, option.WithNodes(node),
 			`cd /mnt/data1/pgjdbc/pgjdbc/ && ../gradlew test`,
 		)
 
-		_ = c.RunE(ctx, node,
+		_ = c.RunE(ctx, option.WithNodes(node),
 			`mkdir -p ~/logs/report/pgjdbc-results`,
 		)
 
@@ -210,11 +202,12 @@ func registerPgjdbc(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "pgjdbc",
-		Owner:   registry.OwnerSQLFoundations,
-		Cluster: r.MakeClusterSpec(1),
-		Leases:  registry.MetamorphicLeases,
-		Tags:    registry.Tags(`default`, `driver`),
+		Name:             "pgjdbc",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.Driver),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPgjdbc(ctx, t, c)
 		},
@@ -223,7 +216,7 @@ func registerPgjdbc(r registry.Registry) {
 
 const pgjdbcDatabaseParams = `
 server=localhost
-port=26257
+port={pgport:1}
 secondaryServer=localhost
 secondaryPort=5433
 secondaryServer2=localhost

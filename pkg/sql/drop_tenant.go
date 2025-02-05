@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -19,6 +14,7 @@ import (
 )
 
 type dropTenantNode struct {
+	zeroInputPlanNode
 	tenantSpec tenantSpec
 	ifExists   bool
 	immediate  bool
@@ -28,7 +24,7 @@ func (p *planner) DropTenant(ctx context.Context, n *tree.DropTenant) (planNode,
 	// Even though the call to DropTenantByID in startExec also
 	// performs this check, we need to do this early because otherwise
 	// the lookup of the ID from the name will fail.
-	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "drop"); err != nil {
+	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, "drop", p.execCfg.Settings); err != nil {
 		return nil, err
 	}
 

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package importer
 
@@ -24,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -60,7 +56,7 @@ func runImport(
 
 	// Install type metadata in all of the import tables.
 	spec = protoutil.Clone(spec).(*execinfrapb.ReadImportDataSpec)
-	importResolver := newImportTypeResolver(spec.Types)
+	importResolver := crosscluster.MakeCrossClusterTypeResolver(spec.Types)
 	for _, table := range spec.Tables {
 		cpy := tabledesc.NewBuilder(table.Desc).BuildCreatedMutableTable()
 		if err := typedesc.HydrateTypesInDescriptor(ctx, cpy, importResolver); err != nil {
@@ -71,8 +67,7 @@ func runImport(
 
 	evalCtx := flowCtx.NewEvalCtx()
 	evalCtx.Regions = makeImportRegionOperator(spec.DatabasePrimaryRegion)
-	semaCtx := tree.MakeSemaContext()
-	semaCtx.TypeResolver = importResolver
+	semaCtx := tree.MakeSemaContext(importResolver)
 	conv, err := makeInputConverter(ctx, &semaCtx, spec, evalCtx, kvCh, seqChunkProvider, flowCtx.Cfg.DB.KV())
 	if err != nil {
 		return nil, err
@@ -112,29 +107,26 @@ func runImport(
 	var summary *kvpb.BulkOpSummary
 	group.GoCtx(func(ctx context.Context) error {
 		summary, err = ingestKvs(ctx, flowCtx, spec, progCh, kvCh)
-		if err != nil {
-			return err
-		}
-		var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
-		prog.ResumePos = make(map[int32]int64)
-		prog.CompletedFraction = make(map[int32]float32)
-		for i := range spec.Uri {
-			prog.CompletedFraction[i] = 1.0
-			prog.ResumePos[i] = math.MaxInt64
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case progCh <- prog:
-			return nil
-		}
+		return err
 	})
 
 	if err = group.Wait(); err != nil {
 		return nil, err
 	}
 
-	return summary, nil
+	var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
+	prog.ResumePos = make(map[int32]int64)
+	prog.CompletedFraction = make(map[int32]float32)
+	for i := range spec.Uri {
+		prog.CompletedFraction[i] = 1.0
+		prog.ResumePos[i] = math.MaxInt64
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case progCh <- prog:
+		return summary, nil
+	}
 }
 
 type readFileFunc func(context.Context, *fileReader, int32, int64, chan string) error
@@ -496,7 +488,8 @@ func makeDatumConverter(
 ) (*row.DatumRowConverter, error) {
 	conv, err := row.NewDatumRowConverter(
 		ctx, importCtx.semaCtx, importCtx.tableDesc, importCtx.targetCols, importCtx.evalCtx,
-		importCtx.kvCh, importCtx.seqChunkProvider, nil /* metrics */, db)
+		importCtx.kvCh, importCtx.seqChunkProvider, nil /* metrics */, db,
+	)
 	if err == nil {
 		conv.KvBatch.Source = fileCtx.source
 	}

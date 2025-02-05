@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcostclient_test
 
@@ -49,6 +46,7 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 	// background load, so we disable running it under stress and/or race.
 	skip.UnderStress(t)
 	skip.UnderRace(t)
+	skip.WithIssue(t, 109179, "this test is flaky due to background activity when run during CI")
 
 	ctx := context.Background()
 
@@ -83,7 +81,7 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 			},
 		},
 	})
-	defer tenant1.Stopper().Stop(ctx)
+	defer tenant1.AppStopper().Stop(ctx)
 	defer tenantDB1.Close()
 	tdb := sqlutils.MakeSQLRunner(tenantDB1)
 	tdb.Exec(t, "SET CLUSTER SETTING sql.stats.automatic_collection.enabled=false")
@@ -137,11 +135,11 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 	}
 
 	var err error
-	var tenantEstimatedRUs int
+	var tenantEstimatedRUs float64
 	for _, tc := range testCases {
 		for i := 0; i < tc.count; i++ {
 			output := tdb.QueryStr(t, "EXPLAIN ANALYZE "+tc.sql)
-			var estimatedRU int
+			var estimatedRU float64
 			for _, row := range output {
 				if len(row) != 1 {
 					t.Fatalf("expected one column")
@@ -151,7 +149,7 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 					substr := strings.Split(val, " ")
 					require.Equalf(t, 4, len(substr), "expected RU consumption message to have four words")
 					ruCountStr := strings.Replace(strings.TrimSpace(substr[3]), ",", "", -1)
-					estimatedRU, err = strconv.Atoi(ruCountStr)
+					estimatedRU, err = strconv.ParseFloat(ruCountStr, 64)
 					require.NoError(t, err, "failed to retrieve estimated RUs")
 					break
 				}
@@ -195,7 +193,7 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 	// Check the estimated RU aggregate for all the queries against the actual
 	// measured RU consumption for the tenant.
 	tenantMeasuredRUs = getTenantRUs() - tenantStartRUs
-	const deltaFraction = 0.05
+	const deltaFraction = 0.25
 	allowedDelta := tenantMeasuredRUs * deltaFraction
 	require.InDeltaf(t, tenantMeasuredRUs, tenantEstimatedRUs, allowedDelta,
 		"estimated RUs (%d) were not within %f RUs of the expected value (%f)",

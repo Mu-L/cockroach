@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -261,9 +256,11 @@ func (c *call) result(ctx context.Context, leader bool) Result {
 					// so far. This is racy with the leader finishing and resetting
 					// c.mu.sp, in which case we'll get nothing; we ignore that
 					// possibiltity as unlikely, making this best-effort.
-					c.mu.Lock()
-					rec := c.mu.sp.GetTraceRecording(sp.RecordingType())
-					c.mu.Unlock()
+					rec := func() tracing.Trace {
+						c.mu.Lock()
+						defer c.mu.Unlock()
+						return c.mu.sp.GetTraceRecording(sp.RecordingType())
+					}()
 					sp.ImportTrace(rec)
 				}
 			}
@@ -393,6 +390,7 @@ func (g *Group) doCall(
 	}
 
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	delete(g.m, key)
 	{
 		c.mu.Lock()
@@ -404,7 +402,6 @@ func (g *Group) doCall(
 	}
 	// Publish the results to all waiters.
 	close(c.c)
-	g.mu.Unlock()
 }
 
 var _ = (*Group).Forget
@@ -414,8 +411,8 @@ var _ = (*Group).Forget
 // an earlier call to complete.
 func (g *Group) Forget(key string) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	delete(g.m, key)
-	g.mu.Unlock()
 }
 
 // NumCalls returns the number of in-flight calls for a given key.

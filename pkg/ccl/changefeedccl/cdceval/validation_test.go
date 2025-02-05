@@ -1,15 +1,13 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdceval
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -18,9 +16,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
@@ -30,8 +30,9 @@ func TestNormalizeAndValidate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.ExecMultiple(t,
@@ -93,8 +94,8 @@ func TestNormalizeAndValidate(t *testing.T) {
 			name: "UDTs fully qualified",
 			desc: fooDesc,
 			stmt: "SELECT *, 'inactive':::status FROM foo AS bar WHERE status = 'open':::status",
-			expectStmt: "SELECT *, 'inactive':::defaultdb.public.status " +
-				"FROM foo AS bar WHERE status = 'open':::defaultdb.public.status",
+			expectStmt: "SELECT *, 'inactive':::public.status " +
+				"FROM foo AS bar WHERE status = 'open':::public.status",
 			splitColFams: false,
 		},
 		{
@@ -205,6 +206,19 @@ func TestNormalizeAndValidate(t *testing.T) {
 			stmt:      "SELECT *, cdc_prev() FROM foo AS bar",
 			expectErr: `unknown function: cdc_prev()`,
 		},
+		{ // Regression for #115245
+			name:      "changefeed_creation_timestamp",
+			desc:      fooDesc,
+			stmt:      "SELECT * FROM foo WHERE changefeed_creation_timestamp() != changefeed_creation_timestamp()",
+			expectErr: `does not match any rows`,
+		},
+		{ // Regression for #115245
+			name: "changefeed_creation_timestamp",
+			desc: fooDesc,
+			stmt: fmt.Sprintf("SELECT * FROM foo WHERE changefeed_creation_timestamp() = %s",
+				tree.AsStringWithFlags(eval.TimestampToDecimalDatum(hlc.Timestamp{WallTime: 42}), tree.FmtExport)),
+			expectErr: `does not match any rows`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sc, err := ParseChangefeedExpression(tc.stmt)
@@ -244,8 +258,9 @@ func TestSelectClauseRequiresPrev(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE table foo (id int primary key, s string)`)

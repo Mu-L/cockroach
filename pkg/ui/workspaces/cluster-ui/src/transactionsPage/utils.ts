@@ -1,21 +1,17 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
+import Long from "long";
+
 import {
   Filters,
   getTimeValueInSeconds,
   calculateActiveFilters,
 } from "../queryFilter";
 import { AggregateStatistics } from "../statementsTable";
-import Long from "long";
 import {
   longToInt,
   addStatementStats,
@@ -177,7 +173,7 @@ export const filterTransactions = (
       const app = t.stats_data.app;
       const isInternal = app.startsWith(internalAppNamePrefix);
 
-      if (filters.app && filters.app != "All") {
+      if (filters.app && filters.app !== "All") {
         const apps = filters.app.split(",");
         let showInternal = false;
         if (apps.includes(internalAppNamePrefix)) {
@@ -193,8 +189,7 @@ export const filterTransactions = (
           apps.includes(app)
         );
       } else {
-        // We don't want to show internal transactions by default.
-        return !isInternal;
+        return true;
       }
     })
     .filter(
@@ -205,7 +200,7 @@ export const filterTransactions = (
     .filter((t: Transaction) => {
       // The transaction must contain at least one value of the regions list
       // (if the list is not empty).
-      if (regions.length == 0) return true;
+      if (regions.length === 0) return true;
 
       return getStatementsByFingerprintId(
         t.stats_data.statement_fingerprint_ids,
@@ -217,7 +212,7 @@ export const filterTransactions = (
     .filter((t: Transaction) => {
       // The transaction must contain at least one value of the nodes list
       // (if the list is not empty).
-      if (nodes.length == 0) return true;
+      if (nodes.length === 0) return true;
 
       // If the cluster is a tenant cluster we don't care about nodes.
       if (isTenant) return true;

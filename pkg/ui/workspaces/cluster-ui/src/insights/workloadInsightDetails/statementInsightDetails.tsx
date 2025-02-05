@@ -1,35 +1,29 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+import { ArrowLeft } from "@cockroachlabs/icons";
+import { Row, Col, Tabs } from "antd";
+import classNames from "classnames/bind";
 import React, { useEffect, useState } from "react";
 import Helmet from "react-helmet";
 import { RouteComponentProps } from "react-router-dom";
-import { ArrowLeft } from "@cockroachlabs/icons";
-import { Row, Col, Tabs } from "antd";
-import "antd/lib/tabs/style";
-import "antd/lib/col/style";
-import "antd/lib/row/style";
+
+import { getExplainPlanFromGist } from "src/api/decodePlanGistApi";
+import { getStmtInsightsApi } from "src/api/stmtInsightsApi";
 import { Button } from "src/button";
+import { commonStyles } from "src/common";
+import insightsDetailsStyles from "src/insights/workloadInsightDetails/insightsDetails.module.scss";
 import { Loading } from "src/loading";
 import { SqlBox, SqlBoxSize } from "src/sql";
 import { getMatchParamByName, idAttr } from "src/util";
-import { StmtInsightEvent } from "../types";
-import { getExplainPlanFromGist } from "src/api/decodePlanGistApi";
-import { StatementInsightDetailsOverviewTab } from "./statementInsightDetailsOverviewTab";
-import { TimeScale, toDateRange } from "../../timeScaleDropdown";
-import { getStmtInsightsApi } from "src/api";
-import { InsightsError } from "../insightsErrorComponent";
-
 // Styles
-import classNames from "classnames/bind";
-import { commonStyles } from "src/common";
-import insightsDetailsStyles from "src/insights/workloadInsightDetails/insightsDetails.module.scss";
+
+import { TimeScale, toDateRange } from "../../timeScaleDropdown";
+import { InsightsError } from "../insightsErrorComponent";
+import { StmtInsightEvent } from "../types";
+
+import { StatementInsightDetailsOverviewTab } from "./statementInsightDetailsOverviewTab";
 
 const cx = classNames.bind(insightsDetailsStyles);
 
@@ -40,7 +34,6 @@ enum TabKeysEnum {
 export interface StatementInsightDetailsStateProps {
   insightEventDetails: StmtInsightEvent;
   insightError: Error | null;
-  isTenant?: boolean;
   timeScale?: TimeScale;
   hasAdminRole: boolean;
 }
@@ -52,7 +45,7 @@ export interface StatementInsightDetailsDispatchProps {
 
 export type StatementInsightDetailsProps = StatementInsightDetailsStateProps &
   StatementInsightDetailsDispatchProps &
-  RouteComponentProps<unknown>;
+  RouteComponentProps;
 
 type ExplainPlanState = {
   explainPlan: string;
@@ -73,7 +66,6 @@ export const StatementInsightDetails: React.FC<
   insightEventDetails,
   insightError,
   match,
-  isTenant,
   timeScale,
   hasAdminRole,
   refreshUserSQLRoles,
@@ -90,13 +82,12 @@ export const StatementInsightDetails: React.FC<
       error: insightError,
     });
 
-  const details = insightDetails.details;
+  const details = insightDetails?.details;
 
   const prevPage = (): void => history.goBack();
 
   const onTabClick = (key: TabKeysEnum) => {
     if (
-      !isTenant &&
       key === TabKeysEnum.EXPLAIN &&
       details?.planGist &&
       !explainPlanState.loaded
@@ -120,7 +111,11 @@ export const StatementInsightDetails: React.FC<
       return;
     }
     const [start, end] = toDateRange(timeScale);
-    getStmtInsightsApi({ stmtExecutionID: executionID, start, end })
+    getStmtInsightsApi({
+      stmtExecutionID: executionID,
+      start,
+      end,
+    })
       .then(res => {
         setInsightDetails({
           details: res?.results?.length ? res.results[0] : null,
@@ -150,16 +145,16 @@ export const StatementInsightDetails: React.FC<
       </h3>
       <div>
         <Loading
-          loading={!insightDetails.loaded}
+          loading={!insightDetails?.loaded}
           page="Statement Insight details"
-          error={insightDetails.error}
-          renderError={() => InsightsError(insightDetails.error?.message)}
+          error={insightDetails?.error}
+          renderError={() => InsightsError(insightDetails?.error?.message)}
         >
           <section className={cx("section")}>
             <Row>
               <Col span={24}>
                 <SqlBox
-                  size={SqlBoxSize.custom}
+                  size={SqlBoxSize.CUSTOM}
                   value={details?.query}
                   format={true}
                 />
@@ -177,34 +172,30 @@ export const StatementInsightDetails: React.FC<
                 hasAdminRole={hasAdminRole}
               />
             </Tabs.TabPane>
-            {!isTenant && (
-              <Tabs.TabPane tab="Explain Plan" key={TabKeysEnum.EXPLAIN}>
-                <section className={cx("section")}>
-                  <Row gutter={24}>
-                    <Col span={24}>
-                      <Loading
-                        loading={
-                          !explainPlanState.loaded &&
-                          details?.planGist?.length > 0
-                        }
-                        page={"stmt_insight_details"}
-                        error={explainPlanState.error}
-                        renderError={() =>
-                          InsightsError(explainPlanState.error?.message)
-                        }
-                      >
-                        <SqlBox
-                          value={
-                            explainPlanState.explainPlan || "Not available."
-                          }
-                          size={SqlBoxSize.custom}
-                        />
-                      </Loading>
-                    </Col>
-                  </Row>
-                </section>
-              </Tabs.TabPane>
-            )}
+            <Tabs.TabPane tab="Explain Plan" key={TabKeysEnum.EXPLAIN}>
+              <section className={cx("section")}>
+                <Row gutter={24}>
+                  <Col span={24}>
+                    <Loading
+                      loading={
+                        !explainPlanState.loaded &&
+                        details?.planGist?.length > 0
+                      }
+                      page={"stmt_insight_details"}
+                      error={explainPlanState.error}
+                      renderError={() =>
+                        InsightsError(explainPlanState.error?.message)
+                      }
+                    >
+                      <SqlBox
+                        value={explainPlanState.explainPlan || "Not available."}
+                        size={SqlBoxSize.CUSTOM}
+                      />
+                    </Loading>
+                  </Col>
+                </Row>
+              </section>
+            </Tabs.TabPane>
           </Tabs>
         </Loading>
       </div>

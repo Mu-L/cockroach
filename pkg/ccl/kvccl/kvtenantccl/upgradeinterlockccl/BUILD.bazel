@@ -8,13 +8,8 @@ go_test(
         "local_test_util_test.go",
         "main_test.go",
     ],
-    args = select({
-        "//build/toolchains:use_ci_timeouts": ["-test.timeout=895s"],
-        "//conditions:default": ["-test.timeout=3595s"],
-    }),
-    exec_properties = {"Pool": "large"},
+    exec_properties = {"test.Pool": "large"},
     shard_count = 14,
-    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
         "//pkg/ccl",
@@ -31,7 +26,7 @@ go_test(
         "//pkg/sql/catalog/lease",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/sqlinstance/instancestorage",
-        "//pkg/sql/sqlliveness/slinstance",
+        "//pkg/sql/sqlliveness/slbase",
         "//pkg/sql/stats",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/skip",  # keep
@@ -52,7 +47,7 @@ genrule(
     cmd = """
         $(location //pkg/ccl/kvccl/kvtenantccl/upgradeinterlockccl/testgen) -output-file-path=$(location generated_test.go)
        """,
-    exec_tools = [
+    tools = [
         "//pkg/ccl/kvccl/kvtenantccl/upgradeinterlockccl/testgen",
     ],
     visibility = [

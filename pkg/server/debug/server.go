@@ -1,29 +1,22 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package debug
 
 import (
-	"context"
 	"expvar"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/pprof"
 	"strconv"
+	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/goroutineui"
@@ -38,6 +31,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	pebbletool "github.com/cockroachdb/pebble/tool"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/felixge/fgprof"
 	metrics "github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
 	"github.com/spf13/cobra"
@@ -57,7 +51,7 @@ const Endpoint = "/debug/"
 // This setting definition still exists so as to not break
 // deployment scripts that set it unconditionally.
 var _ = settings.RegisterStringSetting(
-	settings.TenantWritable, "server.remote_debugging.mode", "unused", "local",
+	settings.ApplicationLevel, "server.remote_debugging.mode", "unused", "local",
 	settings.Retired)
 
 // Server serves the /debug/* family of tools.
@@ -67,8 +61,6 @@ type Server struct {
 	mux        *http.ServeMux
 	spy        logSpy
 }
-
-type serverTickleFn = func(ctx context.Context, name roachpb.TenantName) error
 
 func setupProcessWideRoutes(
 	mux *http.ServeMux,
@@ -107,7 +99,6 @@ func setupProcessWideRoutes(
 	// Cribbed straight from trace's `init()` method. See:
 	// https://github.com/golang/net/blob/master/trace/trace.go
 	mux.HandleFunc("/debug/requests", authzFunc(trace.Traces))
-	mux.HandleFunc("/debug/events", authzFunc(trace.Events))
 
 	// This registers a superset of the variables exposed through the
 	// /debug/vars endpoint onto the /debug/metrics endpoint. It includes all
@@ -142,6 +133,12 @@ func setupProcessWideRoutes(
 		_ = dump.HTML(w)
 	}))
 
+	// WARNING: The /debug/pprof/fgprof endpoint provides wall-clock profiling for
+	// both On-CPU and Off-CPU time. While it is safe to use in production, note
+	// that profiling can introduce performance overhead, especially in
+	// applications with a large number of goroutines (>10k). Use this endpoint
+	// judiciously and monitor its impact on system performance.
+	mux.HandleFunc("/debug/pprof/fgprof", authzFunc(fgprof.Handler().ServeHTTP))
 }
 
 // NewServer sets up a debug server.
@@ -150,7 +147,6 @@ func NewServer(
 	st *cluster.Settings,
 	hbaConfDebugFn http.HandlerFunc,
 	profiler pprofui.Profiler,
-	serverTickleFn serverTickleFn,
 	tenantID roachpb.TenantID,
 	authorizer tenantcapabilities.Authorizer,
 ) *Server {
@@ -167,15 +163,6 @@ func NewServer(
 		// Expose the processed HBA configuration through the debug
 		// interface for inspection during troubleshooting.
 		mux.HandleFunc("/debug/hba_conf", hbaConfDebugFn)
-	}
-
-	if serverTickleFn != nil {
-		// Register the server tickling function.
-		//
-		// TODO(knz): This can be removed once
-		// https://github.com/cockroachdb/cockroach/issues/84585 is
-		// implemented.
-		mux.Handle("/debug/tickle", handleTickle(serverTickleFn))
 	}
 
 	// Set up the log spy, a tool that allows inspecting filtered logs at high
@@ -211,7 +198,11 @@ func analyzeLSM(dir string, writer io.Writer) error {
 		return err
 	}
 
-	t := pebbletool.New(pebbletool.Comparers(storage.EngineComparer))
+	t := pebbletool.New(
+		pebbletool.Comparers(&storage.EngineComparer),
+		pebbletool.KeySchema(storage.DefaultKeySchema),
+		pebbletool.KeySchemas(storage.KeySchemas...),
+	)
 
 	// TODO(yevgeniy): Consider exposing LSM tool directly.
 	var lsm *cobra.Command
@@ -234,38 +225,53 @@ func (ds *Server) RegisterWorkloadCollector(stores *kvserver.Stores) error {
 	return nil
 }
 
-// RegisterEngines setups up debug engine endpoints for the known storage engines.
-func (ds *Server) RegisterEngines(specs []base.StoreSpec, engines []storage.Engine) error {
-	if len(specs) != len(engines) {
-		// TODO(yevgeniy): Consider adding accessors to storage.Engine to get their path.
-		return errors.New("number of store specs must match number of engines")
-	}
-
-	storeIDs := make([]roachpb.StoreIdent, len(engines))
-	for i := range engines {
-		id, err := kvstorage.ReadStoreIdent(context.Background(), engines[i])
+// GetLSMStats creates a mapping between store IDs and LSM stats for all of the
+// provided storage engines.
+func GetLSMStats(engines []storage.Engine) (map[roachpb.StoreID]string, error) {
+	stats := make(map[roachpb.StoreID]string)
+	for _, eng := range engines {
+		storeID, err := eng.GetStoreID()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		storeIDs[i] = id
+		stats[roachpb.StoreID(storeID)] = eng.GetMetrics().String()
 	}
 
+	return stats, nil
+}
+
+// FormatLSMStats combines LSM stats from multiple stores into a single string.
+func FormatLSMStats(stats map[roachpb.StoreID]string) string {
+	var sb strings.Builder
+	for storeID, stat := range stats {
+		sb.WriteString(fmt.Sprintf("Store %d:\n%s\n\n", storeID, stat))
+	}
+	return sb.String()
+}
+
+// RegisterEngines setups up debug engine endpoints for the known storage engines.
+func (ds *Server) RegisterEngines(engines []storage.Engine) error {
 	ds.mux.HandleFunc("/debug/lsm", func(w http.ResponseWriter, req *http.Request) {
-		for i := range engines {
-			fmt.Fprintf(w, "Store %d:\n", storeIDs[i].StoreID)
-			_, _ = io.WriteString(w, engines[i].GetMetrics().String())
-			fmt.Fprintln(w)
+		stats, err := GetLSMStats(engines)
+		if err != nil {
+			fmt.Fprintf(w, "error retrieving LSM stats: %v", err)
 		}
+		fmt.Fprint(w, FormatLSMStats(stats))
 	})
 
-	for i := 0; i < len(specs); i++ {
-		if specs[i].InMemory {
+	for _, eng := range engines {
+		dir := eng.Env().Dir
+		if dir == "" {
 			// TODO(yevgeniy): Add plumbing to support LSM visualization for in memory engines.
 			continue
 		}
 
-		dir := specs[i].Path
-		ds.mux.HandleFunc(fmt.Sprintf("/debug/lsm-viz/%d", storeIDs[i].StoreID),
+		storeID, err := eng.GetStoreID()
+		if err != nil {
+			return err
+		}
+
+		ds.mux.HandleFunc(fmt.Sprintf("/debug/lsm-viz/%d", storeID),
 			func(w http.ResponseWriter, req *http.Request) {
 				if err := analyzeLSM(dir, w); err != nil {
 					fmt.Fprintf(w, "error analyzing LSM at %s: %v", dir, err)
@@ -329,26 +335,4 @@ If you are not redirected automatically, follow this <a href='/#/debug'>link</a>
 </body>
 </html>
 `)
-}
-
-type handleTickle serverTickleFn
-
-func (h handleTickle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	opts := r.URL.Query()
-	var name string
-	if n := opts["name"]; len(n) > 0 {
-		name = n[0]
-	}
-	w.Header().Add("Content-type", "text/plain")
-	if name == "" {
-		fmt.Fprint(w, "no name specified")
-		return
-	}
-	ctx := r.Context()
-	err := serverTickleFn(h)(ctx, roachpb.TenantName(name))
-	if err != nil {
-		fmt.Fprint(w, err)
-		return
-	}
-	fmt.Fprintf(w, "server for tenant %q was tickled", name)
 }

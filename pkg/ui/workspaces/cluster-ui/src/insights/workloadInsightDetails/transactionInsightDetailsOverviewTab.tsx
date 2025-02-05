@@ -1,32 +1,36 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React, { useContext, useState } from "react";
 import { Heading } from "@cockroachlabs/ui-components";
 import { Col, Row } from "antd";
-import "antd/lib/col/style";
-import "antd/lib/row/style";
+import classNames from "classnames/bind";
+import React, { useContext, useState } from "react";
+
+import { TxnInsightDetailsReqErrs } from "src/api";
+import { WaitTimeInsightsLabels } from "src/detailsPanels/waitTimeInsightsPanel";
+import insightsDetailsStyles from "src/insights/workloadInsightDetails/insightsDetails.module.scss";
+import {
+  InsightsSortedTable,
+  makeInsightsColumns,
+} from "src/insightsTable/insightsTable";
+import insightTableStyles from "src/insightsTable/insightsTable.module.scss";
+import { Loading } from "src/loading";
 import { SqlBox, SqlBoxSize } from "src/sql";
 import { SummaryCard, SummaryCardItem } from "src/summaryCard";
+import { NO_SAMPLES_FOUND } from "src/util";
 import {
   Count,
   DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_TZ,
   Duration,
 } from "src/util/format";
-import { WaitTimeInsightsLabels } from "src/detailsPanels/waitTimeInsightsPanel";
-import { NO_SAMPLES_FOUND } from "src/util";
-import {
-  InsightsSortedTable,
-  makeInsightsColumns,
-} from "src/insightsTable/insightsTable";
-import { WaitTimeDetailsTable } from "./insightDetailsTables";
+
+import { CockroachCloudContext } from "../../contexts";
+import { SortSetting } from "../../sortedtable";
+import { TimeScale } from "../../timeScaleDropdown";
+import { Timestamp } from "../../timestamp";
+import { InsightsError } from "../insightsErrorComponent";
 import {
   ContentionDetails,
   ContentionEvent,
@@ -35,20 +39,11 @@ import {
   StmtInsightEvent,
   TxnInsightEvent,
 } from "../types";
-
-import classNames from "classnames/bind";
-import { CockroachCloudContext } from "../../contexts";
-import { TransactionDetailsLink } from "../workloadInsights/util";
-import { TimeScale } from "../../timeScaleDropdown";
 import { getTxnInsightRecommendations } from "../utils";
-import { SortSetting } from "../../sortedtable";
-import { TxnInsightDetailsReqErrs } from "src/api";
-import { Loading } from "src/loading";
+import { TransactionDetailsLink } from "../workloadInsights/util";
 
-import insightTableStyles from "src/insightsTable/insightsTable.module.scss";
-import insightsDetailsStyles from "src/insights/workloadInsightDetails/insightsDetails.module.scss";
-import { InsightsError } from "../insightsErrorComponent";
-import { Timestamp } from "../../timestamp";
+import { FailedInsightDetailsPanel } from "./failedInsightDetailsPanel";
+import { WaitTimeDetailsTable } from "./insightDetailsTables";
 
 const cx = classNames.bind(insightsDetailsStyles);
 const tableCx = classNames.bind(insightTableStyles);
@@ -93,10 +88,11 @@ the maximum number of statements was reached in the console.`;
     true,
   );
 
-  const blockingExecutions: ContentionEvent[] = contentionDetails?.map(
-    event => {
+  const blockingExecutions: ContentionEvent[] = contentionDetails
+    ?.filter(e => e.contentionType === "LOCK_WAIT")
+    .map(event => {
       const stmtInsight = statements.find(
-        stmt => stmt.statementExecutionID == event.waitingStmtID,
+        stmt => stmt.statementExecutionID === event.waitingStmtID,
       );
       return {
         executionID: event.blockingExecutionID,
@@ -113,13 +109,19 @@ the maximum number of statements was reached in the console.`;
         indexName: event.indexName,
         stmtInsightEvent: stmtInsight,
       };
-    },
+    });
+
+  // We only expect up to 1 serialization conflict since only 1 can be recorded
+  // per execution.
+  const serializationConflict = contentionDetails?.find(
+    e => e.contentionType === "SERIALIZATION_CONFLICT",
   );
 
   const insightRecs = getTxnInsightRecommendations(txnDetails);
   const hasContentionInsights =
-    txnDetails?.insights.find(i => i.name === InsightNameEnum.highContention) !=
-    null;
+    txnDetails?.insights.find(
+      i => i.name === InsightNameEnum.HIGH_CONTENTION,
+    ) != null;
 
   return (
     <div>
@@ -134,14 +136,14 @@ the maximum number of statements was reached in the console.`;
             <Col span={24}>
               <SqlBox
                 value={insightQueries}
-                size={SqlBoxSize.custom}
+                size={SqlBoxSize.CUSTOM}
                 format={true}
               />
             </Col>
           </Row>
           {txnDetails && (
             <>
-              <Row gutter={24} type="flex">
+              <Row gutter={24}>
                 <Col span={12}>
                   <SummaryCard>
                     <SummaryCardItem
@@ -171,7 +173,7 @@ the maximum number of statements was reached in the console.`;
                       value={Duration(txnDetails.elapsedTimeMillis * 1e6)}
                     />
                     <SummaryCardItem
-                      label="CPU Time"
+                      label="SQL CPU Time"
                       value={Duration(txnDetails.cpuSQLNanos)}
                     />
                     <SummaryCardItem
@@ -233,6 +235,9 @@ the maximum number of statements was reached in the console.`;
           )}
         </Loading>
       </section>
+      {serializationConflict && (
+        <FailedInsightDetailsPanel conflictDetails={serializationConflict} />
+      )}
       {hasContentionInsights && (
         <Loading
           loading={!maxRequestsReached && contentionDetails == null}
@@ -244,7 +249,7 @@ the maximum number of statements was reached in the console.`;
             <Row gutter={24}>
               <Col>
                 <Heading type="h5">
-                  {WaitTimeInsightsLabels.BLOCKED_TXNS_TABLE_TITLE(
+                  {WaitTimeInsightsLabels.blockedTxnsTableTitle(
                     txnDetails?.transactionExecutionID,
                     InsightExecEnum.TRANSACTION,
                   )}

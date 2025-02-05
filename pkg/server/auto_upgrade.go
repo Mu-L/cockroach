@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -61,23 +57,30 @@ func (s *topLevelServer) startAttemptUpgrade(ctx context.Context) error {
 			// status, or stop attempting upgrade.
 			status, err := s.upgradeStatus(ctx, clusterVersion)
 			switch status {
-			case upgradeBlockedDueToError:
+			case UpgradeBlockedDueToError:
 				log.Errorf(ctx, "failed attempt to upgrade cluster version, error: %v", err)
 				continue
-			case upgradeBlockedDueToMixedVersions:
+			case UpgradeBlockedDueToMixedVersions:
 				log.Infof(ctx, "failed attempt to upgrade cluster version: %v", err)
 				continue
-			case upgradeDisabledByConfiguration:
-				log.Infof(ctx, "auto upgrade is disabled for current version (preserve_downgrade_option): %s", redact.Safe(clusterVersion))
+			case UpgradeDisabledByConfigurationToPreserveDowngrade:
+				log.Infof(ctx, "auto upgrade is disabled by preserve_downgrade_option")
 				// Note: we do 'continue' here (and not 'return') so that the
 				// auto-upgrade gets a chance to continue/complete if the
 				// operator resets `preserve_downgrade_option` after the node
 				// has started up already.
 				continue
-			case upgradeAlreadyCompleted:
+			case UpgradeDisabledByConfiguration:
+				log.Infof(ctx, "auto upgrade is disabled by cluster.auto_upgrade.enabled")
+				// Note: we do 'continue' here (and not 'return') so that the
+				// auto-upgrade gets a chance to continue/complete if the
+				// operator resets `auto_upgrade.enabled` after the node
+				// has started up already.
+				continue
+			case UpgradeAlreadyCompleted:
 				log.Info(ctx, "no need to upgrade, cluster already at the newest version")
 				return
-			case upgradeAllowed:
+			case UpgradeAllowed:
 				// Fall out of the select below.
 			default:
 				panic(errors.AssertionFailedf("unhandled case: %d", status))
@@ -95,7 +98,7 @@ func (s *topLevelServer) startAttemptUpgrade(ctx context.Context) error {
 			for ur := retry.StartWithCtx(ctx, upgradeRetryOpts); ur.Next(); {
 				if _, err := s.sqlServer.internalExecutor.ExecEx(
 					ctx, "set-version", nil, /* txn */
-					sessiondata.RootUserSessionDataOverride,
+					sessiondata.NodeUserSessionDataOverride,
 					"SET CLUSTER SETTING version = crdb_internal.node_executable_version();",
 				); err != nil {
 					log.Errorf(ctx, "error when finalizing cluster version upgrade: %v", err)
@@ -111,12 +114,31 @@ func (s *topLevelServer) startAttemptUpgrade(ctx context.Context) error {
 type upgradeStatus int8
 
 const (
-	upgradeAllowed upgradeStatus = iota
-	upgradeAlreadyCompleted
-	upgradeDisabledByConfiguration
-	upgradeBlockedDueToError
-	upgradeBlockedDueToMixedVersions
+	UpgradeAllowed upgradeStatus = iota
+	UpgradeAlreadyCompleted
+	UpgradeDisabledByConfiguration
+	UpgradeDisabledByConfigurationToPreserveDowngrade
+	UpgradeBlockedDueToError
+	UpgradeBlockedDueToMixedVersions
+	UpgradeBlockedDueToLowStorageClusterVersion
 )
+
+// isAutoUpgradeEnabled consults `cluster.auto_upgrade.enabled` and
+// `cluster.preserve_downgrade_option` settings to decide if automatic
+// upgrade is enabled. The later setting will be retired in a future
+// release.
+func (s *topLevelServer) isAutoUpgradeEnabled(currentClusterVersion string) upgradeStatus {
+	if autoUpgradeEnabled := clusterversion.AutoUpgradeEnabled.Get(&s.ClusterSettings().SV); !autoUpgradeEnabled {
+		// Automatic upgrade is not enabled.
+		return UpgradeDisabledByConfiguration
+	}
+	if downgradeVersion := clusterversion.PreserveDowngradeVersion.Get(&s.ClusterSettings().SV); downgradeVersion != "" {
+		if currentClusterVersion == downgradeVersion {
+			return UpgradeDisabledByConfigurationToPreserveDowngrade
+		}
+	}
+	return UpgradeAllowed
+}
 
 // upgradeStatus lets the main checking loop know if we should do upgrade,
 // keep checking upgrade status, or stop attempting upgrade.
@@ -125,11 +147,11 @@ func (s *topLevelServer) upgradeStatus(
 ) (st upgradeStatus, err error) {
 	nodes, err := s.status.ListNodesInternal(ctx, nil)
 	if err != nil {
-		return upgradeBlockedDueToError, err
+		return UpgradeBlockedDueToError, err
 	}
 	vitalities, err := s.nodeLiveness.ScanNodeVitalityFromKV(ctx)
 	if err != nil {
-		return upgradeBlockedDueToError, err
+		return UpgradeBlockedDueToError, err
 	}
 
 	var newVersion string
@@ -160,46 +182,26 @@ func (s *topLevelServer) upgradeStatus(
 		if newVersion == "" {
 			newVersion = version
 		} else if version != newVersion {
-			return upgradeBlockedDueToMixedVersions, errors.Newf(
+			return UpgradeBlockedDueToMixedVersions, errors.Newf(
 				"not all nodes are running the latest version yet (saw %s and %s)",
 				redact.Safe(newVersion), redact.Safe(version))
 		}
 	}
 
 	if newVersion == "" {
-		return upgradeBlockedDueToError, errors.Errorf("no live nodes found")
+		return UpgradeBlockedDueToError, errors.Errorf("no live nodes found")
 	}
 
 	// Check if we really need to upgrade cluster version.
 	if newVersion == clusterVersion {
-		return upgradeAlreadyCompleted, nil
+		return UpgradeAlreadyCompleted, nil
 	}
 
 	if notRunningErr != nil {
-		return upgradeBlockedDueToError, notRunningErr
+		return UpgradeBlockedDueToError, notRunningErr
 	}
 
-	// Check if auto upgrade is enabled at current version. This is read from
-	// the KV store so that it's in effect on all nodes immediately following a
-	// SET CLUSTER SETTING.
-	row, err := s.sqlServer.internalExecutor.QueryRowEx(
-		ctx, "read-downgrade", nil, /* txn */
-		sessiondata.RootUserSessionDataOverride,
-		"SELECT value FROM system.settings WHERE name = 'cluster.preserve_downgrade_option';",
-	)
-	if err != nil {
-		return upgradeBlockedDueToError, err
-	}
-
-	if row != nil {
-		downgradeVersion := string(tree.MustBeDString(row[0]))
-
-		if clusterVersion == downgradeVersion {
-			return upgradeDisabledByConfiguration, nil
-		}
-	}
-
-	return upgradeAllowed, nil
+	return s.isAutoUpgradeEnabled(clusterVersion), nil
 }
 
 // clusterVersion returns the current cluster version from the SQL subsystem
@@ -208,7 +210,7 @@ func (s *topLevelServer) upgradeStatus(
 func (s *topLevelServer) clusterVersion(ctx context.Context) (string, error) {
 	row, err := s.sqlServer.internalExecutor.QueryRowEx(
 		ctx, "show-version", nil, /* txn */
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		"SHOW CLUSTER SETTING version;",
 	)
 	if err != nil {

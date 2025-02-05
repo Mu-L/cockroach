@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -63,7 +58,7 @@ func TestUpdateAbortSpan(t *testing.T) {
 	}
 	as := abortspan.New(desc.RangeID)
 
-	txn := roachpb.MakeTransaction("test", txnKey, 0, 0, hlc.Timestamp{WallTime: 1}, 0, 1)
+	txn := roachpb.MakeTransaction("test", txnKey, 0, 0, hlc.Timestamp{WallTime: 1}, 0, 1, 0, false /* omitInRangefeeds */)
 	newTxnAbortSpanEntry := roachpb.AbortSpanEntry{
 		Key:       txn.Key,
 		Timestamp: txn.WriteTimestamp,
@@ -85,7 +80,8 @@ func TestUpdateAbortSpan(t *testing.T) {
 	type evalFn func(storage.ReadWriter, EvalContext, *enginepb.MVCCStats) error
 	addIntent := func(b storage.ReadWriter, _ EvalContext, ms *enginepb.MVCCStats) error {
 		val := roachpb.MakeValueFromString("val")
-		return storage.MVCCPut(ctx, b, intentKey, txn.ReadTimestamp, val, storage.MVCCWriteOptions{Txn: &txn, Stats: ms})
+		_, err := storage.MVCCPut(ctx, b, intentKey, txn.ReadTimestamp, val, storage.MVCCWriteOptions{Txn: &txn, Stats: ms})
+		return err
 	}
 	addPrevAbortSpanEntry := func(b storage.ReadWriter, rec EvalContext, ms *enginepb.MVCCStats) error {
 		return UpdateAbortSpan(ctx, rec, b, ms, prevTxn.TxnMeta, true /* poison */)

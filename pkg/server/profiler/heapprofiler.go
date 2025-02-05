@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package profiler
 
@@ -16,6 +11,7 @@ import (
 	"runtime/pprof"
 
 	"github.com/cockroachdb/cockroach/pkg/server/dumpstore"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -33,11 +29,28 @@ type HeapProfiler struct {
 	profiler
 }
 
-// HeapFileNamePrefix is the prefix of files containing pprof data.
-const HeapFileNamePrefix = "memprof"
+// heapFileNamePrefix is the prefix of files containing pprof data.
+const heapFileNamePrefix = "memprof"
 
-// HeapFileNameSuffix is the suffix of files containing pprof data.
-const HeapFileNameSuffix = ".pprof"
+// heapFileNameSuffix is the suffix of files containing pprof data.
+const heapFileNameSuffix = ".pprof"
+
+var maxCombinedFileSize = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
+	"server.mem_profile.total_dump_size_limit",
+	"maximum combined disk size of preserved memory profiles",
+	256<<20, // 256MiB
+)
+
+func init() {
+	_ = settings.RegisterByteSizeSetting(
+		settings.ApplicationLevel,
+		"server.heap_profile.total_dump_size_limit",
+		"use server.mem_profile.total_dump_size_limit instead",
+		256<<20, // 256MiB
+		settings.Retired,
+	)
+}
 
 // NewHeapProfiler creates a HeapProfiler. dir is the directory in which
 // profiles are to be stored.
@@ -50,7 +63,7 @@ func NewHeapProfiler(ctx context.Context, dir string, st *cluster.Settings) (*He
 
 	hp := &HeapProfiler{
 		profiler: makeProfiler(
-			newProfileStore(dumpStore, HeapFileNamePrefix, HeapFileNameSuffix, st),
+			newProfileStore(dumpStore, heapFileNamePrefix, heapFileNameSuffix, st),
 			zeroFloor,
 			envMemprofInterval,
 		),
@@ -69,7 +82,7 @@ func (o *HeapProfiler) MaybeTakeProfile(ctx context.Context, curHeap int64) {
 
 // takeHeapProfile returns true if and only if the profile dump was
 // taken successfully.
-func takeHeapProfile(ctx context.Context, path string) (success bool) {
+func takeHeapProfile(ctx context.Context, path string, _ ...interface{}) (success bool) {
 	// Try writing a go heap profile.
 	f, err := os.Create(path)
 	if err != nil {

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto2";
 package cockroach.sql.sqlbase;
@@ -19,8 +14,14 @@ message UserPrivileges {
   option (gogoproto.equal) = true;
   optional string user_proto = 1 [(gogoproto.nullable) = false,
                                   (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/security/username.SQLUsernameProto"];
-  // privileges is a bitfield of 1<<Privilege values.
+  // Privileges is a bitfield of 1<<Privilege values.
   optional uint64 privileges = 2 [(gogoproto.nullable) = false];
+  // WithGrantOption is a bitfield where each bit corresponds to a bit in
+  // Privileges. If the corresponding bit in Privileges is 0, then the
+  // WithGrantOption bit is zero. If the corresponding bit in Privileges is 1,
+  // then the WithGrantOption bit is either 1, indicating that the privilege can
+  // be granted to other users, or 0, indicating that the privilege cannot be
+  // granted to other users.
   optional uint64 with_grant_option = 3 [(gogoproto.nullable) = false];
 }
 

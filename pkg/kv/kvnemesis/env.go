@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
@@ -68,6 +64,23 @@ func (e *Env) CheckConsistency(ctx context.Context, span roachpb.Span) []error {
 		if err := rows.Scan(&rangeID, &key, &status, &detail); err != nil {
 			return []error{err}
 		}
+		// NB: There's a known issue that can result in a 10-byte discrepancy in
+		// SysBytes. See:
+		// https://github.com/cockroachdb/cockroach/issues/93896
+		//
+		// This isn't critical, so we ignore such discrepancies.
+		if status == kvpb.CheckConsistencyResponse_RANGE_CONSISTENT_STATS_INCORRECT.String() {
+			m := regexp.MustCompile(`.*\ndelta \(stats-computed\): \{(.*)\}`).FindStringSubmatch(detail)
+			if len(m) > 1 {
+				delta := m[1]
+				// Strip out LastUpdateNanos and all zero-valued fields.
+				delta = regexp.MustCompile(`LastUpdateNanos:\d+`).ReplaceAllString(delta, "")
+				delta = regexp.MustCompile(`\S+:0\b`).ReplaceAllString(delta, "")
+				if regexp.MustCompile(`^\s*SysBytes:-?10\s*$`).MatchString(delta) {
+					continue
+				}
+			}
+		}
 		switch status {
 		case kvpb.CheckConsistencyResponse_RANGE_INDETERMINATE.String():
 			// Can't do anything, so let it slide.
@@ -85,15 +98,27 @@ func (e *Env) CheckConsistency(ctx context.Context, span roachpb.Span) []error {
 // SetClosedTimestampInterval sets the kv.closed_timestamp.target_duration
 // cluster setting to the provided duration.
 func (e *Env) SetClosedTimestampInterval(ctx context.Context, d time.Duration) error {
-	q := fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s'`, d)
-	_, err := e.anyNode().ExecContext(ctx, q)
-	return err
+	return e.SetClusterSetting(ctx, "kv.closed_timestamp.target_duration", d.String())
 }
 
 // ResetClosedTimestampInterval resets the kv.closed_timestamp.target_duration
 // cluster setting to its default value.
 func (e *Env) ResetClosedTimestampInterval(ctx context.Context) error {
-	const q = `SET CLUSTER SETTING kv.closed_timestamp.target_duration TO DEFAULT`
+	return e.SetClusterSettingToDefault(ctx, "kv.closed_timestamp.target_duration")
+}
+
+// SetClusterSetting sets the cluster setting with the provided name to the
+// provided value.
+func (e *Env) SetClusterSetting(ctx context.Context, name, val string) error {
+	q := fmt.Sprintf(`SET CLUSTER SETTING %s = '%s'`, name, val)
+	_, err := e.anyNode().ExecContext(ctx, q)
+	return err
+}
+
+// SetClusterSettingToDefault resets the cluster setting with the provided name
+// to its default value.
+func (e *Env) SetClusterSettingToDefault(ctx context.Context, name string) error {
+	q := fmt.Sprintf(`SET CLUSTER SETTING %s TO DEFAULT`, name)
 	_, err := e.anyNode().ExecContext(ctx, q)
 	return err
 }

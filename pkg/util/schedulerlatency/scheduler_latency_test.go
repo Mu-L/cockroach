@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schedulerlatency
 
@@ -78,12 +73,13 @@ func TestSchedulerLatencySampler(t *testing.T) {
 		var err error
 		reg.Each(func(name string, mtr interface{}) {
 			wh := mtr.(metric.WindowedHistogram)
-			avg := wh.MeanWindowed()
+			windowSnapshot := wh.WindowedSnapshot()
+			avg := windowSnapshot.Mean()
 			if math.IsNaN(avg) || math.IsInf(avg, +1) || math.IsInf(avg, -1) {
 				avg = 0
 			}
 
-			if wh.ValueAtQuantileWindowed(99) == 0 || avg == 0 {
+			if windowSnapshot.ValueAtQuantile(99) == 0 || avg == 0 {
 				err = fmt.Errorf("expected non-zero p99 scheduling latency metrics")
 			}
 		})
@@ -194,12 +190,13 @@ func TestComputeSchedulerPercentileAgainstPrometheus(t *testing.T) {
 			}
 		}
 
-		require.InDelta(t, promhist.ValueAtQuantileWindowed(100), percentile(&hist, 1.00), 1) // pmax
-		require.InDelta(t, promhist.ValueAtQuantileWindowed(0), percentile(&hist, 0.00), 1)   // pmin
-		require.InDelta(t, promhist.ValueAtQuantileWindowed(50), percentile(&hist, 0.50), 1)  // p50
-		require.InDelta(t, promhist.ValueAtQuantileWindowed(75), percentile(&hist, 0.75), 1)  // p75
-		require.InDelta(t, promhist.ValueAtQuantileWindowed(90), percentile(&hist, 0.90), 1)  // p90
-		require.InDelta(t, promhist.ValueAtQuantileWindowed(99), percentile(&hist, 0.99), 1)  // p99
+		histWindow := promhist.WindowedSnapshot()
+		require.InDelta(t, histWindow.ValueAtQuantile(100), percentile(&hist, 1.00), 1) // pmax
+		require.InDelta(t, histWindow.ValueAtQuantile(0), percentile(&hist, 0.00), 1)   // pmin
+		require.InDelta(t, histWindow.ValueAtQuantile(50), percentile(&hist, 0.50), 1)  // p50
+		require.InDelta(t, histWindow.ValueAtQuantile(75), percentile(&hist, 0.75), 1)  // p75
+		require.InDelta(t, histWindow.ValueAtQuantile(90), percentile(&hist, 0.90), 1)  // p90
+		require.InDelta(t, histWindow.ValueAtQuantile(99), percentile(&hist, 0.99), 1)  // p99
 	}
 }
 

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lease
 
@@ -122,6 +117,8 @@ func (m *Manager) ExpireLeases(clock *hlc.Clock) {
 		desc.mu.Lock()
 		defer desc.mu.Unlock()
 		desc.mu.expiration = past
+		// Wipe the session as if this is an expired version
+		desc.mu.session = nil
 		return nil
 	})
 }
@@ -158,7 +155,7 @@ func (m *Manager) PublishMultiple(
 		// of the descriptors.
 		expectedVersions := make(map[descpb.ID]descpb.DescriptorVersion)
 		for _, id := range ids {
-			expected, err := m.WaitForOneVersion(ctx, id, base.DefaultRetryOptions())
+			expected, err := m.WaitForOneVersion(ctx, id, nil, base.DefaultRetryOptions())
 			if err != nil {
 				return nil, err
 			}
@@ -297,7 +294,7 @@ func (m *Manager) Publish(
 }
 
 func (m *Manager) TestingRefreshSomeLeases(ctx context.Context) {
-	m.refreshSomeLeases(ctx)
+	m.refreshSomeLeases(ctx, false /*refreshAll*/)
 }
 
 func (m *Manager) TestingDescriptorStateIsNil(id descpb.ID) bool {

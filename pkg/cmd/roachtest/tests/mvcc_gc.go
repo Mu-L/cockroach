@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -22,10 +17,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -38,12 +36,14 @@ import (
 
 func registerMVCCGC(r registry.Registry) {
 	r.Add(registry.TestSpec{
-		Name:    "mvcc_gc",
-		Owner:   registry.OwnerKV,
-		Timeout: 30 * time.Minute,
-		Cluster: r.MakeClusterSpec(3),
-		Leases:  registry.MetamorphicLeases,
-		Run:     runMVCCGC,
+		Name:             "mvcc_gc",
+		Owner:            registry.OwnerKV,
+		Timeout:          30 * time.Minute,
+		Cluster:          r.MakeClusterSpec(3),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
+		Run:              runMVCCGC,
 	})
 }
 
@@ -76,11 +76,19 @@ func runMVCCGC(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// How long to wait for data to be GCd during assert loop.
 	const gcRetryTimeout = 7 * time.Minute
 
-	c.Put(ctx, t.Cockroach(), "./cockroach")
+	var randomSeed int64
+	if roachtestutil.UsingRuntimeAssertions(t) {
+		// Do not use `0` as that is reserved to mean that we are running
+		// without runtime assertions.
+		for randomSeed == 0 {
+			randomSeed = rand.Int63()
+		}
+		c.SetRandomSeed(randomSeed)
+	}
 	s := install.MakeClusterSettings()
 	s.Env = append(s.Env, "COCKROACH_SCAN_INTERVAL=30s")
 	// Disable an automatic scheduled backup as it would mess with the gc ttl this test relies on.
-	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), s)
+	c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), s)
 
 	conn := c.Conn(ctx, t.L(), 1)
 	defer conn.Close()
@@ -95,9 +103,6 @@ func runMVCCGC(ctx context.Context, t test.Test, c cluster.Cluster) {
 		execSQLOrFail(fmt.Sprintf(`SET CLUSTER SETTING %s = $1`, name), value)
 	}
 
-	// Explicitly enable range tombstones. Can be removed once ranges tombstones
-	// are enabled by default.
-	setClusterSetting("storage.mvcc.range_tombstones.enabled", true)
 	// Protected timestamps prevent GC from collecting data, even with low ttl
 	// we need to wait for protected ts to be moved. By reducing this interval
 	// we ensure that data will always be collectable after ttl + 5s.
@@ -111,13 +116,17 @@ func runMVCCGC(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// rebalancing is better than increasing wait time further.
 	setClusterSetting("kv.allocator.load_based_lease_rebalancing.enabled", false)
 
-	if err := WaitFor3XReplication(ctx, t, conn); err != nil {
+	if err := roachtestutil.WaitFor3XReplication(ctx, t.L(), conn); err != nil {
 		t.Fatalf("failed to up-replicate cluster: %s", err)
 	}
 
 	m := c.NewMonitor(ctx)
 	m.Go(func(ctx context.Context) error {
-		c.Run(ctx, c.Node(1), "./cockroach", "workload", "init", "kv", "--cycle-length", "20000")
+		cmd := roachtestutil.NewCommand("./cockroach workload init kv").
+			Flag("cycle-length", 20000).
+			Arg("{pgurl:1}").
+			String()
+		c.Run(ctx, option.WithNodes(c.Node(1)), cmd)
 
 		execSQLOrFail("alter database kv configure zone using gc.ttlseconds = $1", 120)
 
@@ -126,13 +135,21 @@ func runMVCCGC(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 		wlCtx, wlCancel := context.WithCancel(ctx)
 		defer wlCancel()
-		wlFailure := make(chan error)
-		go func() {
+		wlFailure := make(chan error, 1)
+		t.Go(func(context.Context, *logger.Logger) error {
 			defer close(wlFailure)
-			err := c.RunE(wlCtx, c.Node(1), "./cockroach", "workload", "run", "kv", "--cycle-length", "20000",
-				"--max-block-bytes", "2048", "--min-block-bytes", "2048", "--read-percent", "0", "--max-rate", "1800")
+			cmd = roachtestutil.NewCommand("./cockroach workload run kv").
+				Flag("cycle-length", 20000).
+				Flag("max-block-bytes", 2048).
+				Flag("min-block-bytes", 2048).
+				Flag("read-percent", 0).
+				Flag("max-rate", 1800).
+				Arg("{pgurl%s}", c.Node(1)).
+				String()
+			err := c.RunE(wlCtx, option.WithNodes(c.Node(1)), cmd)
 			wlFailure <- err
-		}()
+			return nil
+		}, task.Name("workload"))
 
 		m := queryTableMetaOrFatal(t, conn, "kv", "kv")
 
@@ -140,7 +157,7 @@ func runMVCCGC(ctx context.Context, t test.Test, c cluster.Cluster) {
 			t.L().Printf("performing clean-assert cycle #%d", i)
 
 			if err := retry.WithMaxAttempts(ctx, retry.Options{}, 3, func() error {
-				return deleteSomeTableDataWithOverlappingTombstones(ctx, t, c, conn, rng, m, 5)
+				return deleteSomeTableDataWithOverlappingTombstones(ctx, t, c, conn, rng, m, 5, randomSeed)
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -164,7 +181,7 @@ func runMVCCGC(ctx context.Context, t test.Test, c cluster.Cluster) {
 		wlCancel()
 
 		if err := retry.WithMaxAttempts(ctx, retry.Options{}, 3, func() error {
-			err := deleteAllTableDataWithOverlappingTombstones(ctx, t, c, conn, rng, m, 5)
+			err := deleteAllTableDataWithOverlappingTombstones(ctx, t, c, conn, rng, m, 5, randomSeed)
 			if err != nil {
 				return err
 			}
@@ -281,7 +298,8 @@ func checkRangesConsistentAndHaveNoData(totals enginepb.MVCCStats, details range
 		return errors.Errorf("table ranges contain garbage %s", totals.String())
 	}
 	if totals.LiveBytes > 0 || totals.LiveCount > 0 ||
-		totals.IntentBytes > 0 || totals.IntentCount > 0 || totals.SeparatedIntentCount > 0 {
+		totals.IntentBytes > 0 || totals.IntentCount > 0 ||
+		totals.LockBytes > 0 || totals.LockCount > 0 {
 		return errors.Errorf("table ranges contain live data %s", totals.String())
 	}
 	if details.status != kvpb.CheckConsistencyResponse_RANGE_CONSISTENT.String() {
@@ -481,6 +499,7 @@ func deleteAllTableDataWithOverlappingTombstones(
 	rng *rand.Rand,
 	tm tableMetadata,
 	fragments int,
+	randomSeed int64,
 ) error {
 	t.Helper()
 	encodeKey := func(index int64) roachpb.Key {
@@ -514,7 +533,7 @@ func deleteAllTableDataWithOverlappingTombstones(
 		t.L().Printf("adding range tombstone [%s, %s)", startKey, endKey)
 		addDeleteRangeUsingTombstone(&ba, startKey, endKey)
 	}
-	br, err := sendBatchRequest(ctx, t, c, 1, ba)
+	br, err := sendBatchRequest(ctx, t, c, 1, ba, randomSeed)
 	if err != nil {
 		return err
 	}
@@ -533,6 +552,7 @@ func deleteSomeTableDataWithOverlappingTombstones(
 	rng *rand.Rand,
 	tm tableMetadata,
 	rangeKeys int,
+	randomSeed int64,
 ) error {
 	t.Helper()
 	encodeKey := func(index int64) roachpb.Key {
@@ -559,7 +579,7 @@ func deleteSomeTableDataWithOverlappingTombstones(
 		t.L().Printf("adding range tombstone [%s, %s)", startKey, endKey)
 		addDeleteRangeUsingTombstone(&ba, startKey, endKey)
 	}
-	br, err := sendBatchRequest(ctx, t, c, 1, ba)
+	br, err := sendBatchRequest(ctx, t, c, 1, ba, randomSeed)
 	if err != nil {
 		return err
 	}
@@ -595,18 +615,32 @@ func addDeleteRangeUsingTombstone(ba *kvpb.BatchRequest, startKey, endKey roachp
 }
 
 func sendBatchRequest(
-	ctx context.Context, t test.Test, c cluster.Cluster, node int, ba kvpb.BatchRequest,
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	node int,
+	ba kvpb.BatchRequest,
+	randomSeed int64,
 ) (kvpb.BatchResponse, error) {
 	reqArg, err := batchToJSONOrFatal(ba)
 	if err != nil {
 		return kvpb.BatchResponse{}, err
 	}
-	requestFileName := "request-" + uuid.FastMakeV4().String() + ".json"
+	requestFileName := "request-" + uuid.MakeV4().String() + ".json"
 	if err := c.PutString(ctx, reqArg, requestFileName, 0755, c.Node(node)); err != nil {
 		return kvpb.BatchResponse{}, err
 	}
-	res, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(node), "./cockroach", "debug",
-		"send-kv-batch", "--insecure", requestFileName)
+	var debugEnv string
+	if randomSeed != 0 {
+		debugEnv = fmt.Sprintf("COCKROACH_RANDOM_SEED=%d ", randomSeed)
+	}
+	cmd := roachtestutil.NewCommand("./cockroach debug send-kv-batch").
+		Arg("%s", requestFileName).
+		Flag("certs-dir", install.CockroachNodeCertsDir).
+		Flag("host", fmt.Sprintf("localhost:{pgport:%d}", node)).
+		String()
+	res, err := c.RunWithDetailsSingleNode(
+		ctx, t.L(), option.WithNodes(c.Node(node)), debugEnv+cmd)
 	if err != nil {
 		return kvpb.BatchResponse{}, err
 	}

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -15,12 +10,11 @@ import (
 	"context"
 	gosql "database/sql"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -40,12 +34,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram/exporter"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -97,12 +90,9 @@ func importBankDataSplit(
 ) string {
 	dest := destinationName(c)
 
-	c.Put(ctx, t.DeprecatedWorkload(), "./workload")
-	c.Put(ctx, t.Cockroach(), "./cockroach")
-
 	// NB: starting the cluster creates the logs dir as a side effect,
 	// needed below.
-	c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
+	c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), install.MakeClusterSettings())
 	runImportBankDataSplit(ctx, rows, ranges, t, c)
 	return dest
 }
@@ -186,16 +176,16 @@ func waitForPort(
 func runImportBankDataSplit(ctx context.Context, rows, ranges int, t test.Test, c cluster.Cluster) {
 	csvPort := 8081
 	csvCmd := importBankCSVServerCommand("./cockroach", csvPort)
-	c.Run(ctx, c.All(), csvCmd+` &> logs/workload-csv-server.log < /dev/null &`)
+	c.Run(ctx, option.WithNodes(c.All()), csvCmd+` &> logs/workload-csv-server.log < /dev/null &`)
 	if err := waitForPort(ctx, t.L(), c.All(), csvPort, c); err != nil {
 		t.Fatal(err)
 	}
 	importNode := 1
-	c.Run(ctx, c.Node(importNode), importBankCommand("./cockroach", rows, ranges, csvPort, importNode))
+	c.Run(ctx, option.WithNodes(c.Node(importNode)), importBankCommand("./cockroach", rows, ranges, csvPort, importNode))
 }
 
 func importBankData(ctx context.Context, rows int, t test.Test, c cluster.Cluster) string {
-	return importBankDataSplit(ctx, rows, 0 /* ranges */, t, c)
+	return importBankDataSplit(ctx, rows, 0, t, c)
 }
 
 func registerBackupNodeShutdown(r registry.Registry) {
@@ -214,18 +204,21 @@ func registerBackupNodeShutdown(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:              fmt.Sprintf("backup/nodeShutdown/worker/%s", backupNodeRestartSpec),
-		Owner:             registry.OwnerDisasterRecovery,
-		Cluster:           backupNodeRestartSpec,
-		EncryptionSupport: registry.EncryptionMetamorphic,
-		Leases:            registry.MetamorphicLeases,
+		Name:                      fmt.Sprintf("backup/nodeShutdown/worker/%s", backupNodeRestartSpec),
+		Owner:                     registry.OwnerDisasterRecovery,
+		Cluster:                   backupNodeRestartSpec,
+		EncryptionSupport:         registry.EncryptionMetamorphic,
+		Leases:                    registry.MetamorphicLeases,
+		CompatibleClouds:          registry.AllExceptAWS,
+		Suites:                    registry.Suites(registry.Nightly),
+		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			gatewayNode := 2
 			nodeToShutdown := 3
 			dest := loadBackupData(ctx, t, c)
-			backupQuery := `BACKUP bank.bank TO 'nodelocal://1/` + dest + `' WITH DETACHED`
-			startBackup := func(c cluster.Cluster, t test.Test) (jobID jobspb.JobID, err error) {
-				gatewayDB := c.Conn(ctx, t.L(), gatewayNode)
+			backupQuery := `BACKUP bank.bank INTO 'nodelocal://1/` + dest + `' WITH DETACHED`
+			startBackup := func(c cluster.Cluster, l *logger.Logger) (jobID jobspb.JobID, err error) {
+				gatewayDB := c.Conn(ctx, l, gatewayNode)
 				defer gatewayDB.Close()
 
 				err = gatewayDB.QueryRowContext(ctx, backupQuery).Scan(&jobID)
@@ -236,18 +229,21 @@ func registerBackupNodeShutdown(r registry.Registry) {
 		},
 	})
 	r.Add(registry.TestSpec{
-		Name:              fmt.Sprintf("backup/nodeShutdown/coordinator/%s", backupNodeRestartSpec),
-		Owner:             registry.OwnerDisasterRecovery,
-		Cluster:           backupNodeRestartSpec,
-		EncryptionSupport: registry.EncryptionMetamorphic,
-		Leases:            registry.MetamorphicLeases,
+		Name:                      fmt.Sprintf("backup/nodeShutdown/coordinator/%s", backupNodeRestartSpec),
+		Owner:                     registry.OwnerDisasterRecovery,
+		Cluster:                   backupNodeRestartSpec,
+		EncryptionSupport:         registry.EncryptionMetamorphic,
+		Leases:                    registry.MetamorphicLeases,
+		CompatibleClouds:          registry.AllExceptAWS,
+		Suites:                    registry.Suites(registry.Nightly),
+		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			gatewayNode := 2
 			nodeToShutdown := 2
 			dest := loadBackupData(ctx, t, c)
-			backupQuery := `BACKUP bank.bank TO 'nodelocal://1/` + dest + `' WITH DETACHED`
-			startBackup := func(c cluster.Cluster, t test.Test) (jobID jobspb.JobID, err error) {
-				gatewayDB := c.Conn(ctx, t.L(), gatewayNode)
+			backupQuery := `BACKUP bank.bank INTO 'nodelocal://1/` + dest + `' WITH DETACHED`
+			startBackup := func(c cluster.Cluster, l *logger.Logger) (jobID jobspb.JobID, err error) {
+				gatewayDB := c.Conn(ctx, l, gatewayNode)
 				defer gatewayDB.Close()
 
 				err = gatewayDB.QueryRowContext(ctx, backupQuery).Scan(&jobID)
@@ -260,128 +256,30 @@ func registerBackupNodeShutdown(r registry.Registry) {
 
 }
 
-// fingerprint returns a fingerprint of `db.table`.
-func fingerprint(ctx context.Context, conn *gosql.DB, db, table string) (string, error) {
-	var b strings.Builder
-
-	query := fmt.Sprintf("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s.%s", db, table)
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name, fp string
-		if err := rows.Scan(&name, &fp); err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&b, "%s: %s\n", name, fp)
-	}
-
-	return b.String(), rows.Err()
-}
-
-// disableJobAdoptionStep writes the sentinel file to prevent a node's
-// registry from adopting a job.
-//
-// TODO(renato): remove this duplicated function once
-// `declarative_schema_changer/job-compatibility-mixed-version` is
-// migrated to the new mixed-version testing framework.
-func disableJobAdoptionStep(c cluster.Cluster, nodeIDs option.NodeListOption) versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		for _, nodeID := range nodeIDs {
-			result, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(nodeID), "echo", "-n", "{store-dir}")
-			if err != nil {
-				t.L().Printf("Failed to retrieve store directory from node %d: %v\n", nodeID, err.Error())
-			}
-			storeDirectory := result.Stdout
-			disableJobAdoptionSentinelFilePath := filepath.Join(storeDirectory, jobs.PreventAdoptionFile)
-			cmd := fmt.Sprintf("touch %s", disableJobAdoptionSentinelFilePath)
-			c.Run(ctx, nodeIDs, cmd)
-			t.L().Printf("Disabling job adoption on node %v: > %v\n", nodeID, cmd)
-
-			// Wait for no jobs to be running on the node that we have halted
-			// adoption on.
-			testutils.SucceedsSoon(t, func() error {
-				gatewayDB := c.Conn(ctx, t.L(), nodeID)
-				defer gatewayDB.Close()
-
-				var runningJobIDs []jobspb.JobID
-				row, err := gatewayDB.Query(fmt.Sprintf(`SELECT job_id FROM [SHOW JOBS] WHERE status = 'running' AND coordinator_id = %d`, nodeID))
-				require.NoError(t, err)
-				for row.Next() {
-					var jobID int64
-					require.NoError(t, row.Scan(&jobID))
-					runningJobIDs = append(runningJobIDs, jobspb.JobID(jobID))
-				}
-				require.NoError(t, row.Close())
-
-				if len(runningJobIDs) != 0 {
-					return errors.Newf("node is still running %d jobs: %v", len(runningJobIDs), runningJobIDs)
-				}
-				return nil
-			})
-		}
-
-		// TODO(adityamaru): This is unfortunate and can be deleted once
-		// https://github.com/cockroachdb/cockroach/pull/79666 is backported to
-		// 21.2 and the mixed version map for roachtests is bumped to the 21.2
-		// patch release with the backport.
-		//
-		// The bug above means that nodes for which we have disabled adoption may
-		// still lay claim on the job, and then not clear their claim on realizing
-		// that adoption is disabled. To get around this we set the env variable
-		// to disable the registries from even laying claim on the jobs.
-		_, err := c.RunWithDetails(ctx, t.L(), nodeIDs, "export COCKROACH_JOB_ADOPTIONS_PER_PERIOD=0")
-		require.NoError(t, err)
-	}
-}
-
-// enableJobAdoptionStep clears the sentinel file that prevents a node's
-// registry from adopting a job.
-//
-// TODO(renato): remove this duplicated function once
-// `declarative_schema_changer/job-compatibility-mixed-version` is
-// migrated to the new mixed-version testing framework.
-func enableJobAdoptionStep(c cluster.Cluster, nodeIDs option.NodeListOption) versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		for _, nodeID := range nodeIDs {
-			result, err := c.RunWithDetailsSingleNode(ctx, t.L(),
-				c.Node(nodeID), "echo", "-n", "{store-dir}")
-			if err != nil {
-				t.L().Printf("Failed to retrieve store directory from node %d: %v\n", nodeID, err.Error())
-			}
-			storeDirectory := result.Stdout
-			disableJobAdoptionSentinelFilePath := filepath.Join(storeDirectory, jobs.PreventAdoptionFile)
-			cmd := fmt.Sprintf("rm -f %s", disableJobAdoptionSentinelFilePath)
-			c.Run(ctx, nodeIDs, cmd)
-			t.L().Printf("Enabling job adoption on node %v: > %v\n", nodeID, cmd)
-		}
-
-		// Reset the env variable that controls how many jobs are claimed by the
-		// registry.
-		_, err := c.RunWithDetails(ctx, t.L(), nodeIDs, "export COCKROACH_JOB_ADOPTIONS_PER_PERIOD=10")
-		require.NoError(t, err)
-	}
-}
-
 // initBulkJobPerfArtifacts registers a histogram, creates a performance
 // artifact directory and returns a method that when invoked records a tick.
-func initBulkJobPerfArtifacts(testName string, timeout time.Duration) (func(), *bytes.Buffer) {
+func initBulkJobPerfArtifacts(
+	timeout time.Duration, t test.Test, e exporter.Exporter,
+) (func(), *bytes.Buffer) {
 	// Register a named histogram to track the total time the bulk job took.
 	// Roachperf uses this information to display information about this
 	// roachtest.
-	reg := histogram.NewRegistry(
+
+	reg := histogram.NewRegistryWithExporter(
 		timeout,
 		histogram.MockWorkloadName,
+		e,
 	)
-	reg.GetHandle().Get(testName)
+	reg.GetHandle().Get(t.Name())
 
 	bytesBuf := bytes.NewBuffer([]byte{})
-	jsonEnc := json.NewEncoder(bytesBuf)
+	writer := io.Writer(bytesBuf)
+
+	e.Init(&writer)
+
 	tick := func() {
 		reg.Tick(func(tick histogram.Tick) {
-			_ = jsonEnc.Encode(tick.Snapshot())
+			_ = tick.Exporter.SnapshotAndWrite(tick.Hist, tick.Now, tick.Elapsed, &tick.Name)
 		})
 	}
 
@@ -389,21 +287,29 @@ func initBulkJobPerfArtifacts(testName string, timeout time.Duration) (func(), *
 }
 
 func registerBackup(r registry.Registry) {
-
 	backup2TBSpec := r.MakeClusterSpec(10)
 	r.Add(registry.TestSpec{
-		Name:              fmt.Sprintf("backup/2TB/%s", backup2TBSpec),
-		Owner:             registry.OwnerDisasterRecovery,
-		Benchmark:         true,
-		Cluster:           backup2TBSpec,
-		EncryptionSupport: registry.EncryptionAlwaysDisabled,
+		Name:      fmt.Sprintf("backup/2TB/%s", backup2TBSpec),
+		Owner:     registry.OwnerDisasterRecovery,
+		Benchmark: true,
+		Cluster:   backup2TBSpec,
+		// The default storage on Azure Standard_D4ds_v5 is only 150 GiB compared
+		// to 400 on GCE, which is not enough for this test. We could request a
+		// larger volume size and set spec.LocalSSDDisable if we wanted to run
+		// this on Azure.
+		CompatibleClouds:          registry.OnlyGCE,
+		Suites:                    registry.Suites(registry.Nightly),
+		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
+		EncryptionSupport:         registry.EncryptionAlwaysDisabled,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			rows := rows2TiB
 			if c.IsLocal() {
 				rows = 100
 			}
 			dest := importBankData(ctx, rows, t, c)
-			tick, perfBuf := initBulkJobPerfArtifacts("backup/2TB", 2*time.Hour)
+			exporter := roachtestutil.CreateWorkloadHistogramExporter(t, c)
+			tick, perfBuf := initBulkJobPerfArtifacts(2*time.Hour, t, exporter)
+			defer roachtestutil.CloseExporter(ctx, exporter, t, c, perfBuf, c.Node(1), "")
 
 			m := c.NewMonitor(ctx)
 			m.Go(func(ctx context.Context) error {
@@ -412,59 +318,51 @@ func registerBackup(r registry.Registry) {
 				// total elapsed time. This is used by roachperf to compute and display
 				// the average MB/sec per node.
 				tick()
-				c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "
-				BACKUP bank.bank TO 'gs://`+backupTestingBucket+`/`+dest+`?AUTH=implicit'"`)
+				conn := c.Conn(ctx, t.L(), 1)
+				defer conn.Close()
+				var jobID jobspb.JobID
+				uri := `gs://` + backupTestingBucket + `/` + dest + `?AUTH=implicit`
+				if err := conn.QueryRowContext(ctx, fmt.Sprintf("BACKUP bank.bank INTO '%s' WITH detached", uri)).Scan(&jobID); err != nil {
+					return err
+				}
+				if err := AssertReasonableFractionCompleted(ctx, t.L(), c, jobID, 2); err != nil {
+					return err
+				}
 				tick()
-
-				// Upload the perf artifacts to any one of the nodes so that the test
-				// runner copies it into an appropriate directory path.
-				dest := filepath.Join(t.PerfArtifactsDir(), "stats.json")
-				if err := c.RunE(ctx, c.Node(1), "mkdir -p "+filepath.Dir(dest)); err != nil {
-					log.Errorf(ctx, "failed to create perf dir: %+v", err)
-				}
-				if err := c.PutString(ctx, perfBuf.String(), dest, 0755, c.Node(1)); err != nil {
-					log.Errorf(ctx, "failed to upload perf artifacts to node: %s", err.Error())
-				}
 				return nil
 			})
 			m.Wait()
 		},
 	})
 
-	for _, item := range []struct {
-		cloudProvider string
-		machine       string
-	}{
-		{cloudProvider: "GCS", machine: spec.GCE},
-		{cloudProvider: "AWS", machine: spec.AWS},
-	} {
-		item := item
+	// Skip running on aws because the roachtest env does not have the proper
+	// credentials. See 127062
+	for _, cloudProvider := range []spec.Cloud{spec.GCE} {
 		r.Add(registry.TestSpec{
-			Name:              fmt.Sprintf("backup/assume-role/%s", item.cloudProvider),
-			Owner:             registry.OwnerDisasterRecovery,
-			Cluster:           r.MakeClusterSpec(3),
-			EncryptionSupport: registry.EncryptionMetamorphic,
-			Leases:            registry.MetamorphicLeases,
+			Name:                      fmt.Sprintf("backup/assume-role/%s", cloudProvider),
+			Owner:                     registry.OwnerDisasterRecovery,
+			Cluster:                   r.MakeClusterSpec(3),
+			EncryptionSupport:         registry.EncryptionMetamorphic,
+			Leases:                    registry.MetamorphicLeases,
+			CompatibleClouds:          registry.Clouds(cloudProvider),
+			Suites:                    registry.Suites(registry.Nightly),
+			TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				if c.Spec().Cloud != item.machine {
-					t.Skip("backup assumeRole is only configured to run on "+item.machine, "")
-				}
-
 				rows := 100
 
 				dest := importBankData(ctx, rows, t, c)
 
 				var backupPath, kmsURI string
 				var err error
-				switch item.cloudProvider {
-				case "AWS":
+				switch cloudProvider {
+				case spec.AWS:
 					if backupPath, err = getAWSBackupPath(dest); err != nil {
 						t.Fatal(err)
 					}
 					if kmsURI, err = getAWSKMSAssumeRoleURI(); err != nil {
 						t.Fatal(err)
 					}
-				case "GCS":
+				case spec.GCE:
 					if backupPath, err = getGCSBackupPath(dest); err != nil {
 						t.Fatal(err)
 					}
@@ -497,31 +395,12 @@ func registerBackup(r registry.Registry) {
 						return err
 					}
 
-					fingerprint := func(db string) (string, error) {
-						var b strings.Builder
-
-						query := fmt.Sprintf("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s.%s", db, "bank")
-						rows, err := conn.QueryContext(ctx, query)
-						if err != nil {
-							return "", err
-						}
-						defer rows.Close()
-						for rows.Next() {
-							var name, fp string
-							if err := rows.Scan(&name, &fp); err != nil {
-								return "", err
-							}
-							fmt.Fprintf(&b, "%s: %s\n", name, fp)
-						}
-
-						return b.String(), rows.Err()
-					}
-
-					originalBank, err := fingerprint("bank")
+					table := "bank"
+					originalBank, err := roachtestutil.Fingerprint(ctx, conn, "bank" /* db */, table)
 					if err != nil {
 						return err
 					}
-					restore, err := fingerprint("restoreDB")
+					restore, err := roachtestutil.Fingerprint(ctx, conn, "restoreDB" /* db */, table)
 					if err != nil {
 						return err
 					}
@@ -537,27 +416,17 @@ func registerBackup(r registry.Registry) {
 		})
 	}
 	KMSSpec := r.MakeClusterSpec(3)
-	for _, item := range []struct {
-		kmsProvider string
-		machine     string
-		tags        map[string]struct{}
-	}{
-		{kmsProvider: "GCS", machine: spec.GCE},
-		{kmsProvider: "AWS", machine: spec.AWS, tags: registry.Tags("aws")},
-	} {
-		item := item
+	for _, cloudProvider := range []spec.Cloud{spec.GCE, spec.AWS} {
 		r.Add(registry.TestSpec{
-			Name:              fmt.Sprintf("backup/KMS/%s/%s", item.kmsProvider, KMSSpec.String()),
-			Owner:             registry.OwnerDisasterRecovery,
-			Cluster:           KMSSpec,
-			EncryptionSupport: registry.EncryptionMetamorphic,
-			Leases:            registry.MetamorphicLeases,
-			Tags:              item.tags,
+			Name:                      fmt.Sprintf("backup/KMS/%s/%s", cloudProvider, KMSSpec.String()),
+			Owner:                     registry.OwnerDisasterRecovery,
+			Cluster:                   KMSSpec,
+			EncryptionSupport:         registry.EncryptionMetamorphic,
+			Leases:                    registry.MetamorphicLeases,
+			CompatibleClouds:          registry.Clouds(cloudProvider),
+			Suites:                    registry.Suites(registry.Nightly),
+			TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				if c.Spec().Cloud != item.machine {
-					t.Skip("backupKMS roachtest is only configured to run on "+item.machine, "")
-				}
-
 				// ~10GiB - which is 30Gib replicated.
 				rows := rows30GiB
 				if c.IsLocal() {
@@ -577,12 +446,12 @@ func registerBackup(r registry.Registry) {
 				m.Wait()
 				var kmsURIA, kmsURIB string
 				var err error
-				backupPath := fmt.Sprintf("nodelocal://1/kmsbackup/%s/%s", item.kmsProvider, dest)
+				backupPath := fmt.Sprintf("nodelocal://1/kmsbackup/%s/%s", cloudProvider, dest)
 
 				m = c.NewMonitor(ctx)
 				m.Go(func(ctx context.Context) error {
-					switch item.kmsProvider {
-					case "AWS":
+					switch cloudProvider {
+					case spec.AWS:
 						t.Status(`running encrypted backup with AWS KMS`)
 						kmsURIA, err = getAWSKMSURI(KMSRegionAEnvVar, KMSKeyARNAEnvVar)
 						if err != nil {
@@ -593,7 +462,7 @@ func registerBackup(r registry.Registry) {
 						if err != nil {
 							return err
 						}
-					case "GCS":
+					case spec.GCE:
 						t.Status(`running encrypted backup with GCS KMS`)
 						kmsURIA, err = getGCSKMSURI(KMSKeyNameAEnvVar)
 						if err != nil {
@@ -607,7 +476,7 @@ func registerBackup(r registry.Registry) {
 					}
 
 					kmsOptions := fmt.Sprintf("KMS=('%s', '%s')", kmsURIA, kmsURIB)
-					_, err := conn.ExecContext(ctx, `BACKUP bank.bank TO '`+backupPath+`' WITH `+kmsOptions)
+					_, err := conn.ExecContext(ctx, `BACKUP bank.bank INTO '`+backupPath+`' WITH `+kmsOptions)
 					return err
 				})
 				m.Wait()
@@ -617,7 +486,7 @@ func registerBackup(r registry.Registry) {
 				m.Go(func(ctx context.Context) error {
 					t.Status(`restore using KMSURIA`)
 					if _, err := conn.ExecContext(ctx,
-						`RESTORE bank.bank FROM $1 WITH into_db=restoreA, kms=$2`,
+						`RESTORE TABLE bank.bank FROM LATEST IN $1 WITH into_db=restoreA, kms=$2`,
 						backupPath, kmsURIA,
 					); err != nil {
 						return err
@@ -625,42 +494,23 @@ func registerBackup(r registry.Registry) {
 
 					t.Status(`restore using KMSURIB`)
 					if _, err := conn.ExecContext(ctx,
-						`RESTORE bank.bank FROM $1 WITH into_db=restoreB, kms=$2`,
+						`RESTORE TABLE bank.bank FROM LATEST IN $1 WITH into_db=restoreB, kms=$2`,
 						backupPath, kmsURIB,
 					); err != nil {
 						return err
 					}
 
 					t.Status(`fingerprint`)
-					fingerprint := func(db string) (string, error) {
-						var b strings.Builder
-
-						query := fmt.Sprintf("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s.%s", db, "bank")
-						rows, err := conn.QueryContext(ctx, query)
-						if err != nil {
-							return "", err
-						}
-						defer rows.Close()
-						for rows.Next() {
-							var name, fp string
-							if err := rows.Scan(&name, &fp); err != nil {
-								return "", err
-							}
-							fmt.Fprintf(&b, "%s: %s\n", name, fp)
-						}
-
-						return b.String(), rows.Err()
-					}
-
-					originalBank, err := fingerprint("bank")
+					table := "bank"
+					originalBank, err := roachtestutil.Fingerprint(ctx, conn, "bank" /* db */, table)
 					if err != nil {
 						return err
 					}
-					restoreA, err := fingerprint("restoreA")
+					restoreA, err := roachtestutil.Fingerprint(ctx, conn, "restoreA" /* db */, table)
 					if err != nil {
 						return err
 					}
-					restoreB, err := fingerprint("restoreB")
+					restoreB, err := roachtestutil.Fingerprint(ctx, conn, "restoreB" /* db */, table)
 					if err != nil {
 						return err
 					}
@@ -678,215 +528,6 @@ func registerBackup(r registry.Registry) {
 		})
 	}
 
-	// backupTPCC continuously runs TPCC, takes a full backup after some time,
-	// and incremental after more time. It then restores the two backups and
-	// verifies them with a fingerprint.
-	r.Add(registry.TestSpec{
-		Name:              `backupTPCC`,
-		Owner:             registry.OwnerDisasterRecovery,
-		Cluster:           r.MakeClusterSpec(3),
-		Leases:            registry.MetamorphicLeases,
-		Timeout:           1 * time.Hour,
-		EncryptionSupport: registry.EncryptionMetamorphic,
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			c.Put(ctx, t.Cockroach(), "./cockroach")
-			c.Put(ctx, t.DeprecatedWorkload(), "./workload")
-			c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
-			conn := c.Conn(ctx, t.L(), 1)
-
-			duration := 5 * time.Minute
-			if c.IsLocal() {
-				duration = 5 * time.Second
-			}
-			warehouses := 10
-
-			backupDir := "gs://" + backupTestingBucket + "/" + c.Name() + "?AUTH=implicit"
-			// Use inter-node file sharing on 20.1+.
-			if t.BuildVersion().AtLeast(version.MustParse(`v20.1.0-0`)) {
-				backupDir = "nodelocal://1/" + c.Name()
-			}
-			fullDir := backupDir + "/full"
-			incDir := backupDir + "/inc"
-
-			t.Status(`workload initialization`)
-			cmd := []string{fmt.Sprintf(
-				"./workload init tpcc --warehouses=%d {pgurl:1-%d}",
-				warehouses, c.Spec().NodeCount,
-			)}
-			if !t.BuildVersion().AtLeast(version.MustParse("v20.2.0")) {
-				cmd = append(cmd, "--deprecated-fk-indexes")
-			}
-			c.Run(ctx, c.Node(1), cmd...)
-
-			m := c.NewMonitor(ctx)
-			m.Go(func(ctx context.Context) error {
-				_, err := conn.ExecContext(ctx, `
-					CREATE DATABASE restore_full;
-					CREATE DATABASE restore_inc;
-				`)
-				return err
-			})
-			m.Wait()
-
-			t.Status(`run tpcc`)
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			cmdDone := make(chan error)
-			go func() {
-				cmd := fmt.Sprintf(
-					"./workload run tpcc --warehouses=%d {pgurl:1-%d}",
-					warehouses, c.Spec().NodeCount,
-				)
-
-				cmdDone <- c.RunE(ctx, c.Node(1), cmd)
-			}()
-
-			select {
-			case <-time.After(duration):
-			case <-ctx.Done():
-				return
-			}
-
-			// Use a time slightly in the past to avoid "cannot specify timestamp in the future" errors.
-			tFull := fmt.Sprint(timeutil.Now().Add(time.Second * -2).UnixNano())
-			m = c.NewMonitor(ctx)
-			m.Go(func(ctx context.Context) error {
-				t.Status(`full backup`)
-				_, err := conn.ExecContext(ctx,
-					`BACKUP tpcc.* TO $1 AS OF SYSTEM TIME `+tFull,
-					fullDir,
-				)
-				return err
-			})
-			m.Wait()
-
-			t.Status(`continue tpcc`)
-			select {
-			case <-time.After(duration):
-			case <-ctx.Done():
-				return
-			}
-
-			tInc := fmt.Sprint(timeutil.Now().Add(time.Second * -2).UnixNano())
-			m = c.NewMonitor(ctx)
-			m.Go(func(ctx context.Context) error {
-				t.Status(`incremental backup`)
-				_, err := conn.ExecContext(ctx,
-					`BACKUP tpcc.* TO $1 AS OF SYSTEM TIME `+tInc+` INCREMENTAL FROM $2`,
-					incDir,
-					fullDir,
-				)
-				if err != nil {
-					return err
-				}
-
-				// Backups are done, make sure workload is still running.
-				select {
-				case err := <-cmdDone:
-					// Workload exited before it should have.
-					return err
-				default:
-					return nil
-				}
-			})
-			m.Wait()
-
-			m = c.NewMonitor(ctx)
-			m.Go(func(ctx context.Context) error {
-				t.Status(`restore full`)
-				if _, err := conn.ExecContext(ctx,
-					`RESTORE tpcc.* FROM $1 WITH into_db='restore_full'`,
-					fullDir,
-				); err != nil {
-					return err
-				}
-
-				t.Status(`restore incremental`)
-				if _, err := conn.ExecContext(ctx,
-					`RESTORE tpcc.* FROM $1, $2 WITH into_db='restore_inc'`,
-					fullDir,
-					incDir,
-				); err != nil {
-					return err
-				}
-
-				t.Status(`fingerprint`)
-				// TODO(adityamaru): Pull the fingerprint logic into a utility method
-				// which can be shared by multiple roachtests.
-				fingerprint := func(db string, asof string) (string, error) {
-					var b strings.Builder
-
-					var tables []string
-					rows, err := conn.QueryContext(
-						ctx,
-						fmt.Sprintf("SELECT table_name FROM [SHOW TABLES FROM %s] ORDER BY table_name", db),
-					)
-					if err != nil {
-						return "", err
-					}
-					defer rows.Close()
-					for rows.Next() {
-						var name string
-						if err := rows.Scan(&name); err != nil {
-							return "", err
-						}
-						tables = append(tables, name)
-					}
-
-					for _, table := range tables {
-						fmt.Fprintf(&b, "table %s\n", table)
-						query := fmt.Sprintf("SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s.%s", db, table)
-						if asof != "" {
-							query = fmt.Sprintf("SELECT * FROM [%s] AS OF SYSTEM TIME %s", query, asof)
-						}
-						rows, err = conn.QueryContext(ctx, query)
-						if err != nil {
-							return "", err
-						}
-						defer rows.Close()
-						for rows.Next() {
-							var name, fp string
-							if err := rows.Scan(&name, &fp); err != nil {
-								return "", err
-							}
-							fmt.Fprintf(&b, "%s: %s\n", name, fp)
-						}
-					}
-
-					return b.String(), rows.Err()
-				}
-
-				tpccFull, err := fingerprint("tpcc", tFull)
-				if err != nil {
-					return err
-				}
-				tpccInc, err := fingerprint("tpcc", tInc)
-				if err != nil {
-					return err
-				}
-				restoreFull, err := fingerprint("restore_full", "")
-				if err != nil {
-					return err
-				}
-				restoreInc, err := fingerprint("restore_inc", "")
-				if err != nil {
-					return err
-				}
-
-				if tpccFull != restoreFull {
-					return errors.Errorf("got %s, expected %s", restoreFull, tpccFull)
-				}
-				if tpccInc != restoreInc {
-					return errors.Errorf("got %s, expected %s", restoreInc, tpccInc)
-				}
-
-				return nil
-			})
-			m.Wait()
-		},
-	})
-
 	r.Add(registry.TestSpec{
 		Name:              "backup/mvcc-range-tombstones",
 		Owner:             registry.OwnerDisasterRecovery,
@@ -894,10 +535,12 @@ func registerBackup(r registry.Registry) {
 		Cluster:           r.MakeClusterSpec(3, spec.CPU(8)),
 		Leases:            registry.MetamorphicLeases,
 		EncryptionSupport: registry.EncryptionMetamorphic,
+		// Uses gs://cockroach-fixtures-us-east1. See:
+		// https://github.com/cockroachdb/cockroach/issues/105968
+		CompatibleClouds:          registry.Clouds(spec.GCE, spec.Local),
+		Suites:                    registry.Suites(registry.Nightly),
+		TestSelectionOptOutSuites: registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			if c.Spec().Cloud != spec.GCE {
-				t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
-			}
 			runBackupMVCCRangeTombstones(ctx, t, c, mvccRangeTombstoneConfig{})
 		},
 	})
@@ -941,28 +584,20 @@ func runBackupMVCCRangeTombstones(
 	ctx context.Context, t test.Test, c cluster.Cluster, config mvccRangeTombstoneConfig,
 ) {
 	if !config.skipClusterSetup {
-		c.Put(ctx, t.Cockroach(), "./cockroach")
-		c.Put(ctx, t.DeprecatedWorkload(), "./workload") // required for tpch
-		c.Start(ctx, t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
+		c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), install.MakeClusterSettings())
 	}
 	t.Status("starting csv servers")
-	c.Run(ctx, c.All(), `./cockroach workload csv-server --port=8081 &> logs/workload-csv-server.log < /dev/null &`)
+	c.Run(ctx, option.WithNodes(c.All()), `./cockroach workload csv-server --port=8081 &> logs/workload-csv-server.log < /dev/null &`)
 
-	conn := c.Conn(ctx, t.L(), 1, option.TenantName(config.tenantName))
+	// c2c tests still use the old multitenant API, which does not support non root authentication
+	conn := c.Conn(ctx, t.L(), 1, option.VirtualClusterName(config.tenantName), option.AuthMode(install.AuthRootCert))
 
 	// Configure cluster.
 	t.Status("configuring cluster")
-	_, err := conn.Exec(`SET CLUSTER SETTING kv.bulk_ingest.max_index_buffer_size = '2gb'`)
-	require.NoError(t, err)
-	if config.tenantName == "" {
-		_, err = conn.Exec(`SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = 't'`)
-		require.NoError(t, err)
-	}
-	_, err = conn.Exec(`SET CLUSTER SETTING server.debug.default_vmodule = 'txn=2,sst_batcher=4,
-revert=2'`)
+	_, err := conn.Exec(`SET CLUSTER SETTING server.debug.default_vmodule = 'txn=2,sst_batcher=4,revert=2'`)
 	require.NoError(t, err)
 	// Wait for ranges to upreplicate.
-	require.NoError(t, WaitFor3XReplication(ctx, t, conn))
+	require.NoError(t, roachtestutil.WaitFor3XReplication(ctx, t.L(), conn))
 
 	// Create the orders table. It's about 16 GB across 8 files.
 	t.Status("creating table")
@@ -971,7 +606,7 @@ revert=2'`)
 	_, err = conn.Exec(`USE tpch`)
 	require.NoError(t, err)
 	createStmt, err := readCreateTableFromFixture(
-		"gs://cockroach-fixtures/tpch-csv/schema/orders.sql?AUTH=implicit", conn)
+		"gs://cockroach-fixtures-us-east1/tpch-csv/schema/orders.sql?AUTH=implicit", conn)
 	require.NoError(t, err)
 	_, err = conn.ExecContext(ctx, createStmt)
 	require.NoError(t, err)
@@ -1019,7 +654,7 @@ revert=2'`)
 		require.NoError(t, conn.QueryRowContext(ctx, `SELECT now()`).Scan(&ts))
 
 		t.Status(fmt.Sprintf("fingerprinting %s.%s at time '%s'", database, table, name))
-		fp, err := fingerprint(ctx, conn, database, table)
+		fp, err := roachtestutil.Fingerprint(ctx, conn, database, table)
 		require.NoError(t, err)
 		t.Status("fingerprint:\n", fp)
 
@@ -1038,10 +673,10 @@ revert=2'`)
 	// Import the odd-numbered files.
 	t.Status("importing odd-numbered files")
 	files := []string{
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.1?AUTH=implicit`,
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.3?AUTH=implicit`,
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.5?AUTH=implicit`,
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.7?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.1?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.3?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.5?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.7?AUTH=implicit`,
 	}
 	if config.short {
 		files = files[:2]
@@ -1072,10 +707,10 @@ revert=2'`)
 
 	// Import and cancel even-numbered files twice.
 	files = []string{
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.2?AUTH=implicit`,
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.4?AUTH=implicit`,
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.6?AUTH=implicit`,
-		`gs://cockroach-fixtures/tpch-csv/sf-100/orders.tbl.8?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.2?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.4?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.6?AUTH=implicit`,
+		`gs://cockroach-fixtures-us-east1/tpch-csv/sf-100/orders.tbl.8?AUTH=implicit`,
 	}
 	if config.short {
 		files = files[:1]
@@ -1354,7 +989,7 @@ func getAWSBackupPath(dest string) (string, error) {
 		AssumeRoleAWSKeyIDEnvVar:     amazon.AWSAccessKeyParam,
 		AssumeRoleAWSSecretKeyEnvVar: amazon.AWSSecretParam,
 		AssumeRoleAWSRoleEnvVar:      amazon.AssumeRoleParam,
-		KMSRegionAEnvVar:             amazon.KMSRegionParam,
+		KMSRegionAEnvVar:             amazon.S3RegionParam,
 	}
 	for env, param := range expect {
 		v := os.Getenv(env)

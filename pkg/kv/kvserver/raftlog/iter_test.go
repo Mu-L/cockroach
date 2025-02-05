@@ -1,17 +1,13 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 
 package raftlog
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
@@ -21,11 +17,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/raft/v3/raftpb"
 )
 
 func ents(inds ...uint64) []raftpb.Entry {
@@ -49,7 +45,7 @@ func ents(inds ...uint64) []raftpb.Entry {
 			if ind%2 == 0 {
 				enc = EntryEncodingSideloadedWithAC
 			}
-			data = EncodeCommandBytes(enc, cmdID, b)
+			data = EncodeCommandBytes(enc, cmdID, b, 0 /* pri */)
 		case raftpb.EntryConfChangeV2:
 			c := kvserverpb.ConfChangeContext{
 				CommandID: string(cmdID),
@@ -153,8 +149,9 @@ func TestIteratorEmptyLog(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	eng := storage.NewDefaultInMemForTesting()
+	defer eng.Close()
 	for _, hi := range []kvpb.RaftIndex{0, 1} {
-		it, err := NewIterator(rangeID, eng, IterOptions{Hi: hi})
+		it, err := NewIterator(context.Background(), rangeID, eng, IterOptions{Hi: hi})
 		require.NoError(t, err)
 		ok, err := it.SeekGE(0)
 		it.Close()
@@ -244,13 +241,12 @@ func TestIterator(t *testing.T) {
 					li = math.MaxUint64 - 1
 				}
 				for hi := lo - 1; hi-3 < li; hi++ {
-					hi := hi // allow mutating in the next line w/o clobbering loop var
 					if hi-2 == li {
 						// As the last case, make `hi` unlimited.
 						hi = 0
 					}
 					t.Run(fmt.Sprintf("lo=%s,hi=%s", indToName(lo), indToName(hi)), func(t *testing.T) {
-						it, err := NewIterator(rangeID, eng, IterOptions{Hi: hi})
+						it, err := NewIterator(context.Background(), rangeID, eng, IterOptions{Hi: hi})
 						require.NoError(t, err)
 						sl, err := consumeIter(it, lo)
 						it.Close()

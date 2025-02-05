@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -21,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -28,35 +24,186 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const maxSyncDur = 10 * time.Second
+// registerDiskStalledWALFailover registers the disk stall WAL failover tests.
+// These tests assert that a storage engine configured with WAL failover
+// survives a temporary disk stall through failing over to a secondary disk.
+func registerDiskStalledWALFailover(r registry.Registry) {
+	r.Add(registry.TestSpec{
+		Name:                "disk-stalled/wal-failover/among-stores",
+		Owner:               registry.OwnerStorage,
+		Cluster:             r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.ReuseNone(), spec.SSD(2)),
+		CompatibleClouds:    registry.OnlyGCE,
+		Suites:              registry.Suites(registry.Nightly),
+		Timeout:             3 * time.Hour,
+		SkipPostValidations: registry.PostValidationNoDeadNodes,
+		// Encryption is implemented within the virtual filesystem layer,
+		// just like disk-health monitoring. It's important to exercise
+		// encryption-at-rest to ensure there is not unmonitored I/O within
+		// the encryption-at-rest implementation that could indefinitely
+		// stall the process during a disk stall.
+		EncryptionSupport: registry.EncryptionMetamorphic,
+		Leases:            registry.MetamorphicLeases,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runDiskStalledWALFailover(ctx, t, c)
+		},
+	})
+}
 
-// registerDiskStalledDetection registers the disk stall test.
+func runDiskStalledWALFailover(ctx context.Context, t test.Test, c cluster.Cluster) {
+	startSettings := install.MakeClusterSettings()
+	// Set a high value for the max sync durations to avoid the disk
+	// stall detector fataling the node.
+	const maxSyncDur = 60 * time.Second
+	startSettings.Env = append(startSettings.Env,
+		"COCKROACH_AUTO_BALLAST=false",
+		fmt.Sprintf("COCKROACH_LOG_MAX_SYNC_DURATION=%s", maxSyncDur),
+		fmt.Sprintf("COCKROACH_ENGINE_MAX_SYNC_DURATION_DEFAULT=%s", maxSyncDur))
+
+	t.Status("setting up disk staller")
+	s := roachtestutil.MakeDmsetupDiskStaller(t, c)
+	s.Setup(ctx)
+	defer s.Cleanup(ctx)
+
+	t.Status("starting cluster")
+	startOpts := option.DefaultStartOpts()
+	startOpts.RoachprodOpts.WALFailover = "among-stores"
+	startOpts.RoachprodOpts.StoreCount = 2
+	c.Start(ctx, t.L(), startOpts, startSettings, c.CRDBNodes())
+
+	// Open a SQL connection to n1, the node that will be stalled.
+	n1Conn := c.Conn(ctx, t.L(), 1)
+	defer n1Conn.Close()
+	require.NoError(t, n1Conn.PingContext(ctx))
+	// Wait for upreplication.
+	require.NoError(t, roachtestutil.WaitFor3XReplication(ctx, t.L(), n1Conn))
+	adminUIAddrs, err := c.ExternalAdminUIAddr(ctx, t.L(), c.Nodes(2))
+	require.NoError(t, err)
+	adminURL := adminUIAddrs[0]
+	c.Run(ctx, option.WithNodes(c.WorkloadNode()), `./cockroach workload init kv --splits 1000 {pgurl:1}`)
+	_, err = n1Conn.ExecContext(ctx, `USE kv;`)
+	require.NoError(t, err)
+
+	t.Status("starting workload")
+	workloadStartAt := timeutil.Now()
+	m := c.NewMonitor(ctx, c.CRDBNodes())
+	m.Go(func(ctx context.Context) error {
+		c.Run(ctx, option.WithNodes(c.WorkloadNode()), `./cockroach workload run kv --read-percent 0 `+
+			`--duration 60m --concurrency 4096 --ramp=1m --max-rate 4096 --tolerate-errors `+
+			` --min-block-bytes=2048 --max-block-bytes=2048 --timeout 1s `+
+			`{pgurl:1-3}`)
+		return nil
+	})
+
+	const pauseBetweenStalls = 10 * time.Minute
+	t.Status("pausing ", pauseBetweenStalls, " before simulated disk stall on n1")
+	ticker := time.NewTicker(time.Second)
+	nextStallAt := workloadStartAt.Add(pauseBetweenStalls)
+	defer ticker.Stop()
+
+	progressEvery := roachtestutil.Every(time.Minute)
+	for timeutil.Since(workloadStartAt) < time.Hour+5*time.Minute {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done before finished workload: %s", ctx.Err())
+		case now := <-ticker.C:
+			if now.Before(nextStallAt) {
+				if progressEvery.ShouldLog() {
+					t.Status("pausing ", nextStallAt.Sub(now), " before next simulated disk stall on n1")
+				}
+				continue
+			}
+			func() {
+				t.Status("Stalling disk on n1")
+				stopStall := time.After(30 * time.Second)
+				s.Stall(ctx, c.Node(1))
+				t.Status("Stalled disk on n1")
+				// NB: We use a background context in the defer'ed unstall command,
+				// otherwise on test failure our Unstall calls will be ignored. Leaving
+				// the disk stalled will prevent artifact collection, making debugging
+				// difficult.
+				defer func() {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+					defer cancel()
+					t.Status("Unstalling disk on n1")
+					s.Unstall(ctx, c.Node(1))
+					t.Status("Unstalled disk on n1")
+				}()
+
+				t.Status("waiting for 30s to elapse before unstalling")
+				select {
+				case <-ctx.Done():
+					t.Fatalf("context done while stall induced: %s", ctx.Err())
+				case <-stopStall:
+					// Return from the anonymous function, allowing the
+					// defer to unstall the node.
+					return
+				}
+			}()
+			nextStallAt = now.Add(pauseBetweenStalls)
+		}
+	}
+	t.Status("exited stall loop")
+
+	time.Sleep(1 * time.Second)
+	exit, ok := getProcessExitMonotonic(ctx, t, c, 1)
+	if ok && exit > 0 {
+		t.Fatal("process exited unexpectedly")
+	}
+
+	data := mustGetMetrics(ctx, c, t, adminURL, install.SystemInterfaceName,
+		workloadStartAt.Add(5*time.Minute),
+		timeutil.Now().Add(-time.Minute),
+		[]tsQuery{
+			{name: "cr.node.sql.exec.latency-p99.99", queryType: total, sources: []string{"2"}},
+			{name: "cr.store.storage.wal.failover.secondary.duration", queryType: total, sources: []string{"1"}},
+		})
+
+	for _, dp := range data.Results[0].Datapoints {
+		if dur := time.Duration(dp.Value); dur > time.Second {
+			t.Errorf("unexpectedly high p99.99 latency %s at %s", dur, timeutil.Unix(0, dp.TimestampNanos).Format(time.RFC3339))
+		}
+	}
+
+	// Over the course of the 1h test, we expect ~6 stalls each lasting 30s. Assert that
+	// the total time spent writing to the secondary is at least 1 minute.
+	durInFailover := time.Duration(data.Results[1].Datapoints[len(data.Results[0].Datapoints)-1].Value)
+	t.L().PrintfCtx(ctx, "duration s1 spent writing to secondary %s", durInFailover)
+	if durInFailover < 60*time.Second {
+		t.Errorf("expected s1 to spend at least 60s writing to secondary, but spent %s", durInFailover)
+	}
+	// Wait for the workload to finish (if it hasn't already).
+	m.Wait()
+
+	// Shut down the nodes, allowing any devices to be unmounted during cleanup.
+	c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.CRDBNodes())
+}
+
+// registerDiskStalledDetection registers the disk stall detection tests. These
+// tests assert that a disk stall is detected and the process crashes
+// appropriately.
 func registerDiskStalledDetection(r registry.Registry) {
 	stallers := map[string]func(test.Test, cluster.Cluster) diskStaller{
-		"dmsetup": func(t test.Test, c cluster.Cluster) diskStaller { return &dmsetupDiskStaller{t: t, c: c} },
+		"dmsetup": func(t test.Test, c cluster.Cluster) diskStaller { return roachtestutil.MakeDmsetupDiskStaller(t, c) },
 		"cgroup/read-write/logs-too=false": func(t test.Test, c cluster.Cluster) diskStaller {
-			return &cgroupDiskStaller{t: t, c: c, readOrWrite: []string{"write", "read"}}
+			return roachtestutil.MakeCgroupDiskStaller(t, c, true, false)
 		},
 		"cgroup/read-write/logs-too=true": func(t test.Test, c cluster.Cluster) diskStaller {
-			return &cgroupDiskStaller{t: t, c: c, readOrWrite: []string{"write", "read"}, logsToo: true}
+			return roachtestutil.MakeCgroupDiskStaller(t, c, true, true)
 		},
 		"cgroup/write-only/logs-too=true": func(t test.Test, c cluster.Cluster) diskStaller {
-			return &cgroupDiskStaller{t: t, c: c, readOrWrite: []string{"write"}, logsToo: true}
+			return roachtestutil.MakeCgroupDiskStaller(t, c, false, true)
 		},
 	}
-	makeSpec := func() spec.ClusterSpec {
-		s := r.MakeClusterSpec(4, spec.ReuseNone())
-		// Use PDs in an attempt to work around flakes encountered when using SSDs.
-		// See #97968.
-		s.PreferLocalSSD = false
-		return s
-	}
+
 	for name, makeStaller := range stallers {
-		name, makeStaller := name, makeStaller
 		r.Add(registry.TestSpec{
-			Name:                fmt.Sprintf("disk-stalled/%s", name),
-			Owner:               registry.OwnerStorage,
-			Cluster:             makeSpec(),
+			Name:  fmt.Sprintf("disk-stalled/detection/%s", name),
+			Owner: registry.OwnerStorage,
+			// Use PDs in an attempt to work around flakes encountered when using SSDs.
+			// See #97968.
+			Cluster:             r.MakeClusterSpec(4, spec.WorkloadNode(), spec.ReuseNone(), spec.DisableLocalSSD()),
+			CompatibleClouds:    registry.OnlyGCE,
+			Suites:              registry.Suites(registry.Nightly),
 			Timeout:             30 * time.Minute,
 			SkipPostValidations: registry.PostValidationNoDeadNodes,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -76,6 +223,8 @@ func registerDiskStalledDetection(r registry.Registry) {
 func runDiskStalledDetection(
 	ctx context.Context, t test.Test, c cluster.Cluster, s diskStaller, doStall bool,
 ) {
+	const maxSyncDur = 10 * time.Second
+
 	startOpts := option.DefaultStartOpts()
 	startOpts.RoachprodOpts.ExtraArgs = []string{
 		"--store", s.DataDir(),
@@ -92,8 +241,7 @@ func runDiskStalledDetection(
 	defer s.Cleanup(ctx)
 
 	t.Status("starting cluster")
-	c.Put(ctx, t.Cockroach(), "./cockroach")
-	c.Start(ctx, t.L(), startOpts, startSettings, c.Range(1, 3))
+	c.Start(ctx, t.L(), startOpts, startSettings, c.CRDBNodes())
 
 	// Assert the process monotonic times are as expected.
 	var ok bool
@@ -119,24 +267,26 @@ func runDiskStalledDetection(
 	require.NoError(t, n1Conn.PingContext(ctx))
 
 	// Wait for upreplication.
-	require.NoError(t, WaitFor3XReplication(ctx, t, n2conn))
+	require.NoError(t, roachtestutil.WaitFor3XReplication(ctx, t.L(), n2conn))
 
-	c.Run(ctx, c.Node(4), `./cockroach workload init kv --splits 1000 {pgurl:1}`)
+	c.Run(ctx, option.WithNodes(c.WorkloadNode()), `./cockroach workload init kv --splits 1000 {pgurl:1}`)
 
 	_, err = n2conn.ExecContext(ctx, `USE kv;`)
 	require.NoError(t, err)
 
 	t.Status("starting workload")
 	workloadStartAt := timeutil.Now()
-	m := c.NewMonitor(ctx, c.Range(1, 3))
+	m := c.NewMonitor(ctx, c.CRDBNodes())
 	m.Go(func(ctx context.Context) error {
-		c.Run(ctx, c.Node(4), `./cockroach workload run kv --read-percent 50 `+
+		// NB: Since we stall node 1, we run the workload only on nodes 2-3 so
+		// the post-stall QPS isn't affected by the fact that 1/3rd of workload
+		// workers just can't connect to a working node.
+		c.Run(ctx, option.WithNodes(c.WorkloadNode()), `./cockroach workload run kv --read-percent 50 `+
 			`--duration 10m --concurrency 256 --max-rate 2048 --tolerate-errors `+
 			` --min-block-bytes=512 --max-block-bytes=512 `+
-			`{pgurl:1-3}`)
+			`{pgurl:2-3}`)
 		return nil
 	})
-	defer m.Wait()
 
 	// Wait between [3m,6m) before stalling the disk.
 	pauseDur := 3*time.Minute + time.Duration(rand.Intn(3))*time.Minute
@@ -149,12 +299,12 @@ func runDiskStalledDetection(
 	}
 
 	stallAt := timeutil.Now()
-	response := mustGetMetrics(t, adminURL, workloadStartAt, stallAt, []tsQuery{
-		{name: "cr.node.txn.commits", queryType: total},
+	response := mustGetMetrics(ctx, c, t, adminURL, install.SystemInterfaceName, workloadStartAt, stallAt, []tsQuery{
+		{name: "cr.node.sql.query.count", queryType: total},
 	})
 	cum := response.Results[0].Datapoints
-	totalTxnsPreStall := cum[len(cum)-1].Value - cum[0].Value
-	t.L().PrintfCtx(ctx, "%.2f transactions completed before stall", totalTxnsPreStall)
+	totalQueriesPreStall := sumCounterIncreases(cum)
+	t.L().PrintfCtx(ctx, "%.2f queries completed before stall", totalQueriesPreStall)
 
 	t.Status("inducing write stall")
 	if doStall {
@@ -191,7 +341,8 @@ func runDiskStalledDetection(
 	}
 
 	// Let the workload continue after the stall.
-	workloadAfterDur := 10*time.Minute - timeutil.Since(workloadStartAt)
+	workloadContinuedAt := timeutil.Now()
+	workloadAfterDur := 10*time.Minute - workloadContinuedAt.Sub(workloadStartAt)
 	t.Status("letting workload continue for ", workloadAfterDur, " with n1 stalled")
 	select {
 	case <-ctx.Done():
@@ -201,17 +352,17 @@ func runDiskStalledDetection(
 
 	{
 		now := timeutil.Now()
-		response := mustGetMetrics(t, adminURL, workloadStartAt, now, []tsQuery{
-			{name: "cr.node.txn.commits", queryType: total},
+		response := mustGetMetrics(ctx, c, t, adminURL, install.SystemInterfaceName, workloadContinuedAt, now, []tsQuery{
+			{name: "cr.node.sql.query.count", queryType: total},
 		})
 		cum := response.Results[0].Datapoints
-		totalTxnsPostStall := cum[len(cum)-1].Value - totalTxnsPreStall
-		preStallTPS := totalTxnsPreStall / stallAt.Sub(workloadStartAt).Seconds()
-		postStallTPS := totalTxnsPostStall / workloadAfterDur.Seconds()
-		t.L().PrintfCtx(ctx, "%.2f total transactions committed after stall\n", totalTxnsPostStall)
-		t.L().PrintfCtx(ctx, "pre-stall tps: %.2f, post-stall tps: %.2f\n", preStallTPS, postStallTPS)
-		if postStallTPS < preStallTPS/2 {
-			t.Fatalf("post-stall TPS %.2f is less than 50%% of pre-stall TPS %.2f", postStallTPS, preStallTPS)
+		totalQueriesPostStall := sumCounterIncreases(cum)
+		preStallQPS := totalQueriesPreStall / stallAt.Sub(workloadStartAt).Seconds()
+		postStallQPS := totalQueriesPostStall / workloadAfterDur.Seconds()
+		t.L().PrintfCtx(ctx, "%.2f total queries committed after stall\n", totalQueriesPostStall)
+		t.L().PrintfCtx(ctx, "pre-stall qps: %.2f, post-stall qps: %.2f\n", preStallQPS, postStallQPS)
+		if postStallQPS < preStallQPS/2 {
+			t.Fatalf("post-stall QPS %.2f is less than 50%% of pre-stall QPS %.2f", postStallQPS, preStallQPS)
 		}
 	}
 
@@ -234,9 +385,11 @@ func runDiskStalledDetection(
 	} else if ok && exit > 0 {
 		t.Fatal("no stall induced, but process exited")
 	}
+	// Wait for the workload to finish (if it hasn't already).
+	m.Wait()
 
 	// Shut down the nodes, allowing any devices to be unmounted during cleanup.
-	c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Range(1, 3))
+	c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.CRDBNodes())
 }
 
 func getProcessStartMonotonic(
@@ -254,8 +407,8 @@ func getProcessExitMonotonic(
 func getProcessMonotonicTimestamp(
 	ctx context.Context, t test.Test, c cluster.Cluster, nodeID int, prop string,
 ) (time.Duration, bool) {
-	details, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(nodeID),
-		"systemctl show cockroach.service --property="+prop)
+	details, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(c.Node(nodeID)), fmt.Sprintf(
+		"systemctl show %s --property=%s", roachtestutil.SystemInterfaceSystemdUnitName(), prop))
 	require.NoError(t, err)
 	require.NoError(t, details.Err)
 	parts := strings.Split(details.Stdout, "=")
@@ -276,125 +429,4 @@ func getProcessMonotonicTimestamp(
 	return time.Duration(u) * time.Microsecond, true
 }
 
-type diskStaller interface {
-	Setup(ctx context.Context)
-	Cleanup(ctx context.Context)
-	Stall(ctx context.Context, nodes option.NodeListOption)
-	Unstall(ctx context.Context, nodes option.NodeListOption)
-	DataDir() string
-	LogDir() string
-}
-
-type dmsetupDiskStaller struct {
-	t test.Test
-	c cluster.Cluster
-}
-
-var _ diskStaller = (*dmsetupDiskStaller)(nil)
-
-func (s *dmsetupDiskStaller) device() string { return getDevice(s.t, s.c.Spec()) }
-
-func (s *dmsetupDiskStaller) Setup(ctx context.Context) {
-	dev := s.device()
-	s.c.Run(ctx, s.c.All(), `sudo umount -f /mnt/data1 || true`)
-	s.c.Run(ctx, s.c.All(), `sudo dmsetup remove_all`)
-	s.c.Run(ctx, s.c.All(), `echo "0 $(sudo blockdev --getsz `+dev+`) linear `+dev+` 0" | `+
-		`sudo dmsetup create data1`)
-	s.c.Run(ctx, s.c.All(), `sudo mount /dev/mapper/data1 /mnt/data1`)
-}
-
-func (s *dmsetupDiskStaller) Cleanup(ctx context.Context) {
-	s.c.Run(ctx, s.c.All(), `sudo dmsetup resume data1`)
-	s.c.Run(ctx, s.c.All(), `sudo umount /mnt/data1`)
-	s.c.Run(ctx, s.c.All(), `sudo dmsetup remove_all`)
-	s.c.Run(ctx, s.c.All(), `sudo mount /mnt/data1`)
-}
-
-func (s *dmsetupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {
-	s.c.Run(ctx, nodes, `sudo dmsetup suspend --noflush --nolockfs data1`)
-}
-
-func (s *dmsetupDiskStaller) Unstall(ctx context.Context, nodes option.NodeListOption) {
-	s.c.Run(ctx, nodes, `sudo dmsetup resume data1`)
-}
-
-func (s *dmsetupDiskStaller) DataDir() string { return "{store-dir}" }
-func (s *dmsetupDiskStaller) LogDir() string  { return "logs" }
-
-type cgroupDiskStaller struct {
-	t           test.Test
-	c           cluster.Cluster
-	readOrWrite []string
-	logsToo     bool
-}
-
-var _ diskStaller = (*cgroupDiskStaller)(nil)
-
-func (s *cgroupDiskStaller) DataDir() string { return "{store-dir}" }
-func (s *cgroupDiskStaller) LogDir() string {
-	return "logs"
-}
-func (s *cgroupDiskStaller) Setup(ctx context.Context) {
-	if s.logsToo {
-		s.c.Run(ctx, s.c.All(), "mkdir -p {store-dir}/logs")
-		s.c.Run(ctx, s.c.All(), "rm -f logs && ln -s {store-dir}/logs logs || true")
-	}
-}
-func (s *cgroupDiskStaller) Cleanup(ctx context.Context) {}
-
-func (s *cgroupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {
-	// Shuffle the order of read and write stall initiation.
-	rand.Shuffle(len(s.readOrWrite), func(i, j int) {
-		s.readOrWrite[i], s.readOrWrite[j] = s.readOrWrite[j], s.readOrWrite[i]
-	})
-	for _, rw := range s.readOrWrite {
-		s.setThroughput(ctx, nodes, rw, 1)
-	}
-}
-
-func (s *cgroupDiskStaller) Unstall(ctx context.Context, nodes option.NodeListOption) {
-	for _, rw := range s.readOrWrite {
-		s.setThroughput(ctx, nodes, rw, 0)
-	}
-}
-
-func (s *cgroupDiskStaller) device() (major, minor int) {
-	// TODO(jackson): Programmatically determine the device major,minor numbers.
-	// eg,:
-	//    deviceName := getDevice(s.t, s.c.Spec())
-	//    `cat /proc/partitions` and find `deviceName`
-	switch s.c.Spec().Cloud {
-	case spec.GCE:
-		// ls -l /dev/sdb
-		// brw-rw---- 1 root disk 8, 16 Mar 27 22:08 /dev/sdb
-		return 8, 16
-	default:
-		s.t.Fatalf("unsupported cloud %q", s.c.Spec().Cloud)
-		return 0, 0
-	}
-}
-
-func (s *cgroupDiskStaller) setThroughput(
-	ctx context.Context, nodes option.NodeListOption, readOrWrite string, bytesPerSecond int,
-) {
-	major, minor := s.device()
-	s.c.Run(ctx, nodes, "sudo", "/bin/bash", "-c", fmt.Sprintf(
-		"'echo %d:%d %d > /sys/fs/cgroup/blkio/blkio.throttle.%s_bps_device'",
-		major,
-		minor,
-		bytesPerSecond,
-		readOrWrite,
-	))
-}
-
-func getDevice(t test.Test, s spec.ClusterSpec) string {
-	switch s.Cloud {
-	case spec.GCE:
-		return "/dev/sdb"
-	case spec.AWS:
-		return "/dev/nvme1n1"
-	default:
-		t.Fatalf("unsupported cloud %q", s.Cloud)
-		return ""
-	}
-}
+type diskStaller = roachtestutil.DiskStaller

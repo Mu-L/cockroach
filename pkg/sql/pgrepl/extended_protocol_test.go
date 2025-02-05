@@ -1,18 +1,12 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgrepl
 
 import (
 	"context"
-	"net/url"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -40,7 +34,9 @@ func TestExtendedProtocolDisabled(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `CREATE USER testuser LOGIN REPLICATION`)
 
-	pgURL, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "pgrepl_extended_protocol_test", url.User(username.TestUser))
+	pgURL, cleanup := s.PGUrl(
+		t, serverutils.CertsDirPrefix("pgrepl_extended_protocol_test"), serverutils.User(username.TestUser),
+	)
 	defer cleanup()
 
 	cfg, err := pgconn.ParseConfig(pgURL.String())

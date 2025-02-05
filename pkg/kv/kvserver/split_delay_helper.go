@@ -1,26 +1,21 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
-	"fmt"
 	"math"
-	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/tracker"
+	"github.com/cockroachdb/redact"
 )
 
 type splitDelayHelperI interface {
@@ -77,20 +72,22 @@ func (sdh *splitDelayHelper) TickDuration() time.Duration {
 	return r.store.cfg.RaftTickInterval
 }
 
-func maybeDelaySplitToAvoidSnapshot(ctx context.Context, sdh splitDelayHelperI) string {
+func maybeDelaySplitToAvoidSnapshot(
+	ctx context.Context, sdh splitDelayHelperI,
+) redact.RedactableString {
 	tickDur := sdh.TickDuration()
 	budget := sdh.MaxDelay()
 
 	var slept time.Duration
-	var problems []string
-	var lastProblems []string
+	var problems []redact.RedactableString
+	var lastProblems []redact.RedactableString
 	var i int
 	for slept < budget {
 		i++
 		problems = problems[:0]
 		rangeID, raftStatus := sdh.RaftStatus(ctx)
 
-		if raftStatus == nil || raftStatus.RaftState == raft.StateFollower {
+		if raftStatus == nil || raftStatus.RaftState == raftpb.StateFollower {
 			// Don't delay on followers (we don't have information about the
 			// peers in that state and thus can't determine when it is safe
 			// to continue). This case is hit rarely enough to not matter,
@@ -149,8 +146,8 @@ func maybeDelaySplitToAvoidSnapshot(ctx context.Context, sdh splitDelayHelperI) 
 		//
 		// See TestSplitBurstWithSlowFollower for end-to-end verification of this
 		// mechanism.
-		if raftStatus.RaftState != raft.StateLeader {
-			problems = append(problems, fmt.Sprintf("not leader (%s)", raftStatus.RaftState))
+		if raftStatus.RaftState != raftpb.StateLeader {
+			problems = append(problems, redact.Sprintf("not leader (%s)", redact.Safe(raftStatus.RaftState)))
 		}
 
 		for replicaID, pr := range raftStatus.Progress {
@@ -159,11 +156,11 @@ func maybeDelaySplitToAvoidSnapshot(ctx context.Context, sdh splitDelayHelperI) 
 				if !pr.RecentActive {
 					if slept < tickDur {
 						// We don't want to delay splits for a follower who hasn't responded within a tick.
-						problems = append(problems, fmt.Sprintf("r%d/%d inactive", rangeID, replicaID))
+						problems = append(problems, redact.Sprintf("r%d/%d inactive", rangeID, replicaID))
 					}
 					continue
 				}
-				problems = append(problems, fmt.Sprintf("replica r%d/%d not caught up: %+v", rangeID, replicaID, &pr))
+				problems = append(problems, redact.Sprintf("replica r%d/%d not caught up: %+v", rangeID, replicaID, redact.Safe(&pr)))
 			}
 		}
 		if len(problems) == 0 {
@@ -183,19 +180,19 @@ func maybeDelaySplitToAvoidSnapshot(ctx context.Context, sdh splitDelayHelperI) 
 		slept += sleepDur
 
 		if err := ctx.Err(); err != nil {
-			problems = append(problems, err.Error())
+			problems = append(problems, redact.Sprintf("error: %s", err.Error()))
 			break
 		}
 	}
 
-	var msg string
+	var msg redact.RedactableString
 	// If we exited the loop with problems, use them as lastProblems
 	// and indicate that we did not manage to "delay the problems away".
 	if len(problems) != 0 {
 		lastProblems = problems
 	}
 	if len(lastProblems) != 0 {
-		msg = fmt.Sprintf("; delayed by %.1fs to resolve: %s", slept.Seconds(), strings.Join(lastProblems, "; "))
+		msg = redact.Sprintf("; delayed by %.1fs to resolve: %s", slept.Seconds(), redact.Join("; ", lastProblems))
 		if len(problems) != 0 {
 			msg += " (without success)"
 		}

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package fmtsafe
 
@@ -70,6 +65,7 @@ var requireConstFmt = map[string]bool{
 	"github.com/cockroachdb/cockroach/pkg/util/log.shoutfDepth":            true,
 	"github.com/cockroachdb/cockroach/pkg/util/log.logfDepthInternal":      true,
 	"github.com/cockroachdb/cockroach/pkg/util/log.makeStartLine":          true,
+	"github.com/cockroachdb/cockroach/pkg/util/log.untypedVEventfDepth":    true,
 
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash.ReportOrPanic": true,
 
@@ -86,6 +82,7 @@ var requireConstFmt = map[string]bool{
 
 	"(github.com/cockroachdb/cockroach/pkg/storage.pebbleLogger).Infof":  true,
 	"(github.com/cockroachdb/cockroach/pkg/storage.pebbleLogger).Fatalf": true,
+	"(github.com/cockroachdb/cockroach/pkg/storage.pebbleLogger).Errorf": true,
 	"(github.com/cockroachdb/cockroach/pkg/storage.pebbleLogger).Eventf": true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/util/grpcutil.grpcLogger).Infof":    true,
@@ -107,6 +104,15 @@ var requireConstFmt = map[string]bool{
 	"(*main.testImpl).Errorf": true,
 	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.testImpl).Errorf": true,
 
+	"(*main.operationImpl).addFailure":                                                        true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.operationImpl).addFailure":          true,
+	"(*main.operationImpl).addFailureAndCancel":                                               true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.operationImpl).addFailureAndCancel": true,
+	"(*main.operationImpl).Errorf":                                                            true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.operationImpl).Errorf":              true,
+	"(*main.operationImpl).Fatalf":                                                            true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.operationImpl).Fatalf":              true,
+
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Debugf":   true,
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Infof":    true,
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Warningf": true,
@@ -114,12 +120,16 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Fatalf":   true,
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Panicf":   true,
 
-	"(go.etcd.io/raft/v3.Logger).Debugf":   true,
-	"(go.etcd.io/raft/v3.Logger).Infof":    true,
-	"(go.etcd.io/raft/v3.Logger).Warningf": true,
-	"(go.etcd.io/raft/v3.Logger).Errorf":   true,
-	"(go.etcd.io/raft/v3.Logger).Fatalf":   true,
-	"(go.etcd.io/raft/v3.Logger).Panicf":   true,
+	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver/rafttrace.traceValue).logf": true,
+
+	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2.LogTracker).errorf": true,
+
+	"(github.com/cockroachdb/cockroach/pkg/raft/raftlogger.Logger).Debugf":   true,
+	"(github.com/cockroachdb/cockroach/pkg/raft/raftlogger.Logger).Infof":    true,
+	"(github.com/cockroachdb/cockroach/pkg/raft/raftlogger.Logger).Warningf": true,
+	"(github.com/cockroachdb/cockroach/pkg/raft/raftlogger.Logger).Errorf":   true,
+	"(github.com/cockroachdb/cockroach/pkg/raft/raftlogger.Logger).Fatalf":   true,
+	"(github.com/cockroachdb/cockroach/pkg/raft/raftlogger.Logger).Panicf":   true,
 
 	"(google.golang.org/grpc/grpclog.Logger).Infof":    true,
 	"(google.golang.org/grpc/grpclog.Logger).Warningf": true,
@@ -128,9 +138,6 @@ var requireConstFmt = map[string]bool{
 	"(github.com/cockroachdb/pebble.Logger).Infof":           true,
 	"(github.com/cockroachdb/pebble.Logger).Fatalf":          true,
 	"(github.com/cockroachdb/pebble.LoggerAndTracer).Eventf": true,
-
-	"(github.com/cockroachdb/circuitbreaker.Logger).Infof":  true,
-	"(github.com/cockroachdb/circuitbreaker.Logger).Debugf": true,
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen.errorf": true,
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optgen/exprgen.wrapf":  true,
@@ -161,6 +168,8 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvnemesis.logLogger).Logf": true,
 
 	"(github.com/cockroachdb/cockroach/pkg/kv/kvpb.TestPrinter).Printf": true,
+
+	"(*github.com/cockroachdb/cockroach/pkg/cloud/amazon.awsLogAdapter).Logf": true,
 
 	// Error things are populated in the init() message.
 }

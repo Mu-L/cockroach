@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserverbase
 
@@ -19,10 +14,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/redact"
+)
+
+// LeaseQueueEnabled is a setting that controls whether the lease queue
+// is enabled.
+var LeaseQueueEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.lease_queue.enabled",
+	"whether the lease queue is enabled",
+	true,
 )
 
 // MergeQueueEnabled is a setting that controls whether the merge queue is
@@ -140,18 +145,26 @@ type FilterArgs struct {
 // ProposalFilterArgs groups the arguments to ReplicaProposalFilter.
 type ProposalFilterArgs struct {
 	Ctx        context.Context
+	RangeID    roachpb.RangeID
+	StoreID    roachpb.StoreID
+	ReplicaID  roachpb.ReplicaID
 	Cmd        *kvserverpb.RaftCommand
 	QuotaAlloc *quotapool.IntAlloc
 	CmdID      CmdIDKey
-	Req        kvpb.BatchRequest
+	SeedID     CmdIDKey
+	Req        *kvpb.BatchRequest
 }
 
 // ApplyFilterArgs groups the arguments to a ReplicaApplyFilter.
 type ApplyFilterArgs struct {
 	kvserverpb.ReplicatedEvalResult
 	CmdID       CmdIDKey
+	Cmd         kvserverpb.RaftCommand
+	Entry       raftpb.Entry
 	RangeID     roachpb.RangeID
 	StoreID     roachpb.StoreID
+	ReplicaID   roachpb.ReplicaID
+	Ephemeral   bool
 	Req         *kvpb.BatchRequest // only set on the leaseholder
 	ForcedError *kvpb.Error
 }
@@ -279,7 +292,7 @@ func IntersectSpan(
 
 // SplitByLoadMergeDelay wraps "kv.range_split.by_load_merge_delay".
 var SplitByLoadMergeDelay = settings.RegisterDurationSetting(
-	settings.SystemOnly,
+	settings.SystemVisible, // used by TRUNCATE in SQL
 	"kv.range_split.by_load_merge_delay",
 	"the delay that range splits created due to load will wait before considering being merged away",
 	5*time.Minute,
@@ -298,7 +311,7 @@ const (
 
 // MaxCommandSize wraps "kv.raft.command.max_size".
 var MaxCommandSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemVisible, // used by SQL/bulk to determine mutation batch sizes
 	"kv.raft.command.max_size",
 	"maximum size of a raft command",
 	MaxCommandSizeDefault,

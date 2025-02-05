@@ -1,20 +1,18 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package funcdesc
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -92,7 +90,7 @@ func (fdb *functionDescriptorBuilder) RunPostDeserializationChanges() (err error
 	// Set the ModificationTime field before doing anything else.
 	// Other changes may depend on it.
 	mustSetModTime, err := descpb.MustSetModificationTime(
-		fdb.original.ModificationTime, fdb.mvccTimestamp, fdb.original.Version,
+		fdb.original.ModificationTime, fdb.mvccTimestamp, fdb.original.Version, fdb.original.State,
 	)
 	if err != nil {
 		return err
@@ -101,6 +99,19 @@ func (fdb *functionDescriptorBuilder) RunPostDeserializationChanges() (err error
 	if mustSetModTime {
 		fdb.maybeModified.ModificationTime = fdb.mvccTimestamp
 		fdb.changes.Add(catalog.SetModTimeToMVCCTimestamp)
+	}
+	desc := fdb.maybeModified
+	if desc.GetPrivileges().Version < catpb.Version23_2 {
+		// Grant EXECUTE privilege on the function for the public role if the
+		// descriptor was created before v23.2. This matches the default
+		// privilege for newly created functions.
+		desc.GetPrivileges().Grant(
+			username.PublicRoleName(),
+			privilege.List{privilege.EXECUTE},
+			false, /* withGrantOption */
+		)
+		desc.GetPrivileges().SetVersion(catpb.Version23_2)
+		fdb.changes.Add(catalog.GrantExecuteOnFunctionToPublicRole)
 	}
 	return nil
 }
@@ -131,6 +142,31 @@ func (fdb *functionDescriptorBuilder) StripDanglingBackReferences(
 	if sliceIdx < len(fdb.maybeModified.DependedOnBy) {
 		fdb.maybeModified.DependedOnBy = fdb.maybeModified.DependedOnBy[:sliceIdx]
 		fdb.changes.Add(catalog.StrippedDanglingBackReferences)
+	}
+	return nil
+}
+
+// StripNonExistentRoles implements the catalog.DescriptorBuilder
+// interface.
+func (fdb *functionDescriptorBuilder) StripNonExistentRoles(
+	roleExists func(role username.SQLUsername) bool,
+) error {
+	// If the owner doesn't exist, change the owner to admin.
+	if !roleExists(fdb.maybeModified.GetPrivileges().Owner()) {
+		fdb.maybeModified.Privileges.OwnerProto = username.AdminRoleName().EncodeProto()
+		fdb.changes.Add(catalog.StrippedNonExistentRoles)
+	}
+	// Remove any non-existent roles from the privileges.
+	newPrivs := make([]catpb.UserPrivileges, 0, len(fdb.maybeModified.Privileges.Users))
+	for _, priv := range fdb.maybeModified.Privileges.Users {
+		exists := roleExists(priv.UserProto.Decode())
+		if exists {
+			newPrivs = append(newPrivs, priv)
+		}
+	}
+	if len(newPrivs) != len(fdb.maybeModified.Privileges.Users) {
+		fdb.maybeModified.Privileges.Users = newPrivs
+		fdb.changes.Add(catalog.StrippedNonExistentRoles)
 	}
 	return nil
 }

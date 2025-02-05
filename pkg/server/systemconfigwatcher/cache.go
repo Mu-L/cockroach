@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package systemconfigwatcher
 
@@ -31,14 +26,13 @@ import (
 // cache provides a consistent snapshot when available, but the snapshot
 // may be stale.
 type Cache struct {
-	w                   *rangefeedcache.Watcher
+	w                   *rangefeedcache.Watcher[*kvpb.RangeFeedValue]
 	defaultZoneConfig   *zonepb.ZoneConfig
 	additionalKVsSource config.SystemConfigProvider
 	mu                  struct {
 		syncutil.RWMutex
 
-		cfg       *config.SystemConfig
-		timestamp hlc.Timestamp
+		cfg *config.SystemConfig
 
 		registry notificationRegistry
 
@@ -83,6 +77,7 @@ func NewWithAdditionalProvider(
 	// many rows.
 	const bufferSize = 1 << 20 // infinite?
 	const withPrevValue = false
+	const withRowTSInInitialScan = true
 	c := Cache{
 		defaultZoneConfig: defaultZoneConfig,
 	}
@@ -90,20 +85,15 @@ func NewWithAdditionalProvider(
 	c.additionalKVsSource = additional
 
 	spans := []roachpb.Span{
-		{
-			Key:    append(codec.TenantPrefix(), keys.SystemDescriptorTableSpan.Key...),
-			EndKey: append(codec.TenantPrefix(), keys.SystemDescriptorTableSpan.EndKey...),
-		},
-		{
-			Key:    append(codec.TenantPrefix(), keys.SystemZonesTableSpan.Key...),
-			EndKey: append(codec.TenantPrefix(), keys.SystemZonesTableSpan.EndKey...),
-		},
+		codec.TableSpan(keys.DescriptorTableID),
+		codec.TableSpan(keys.ZonesTableID),
 	}
 	c.w = rangefeedcache.NewWatcher(
 		"system-config-cache", clock, f,
 		bufferSize,
 		spans,
 		withPrevValue,
+		withRowTSInInitialScan,
 		passThroughTranslation,
 		c.handleUpdate,
 		nil)
@@ -173,15 +163,6 @@ func (c *Cache) RegisterSystemConfigChannel() (_ <-chan struct{}, unregister fun
 	}
 }
 
-// LastUpdated returns the timestamp corresponding to the current state of
-// the cache. Any subsequent call to GetSystemConfig will see a state that
-// corresponds to a snapshot as least as new as this timestamp.
-func (c *Cache) LastUpdated() hlc.Timestamp {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.mu.timestamp
-}
-
 func (c *Cache) setAdditionalKeys(kvs []roachpb.KeyValue) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -230,7 +211,9 @@ func (k keyValues) Less(i, j int) bool { return k[i].Key.Compare(k[j].Key) < 0 }
 
 var _ sort.Interface = (keyValues)(nil)
 
-func (c *Cache) handleUpdate(_ context.Context, update rangefeedcache.Update) {
+func (c *Cache) handleUpdate(
+	_ context.Context, update rangefeedcache.Update[*kvpb.RangeFeedValue],
+) {
 	updateKVs := rangefeedbuffer.EventsToKVs(update.Events,
 		rangefeedbuffer.RangeFeedValueEventToKV)
 	c.mu.Lock()
@@ -240,36 +223,34 @@ func (c *Cache) handleUpdate(_ context.Context, update rangefeedcache.Update) {
 	case rangefeedcache.CompleteUpdate:
 		updatedData = rangefeedbuffer.MergeKVs(c.mu.additionalKVs, updateKVs)
 	case rangefeedcache.IncrementalUpdate:
+		if len(updateKVs) == 0 {
+			// Simply return since there is nothing interesting.
+			return
+		}
 		// Note that handleUpdate is called synchronously, so we can use the
 		// old snapshot as the basis for the new snapshot without any risk of
 		// missing anything.
 		prev := c.mu.cfg
-
-		// If there is nothing interesting, just update the timestamp and
-		// return without notifying anybody.
-		if len(updateKVs) == 0 {
-			c.setUpdatedConfigLocked(prev, update.Timestamp)
-			return
-		}
 		updatedData = rangefeedbuffer.MergeKVs(prev.Values, updateKVs)
 	}
 
 	updatedCfg := config.NewSystemConfig(c.defaultZoneConfig)
 	updatedCfg.Values = updatedData
-	c.setUpdatedConfigLocked(updatedCfg, update.Timestamp)
+	c.setUpdatedConfigLocked(updatedCfg)
 }
 
-func (c *Cache) setUpdatedConfigLocked(updated *config.SystemConfig, ts hlc.Timestamp) {
+func (c *Cache) setUpdatedConfigLocked(updated *config.SystemConfig) {
 	changed := c.mu.cfg != updated
 	c.mu.cfg = updated
-	c.mu.timestamp = ts
 	if changed {
 		c.mu.registry.notify()
 	}
 }
 
-func passThroughTranslation(ctx context.Context, value *kvpb.RangeFeedValue) rangefeedbuffer.Event {
-	return value
+func passThroughTranslation(
+	ctx context.Context, value *kvpb.RangeFeedValue,
+) (*kvpb.RangeFeedValue, bool) {
+	return value, value != nil
 }
 
 var _ config.SystemConfigProvider = (*Cache)(nil)

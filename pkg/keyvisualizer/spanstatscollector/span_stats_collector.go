@@ -1,17 +1,11 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanstatscollector
 
 import (
-	"container/ring"
 	"context"
 	"sync/atomic"
 	"time"
@@ -20,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvissettings"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/container/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -65,7 +60,7 @@ type SpanStatsCollector struct {
 		// A ring buffer is used to persist previous samples until they're
 		// requested. After the last empty element is filled, r points to the
 		// oldest sample, which is the next sample to be overwritten.
-		r *ring.Ring
+		r *ring.Ring[keyvispb.Sample]
 	}
 }
 
@@ -78,7 +73,7 @@ func New(settings *cluster.Settings) *SpanStatsCollector {
 	collector := &SpanStatsCollector{}
 	collector.tree.Store(newTreeWithBoundaries(nil))
 	collector.settings = settings
-	collector.mu.r = ring.New(5) // Keep the 5 most recent samples.
+	collector.mu.r = ring.New[keyvispb.Sample](5) // Keep the 5 most recent samples.
 	return collector
 }
 
@@ -87,7 +82,8 @@ func (s *SpanStatsCollector) Start(ctx context.Context, stopper *stop.Stopper) {
 	if err := stopper.RunAsyncTask(ctx, "span-stats-collector",
 		func(ctx context.Context) {
 			s.reset()
-			t := timeutil.NewTimer()
+			var t timeutil.Timer
+			defer t.Stop()
 			for {
 				samplePeriod := keyvissettings.SampleInterval.Get(&s.settings.SV)
 				now := timeutil.Now()

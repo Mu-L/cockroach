@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
@@ -124,6 +119,24 @@ type TxnSender interface {
 	// SetDebugName sets the txn's debug name.
 	SetDebugName(name string)
 
+	// GetOmitInRangefeeds returns the value of the OmitInRangefeeds attribute of
+	// the Transaction proto.
+	GetOmitInRangefeeds() bool
+
+	// SetOmitInRangefeeds sets the OmitInRangefeeds attribute to true in the
+	// Transaction proto.
+	SetOmitInRangefeeds()
+
+	// SetBufferedWritesEnabled toggles whether the writes are buffered on the
+	// gateway node until the commit time. Only allowed on the RootTxn. Buffered
+	// writes cannot be enabled on a txn that performed any requests.
+	// TODO(yuzefovich): should we flush the buffer when going from "enabled" to
+	// "disabled"?
+	SetBufferedWritesEnabled(bool)
+
+	// BufferedWritesEnabled returns whether the buffered writes are enabled.
+	BufferedWritesEnabled() bool
+
 	// String returns a string representation of the txn.
 	String() string
 
@@ -163,6 +176,10 @@ type TxnSender interface {
 	//
 	// This method is only valid when called on RootTxns.
 	ReleaseSavepoint(context.Context, SavepointToken) error
+
+	// CanUseSavepoint checks whether it would be valid to roll back or release
+	// the given savepoint in the current transaction state. It will never error.
+	CanUseSavepoint(context.Context, SavepointToken) bool
 
 	// SetFixedTimestamp makes the transaction run in an unusual way, at
 	// a "fixed timestamp": Timestamp and ReadTimestamp are set to ts,
@@ -208,8 +225,10 @@ type TxnSender interface {
 	// TxnSender usable again.
 	GetRetryableErr(ctx context.Context) *kvpb.TransactionRetryWithProtoRefreshError
 
-	// ClearRetryableErr clears the retryable error, if any.
-	ClearRetryableErr(ctx context.Context)
+	// ClearRetryableErr clears the retryable error. Returns an error if the
+	// TxnSender was not in a retryable error state or if the TxnSender was
+	// aborted.
+	ClearRetryableErr(ctx context.Context) error
 
 	// DisablePipelining instructs the TxnSender not to pipeline
 	// requests. It should rarely be necessary to call this method. It
@@ -280,6 +299,10 @@ type TxnSender interface {
 	// https://github.com/cockroachdb/cockroach/issues/15012
 	Active() bool
 
+	// Key returns the current "anchor" key of the transaction, or nil if no such
+	// key has been set because the transaction has not yet acquired any locks.
+	Key() roachpb.Key
+
 	// Epoch returns the txn's epoch.
 	Epoch() enginepb.TxnEpoch
 
@@ -298,17 +321,17 @@ type TxnSender interface {
 	// the time the snapshot was established and ignore writes performed by the
 	// transaction since.
 	//
-	// Additionally, for Read Committed transactions, Step also advances the
-	// transaction's external read snapshot (i.e. ReadTimestamp) to a timestamp
-	// captured from the local HLC clock. This ensures that subsequent read-only
-	// operations observe the writes of other transactions that were committed
-	// before the time the new snapshot was established. For more detail on the
-	// interaction between transaction isolation levels and Step, see
-	// (isolation.Level).PerStatementReadSnapshot.
+	// Additionally, for Read Committed transactions, if allowReadTimestampStep is
+	// set, Step also advances the transaction's external read snapshot (i.e.
+	// ReadTimestamp) to a timestamp captured from the local HLC clock. This
+	// ensures that subsequent read-only operations observe the writes of other
+	// transactions that were committed before the time the new snapshot was
+	// established. For more detail on the interaction between transaction
+	// isolation levels and Step, see (isolation.Level).PerStatementReadSnapshot.
 	//
 	// Step() can only be called after stepping mode has been enabled
 	// using ConfigureStepping(SteppingEnabled).
-	Step(context.Context) error
+	Step(ctx context.Context, allowReadTimestampStep bool) error
 
 	// GetReadSeqNum gets the read sequence point for the current transaction.
 	GetReadSeqNum() enginepb.TxnSeq

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -33,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
 // CreatedByScheduledJobs identifies the job that was created
@@ -84,7 +80,7 @@ func (s scheduledJobStorageTxn) loadCandidateScheduleForExecution(
 	row, cols, err := s.txn.QueryRowExWithCols(
 		ctx, "find-scheduled-jobs-exec",
 		s.txn.KV(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		lookupStmt)
 	if err != nil {
 		return nil, err
@@ -103,7 +99,10 @@ func (s scheduledJobStorageTxn) loadCandidateScheduleForExecution(
 
 // lookupNumRunningJobs returns the number of running jobs for the specified schedule.
 func lookupNumRunningJobs(
-	ctx context.Context, scheduleID int64, env scheduledjobs.JobSchedulerEnv, txn isql.Txn,
+	ctx context.Context,
+	scheduleID jobspb.ScheduleID,
+	env scheduledjobs.JobSchedulerEnv,
+	txn isql.Txn,
 ) (int64, error) {
 	lookupStmt := fmt.Sprintf(
 		"SELECT count(*) FROM %s WHERE created_by_type = '%s' AND created_by_id = %d AND status IN %s",
@@ -111,7 +110,7 @@ func lookupNumRunningJobs(
 	row, err := txn.QueryRowEx(
 		ctx, "lookup-num-running",
 		txn.KV(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		lookupStmt)
 	if err != nil {
 		return 0, err
@@ -132,14 +131,14 @@ func (s *jobScheduler) processSchedule(
 			// In particular, it'd be nice to add more time when repeatedly rescheduling
 			// a job.  It would also be nice not to log each event.
 			schedule.SetNextRun(s.env.Now().Add(recheckRunningAfter))
-			schedule.SetScheduleStatus("delayed due to %d already running", numRunning)
+			schedule.SetScheduleStatusf("delayed due to %d already running", numRunning)
 			s.metrics.RescheduleWait.Inc(1)
 			return scheduleStorage.Update(ctx, schedule)
 		case jobspb.ScheduleDetails_SKIP:
 			if err := schedule.ScheduleNextRun(); err != nil {
 				return err
 			}
-			schedule.SetScheduleStatus("rescheduled due to %d already running", numRunning)
+			schedule.SetScheduleStatusf("rescheduled due to %d already running", numRunning)
 			s.metrics.RescheduleSkip.Inc(1)
 			return scheduleStorage.Update(ctx, schedule)
 		}
@@ -261,7 +260,7 @@ func (s *jobScheduler) executeCandidateSchedule(
 	if processErr := withSavePoint(ctx, txn.KV(), func() error {
 		if timeout > 0 {
 			return timeutil.RunWithTimeout(
-				ctx, fmt.Sprintf("process-schedule-%d", schedule.ScheduleID()), timeout,
+				ctx, redact.Sprintf("process-schedule-%d", schedule.ScheduleID()), timeout,
 				func(ctx context.Context) error {
 					return s.processSchedule(ctx, schedule, numRunning, txn)
 				})
@@ -323,7 +322,7 @@ func (s *jobScheduler) executeSchedules(ctx context.Context, maxSchedules int64)
 	it, err := s.DB.Executor().QueryIteratorEx(
 		ctx, "find-scheduled-jobs",
 		/*txn=*/ nil,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		findSchedulesStmt)
 
 	if err != nil {
@@ -362,10 +361,10 @@ func newCancelWhenDisabled(sv *settings.Values) *syncCancelFunc {
 	schedulerEnabledSetting.SetOnChange(sv, func(ctx context.Context) {
 		if !schedulerEnabledSetting.Get(sv) {
 			sf.Lock()
+			defer sf.Unlock()
 			if sf.CancelFunc != nil {
 				sf.CancelFunc()
 			}
-			sf.Unlock()
 		}
 	})
 	return sf
@@ -384,6 +383,7 @@ func (sf *syncCancelFunc) withCancelOnDisabled(
 		sf.CancelFunc = cancel
 
 		if !schedulerEnabledSetting.Get(sv) {
+			log.Warning(ctx, "scheduled job system disabled by setting, cancelling execution")
 			cancel()
 		}
 
@@ -419,6 +419,7 @@ func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
 				return
 			case <-timer.C:
 				if !schedulerEnabledSetting.Get(&s.Settings.SV) {
+					log.Warning(ctx, "scheduled job system disabled by setting")
 					continue
 				}
 
@@ -426,7 +427,7 @@ func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
 				if err := whenDisabled.withCancelOnDisabled(ctx, &s.Settings.SV, func(ctx context.Context) error {
 					return s.executeSchedules(ctx, maxSchedules)
 				}); err != nil {
-					log.Errorf(ctx, "error executing schedules: %+v", err)
+					log.Errorf(ctx, "error executing schedules: %v", err)
 				}
 			}
 		}
@@ -434,28 +435,28 @@ func (s *jobScheduler) runDaemon(ctx context.Context, stopper *stop.Stopper) {
 }
 
 var schedulerEnabledSetting = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"jobs.scheduler.enabled",
 	"enable/disable job scheduler",
 	true,
 )
 
 var schedulerPaceSetting = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"jobs.scheduler.pace",
 	"how often to scan system.scheduled_jobs table",
 	time.Minute,
 )
 
 var schedulerMaxJobsPerIterationSetting = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"jobs.scheduler.max_jobs_per_iteration",
 	"how many schedules to start per iteration; setting to 0 turns off this limit",
 	5,
 )
 
 var schedulerScheduleExecutionTimeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"jobs.scheduler.schedule_execution.timeout",
 	"sets a timeout on for schedule execution; 0 disables timeout",
 	30*time.Second,

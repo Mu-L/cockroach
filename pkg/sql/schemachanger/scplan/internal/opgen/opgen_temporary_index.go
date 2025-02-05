@@ -1,17 +1,11 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opgen
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -28,6 +22,17 @@ func init() {
 						IsSecondaryIndex: this.IsUsingSecondaryEncoding,
 					}
 				}),
+				emit(func(this *scpb.TemporaryIndex) *scop.SetAddedIndexPartialPredicate {
+					if this.Expr == nil {
+						return nil
+					}
+					return &scop.SetAddedIndexPartialPredicate{
+						TableID: this.TableID,
+						IndexID: this.IndexID,
+						Expr:    this.Expr.Expr,
+					}
+				}),
+
 				emit(func(this *scpb.TemporaryIndex, md *opGenContext) *scop.MaybeAddSplitForIndex {
 					// Avoid adding splits for tables without any data (i.e. newly created ones).
 					if checkIfDescriptorIsWithoutData(this.TableID, md) {
@@ -66,13 +71,6 @@ func init() {
 			),
 			to(scpb.Status_ABSENT,
 				emit(func(this *scpb.TemporaryIndex, md *opGenContext) *scop.CreateGCJobForIndex {
-					if !md.ActiveVersion.IsActive(clusterversion.V23_1) {
-						return &scop.CreateGCJobForIndex{
-							TableID:             this.TableID,
-							IndexID:             this.IndexID,
-							StatementForDropJob: statementForDropJob(this, md),
-						}
-					}
 					return nil
 				}),
 				emit(func(this *scpb.TemporaryIndex) *scop.MakeIndexAbsent {

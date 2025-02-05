@@ -7,6 +7,7 @@ go_library(
         "doc.go",
         "list.go",
         "manager.go",
+        "settings.go",
         "signal.go",
         ":latch_interval_btree.go",  # keep
     ],
@@ -18,12 +19,15 @@ go_library(
         "//pkg/kv/kvserver/concurrency/poison",
         "//pkg/kv/kvserver/spanset",
         "//pkg/roachpb",
+        "//pkg/settings",
+        "//pkg/settings/cluster",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/metric",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
+        "@com_github_cockroachdb_crlib//crtime",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
     ],
@@ -37,11 +41,11 @@ go_test(
         "signal_test.go",
         ":latch_interval_btree_test.go",  # keep
     ],
-    args = ["-test.timeout=895s"],
     embed = [":spanlatch"],
     shard_count = 16,
     deps = [
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/concurrency/poison",
         "//pkg/kv/kvserver/spanset",
         "//pkg/roachpb",
@@ -50,6 +54,7 @@ go_test(
         "//pkg/util/leaktest",
         "//pkg/util/timeutil",  # keep
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_stretchr_testify//require",
     ],
 )

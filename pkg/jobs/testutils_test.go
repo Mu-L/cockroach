@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -83,6 +78,7 @@ func newTestHelperForTables(
 	s, db, _ := serverutils.StartServer(t, args)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, "CREATE USER testuser")
 
 	if envTableType == jobstest.UseTestTables {
 		sqlDB.Exec(t, jobstest.GetScheduledJobsTableSchema(env))
@@ -115,6 +111,7 @@ func (h *testHelper) newScheduledJob(t *testing.T, scheduleLabel, sql string) *S
 	j.SetOwner(username.TestUserName())
 	any, err := types.MarshalAny(&jobspb.SqlStatementExecutionArg{Statement: sql})
 	require.NoError(t, err)
+	j.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	j.SetExecutionDetails(InlineExecutorName, jobspb.ExecutionArguments{Args: any})
 	return j
 }
@@ -128,15 +125,16 @@ func (h *testHelper) newScheduledJobForExecutor(
 	j.SetScheduleLabel(scheduleLabel)
 	j.SetOwner(username.TestUserName())
 	j.SetExecutionDetails(executorName, jobspb.ExecutionArguments{Args: executorArgs})
+	j.SetScheduleDetails(jobstest.AddDummyScheduleDetails(jobspb.ScheduleDetails{}))
 	return j
 }
 
 // loadSchedule loads  all columns for the specified scheduled job.
-func (h *testHelper) loadSchedule(t *testing.T, id int64) *ScheduledJob {
+func (h *testHelper) loadSchedule(t *testing.T, id jobspb.ScheduleID) *ScheduledJob {
 	j := NewScheduledJob(h.env)
 	row, cols, err := h.cfg.DB.Executor().QueryRowExWithCols(
 		context.Background(), "sched-load", nil,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf(
 			"SELECT * FROM %s WHERE schedule_id = %d",
 			h.env.ScheduledJobsTableName(), id),
@@ -166,18 +164,17 @@ func registerScopedScheduledJobExecutor(name string, ex ScheduledJobExecutor) fu
 // addFakeJob adds a fake job associated with the specified scheduleID.
 // Returns the id of the newly created job.
 func addFakeJob(
-	t *testing.T, h *testHelper, scheduleID int64, status Status, txn isql.Txn,
+	t *testing.T, h *testHelper, scheduleID jobspb.ScheduleID, status Status, txn isql.Txn,
 ) jobspb.JobID {
-	payload := []byte("fake payload")
 	datums, err := txn.QueryRowEx(context.Background(), "fake-job", txn.KV(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		fmt.Sprintf(`
-INSERT INTO %s (created_by_type, created_by_id, status, payload)
-VALUES ($1, $2, $3, $4)
+INSERT INTO %s (created_by_type, created_by_id, status)
+VALUES ($1, $2, $3)
 RETURNING id`,
 			h.env.SystemJobsTableName(),
 		),
-		CreatedByScheduledJobs, scheduleID, status, payload,
+		CreatedByScheduledJobs, scheduleID, status,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, datums)

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cat
 
@@ -180,17 +175,43 @@ type Table interface {
 	// IsHypothetical returns true if this is a hypothetical table (used when
 	// searching for index recommendations).
 	IsHypothetical() bool
+
+	// TriggerCount returns the number of triggers present on the table.
+	TriggerCount() int
+
+	// Trigger returns the ith trigger, where i < TriggerCount.
+	Trigger(i int) Trigger
+
+	// IsRowLevelSecurityEnabled is true if policies should be applied during the query.
+	IsRowLevelSecurityEnabled() bool
+
+	// PolicyCount returns the number of policies in the table for the given type.
+	PolicyCount(polType tree.PolicyType) int
+
+	// Policy retrieves the policy of the specified type at the given index (i),
+	// where i < PolicyCount for the specified type.
+	Policy(polType tree.PolicyType, i int) Policy
 }
 
-// CheckConstraint contains the SQL text and the validity status for a check
-// constraint on a table. Check constraints are user-defined restrictions
-// on the content of each row in a table. For example, this check constraint
-// ensures that only values greater than zero can be inserted into the table:
+// CheckConstraint represents a check constraint on a table. Check constraints
+// are user-defined restrictions on the content of each row in a table. For
+// example, this check constraint ensures that only values greater than zero can
+// be inserted into the table:
 //
 //	CREATE TABLE a (a INT CHECK (a > 0))
-type CheckConstraint struct {
-	Constraint string
-	Validated  bool
+type CheckConstraint interface {
+	// Constraint contains the SQL text of this check constraint.
+	Constraint() string
+
+	// Validated returns true if this check constraint has been validated.
+	Validated() bool
+
+	// ColumnCount returns the number of columns in this constraint.
+	ColumnCount() int
+
+	// ColumnOrdinal returns the table column ordinal of the ith column in this
+	// constraint.
+	ColumnOrdinal(i int) int
 }
 
 // TableStatistic is an interface to a table statistic. Each statistic is
@@ -351,6 +372,12 @@ type UniqueConstraint interface {
 
 	// WithoutIndex is true if this unique constraint is not enforced by an index.
 	WithoutIndex() bool
+
+	// TombstoneIndexOrdinal returns the index ordinal of the index into which to write
+	// tombstones for the enforcement of this uniqueness constraint, or -1 if this
+	// constraint is not enforceable with tombstones. 'ok' is true if this constraint is
+	// enforceable with tombstones, false otherwise.
+	TombstoneIndexOrdinal() (_ IndexOrdinal, ok bool)
 
 	// Validated is true if the constraint is validated (i.e. we know that the
 	// existing data satisfies the constraint). It is possible to set up a unique

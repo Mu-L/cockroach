@@ -853,6 +853,7 @@ vectorized: true
 │             missing stats
 │             table: parent@parent_pkey
 │             spans: [/2 - /2]
+│             locking strength: for update
 │
 └── • constraint-check
     │
@@ -894,27 +895,17 @@ vectorized: true
     │
     └── • error if rows
         │
-        └── • hash join
+        └── • lookup join (semi)
+            │ table: child@c_idx_invisible
             │ equality: (p) = (p)
-            │ left cols are key
-            │ right cols are key
             │
-            ├── • except all
-            │   │
-            │   ├── • scan buffer
-            │   │     label: buffer 1
-            │   │
-            │   └── • scan buffer
-            │         label: buffer 1
-            │
-            └── • distinct
-                │ distinct on: p
-                │ order key: p
+            └── • except all
                 │
-                └── • scan
-                      missing stats
-                      table: child@c_idx_invisible
-                      spans: FULL SCAN
+                ├── • scan buffer
+                │     label: buffer 1
+                │
+                └── • scan buffer
+                      label: buffer 1
 
 statement ok
 DROP TABLE child
@@ -1043,10 +1034,19 @@ vectorized: true
 │             missing stats
 │             table: parent@parent_pkey
 │             spans: [/2 - /2]
+│             locking strength: for update
 │
 ├── • fk-cascade
-│     fk: child_delete_p_fkey
-│     input: buffer 1
+│   │ fk: child_delete_p_fkey
+│   │
+│   └── • delete
+│       │ from: child_delete
+│       │
+│       └── • scan
+│             missing stats
+│             table: child_delete@c_delete_idx_invisible
+│             spans: [/2 - /2]
+│             locking strength: for update
 │
 └── • constraint-check
     │
@@ -1085,29 +1085,33 @@ vectorized: true
 │                 spans: FULL SCAN
 │
 ├── • fk-cascade
-│     fk: child_delete_p_fkey
-│     input: buffer 1
+│   │ fk: child_delete_p_fkey
+│   │
+│   └── • delete
+│       │ from: child_delete
+│       │
+│       └── • lookup join
+│           │ table: child_delete@c_delete_idx_invisible
+│           │ equality: (p) = (p)
+│           │
+│           └── • distinct
+│               │ estimated row count: 10
+│               │ distinct on: p
+│               │
+│               └── • scan buffer
+│                     estimated row count: 100
+│                     label: buffer 1000000
 │
 └── • constraint-check
     │
     └── • error if rows
         │
-        └── • hash join
+        └── • lookup join (semi)
+            │ table: child_update@c_update_idx_invisible
             │ equality: (p) = (p)
-            │ left cols are key
-            │ right cols are key
             │
-            ├── • scan buffer
-            │     label: buffer 1
-            │
-            └── • distinct
-                │ distinct on: p
-                │ order key: p
-                │
-                └── • scan
-                      missing stats
-                      table: child_update@c_update_idx_invisible
-                      spans: FULL SCAN
+            └── • scan buffer
+                  label: buffer 1
 
 # c_delete_idx_invisible is used for constraint check (update on a parent table
 # requires FK check).
@@ -1135,34 +1139,56 @@ vectorized: true
 │                 locking strength: for update
 │
 ├── • fk-cascade
-│     fk: child_update_p_fkey
-│     input: buffer 1
+│   │ fk: child_update_p_fkey
+│   │
+│   └── • root
+│       │
+│       ├── • update
+│       │   │ table: child_update
+│       │   │ set: p
+│       │   │
+│       │   └── • buffer
+│       │       │ label: buffer 1
+│       │       │
+│       │       └── • lookup join
+│       │           │ table: child_update@c_update_idx_invisible
+│       │           │ equality: (p) = (p)
+│       │           │
+│       │           └── • filter
+│       │               │ estimated row count: 33
+│       │               │ filter: p IS DISTINCT FROM p_new
+│       │               │
+│       │               └── • scan buffer
+│       │                     estimated row count: 100
+│       │                     label: buffer 1000000
+│       │
+│       └── • constraint-check
+│           │
+│           └── • error if rows
+│               │
+│               └── • lookup join (anti)
+│                   │ table: parent@parent_pkey
+│                   │ equality: (p_new) = (p)
+│                   │ equality cols are key
+│                   │
+│                   └── • scan buffer
+│                         label: buffer 1
 │
 └── • constraint-check
     │
     └── • error if rows
         │
-        └── • hash join
+        └── • lookup join (semi)
+            │ table: child_delete@c_delete_idx_invisible
             │ equality: (p) = (p)
-            │ left cols are key
-            │ right cols are key
             │
-            ├── • except all
-            │   │
-            │   ├── • scan buffer
-            │   │     label: buffer 1
-            │   │
-            │   └── • scan buffer
-            │         label: buffer 1
-            │
-            └── • distinct
-                │ distinct on: p
-                │ order key: p
+            └── • except all
                 │
-                └── • scan
-                      missing stats
-                      table: child_delete@c_delete_idx_invisible
-                      spans: FULL SCAN
+                ├── • scan buffer
+                │     label: buffer 1
+                │
+                └── • scan buffer
+                      label: buffer 1
 
 statement ok
 DROP TABLE child_delete

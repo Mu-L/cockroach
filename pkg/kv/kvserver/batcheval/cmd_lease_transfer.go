@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -17,7 +12,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -35,7 +29,7 @@ func declareKeysTransferLease(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
+) error {
 	// TransferLease must not run concurrently with any other request so it uses
 	// latches to synchronize with all other reads and writes on the outgoing
 	// leaseholder. Additionally, it observes the state of the timestamp cache
@@ -56,6 +50,7 @@ func declareKeysTransferLease(
 	// reads. We'd need to be careful here, so we should only pull on this if we
 	// decide that doing so is important.
 	declareAllKeys(latchSpans)
+	return nil
 }
 
 // TransferLease sets the lease holder for the range.
@@ -69,17 +64,12 @@ func TransferLease(
 	// When returning an error from this method, must always return
 	// a newFailedLeaseTrigger() to satisfy stats.
 	args := cArgs.Args.(*kvpb.TransferLeaseRequest)
-
-	// NOTE: we use the range's current lease as prevLease instead of
-	// args.PrevLease so that we can detect lease transfers that will
-	// inevitably fail early and reject them with a detailed
-	// LeaseRejectedError before going through Raft.
-	prevLease, _ := cArgs.EvalCtx.GetLease()
-
+	prevLease := args.PrevLease
 	newLease := args.Lease
 
 	// If this check is removed at some point, the filtering of learners on the
 	// sending side would have to be removed as well.
+	// TODO(nvanbenschoten): move this into leases.Verify.
 	if err := roachpb.CheckCanReceiveLease(
 		newLease.Replica, cArgs.EvalCtx.Desc().Replicas(), false, /* wasLastLeaseholder */
 	); err != nil {
@@ -105,7 +95,7 @@ func TransferLease(
 	// such cases, we could detect that here and fail fast, but it's safe and
 	// easier to just let the TransferLease be proposed under the wrong lease
 	// and be rejected with the correct error below Raft.
-	cArgs.EvalCtx.RevokeLease(ctx, args.PrevLease.Sequence)
+	cArgs.EvalCtx.RevokeLease(ctx, prevLease.Sequence)
 
 	// Forward the lease's start time to a current clock reading. At this
 	// point, we're holding latches across the entire range, we know that
@@ -115,24 +105,13 @@ func TransferLease(
 	// previous lease was revoked).
 	newLease.Start.Forward(cArgs.EvalCtx.Clock().NowAsClockTimestamp())
 
-	// Collect a read summary from the outgoing leaseholder to ship to the
-	// incoming leaseholder. This is used to instruct the new leaseholder on how
-	// to update its timestamp cache to ensure that no future writes are allowed
-	// to invalidate prior reads.
-	priorReadSum := cArgs.EvalCtx.GetCurrentReadSummary(ctx)
-	// For now, forward this summary to the proposed lease's start time. This
-	// may appear to undermine the benefit of the read summary, but it doesn't
-	// entirely. Until we ship higher-resolution read summaries, the read
-	// summary doesn't provide much value in avoiding transaction retries, but
-	// it is necessary for correctness if the outgoing leaseholder has served
-	// reads at future times above the proposed lease start time.
-	//
-	// We can remove this in the future when we increase the resolution of read
-	// summaries and have a per-range closed timestamp system that is easier to
-	// think about.
-	priorReadSum.Merge(rspb.FromTimestamp(newLease.Start.ToTimestamp()))
+	// Forwarding the lease's start time is safe because we know that the
+	// lease's sequence number has been incremented. Assert this.
+	if newLease.Sequence <= prevLease.Sequence {
+		log.Fatalf(ctx, "lease sequence not incremented: prev=%s, new=%s", prevLease, newLease)
+	}
 
 	log.VEventf(ctx, 2, "lease transfer: prev lease: %+v, new lease: %+v", prevLease, newLease)
 	return evalNewLease(ctx, cArgs.EvalCtx, readWriter, cArgs.Stats,
-		newLease, prevLease, &priorReadSum, false /* isExtension */, true /* isTransfer */)
+		newLease, prevLease, true /* isTransfer */)
 }

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -28,8 +23,13 @@ const (
 
 func main() {
 	var gcsBucket string
+	var platforms release.Platforms
 	flag.StringVar(&gcsBucket, "gcs-bucket", "", "GCS bucket")
+	flag.Var(&platforms, "platform", "platforms to build")
 	flag.Parse()
+	if len(platforms) == 0 {
+		platforms = release.DefaultPlatforms()
+	}
 
 	if gcsBucket == "" {
 		log.Fatal("GCS bucket is not set")
@@ -66,7 +66,7 @@ func main() {
 	}
 	versionStr := string(bytes.TrimSpace(out))
 
-	run(providers, runFlags{
+	run(providers, platforms, runFlags{
 		pkgDir: pkg,
 		branch: branch,
 		sha:    versionStr,
@@ -79,15 +79,13 @@ type runFlags struct {
 	pkgDir string
 }
 
-func run(providers []release.ObjectPutGetter, flags runFlags, execFn release.ExecFn) {
-	for _, platform := range []release.Platform{
-		release.PlatformLinux,
-		release.PlatformLinuxFIPS,
-		release.PlatformLinuxArm,
-		release.PlatformMacOS,
-		release.PlatformMacOSArm,
-		release.PlatformWindows,
-	} {
+func run(
+	providers []release.ObjectPutGetter,
+	platforms release.Platforms,
+	flags runFlags,
+	execFn release.ExecFn,
+) {
+	for _, platform := range platforms {
 		var o opts
 		o.Platform = platform
 		o.ReleaseVersions = []string{flags.sha}

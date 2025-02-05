@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package authserver
 
@@ -15,8 +10,6 @@ import (
 	"net/http"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 )
 
 type ServerV2 interface {
@@ -43,7 +36,6 @@ func NewV2Server(
 		sqlServer:  s,
 		authServer: innerServer,
 		mux:        simpleMux,
-		ctx:        ctx,
 		basePath:   basePath,
 	}
 
@@ -63,12 +55,11 @@ func NewV2Mux(s ServerV2, inner http.Handler, allowAnonymous bool) AuthV2Mux {
 
 // NewRoleAuthzMux creates a new RoleAuthzMux.
 func NewRoleAuthzMux(
-	ie isql.Executor, role APIRole, option roleoption.Option, inner http.Handler,
+	authzAccessorFactory authzAccessorFactory, role APIRole, inner http.Handler,
 ) RoleAuthzMux {
 	return &roleAuthorizationMux{
-		ie:     ie,
-		role:   role,
-		option: option,
-		inner:  inner,
+		authzAccessorFactory: authzAccessorFactory,
+		role:                 role,
+		inner:                inner,
 	}
 }

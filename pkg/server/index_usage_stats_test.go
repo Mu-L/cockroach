@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -71,16 +66,16 @@ func TestStatusAPIIndexUsage(t *testing.T) {
 	}
 
 	expectedStatsIndexB := roachpb.IndexUsageStatistics{
-		TotalReadCount: 2,
-		LastRead:       timeutil.Now(),
-	}
-
-	expectedStatsIndexPrimary := roachpb.IndexUsageStatistics{
 		TotalReadCount: 1,
 		LastRead:       timeutil.Now(),
 	}
 
-	firstServerSQLConn := firstServer.SQLConn(t, "")
+	expectedStatsIndexPrimary := roachpb.IndexUsageStatistics{
+		TotalReadCount: 2,
+		LastRead:       timeutil.Now(),
+	}
+
+	firstServerSQLConn := firstServer.SQLConn(t)
 
 	// Create table on the first node.
 	_, err := firstServerSQLConn.Exec("CREATE TABLE t (k INT PRIMARY KEY, a INT, b INT, c INT, INDEX(a), INDEX(b))")
@@ -124,7 +119,7 @@ func TestStatusAPIIndexUsage(t *testing.T) {
 	secondServer := testCluster.Server(1 /* idx */)
 	secondLocalStatsReader := secondServer.SQLServer().(*sql.Server).GetLocalIndexStatistics()
 
-	secondServerSQLConn := secondServer.SQLConn(t, "")
+	secondServerSQLConn := secondServer.SQLConn(t)
 
 	// Records a non-full scan over t_a_idx.
 	_, err = secondServerSQLConn.Exec("SELECT k, a FROM t WHERE a = 0")
@@ -146,7 +141,7 @@ func TestStatusAPIIndexUsage(t *testing.T) {
 	fourthServer := testCluster.Server(3 /* idx */)
 	fourthLocalStatsReader := fourthServer.SQLServer().(*sql.Server).GetLocalIndexStatistics()
 
-	fourthServerSQLConn := fourthServer.SQLConn(t, "")
+	fourthServerSQLConn := fourthServer.SQLConn(t)
 
 	// Test that total_reads / last_read was not populated by an explicit CREATE INDEX query.
 	_, err = fourthServerSQLConn.Exec("CREATE TABLE test(num INT PRIMARY KEY, letter CHAR)")
@@ -356,17 +351,18 @@ CREATE TABLE schema.test_table (
 
 	for _, tc := range testCases {
 		tableName := fmt.Sprintf("%s.%s", tc.schema, tc.table)
-		tableID, err := getTableIDFromDatabaseAndTableName(ctx, tc.database, tableName, s.InternalExecutor().(*sql.InternalExecutor), userName)
+		tableID, databaseID, err := getIDFromDatabaseAndTableName(ctx, tc.database, tableName, s.InternalExecutor().(*sql.InternalExecutor), userName)
 		require.NoError(t, err)
 
 		// Get actual Table ID.
 		actualTableID := db.QueryStr(t, `
-SELECT table_id 
+SELECT table_id, parent_id
 FROM crdb_internal.tables 
 WHERE database_name=$1 AND schema_name=$2 AND name=$3`,
 			tc.database, tc.schema, tc.table)
 
 		// Assert Table ID is correct.
 		require.Equal(t, fmt.Sprint(tableID), actualTableID[0][0])
+		require.Equal(t, fmt.Sprint(databaseID), actualTableID[0][1])
 	}
 }

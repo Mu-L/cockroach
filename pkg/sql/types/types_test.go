@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package types
 
@@ -112,7 +107,7 @@ func TestTypes(t *testing.T) {
 		{MakeCollatedString(MakeVarChar(20), enCollate),
 			MakeScalar(CollatedStringFamily, oid.T_varchar, 0, 20, enCollate)},
 
-		{MakeCollatedString(typeBpChar, enCollate), &T{InternalType: InternalType{
+		{MakeCollatedString(BPChar, enCollate), &T{InternalType: InternalType{
 			Family: CollatedStringFamily, Oid: oid.T_bpchar, Locale: &enCollate}}},
 		{MakeCollatedString(MakeChar(20), enCollate), &T{InternalType: InternalType{
 			Family: CollatedStringFamily, Oid: oid.T_bpchar, Width: 20, Locale: &enCollate}}},
@@ -363,6 +358,10 @@ func TestTypes(t *testing.T) {
 			Family: OidFamily, Oid: oid.T_regtype, Locale: &emptyLocale}}},
 		{Oid, MakeScalar(OidFamily, oid.T_oid, 0, 0, emptyLocale)},
 		{RegClass, MakeScalar(OidFamily, oid.T_regclass, 0, 0, emptyLocale)},
+
+		{RefCursor, &T{InternalType: InternalType{
+			Family: RefCursorFamily, Oid: oid.T_refcursor, Locale: &emptyLocale}}},
+		{RefCursor, MakeScalar(RefCursorFamily, oid.T_refcursor, 0, 0, emptyLocale)},
 
 		// STRING
 		{MakeString(0), String},
@@ -769,6 +768,9 @@ func TestMarshalCompat(t *testing.T) {
 		{Float, InternalType{Family: FloatFamily, Oid: oid.T_float8, Width: 64}},
 		{Float4, InternalType{Family: FloatFamily, Oid: oid.T_float4, Width: 32, VisibleType: visibleREAL}},
 
+		// REFCURSOR
+		{RefCursor, InternalType{Family: RefCursorFamily, Oid: oid.T_refcursor}},
+
 		// STRING
 		{MakeString(10), InternalType{Family: StringFamily, Oid: oid.T_text, Width: 10}},
 		{VarChar, InternalType{Family: StringFamily, Oid: oid.T_varchar, VisibleType: visibleVARCHAR}},
@@ -832,11 +834,14 @@ func TestUnmarshalCompat(t *testing.T) {
 		{InternalType{Family: IntFamily, Width: 20}, Int},
 		{InternalType{Family: IntFamily}, Int},
 
+		// REFCURSOR
+		{InternalType{Family: RefCursorFamily, Oid: oid.T_refcursor}, RefCursor},
+
 		// STRING
 		{InternalType{Family: StringFamily}, String},
 		{InternalType{Family: StringFamily, VisibleType: visibleVARCHAR}, VarChar},
 		{InternalType{Family: StringFamily, VisibleType: visibleVARCHAR, Width: 20}, MakeVarChar(20)},
-		{InternalType{Family: StringFamily, VisibleType: visibleCHAR}, typeBpChar},
+		{InternalType{Family: StringFamily, VisibleType: visibleCHAR}, BPChar},
 		{InternalType{Family: StringFamily, VisibleType: visibleQCHAR, Width: 1}, QChar},
 	}
 
@@ -1061,7 +1066,7 @@ func TestOidSetDuringUpgrade(t *testing.T) {
 }
 
 func TestSQLStandardName(t *testing.T) {
-	for _, typ := range Scalar {
+	for _, typ := range append([]*T{Any, AnyArray}, Scalar...) {
 		t.Run(typ.Name(), func(t *testing.T) {
 			require.NotEmpty(t, typ.SQLStandardName())
 		})
@@ -1078,11 +1083,11 @@ func TestWithoutTypeModifiers(t *testing.T) {
 		{MakeVarBit(2), VarBit},
 		{MakeString(2), String},
 		{MakeVarChar(2), VarChar},
-		{MakeChar(2), typeBpChar},
+		{MakeChar(2), BPChar},
 		{QChar, typeQChar},
 		{MakeCollatedString(MakeString(2), "en"), MakeCollatedString(String, "en")},
 		{MakeCollatedString(MakeVarChar(2), "en"), MakeCollatedString(VarChar, "en")},
-		{MakeCollatedString(MakeChar(2), "en"), MakeCollatedString(typeBpChar, "en")},
+		{MakeCollatedString(MakeChar(2), "en"), MakeCollatedString(BPChar, "en")},
 		{MakeCollatedString(QChar, "en"), MakeCollatedString(typeQChar, "en")},
 		{MakeDecimal(5, 1), Decimal},
 		{MakeTime(2), Time},
@@ -1113,6 +1118,7 @@ func TestWithoutTypeModifiers(t *testing.T) {
 		{Jsonb, Jsonb},
 		{Name, Name},
 		{Uuid, Uuid},
+		{RefCursor, RefCursor},
 	}
 
 	for _, tc := range testCases {
@@ -1142,6 +1148,7 @@ func TestDelimiter(t *testing.T) {
 		{VarChar, ","},
 		{QChar, ","},
 		{Name, ","},
+		{RefCursor, ","},
 		{Bytes, ","},
 		{Date, ","},
 		{Time, ","},
@@ -1168,11 +1175,15 @@ func TestDelimiter(t *testing.T) {
 
 // Prior to the patch which introduced this test, the below calls would
 // have panicked.
-func TestEnumWithoutTypeMetaNameDoesNotPanicInSQLString(t *testing.T) {
+func TestUDTWithoutTypeMetaNameDoesNotPanicInSQLString(t *testing.T) {
 	typ := MakeEnum(100100, 100101)
 	require.Equal(t, "@100100", typ.SQLString())
 	arrayType := MakeArray(typ)
 	require.Equal(t, "@100100[]", arrayType.SQLString())
+	compositeType := NewCompositeType(100200, 100201, nil, nil)
+	require.Equal(t, "@100200", compositeType.SQLString())
+	arrayCompositeType := MakeArray(compositeType)
+	require.Equal(t, "@100200[]", arrayCompositeType.SQLString())
 }
 
 func TestSQLStringForError(t *testing.T) {
@@ -1229,7 +1240,7 @@ func TestSQLStringForError(t *testing.T) {
 		},
 		{ // Case 10: redacted because user-defined
 			typ:      userDefinedTuple,
-			expected: "USER DEFINED RECORD: ‹FOO›",
+			expected: "USER DEFINED RECORD: ‹foo›",
 		},
 		{ // Case 11: un-redacted
 			typ:      MakeArray(Int),

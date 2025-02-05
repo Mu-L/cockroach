@@ -11,8 +11,10 @@ go_library(
     deps = [
         "//pkg/kv/kvserver/allocator/load",
         "//pkg/kv/kvserver/constraint",
+        "//pkg/raft",
         "//pkg/roachpb",
         "//pkg/settings",
-        "@io_etcd_go_raft_v3//:raft",
+        "//pkg/util/humanizeutil",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
@@ -14,6 +9,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -83,12 +79,16 @@ func BuildChildRequired(
 //
 // This function assumes that the provided orderings have already been set in
 // the children of the expression.
-func BuildProvided(expr memo.RelExpr, required *props.OrderingChoice) opt.Ordering {
+func BuildProvided(
+	evalCtx *eval.Context, expr memo.RelExpr, required *props.OrderingChoice,
+) opt.Ordering {
 	if required.Any() {
 		return nil
 	}
 	provided := funcMap[expr.Op()].buildProvidedOrdering(expr, required)
-	provided = finalizeProvided(provided, required, expr.Relational().OutputCols)
+	if evalCtx.SessionData().OptimizerUseProvidedOrderingFix {
+		provided = finalizeProvided(provided, required, expr.Relational().OutputCols)
+	}
 
 	if buildutil.CrdbTestBuild {
 		checkProvided(expr, required, provided)
@@ -265,6 +265,11 @@ func init() {
 		canProvideOrdering:    mutationCanProvideOrdering,
 		buildChildReqOrdering: mutationBuildChildReqOrdering,
 		buildProvidedOrdering: mutationBuildProvided,
+	}
+	funcMap[opt.LockOp] = funcs{
+		canProvideOrdering:    lockCanProvideOrdering,
+		buildChildReqOrdering: lockBuildChildReqOrdering,
+		buildProvidedOrdering: lockBuildProvided,
 	}
 	funcMap[opt.ExplainOp] = funcs{
 		canProvideOrdering:    canNeverProvideOrdering,

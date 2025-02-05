@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -67,7 +62,7 @@ type tShim interface {
 
 // Scope creates a TestLogScope which corresponds to the lifetime of a
 // temporary logging directory. If -show-logs was passed on the
-// command line, this is a no-op. Otherwise, it behaves
+// // command line, this is a no-op. Otherwise, it behaves
 // like ScopeWithoutShowLogs().
 //
 // See the documentation of ScopeWithoutShowLogs() for API usage and
@@ -109,6 +104,9 @@ func newLogScope(t tShim, mostlyInline bool) (sc *TestLogScope) {
 	// We'll use this as a double-check that our save and restore
 	// logic work properly.
 	sc.previous.appliedConfig = DescribeAppliedConfig()
+	if logging.metrics == nil {
+		SetLogMetrics(&TestLogMetricsImpl{})
+	}
 
 	logging.allSinkInfos.mu.Lock()
 	sc.previous.allSinkInfos = logging.allSinkInfos.mu.sinkInfos
@@ -159,7 +157,7 @@ func newLogScope(t tShim, mostlyInline bool) (sc *TestLogScope) {
 
 		// Switch to the new configuration.
 		TestingResetActive()
-		sc.cleanupFn, err = ApplyConfig(cfg)
+		sc.cleanupFn, err = ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 		if err != nil {
 			return err
 		}
@@ -352,7 +350,7 @@ func (l *TestLogScope) SetupSingleFileLogging() (cleanup func()) {
 
 	// Apply the configuration.
 	TestingResetActive()
-	cleanup, err := ApplyConfig(cfg)
+	cleanup, err := ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	if err != nil {
 		panic(errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error in predefined log config"))
 	}
@@ -380,7 +378,7 @@ func (l *TestLogScope) Rotate(t tShim) {
 	t.Helper()
 	t.Logf("-- test log scope file rotation --")
 	// Ensure remaining logs are written.
-	Flush()
+	FlushFiles()
 
 	if err := logging.allSinkInfos.iterFileSinks(func(l *fileSink) error {
 		l.mu.Lock()
@@ -402,7 +400,7 @@ func (l *TestLogScope) Close(t tShim) {
 	t.Logf("-- test log scope end --")
 
 	// Ensure any remaining logs are written to files.
-	Flush()
+	FlushFiles()
 
 	if l.logDir != "" {
 		defer func() {
@@ -500,3 +498,14 @@ func isDirEmpty(dirname string) (bool, error) {
 	}
 	return len(list) == 0, nil
 }
+
+// TestLogMetricsImpl is a dummy implementation of the LogMetrics
+// interface, used for tests. This allows tests that exercise codepaths
+// making use of log metrics proceed without error.
+//
+// NB: All operations performed against *TestLogMetricsImpl are no-ops.
+type TestLogMetricsImpl struct{}
+
+func (t *TestLogMetricsImpl) IncrementCounter(_ Metric, _ int64) {}
+
+var _ LogMetrics = (*TestLogMetricsImpl)(nil)

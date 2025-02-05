@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlccl
 
@@ -49,7 +46,7 @@ func TestGCTenantRemovesSpanConfigs(t *testing.T) {
 
 	ctx := context.Background()
 	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantProbabilistic,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		Knobs: base.TestingKnobs{
 			SpanConfig: &spanconfig.TestingKnobs{
 				// Disable the system tenant's reconciliation process so that we can
@@ -60,8 +57,11 @@ func TestGCTenantRemovesSpanConfigs(t *testing.T) {
 		},
 	})
 	defer ts.Stopper().Stop(ctx)
-	execCfg := ts.ExecutorConfig().(sql.ExecutorConfig)
-	scKVAccessor := ts.SpanConfigKVAccessor().(spanconfig.KVAccessor)
+
+	sys := ts.SystemLayer()
+
+	execCfg := sys.ExecutorConfig().(sql.ExecutorConfig)
+	scKVAccessor := sys.SpanConfigKVAccessor().(spanconfig.KVAccessor)
 
 	gcClosure := func(tenID uint64, progress *jobspb.SchemaChangeGCProgress) error {
 		return gcjob.TestingGCTenant(ctx, &execCfg, tenID, progress)
@@ -69,7 +69,7 @@ func TestGCTenantRemovesSpanConfigs(t *testing.T) {
 
 	tenantID := roachpb.MustMakeTenantID(10)
 
-	tt, err := ts.StartTenant(ctx, base.TestTenantArgs{
+	tt, err := ts.TenantController().StartTenant(ctx, base.TestTenantArgs{
 		TenantID: tenantID,
 		TestingKnobs: base.TestingKnobs{
 			SpanConfig: &spanconfig.TestingKnobs{
@@ -114,11 +114,11 @@ func TestGCTenantRemovesSpanConfigs(t *testing.T) {
 
 	// Mark the tenant as dropped by updating its record.
 
-	require.NoError(t, ts.InternalDB().(isql.DB).Txn(ctx, func(
+	require.NoError(t, sys.InternalDB().(isql.DB).Txn(ctx, func(
 		ctx context.Context, txn isql.Txn,
 	) error {
 		return sql.TestingUpdateTenantRecord(
-			ctx, ts.ClusterSettings(), txn,
+			ctx, sys.ClusterSettings(), txn,
 			&mtinfopb.TenantInfo{
 				SQLInfo: mtinfopb.SQLInfo{
 					ID:          tenantID.ToUint64(),
@@ -184,7 +184,7 @@ func TestGCTenantJobWaitsForProtectedTimestamps(t *testing.T) {
 
 	checkGCBlockedByPTS := func(t *testing.T, sj *jobs.StartableJob, tenID uint64) {
 		testutils.SucceedsSoon(t, func() error {
-			log.Flush()
+			log.FlushFiles()
 			entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
 				regexp.MustCompile(fmt.Sprintf("GC TTL for dropped tenant %d has expired, but protected timestamp record\\(s\\)", tenID)),
 				log.WithFlattenedSensitiveData)

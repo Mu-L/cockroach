@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/common/expfmt"
 )
 
 var (
@@ -49,6 +45,17 @@ type loadEndpoint struct {
 	mainMetricSource metricMarshaler
 }
 
+// additionalLoadEndpointMetricsSet returns the set of all custom metric names that
+// the load endpoint should export.
+func additionalLoadEndpointMetricsSet() map[string]struct{} {
+	return map[string]struct{}{
+		jobs.MetaRunningNonIdleJobs.Name: {},
+		pgwire.MetaConns.Name:            {},
+		pgwire.MetaNewConns.Name:         {},
+		sql.MetaQueryExecuted.Name:       {},
+	}
+}
+
 func newLoadEndpoint(
 	rsr *status.RuntimeStatSampler, mainMetricSource metricMarshaler,
 ) (*loadEndpoint, error) {
@@ -65,11 +72,7 @@ func newLoadEndpoint(
 		mainMetricSource:   mainMetricSource,
 	}
 	// Exporter for the selected metrics that also show in /_status/vars.
-	result.exporterVars = metric.MakePrometheusExporterForSelectedMetrics(map[string]struct{}{
-		sql.MetaQueryExecuted.Name:       {},
-		pgwire.MetaConns.Name:            {},
-		jobs.MetaRunningNonIdleJobs.Name: {},
-	})
+	result.exporterVars = metric.MakePrometheusExporterForSelectedMetrics(additionalLoadEndpointMetricsSet())
 
 	result.cpuUserNanos = metric.NewGauge(rsr.CPUUserNS.GetMetadata())
 	result.cpuSysNanos = metric.NewGauge(rsr.CPUSysNS.GetMetadata())
@@ -112,13 +115,15 @@ func (le *loadEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	le.cpuNowNanos.Update(timeutil.Now().UnixNano())
 	le.uptimeSeconds.Update(float64(timeutil.Now().UnixNano()-le.initTimeNanos) / 1e9)
 
-	if err := le.exporterLoad.ScrapeAndPrintAsText(w, le.scrapeLoadVarsIntoPrometheus); err != nil {
+	contentType := expfmt.Negotiate(r.Header)
+
+	if err := le.exporterLoad.ScrapeAndPrintAsText(w, contentType, le.scrapeLoadVarsIntoPrometheus); err != nil {
 		log.Errorf(r.Context(), "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if err := le.exporterVars.ScrapeAndPrintAsText(w, le.mainMetricSource.ScrapeIntoPrometheus); err != nil {
+	if err := le.exporterVars.ScrapeAndPrintAsText(w, contentType, le.mainMetricSource.ScrapeIntoPrometheus); err != nil {
 		log.Errorf(r.Context(), "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

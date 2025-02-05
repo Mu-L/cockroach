@@ -1,15 +1,9 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build bazel
-// +build bazel
 
 package main
 
@@ -48,6 +42,7 @@ const (
 	buildSubcmd             = "build"
 	runSubcmd               = "run"
 	testSubcmd              = "test"
+	coverageSubcmd          = "coverage"
 	mergeTestXMLsSubcmd     = "merge-test-xmls"
 	mungeTestXMLSubcmd      = "munge-test-xml"
 	beaverHubServerEndpoint = "https://beaver-hub-server-jjd2v2r2dq-uk.a.run.app/process"
@@ -206,7 +201,6 @@ func (s *monitorBuildServer) handleBuildEvent(
 			outputDir = strings.ReplaceAll(outputDir, ":", "/")
 			outputDir = filepath.Join("bazel-testlogs", outputDir)
 			summary := bazelBuildEvent.GetTestSummary()
-			lastAttempt := summary.AttemptCount
 			for _, testResult := range s.testResults[label] {
 				outputDir := outputDir
 				if testResult.run > 1 {
@@ -215,15 +209,16 @@ func (s *monitorBuildServer) handleBuildEvent(
 				if summary != nil && summary.ShardCount > 1 {
 					outputDir = filepath.Join(outputDir, fmt.Sprintf("shard_%d_of_%d", testResult.shard, summary.ShardCount))
 				}
-				// Add `.tc_ignore_attempt#` to the filename of all attempts but the last one. This ensures that
-				// those results are uploaded to TC in case we need them but the results are ignored
-				// by TC because the filename doesn't end with `.xml`.
-				append_tc_ignore := testResult.attempt != lastAttempt
+				// Add `.tc_ignore_attempt#` to the filename of all attempts but the
+				// last one. This ensures that those results are uploaded to TC in case
+				// we need them but the results are ignored by TC because the filename
+				// doesn't end with `.xml`.
+				append_tc_ignore := summary != nil && testResult.attempt != summary.AttemptCount
 				if testResult.testResult == nil {
 					continue
 				}
 				for _, output := range testResult.testResult.TestActionOutput {
-					if output.Name == "test.log" || output.Name == "test.xml" {
+					if output.Name == "test.log" || output.Name == "test.xml" || output.Name == "test.lcov" {
 						src := strings.TrimPrefix(output.GetUri(), "file://")
 						dst := filepath.Join(artifactsDir, outputDir, filepath.Base(src))
 						if append_tc_ignore {
@@ -236,7 +231,7 @@ func (s *monitorBuildServer) handleBuildEvent(
 							s.testXmls = append(s.testXmls, src)
 						}
 					} else {
-						panic(output)
+						panic(fmt.Sprintf("Unknown TestActionOutput: %v", output))
 					}
 				}
 			}
@@ -318,8 +313,9 @@ func sendBepDataToBeaverHub(bepFilepath string) error {
 }
 
 func bazciImpl(cmd *cobra.Command, args []string) error {
-	if args[0] != buildSubcmd && args[0] != runSubcmd && args[0] != testSubcmd && args[0] != mungeTestXMLSubcmd && args[0] != mergeTestXMLsSubcmd {
-		return errors.Newf("First argument must be `build`, `run`, `test`, `merge-test-xmls`, or `munge-test-xml`; got %v", args[0])
+	if args[0] != buildSubcmd && args[0] != runSubcmd && args[0] != coverageSubcmd &&
+		args[0] != testSubcmd && args[0] != mungeTestXMLSubcmd && args[0] != mergeTestXMLsSubcmd {
+		return errors.Newf("First argument must be `build`, `run`, `test`, `coverage`, `merge-test-xmls`, or `munge-test-xml`; got %v", args[0])
 	}
 
 	// Special case: munge-test-xml/merge-test-xmls don't require running Bazel at all.
@@ -345,17 +341,20 @@ func bazciImpl(cmd *cobra.Command, args []string) error {
 	}
 	args = append(args, fmt.Sprintf("--build_event_binary_file=%s", bepLoc))
 	args = append(args, fmt.Sprintf("--bes_backend=grpc://127.0.0.1:%d", port))
-	// Insert `--config ci` if it's not already in the args list.
-	hasCiConfig := false
-	for idx, arg := range args {
-		if arg == "--config=ci" || arg == "--config=cinolint" ||
-			(arg == "--config" && idx < len(args)-1 && (args[idx+1] == "ci" || args[idx+1] == "cinolint")) {
-			hasCiConfig = true
-			break
+	// Insert `--config=ci` if it's not already in the args list,
+	// specifically for tests.
+	if args[0] == testSubcmd || args[0] == coverageSubcmd {
+		hasCiConfig := false
+		for idx, arg := range args {
+			if arg == "--config=ci" || arg == "--config=cinolint" ||
+				(arg == "--config" && idx < len(args)-1 && (args[idx+1] == "ci" || args[idx+1] == "cinolint")) {
+				hasCiConfig = true
+				break
+			}
 		}
-	}
-	if !hasCiConfig {
-		args = append(args, "--config", "ci")
+		if !hasCiConfig {
+			args = append(args, "--config", "ci")
+		}
 	}
 	fmt.Println("running bazel w/ args: ", shellescape.QuoteCommand(args))
 	bazelCmd := exec.Command("bazel", args...)
@@ -478,17 +477,19 @@ func processTestXmls(testXmls []string) error {
 	if doPost() {
 		var postErrors []string
 		for _, testXml := range testXmls {
-			xmlFile, err := os.Open(testXml)
+			xmlFile, err := os.ReadFile(testXml)
 			if err != nil {
-				postErrors = append(postErrors, fmt.Sprintf("Failed to open %s with the following error: %v", testXml, err))
+				postErrors = append(postErrors, fmt.Sprintf("Failed to read %s with the following error: %v", testXml, err))
 				continue
 			}
-			if err := githubpost.PostFromTestXML(githubPostFormatterName, xmlFile); err != nil {
+			var testSuites bazelutil.TestSuites
+			err = xml.Unmarshal(xmlFile, &testSuites)
+			if err != nil {
+				postErrors = append(postErrors, fmt.Sprintf("Failed to parse test.xml file with the following error: %+v", err))
+				continue
+			}
+			if err := githubpost.PostFromTestXMLWithFormatterName(githubPostFormatterName, testSuites); err != nil {
 				postErrors = append(postErrors, fmt.Sprintf("Failed to process %s with the following error: %+v", testXml, err))
-				continue
-			}
-			if err := xmlFile.Close(); err != nil {
-				postErrors = append(postErrors, fmt.Sprintf("Failed to close %s with error: %v\n", testXml, err))
 				continue
 			}
 		}

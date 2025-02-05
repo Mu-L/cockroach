@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package importer_test
 
@@ -18,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -35,9 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	crlparquet "github.com/cockroachdb/cockroach/pkg/util/parquet"
+	"github.com/cockroachdb/cockroach/pkg/util/parquet"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/fraugster/parquet-go/parquet"
 	"github.com/stretchr/testify/require"
 )
 
@@ -67,10 +62,6 @@ type parquetTest struct {
 	// cols provides the expected column name and type
 	cols colinfo.ResultColumns
 
-	// colFieldRepType provides the expected parquet repetition type of each column in
-	// the parquet file.
-	colFieldRepType []parquet.FieldRepetitionType
-
 	// datums provides the expected values of the parquet file.
 	datums []tree.Datums
 }
@@ -93,7 +84,7 @@ func validateParquetFile(
 		"",
 		nil,
 		sessiondata.InternalExecutorOverride{
-			User:     username.RootUserName(),
+			User:     username.NodeUserName(),
 			Database: test.dbName,
 		},
 		validationStmt)
@@ -111,7 +102,7 @@ func validateParquetFile(
 		test.datums = make([]tree.Datums, 0)
 	}
 
-	meta, readDatums, err := crlparquet.ReadFile(paths[0])
+	meta, readDatums, err := parquet.ReadFile(paths[0])
 	require.NoError(t, err)
 
 	require.Equal(t, len(test.cols), meta.NumCols)
@@ -140,7 +131,8 @@ func validateDatum(t *testing.T, expected tree.Datum, actual tree.Datum, typ *ty
 		eArr := expected.(*tree.DArray)
 		aArr := actual.(*tree.DArray)
 		for i := 0; i < eArr.Len(); i++ {
-			validateDatum(t, tree.UnwrapDOidWrapper(eArr.Array[i]), aArr.Array[i], typ.ArrayContents())
+			validateDatum(t, tree.UnwrapDOidWrapper(eArr.Array[i]),
+				tree.UnwrapDOidWrapper(aArr.Array[i]), typ.ArrayContents())
 		}
 	case types.DateFamily:
 		// pgDate.orig property doesn't matter and can cause the test to fail
@@ -180,6 +172,7 @@ func validateDatum(t *testing.T, expected tree.Datum, actual tree.Datum, typ *ty
 func TestRandomParquetExports(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()() // allow usage of partitions
 
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
@@ -205,10 +198,9 @@ func TestRandomParquetExports(t *testing.T) {
 			numTables   = 20
 		)
 
-		stmts := randgen.RandCreateTables(rng, tablePrefix, numTables,
-			false, /* isMultiRegion */
-			randgen.PartialIndexMutator,
-			randgen.ForeignKeyMutator,
+		stmts := randgen.RandCreateTables(
+			ctx, rng, tablePrefix, numTables, randgen.TableOptNone,
+			randgen.PartialIndexMutator, randgen.ForeignKeyMutator,
 		)
 
 		var sb strings.Builder
@@ -220,7 +212,7 @@ func TestRandomParquetExports(t *testing.T) {
 
 		for i = 0; i < numTables; i++ {
 			tableName = string(stmts[i].(*tree.CreateTable).Table.ObjectName)
-			numRows, err := randgen.PopulateTableWithRandData(rng, db, tableName, 20)
+			numRows, err := randgen.PopulateTableWithRandData(rng, db, tableName, 20, nil)
 			require.NoError(t, err)
 			if numRows > 5 {
 				// Ensure the table only contains columns supported by EXPORT Parquet. If an
@@ -231,7 +223,7 @@ func TestRandomParquetExports(t *testing.T) {
 						"",
 						nil,
 						sessiondata.InternalExecutorOverride{
-							User:     username.RootUserName(),
+							User:     username.NodeUserName(),
 							Database: dbName},
 						fmt.Sprintf("SELECT * FROM %s LIMIT 1", tree.NameString(tableName)))
 					require.NoError(t, err)
@@ -239,7 +231,7 @@ func TestRandomParquetExports(t *testing.T) {
 					for _, col := range cols {
 						// TODO(#104278): don't call this function to check if a type is supported.
 						// We should explicitly use the ones supported by  util/parquet).
-						_, err := importer.NewParquetColumn(col.Typ, "", false)
+						_, err := parquet.NewSchema([]string{"test"}, []*types.T{col.Typ})
 						if err != nil {
 							_, err = sqlDB.DB.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s`, tree.NameString(tableName), tree.NameString(col.Name)))
 							if err != nil {
@@ -316,17 +308,10 @@ INDEX (y))`)
 			stmt: `EXPORT INTO PARQUET 'nodelocal://1/colname' FROM SELECT avg(z), min(y) AS baz
 							FROM foo`,
 		},
-		// TODO(#104279): when the underlying library supports repetition type required,
-		// update this test.
 		{
 			filePrefix: "nullable",
 			stmt: `EXPORT INTO PARQUET 'nodelocal://1/nullable' FROM SELECT y,z,x
 							FROM foo`,
-			colFieldRepType: []parquet.FieldRepetitionType{
-				parquet.FieldRepetitionType_OPTIONAL,
-				parquet.FieldRepetitionType_OPTIONAL,
-				parquet.FieldRepetitionType_OPTIONAL,
-			},
 		},
 		{
 			// TODO (mb): switch one of the values in the array to NULL once the
@@ -406,11 +391,12 @@ func TestMemoryMonitor(t *testing.T) {
 
 	// Arrange for a small memory budget.
 	budget := int64(4096)
-	mm := mon.NewMonitorWithLimit(
-		"test-mm", mon.MemoryResource, budget,
-		nil, nil,
-		128 /* small allocation increment */, 100,
-		cluster.MakeTestingClusterSettings())
+	mm := mon.NewMonitor(mon.Options{
+		Name:      mon.MakeMonitorName("test-mm"),
+		Limit:     budget,
+		Increment: 128, /* small allocation increment */
+		Settings:  cluster.MakeTestingClusterSettings(),
+	})
 	mm.Start(context.Background(), nil, mon.NewStandaloneBudget(budget))
 
 	dir, dirCleanupFn := testutils.TempDir(t)

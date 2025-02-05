@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /*
 	Package client_test tests clients against a fully-instantiated
@@ -33,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -915,8 +911,9 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 		})
 
 	setup := func(nodeID roachpb.NodeID) *kv.DB {
+		st := cluster.MakeTestingClusterSettings()
 		clock := hlc.NewClockForTesting(nil)
-		dbCtx := kv.DefaultDBContext(stopper)
+		dbCtx := kv.DefaultDBContext(st, stopper)
 		var c base.NodeIDContainer
 		if nodeID != 0 {
 			c.Set(context.Background(), nodeID)
@@ -944,7 +941,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 			now := db.Clock().NowAsClockTimestamp()
 			kvTxn := roachpb.MakeTransaction(
 				"unnamed", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority,
-				now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds(), int32(test.nodeID))
+				now.ToTimestamp(), db.Clock().MaxOffset().Nanoseconds(), int32(test.nodeID), 0, false /* omitInRangefeeds */)
 			txn := kv.NewTxnFromProto(ctx, db, test.nodeID, now, test.typ, &kvTxn)
 			ots := txn.TestingCloneTxn().ObservedTimestamps
 			if (len(ots) == 1 && ots[0].NodeID == test.nodeID) != test.expObserved {

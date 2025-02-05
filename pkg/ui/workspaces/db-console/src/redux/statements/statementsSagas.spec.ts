@@ -1,21 +1,20 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 import { expectSaga } from "redux-saga-test-plan";
 import { call } from "redux-saga-test-plan/matchers";
+import { throwError } from "redux-saga-test-plan/providers";
 
+import { PayloadAction, WithRequest } from "src/interfaces/action";
 import {
-  cancelDiagnosticsReportSaga,
-  createDiagnosticsReportSaga,
-  receivedStatementDiagnosticsSaga,
-} from "./statementsSagas";
+  invalidateStatementDiagnosticsRequests,
+  RECEIVE_STATEMENT_DIAGNOSTICS_REPORT,
+  refreshStatementDiagnosticsRequests,
+} from "src/redux/apiReducers";
+
 import {
   createStatementDiagnosticsReportCompleteAction,
   createStatementDiagnosticsReportFailedAction,
@@ -24,25 +23,25 @@ import {
   cancelStatementDiagnosticsReportFailedAction,
   cancelStatementDiagnosticsReportAction,
 } from "./statementsActions";
-import { throwError } from "redux-saga-test-plan/providers";
-import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
-import { PayloadAction, WithRequest } from "src/interfaces/action";
 import {
-  invalidateStatementDiagnosticsRequests,
-  RECEIVE_STATEMENT_DIAGNOSTICS_REPORT,
-  refreshStatementDiagnosticsRequests,
-} from "src/redux/apiReducers";
+  cancelDiagnosticsReportSaga,
+  createDiagnosticsReportSaga,
+  receivedStatementDiagnosticsSaga,
+} from "./statementsSagas";
 
 describe("statementsSagas", () => {
   describe("requestDiagnostics generator", () => {
     it("calls api#createStatementDiagnosticsReport with statement fingerprint, min exec latency, and expires after fields as payload", () => {
       const statementFingerprint = "some-id";
+      const planGist = "gist";
       const minExecLatency = 10; // num seconds
       const expiresAfter = 15 * 60; // num seconds (num mins * num seconds per min)
       const insertStmtDiagnosticsRequest = {
         stmtFingerprint: statementFingerprint,
         minExecutionLatencySeconds: minExecLatency,
         expiresAfterSeconds: expiresAfter,
+        planGist: planGist,
+        redacted: false,
       };
       const action = createStatementDiagnosticsReportAction(
         insertStmtDiagnosticsRequest,
@@ -66,12 +65,15 @@ describe("statementsSagas", () => {
 
   it("calls dispatched failed action if api#createStatementDiagnosticsReport request failed ", () => {
     const statementFingerprint = "some-id";
+    const planGist = "gist";
     const minExecLatency = 10; // num seconds
     const expiresAfter = 15 * 60; // num seconds (num mins * num seconds per min)
     const insertStmtDiagnosticsRequest = {
       stmtFingerprint: statementFingerprint,
       minExecutionLatencySeconds: minExecLatency,
       expiresAfterSeconds: expiresAfter,
+      planGist: planGist,
+      redacted: false,
     };
     const action = createStatementDiagnosticsReportAction(
       insertStmtDiagnosticsRequest,

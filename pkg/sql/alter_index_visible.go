@@ -1,19 +1,13 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -21,11 +15,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 type alterIndexVisibleNode struct {
+	zeroInputPlanNode
 	n         *tree.AlterIndexVisible
 	tableDesc *tabledesc.Mutable
 	index     catalog.Index
@@ -72,7 +66,7 @@ func (p *planner) AlterIndexVisible(
 	}
 
 	// Disallow schema changes if this table's schema is locked.
-	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+	if err := checkSchemaChangeIsAllowed(tableDesc, n); err != nil {
 		return nil, err
 	}
 
@@ -82,19 +76,13 @@ func (p *planner) AlterIndexVisible(
 func (n *alterIndexVisibleNode) ReadingOwnWrites() {}
 
 func (n *alterIndexVisibleNode) startExec(params runParams) error {
-	if n.n.Invisibility != 0.0 && n.index.Primary() {
+	if n.n.Invisibility.Value != 0.0 && n.index.Primary() {
 		return pgerror.Newf(pgcode.FeatureNotSupported, "primary index cannot be invisible")
-	}
-
-	activeVersion := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
-	if !activeVersion.IsActive(clusterversion.V23_2_PartiallyVisibleIndexes) &&
-		n.n.Invisibility > 0.0 && n.n.Invisibility < 1.0 {
-		return unimplemented.New("partially visible indexes", "partially visible indexes are not yet supported")
 	}
 
 	// Warn if this invisible index may still be used to enforce constraint check
 	// behind the scene.
-	if n.n.Invisibility != 0.0 {
+	if n.n.Invisibility.Value != 0.0 {
 		if notVisibleIndexNotice := tabledesc.ValidateNotVisibleIndex(n.index, n.tableDesc); notVisibleIndexNotice != nil {
 			params.p.BufferClientNotice(
 				params.ctx,
@@ -103,13 +91,13 @@ func (n *alterIndexVisibleNode) startExec(params runParams) error {
 		}
 	}
 
-	if n.index.GetInvisibility() == n.n.Invisibility {
+	if n.index.GetInvisibility() == n.n.Invisibility.Value {
 		// Nothing needed if the index is already what they want.
 		return nil
 	}
 
-	n.index.IndexDesc().NotVisible = n.n.Invisibility != 0.0
-	n.index.IndexDesc().Invisibility = n.n.Invisibility
+	n.index.IndexDesc().NotVisible = n.n.Invisibility.Value != 0.0
+	n.index.IndexDesc().Invisibility = n.n.Invisibility.Value
 
 	if err := validateDescriptor(params.ctx, params.p, n.tableDesc); err != nil {
 		return err
@@ -126,8 +114,8 @@ func (n *alterIndexVisibleNode) startExec(params runParams) error {
 		&eventpb.AlterIndexVisible{
 			TableName:    n.n.Index.Table.FQString(),
 			IndexName:    n.index.GetName(),
-			NotVisible:   n.n.Invisibility != 0.0,
-			Invisibility: n.n.Invisibility,
+			NotVisible:   n.n.Invisibility.Value != 0.0,
+			Invisibility: n.n.Invisibility.Value,
 		})
 }
 func (n *alterIndexVisibleNode) Next(runParams) (bool, error) { return false, nil }

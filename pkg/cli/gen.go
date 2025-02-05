@@ -1,32 +1,34 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"html"
-	"io"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	slugify "github.com/mozillazg/go-slugify"
 	"github.com/spf13/cobra"
@@ -138,63 +140,6 @@ func runGenAutocompleteCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-var aesSize int
-var overwriteKey bool
-
-// GenEncryptionKeyCmd is a command to generate a store key for Encryption At
-// Rest.
-// Exported to allow use by CCL code.
-var GenEncryptionKeyCmd = &cobra.Command{
-	Use:   "encryption-key <key-file>",
-	Short: "generate store key for encryption at rest",
-	Long: `Generate store key for encryption at rest.
-
-Generates a key suitable for use as a store key for Encryption At Rest.
-The resulting key file will be 32 bytes (random key ID) + key_size in bytes.
-`,
-	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		encryptionKeyPath := args[0]
-
-		// Check encryptionKeySize is suitable for the encryption algorithm.
-		if aesSize != 128 && aesSize != 192 && aesSize != 256 {
-			return fmt.Errorf("store key size should be 128, 192, or 256 bits, got %d", aesSize)
-		}
-
-		// 32 bytes are reserved for key ID.
-		kSize := aesSize/8 + 32
-		b := make([]byte, kSize)
-		if _, err := rand.Read(b); err != nil {
-			return fmt.Errorf("failed to create key with size %d bytes", kSize)
-		}
-
-		// Write key to the file with owner read/write permission.
-		openMode := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-		if !overwriteKey {
-			openMode |= os.O_EXCL
-		}
-
-		f, err := os.OpenFile(encryptionKeyPath, openMode, 0600)
-		if err != nil {
-			return err
-		}
-		n, err := f.Write(b)
-		if err == nil && n < len(b) {
-			err = io.ErrShortWrite
-		}
-		if err1 := f.Close(); err == nil {
-			err = err1
-		}
-
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("successfully created AES-%d key: %s\n", aesSize, encryptionKeyPath)
-		return nil
-	},
-}
-
 var includeAllSettings bool
 var excludeSystemSettings bool
 var showSettingClass bool
@@ -216,10 +161,17 @@ Output the list of cluster settings known to this binary.
 		}
 
 		wrapDivSlug := func(key settings.InternalKey, name settings.SettingName) string {
+			toDisplay := string(name)
 			if sqlExecCtx.TableDisplayFormat == clisqlexec.TableDisplayRawHTML {
-				return fmt.Sprintf(`<div id="setting-%s" class="anchored">%s</div>`, slugify.Slugify(string(key)), wrapCode(string(name)))
+				if string(key) != string(name) {
+					toDisplay = fmt.Sprintf("%s<br />(alias: %s)", name, key)
+				}
+				return fmt.Sprintf(`<div id="setting-%s" class="anchored">%s</div>`, slugify.Slugify(string(key)), wrapCode(toDisplay))
 			}
-			return string(name)
+			if string(key) != string(name) {
+				toDisplay = fmt.Sprintf("%s (alias: %s)", name, key)
+			}
+			return toDisplay
 		}
 
 		// Fill a Values struct with the defaults.
@@ -277,9 +229,9 @@ This session variable default should now be configured using %s`,
 				switch setting.Class() {
 				case settings.SystemOnly:
 					class = classLabels[0]
-				case settings.TenantReadOnly:
+				case settings.SystemVisible:
 					class = classLabels[1]
-				case settings.TenantWritable:
+				case settings.ApplicationLevel:
 					class = classLabels[2]
 				}
 				row = append(row, class)
@@ -309,7 +261,111 @@ This session variable default should now be configured using %s`,
 	},
 }
 
-var genCmd = &cobra.Command{
+var genMetricListCmd = &cobra.Command{
+	Use:   "metric-list",
+	Short: "output a list of available metrics",
+	Long: `
+Output the list of metrics typical for a node.
+`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background()
+
+		// Use a testserver. We presume that all relevant metrics exist in
+		// test servers too.
+		sArgs := base.TestServerArgs{
+			Insecure:          true,
+			DefaultTestTenant: base.ExternalTestTenantAlwaysEnabled,
+		}
+		s, err := server.TestServerFactory.New(sArgs)
+		if err != nil {
+			return err
+		}
+		srv := s.(serverutils.TestServerInterfaceRaw)
+		defer srv.Stopper().Stop(ctx)
+
+		// We want to only return after the server is ready.
+		readyCh := make(chan struct{})
+		srv.SetReadyFn(func(bool) {
+			close(readyCh)
+		})
+
+		// Start the server.
+		if err := srv.Start(ctx); err != nil {
+			return err
+		}
+
+		// Wait until the server is ready to action.
+		select {
+		case <-readyCh:
+		case <-time.After(5 * time.Second):
+			return errors.AssertionFailedf("could not initialize server in time")
+		}
+
+		var sections []catalog.ChartSection
+
+		// Retrieve the chart catalog (metric list) for the system tenant over RPC.
+		retrieve := func(layer serverutils.ApplicationLayerInterface, predicate func(catalog.MetricLayer) bool) error {
+			conn, err := layer.RPCClientConnE(username.RootUserName())
+			if err != nil {
+				return err
+			}
+			client := serverpb.NewAdminClient(conn)
+
+			resp, err := client.ChartCatalog(ctx, &serverpb.ChartCatalogRequest{})
+			if err != nil {
+				return err
+			}
+			for _, section := range resp.Catalog {
+				if !predicate(section.MetricLayer) {
+					continue
+				}
+				sections = append(sections, section)
+			}
+			return nil
+		}
+
+		if err := retrieve(srv, func(layer catalog.MetricLayer) bool {
+			return layer != catalog.MetricLayer_APPLICATION
+		}); err != nil {
+			return err
+		}
+		if err := retrieve(srv.TestTenant(), func(layer catalog.MetricLayer) bool {
+			return layer == catalog.MetricLayer_APPLICATION
+		}); err != nil {
+			return err
+		}
+
+		// Sort by layer then metric name.
+		sort.Slice(sections, func(i, j int) bool {
+			return sections[i].MetricLayer < sections[j].MetricLayer ||
+				(sections[i].MetricLayer == sections[j].MetricLayer &&
+					sections[i].Title < sections[j].Title)
+		})
+
+		// Populate the resulting table.
+		cols := []string{"Layer", "Metric", "Description", "Y-Axis Label", "Type", "Unit", "Aggregation", "Derivative"}
+		var rows [][]string
+		for _, section := range sections {
+			rows = append(rows,
+				[]string{
+					section.MetricLayer.String(),
+					section.Title,
+					section.Charts[0].Metrics[0].Help,
+					section.Charts[0].AxisLabel,
+					section.Charts[0].Metrics[0].MetricType.String(),
+					section.Charts[0].Units.String(),
+					section.Charts[0].Aggregator.String(),
+					section.Charts[0].Derivative.String(),
+				})
+		}
+		align := "dddddddd"
+		sliceIter := clisqlexec.NewRowSliceIter(rows, align)
+		return sqlExecCtx.PrintQueryOutput(os.Stdout, stderr, cols, sliceIter)
+	},
+}
+
+// GenCmd is the root of all gen commands. Exported to allow modification by CCL code.
+var GenCmd = &cobra.Command{
 	Use:   "gen [command]",
 	Short: "generate auxiliary files",
 	Long:  "Generate manpages, example shell settings, example databases, etc.",
@@ -322,7 +378,8 @@ var genCmds = []*cobra.Command{
 	genExamplesCmd,
 	genHAProxyCmd,
 	genSettingsListCmd,
-	GenEncryptionKeyCmd,
+	genMetricListCmd,
+	genEncryptionKeyCmd,
 }
 
 func init() {
@@ -333,10 +390,6 @@ func init() {
 	genHAProxyCmd.PersistentFlags().StringVar(&haProxyPath, "out", "haproxy.cfg",
 		"path to generated haproxy configuration file")
 	cliflagcfg.VarFlag(genHAProxyCmd.Flags(), &haProxyLocality, cliflags.Locality)
-	GenEncryptionKeyCmd.PersistentFlags().IntVarP(&aesSize, "size", "s", 128,
-		"AES key size for encryption at rest (one of: 128, 192, 256)")
-	GenEncryptionKeyCmd.PersistentFlags().BoolVar(&overwriteKey, "overwrite", false,
-		"Overwrite key if it exists")
 
 	f := genSettingsListCmd.PersistentFlags()
 	f.BoolVar(&includeAllSettings, "all-settings", false,
@@ -348,8 +401,8 @@ func init() {
 	f.StringVar(&classHeaderLabel, "class-header-label", "Class",
 		"label to use in the output for the class column")
 	f.StringSliceVar(&classLabels, "class-labels",
-		[]string{"system-only", "tenant-ro", "tenant-rw"},
+		[]string{"system-only", "system-visible", "application"},
 		"label to use in the output for the various setting classes")
 
-	genCmd.AddCommand(genCmds...)
+	GenCmd.AddCommand(genCmds...)
 }

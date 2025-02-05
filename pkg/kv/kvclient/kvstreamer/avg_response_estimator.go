@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvstreamer
 
@@ -34,14 +29,15 @@ const (
 	// response.
 	// TODO(yuzefovich): use the optimizer-driven estimates.
 	InitialAvgResponseSize = 1 << 10 // 1KiB
-	// This value was determined using tpchvec/bench test on all TPC-H queries.
-	defaultAvgResponseSizeMultiple = 1.5
+	// This value was determined using tpchvec/bench test on all TPC-H queries
+	// as well as the query in TestStreamerVaryingResponseSizes.
+	defaultAvgResponseSizeMultiple = 3.0
 )
 
 // streamerAvgResponseSizeMultiple determines the multiple used when calculating
 // the average response size.
 var streamerAvgResponseSizeMultiple = settings.RegisterFloatSetting(
-	settings.TenantReadOnly,
+	settings.ApplicationLevel,
 	"sql.distsql.streamer.avg_response_size_multiple",
 	"determines the multiple used when calculating the average response size by the streamer component",
 	defaultAvgResponseSizeMultiple,

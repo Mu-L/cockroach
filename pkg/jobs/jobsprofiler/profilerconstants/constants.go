@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package profilerconstants
 
@@ -20,6 +15,9 @@ import (
 )
 
 const DSPDiagramInfoKeyPrefix = "~dsp-diag-url-"
+
+// DSPDiagramInfoKeyMax sorts after any diagram info key, because `:“ > [0-9].
+const DSPDiagramInfoKeyMax = DSPDiagramInfoKeyPrefix + ":"
 
 // MakeDSPDiagramInfoKey constructs an ephemeral DSP diagram info key.
 func MakeDSPDiagramInfoKey(timestampInNanos int64) string {
@@ -41,16 +39,10 @@ func MakeNodeProcessorProgressInfoKey(flowID string, instanceID string, processo
 // store chunks of a job's execution details.
 const ExecutionDetailsChunkKeyPrefix = "~profiler/"
 
-// MakeProfilerExecutionDetailsChunkKeyPrefix is the prefix of the info key used to store all
-// chunks of a job's execution details.
+// MakeProfilerExecutionDetailsChunkKeyPrefix is the prefix of the info key used
+// to store all chunks of a job's execution details.
 func MakeProfilerExecutionDetailsChunkKeyPrefix(filename string) string {
 	return fmt.Sprintf("%s%s", ExecutionDetailsChunkKeyPrefix, filename)
-}
-
-// MakeProfilerExecutionDetailsChunkKey is the info key used to store a chunk of
-// a job's execution details.
-func MakeProfilerExecutionDetailsChunkKey(chunkName string) string {
-	return fmt.Sprintf("%s%s", ExecutionDetailsChunkKeyPrefix, chunkName)
 }
 
 // GetNodeProcessorProgressInfoKeyParts deconstructs the passed in info key and

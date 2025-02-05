@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs
 
@@ -142,13 +137,19 @@ func (g ByIDGetter) Function(
 	desc, err := g.Desc(ctx, id)
 	if err != nil {
 		if errors.Is(err, catalog.ErrDescriptorNotFound) {
-			return nil, errors.Wrapf(tree.ErrFunctionUndefined, "function %d does not exist", id)
+			return nil, errors.Mark(
+				pgerror.Newf(pgcode.UndefinedFunction, "function %d does not exist", id),
+				tree.ErrRoutineUndefined,
+			)
 		}
 		return nil, err
 	}
 	fn, ok := desc.(catalog.FunctionDescriptor)
 	if !ok {
-		return nil, errors.Wrapf(tree.ErrFunctionUndefined, "function %d does not exist", id)
+		return nil, errors.Mark(
+			pgerror.Newf(pgcode.UndefinedFunction, "function %d does not exist", id),
+			tree.ErrRoutineUndefined,
+		)
 	}
 	return fn, nil
 }
@@ -240,6 +241,12 @@ type ByNameGetter getterBase
 func (g ByNameGetter) Database(
 	ctx context.Context, name string,
 ) (catalog.DatabaseDescriptor, error) {
+	if name == "" {
+		if g.flags.isOptional {
+			return nil, nil
+		}
+		return nil, sqlerrors.ErrEmptyDatabaseName
+	}
 	desc, err := getDescriptorByName(
 		ctx, g.KV(), g.Descriptors(), nil /* db */, nil /* sc */, name, g.flags, catalog.Database,
 	)
@@ -325,7 +332,7 @@ func (g ByNameGetter) Type(
 		tn := tree.MakeTableNameWithSchema(
 			tree.Name(db.GetName()), tree.Name(sc.GetName()), tree.Name(name),
 		)
-		return nil, sqlerrors.NewUndefinedRelationError(&tn)
+		return nil, sqlerrors.NewUndefinedTypeError(&tn)
 	}
 	if tbl, ok := desc.(catalog.TableDescriptor); ok {
 		// A given table name can resolve to either a type descriptor or a table
@@ -396,34 +403,26 @@ func (g MutableByNameGetter) Type(
 
 func makeGetterBase(txn *kv.Txn, col *Collection, flags getterFlags) getterBase {
 	return getterBase{
-		txn:   &txnWrapper{Txn: txn, Collection: col},
-		flags: flags,
+		txnWrapper: txnWrapper{Txn: txn, Collection: col},
+		flags:      flags,
 	}
 }
 
 type getterBase struct {
-	txn
+	txnWrapper
 	flags getterFlags
 }
 
-type (
-	txn interface {
-		KV() *kv.Txn
-		Descriptors() *Collection
-	}
-	txnWrapper struct {
-		*kv.Txn
-		*Collection
-	}
-)
+type txnWrapper struct {
+	*kv.Txn
+	*Collection
+}
 
-var _ txn = &txnWrapper{}
-
-func (w *txnWrapper) KV() *kv.Txn {
+func (w txnWrapper) KV() *kv.Txn {
 	return w.Txn
 }
 
-func (w *txnWrapper) Descriptors() *Collection {
+func (w txnWrapper) Descriptors() *Collection {
 	return w.Collection
 }
 
@@ -484,10 +483,10 @@ func defaultUnleasedFlags() (f getterFlags) {
 	return f
 }
 
-// ByID returns a ByIDGetterBuilder set up to look up descriptors by ID
+// ByIDWithoutLeased returns a ByIDGetterBuilder set up to look up descriptors by ID
 // in all layers except the leased descriptors layer. To opt in to the
 // leased descriptors, use ByIDWithLeased instead.
-func (tc *Collection) ByID(txn *kv.Txn) ByIDGetterBuilder {
+func (tc *Collection) ByIDWithoutLeased(txn *kv.Txn) ByIDGetterBuilder {
 	return ByIDGetterBuilder(makeGetterBase(txn, tc, getterFlags{
 		layerFilters: layerFilters{
 			withoutLeased: true,
@@ -495,7 +494,7 @@ func (tc *Collection) ByID(txn *kv.Txn) ByIDGetterBuilder {
 	}))
 }
 
-// ByIDWithLeased is like ByID but also looks up in the leased descriptors
+// ByIDWithLeased is like ByIDWithoutLeased but also looks up in the leased descriptors
 // layer. This may save a round-trip to KV at the expense of the descriptor
 // being slightly stale (one version off).
 func (tc *Collection) ByIDWithLeased(txn *kv.Txn) ByIDGetterBuilder {

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package importer
 
@@ -82,9 +77,11 @@ func newMysqldumpReader(
 			converters[name] = nil
 			continue
 		}
-		conv, err := row.NewDatumRowConverter(ctx, semaCtx, tabledesc.NewBuilder(table.Desc).
-			BuildImmutableTable(), nil /* targetColNames */, evalCtx, kvCh,
-			nil /* seqChunkProvider */, nil /* metrics */, db)
+		conv, err := row.NewDatumRowConverter(
+			ctx, semaCtx, tabledesc.NewBuilder(table.Desc).BuildImmutableTable(),
+			nil /* targetColNames */, evalCtx, kvCh,
+			nil /* seqChunkProvider */, nil /* metrics */, db,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -171,7 +168,7 @@ func (m *mysqldumpReader) readFile(
 					return errors.Errorf("expected %d values, got %d: %v", expected, got, inputRow)
 				}
 				for i, raw := range inputRow {
-					converted, err := mysqlValueToDatum(ctx, raw, conv.VisibleColTypes[i], conv.EvalCtx)
+					converted, err := mysqlValueToDatum(ctx, raw, conv.VisibleColTypes[i], conv.EvalCtx, conv.SemaCtx)
 					if err != nil {
 						return errors.Wrapf(err, "reading row %d (%d in insert statement %d)",
 							count, count-startingCount, inserts)
@@ -227,7 +224,11 @@ func mysqlStrToDatum(evalCtx *eval.Context, s string, desired *types.T) (tree.Da
 // wrapper types are: StrVal, IntVal, FloatVal, HexNum, HexVal, ValArg, BitVal
 // as well as NullVal.
 func mysqlValueToDatum(
-	ctx context.Context, raw mysql.Expr, desired *types.T, evalContext *eval.Context,
+	ctx context.Context,
+	raw mysql.Expr,
+	desired *types.T,
+	evalContext *eval.Context,
+	semaCtx *tree.SemaContext,
 ) (tree.Datum, error) {
 	switch v := raw.(type) {
 	case mysql.BoolVal:
@@ -255,9 +256,9 @@ func mysqlValueToDatum(
 			}
 			return mysqlStrToDatum(evalContext, s, desired)
 		case mysql.IntVal:
-			return rowenc.ParseDatumStringAs(ctx, desired, string(v.Val), evalContext)
+			return rowenc.ParseDatumStringAs(ctx, desired, string(v.Val), evalContext, semaCtx)
 		case mysql.FloatVal:
-			return rowenc.ParseDatumStringAs(ctx, desired, string(v.Val), evalContext)
+			return rowenc.ParseDatumStringAs(ctx, desired, string(v.Val), evalContext, semaCtx)
 		case mysql.HexVal:
 			v, err := v.HexDecode()
 			return tree.NewDBytes(tree.DBytes(v)), err
@@ -270,7 +271,7 @@ func mysqlValueToDatum(
 	case *mysql.UnaryExpr:
 		switch v.Operator {
 		case mysql.UMinusOp:
-			parsed, err := mysqlValueToDatum(ctx, v.Expr, desired, evalContext)
+			parsed, err := mysqlValueToDatum(ctx, v.Expr, desired, evalContext, semaCtx)
 			if err != nil {
 				return nil, err
 			}
@@ -289,7 +290,7 @@ func mysqlValueToDatum(
 			}
 		case mysql.UBinaryOp:
 			// TODO(dt): do we want to use this hint to change our decoding logic?
-			return mysqlValueToDatum(ctx, v.Expr, desired, evalContext)
+			return mysqlValueToDatum(ctx, v.Expr, desired, evalContext, semaCtx)
 		default:
 			return nil, errors.Errorf("unexpected operator: %q", v.Operator)
 		}
@@ -520,11 +521,13 @@ func mysqlTableToCockroach(
 		stmt.Defs = append(stmt.Defs, c)
 	}
 
-	semaCtx := tree.MakeSemaContext()
-	semaCtxPtr := &semaCtx
+	var semaCtxPtr *tree.SemaContext
 	// p is nil in some tests.
 	if p != nil && p.SemaCtx() != nil {
 		semaCtxPtr = p.SemaCtx()
+	} else {
+		semaCtx := tree.MakeSemaContext(nil /* resolver */)
+		semaCtxPtr = &semaCtx
 	}
 
 	// Bundle imports do not support user defined types, and so we nil out the

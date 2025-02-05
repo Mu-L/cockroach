@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package oidcccl
 
@@ -14,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/errors"
@@ -38,11 +36,12 @@ const (
 	OIDCGenerateClusterSSOTokenUseTokenSettingName = baseOIDCSettingName + "generate_cluster_sso_token.use_token"
 	OIDCGenerateClusterSSOTokenSQLHostSettingName  = baseOIDCSettingName + "generate_cluster_sso_token.sql_host"
 	OIDCGenerateClusterSSOTokenSQLPortSettingName  = baseOIDCSettingName + "generate_cluster_sso_token.sql_port"
+	oidcAuthClientTimeoutSettingName               = baseOIDCSettingName + "client.timeout"
 )
 
 // OIDCEnabled enables or disabled OIDC login for the DB Console.
 var OIDCEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCEnabledSettingName,
 	"enables or disabled OIDC login for the DB Console",
 	false,
@@ -52,22 +51,36 @@ var OIDCEnabled = settings.RegisterBoolSetting(
 
 // OIDCClientID is the OIDC client id.
 var OIDCClientID = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCClientIDSettingName,
 	"sets OIDC client id",
 	"",
 	settings.WithPublic,
-	settings.WithReportable(true),
+	settings.WithReportable(false),
+	settings.Sensitive,
 )
 
 // OIDCClientSecret is the OIDC client secret.
 var OIDCClientSecret = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCClientSecretSettingName,
 	"sets OIDC client secret",
 	"",
 	settings.WithPublic,
 	settings.WithReportable(false),
+	settings.Sensitive,
+)
+
+// OIDCAuthClientTimeout is the client timeout for all the external calls made
+// during OIDC authentication (e.g. authorization code flow, etc.).
+var OIDCAuthClientTimeout = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
+	oidcAuthClientTimeoutSettingName,
+	"sets the client timeout for external calls made during OIDC authentication "+
+		"(e.g. authorization code flow, etc.)",
+	15*time.Second,
+	settings.NonNegativeDuration,
+	settings.WithPublic,
 )
 
 type redirectURLConf struct {
@@ -171,7 +184,7 @@ func validateOIDCRedirectURL(values *settings.Values, s string) error {
 // where the cluster's region is not listed in the `redirect_urls` object, we
 // will use the required `default_url` callback URL.
 var OIDCRedirectURL = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCRedirectURLSettingName,
 	"sets OIDC redirect URL via a URL string or a JSON string containing a required "+
 		"`redirect_urls` key with an object that maps from region keys to URL strings "+
@@ -185,7 +198,7 @@ var OIDCRedirectURL = settings.RegisterStringSetting(
 // OIDCProviderURL is the location of the OIDC discovery document for the auth
 // provider.
 var OIDCProviderURL = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCProviderURLSettingName,
 	"sets OIDC provider URL ({provider_url}/.well-known/openid-configuration must resolve)",
 	"",
@@ -201,7 +214,7 @@ var OIDCProviderURL = settings.RegisterStringSetting(
 
 // OIDCScopes contains the list of scopes to request from the auth provider.
 var OIDCScopes = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCScopesSettingName,
 	"sets OIDC scopes to include with authentication request "+
 		"(space delimited list of strings, required to start with `openid`)",
@@ -218,7 +231,7 @@ var OIDCScopes = settings.RegisterStringSetting(
 
 // OIDCClaimJSONKey is the key of the claim to extract from the OIDC id_token.
 var OIDCClaimJSONKey = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCClaimJSONKeySettingName,
 	"sets JSON key of principal to extract from payload after OIDC authentication completes "+
 		"(usually email or sid)",
@@ -229,7 +242,7 @@ var OIDCClaimJSONKey = settings.RegisterStringSetting(
 // OIDCPrincipalRegex is a regular expression to apply to the OIDC id_token
 // claim value to conver it to a DB principal.
 var OIDCPrincipalRegex = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCPrincipalRegexSettingName,
 	"regular expression to apply to extracted principal (see claim_json_key setting) to "+
 		"translate to SQL user (golang regex format, must include 1 grouping to extract)",
@@ -247,7 +260,7 @@ var OIDCPrincipalRegex = settings.RegisterStringSetting(
 // OIDCButtonText is a string to display on the button in the DB Console to
 // login with OIDC.
 var OIDCButtonText = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCButtonTextSettingName,
 	"text to show on button on DB Console login page to login with your OIDC provider "+
 		"(only shown if OIDC is enabled)",
@@ -258,7 +271,7 @@ var OIDCButtonText = settings.RegisterStringSetting(
 // OIDCAutoLogin is a boolean that enables automatic redirection to OIDC auth in
 // the DB Console.
 var OIDCAutoLogin = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"server.oidc_authentication.autologin",
 	"if true, logged-out visitors to the DB Console will be "+
 		"automatically redirected to the OIDC login endpoint",
@@ -270,7 +283,7 @@ var OIDCAutoLogin = settings.RegisterBoolSetting(
 // OIDCGenerateClusterSSOTokenEnabled enables or disables generating JWT auth
 // tokens for cluster SSO with OIDC.
 var OIDCGenerateClusterSSOTokenEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCGenerateClusterSSOTokenEnabledSettingName,
 	"enables or disables using OIDC to generate JWT auth tokens for cluster SSO",
 	false,
@@ -286,20 +299,20 @@ const (
 // OIDCGenerateClusterSSOTokenUseToken selects which OIDC callback token to use
 // for cluster SSO.
 var OIDCGenerateClusterSSOTokenUseToken = settings.RegisterEnumSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCGenerateClusterSSOTokenUseTokenSettingName,
 	"selects which OIDC callback token to use for cluster SSO",
 	"id_token",
-	map[int64]string{
-		int64(useIdToken):     "id_token",
-		int64(useAccessToken): "access_token",
+	map[tokenToUse]string{
+		useIdToken:     "id_token",
+		useAccessToken: "access_token",
 	},
 )
 
 // OIDCGenerateClusterSSOTokenSQLHost stores the host name or address to be used
 // for making SQL connections to the cluster, for display purposes only.
 var OIDCGenerateClusterSSOTokenSQLHost = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCGenerateClusterSSOTokenSQLHostSettingName,
 	"stores the host name or address to be used for making SQL connections to the cluster, for display purposes only",
 	"localhost",
@@ -308,7 +321,7 @@ var OIDCGenerateClusterSSOTokenSQLHost = settings.RegisterStringSetting(
 // OIDCGenerateClusterSSOTokenSQLPort stores the port number to be used for making
 // SQL connections to the cluster, for display purposes only.
 var OIDCGenerateClusterSSOTokenSQLPort = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	OIDCGenerateClusterSSOTokenSQLPortSettingName,
 	"stores the port number to be used for making SQL connections to the cluster, for display purposes only",
 	26257,

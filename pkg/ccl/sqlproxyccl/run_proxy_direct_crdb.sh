@@ -1,4 +1,10 @@
 #!/bin/bash
+
+# Copyright 2021 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 set -euo pipefail
 
 # This script sets up an sql proxy, test directory server and a host server to help with end to end testing.
@@ -95,6 +101,6 @@ $COCKROACH mt start-proxy  --listen-addr=localhost:$PROXY_P --listen-cert=* --li
 
 echo "All files are in $BASE"
 echo "To connect:"
-echo "  $COCKROACH sql --url=\"postgresql://root:secret@127.0.0.1:$PROXY_P?sslmode=require&sslrootcert=a&options=--cluster%3Dtenant-cluster-123\""
+echo "  $COCKROACH sql --url=\"postgresql://root:secret@127.0.0.1:$PROXY_P?sslmode=require&options=--cluster%3Dtenant-cluster-123\""
 echo "Press any key to shutdown all processes and cleanup."
 read -r

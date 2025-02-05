@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package invertedidx
 
@@ -208,25 +203,17 @@ var _ invertedexpr.DatumsToInvertedExpr = &jsonOrArrayDatumsToInvertedExpr{}
 var _ eval.IndexedVarContainer = &jsonOrArrayDatumsToInvertedExpr{}
 
 // IndexedVarEval is part of the eval.IndexedVarContainer interface.
-func (g *jsonOrArrayDatumsToInvertedExpr) IndexedVarEval(
-	ctx context.Context, idx int, e tree.ExprEvaluator,
-) (tree.Datum, error) {
+func (g *jsonOrArrayDatumsToInvertedExpr) IndexedVarEval(idx int) (tree.Datum, error) {
 	err := g.row[idx].EnsureDecoded(g.colTypes[idx], &g.alloc)
 	if err != nil {
 		return nil, err
 	}
-	return g.row[idx].Datum.Eval(ctx, e)
+	return g.row[idx].Datum, nil
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
 func (g *jsonOrArrayDatumsToInvertedExpr) IndexedVarResolvedType(idx int) *types.T {
 	return g.colTypes[idx]
-}
-
-// IndexedVarNodeFormatter is part of the IndexedVarContainer interface.
-func (g *jsonOrArrayDatumsToInvertedExpr) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	n := tree.Name(fmt.Sprintf("$%d", idx))
-	return &n
 }
 
 // NewJSONOrArrayDatumsToInvertedExpr returns a new
@@ -568,7 +555,13 @@ func (j *jsonOrArrayFilterPlanner) extractJSONExistsCondition(
 func (j *jsonOrArrayFilterPlanner) extractJSONEqCondition(
 	ctx context.Context, evalCtx *eval.Context, left *memo.VariableExpr, right opt.ScalarExpr,
 ) inverted.Expression {
-	// The right side of the expression should be a constant JSON value.
+	// The left side of the expression must be a variable expression of the
+	// indexed column.
+	if !isIndexColumn(j.tabID, j.index, left, j.computedColumns) {
+		return inverted.NonInvertedColExpression{}
+	}
+
+	// The right side of the expression must be a constant JSON value.
 	if !memo.CanExtractConstDatum(right) {
 		return inverted.NonInvertedColExpression{}
 	}
@@ -577,8 +570,7 @@ func (j *jsonOrArrayFilterPlanner) extractJSONEqCondition(
 		return inverted.NonInvertedColExpression{}
 	}
 
-	// For Equals expressions, we will generate the inverted expression for the
-	// single object built from the keys and val.
+	// For Equals expressions, we will generate the inverted expression for val.
 	invertedExpr := getInvertedExprForJSONOrArrayIndexForContaining(ctx, evalCtx, val)
 
 	// Generated inverted expression won't be tight as we are searching for rows

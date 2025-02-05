@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package vm
 
@@ -35,18 +30,65 @@ const (
 	TagLifetime = "lifetime"
 	// TagRoachprod is roachprod tag const, value is true & false.
 	TagRoachprod = "roachprod"
+	// TagSpotInstance is a tag added to spot instance vms with value as true.
+	TagSpotInstance = "spot"
 	// TagUsage indicates where a certain resource is used. "roachtest" is used
 	// as the key for roachtest created resources.
 	TagUsage = "usage"
 	// TagArch is the CPU architecture tag const.
 	TagArch = "arch"
 
-	ArchARM64 = CPUArch("arm64")
-	ArchAMD64 = CPUArch("amd64")
-	ArchFIPS  = CPUArch("fips")
+	ArchARM64   = CPUArch("arm64")
+	ArchAMD64   = CPUArch("amd64")
+	ArchFIPS    = CPUArch("fips")
+	ArchUnknown = CPUArch("unknown")
+
+	// InitializedFile is the base name of the initialization paths defined below.
+	InitializedFile = ".roachprod-initialized"
+	// OSInitializedFile is a marker file that is created on a VM to indicate
+	// that it has been initialized at least once by the VM start-up script. This
+	// is used to avoid re-initializing a VM that has been stopped and restarted.
+	OSInitializedFile = "/" + InitializedFile
+	// DisksInitializedFile is a marker file that is created on a VM to indicate
+	// that the disks have been initialized by the VM start-up script. This is
+	// separate from OSInitializedFile, because the disks may be ephemeral and
+	// need to be re-initialized on every start. The presence of this file
+	// automatically implies the presence of OSInitializedFile.
+	DisksInitializedFile = "/mnt/data1/" + InitializedFile
+	// StartupLogs is a log file that is created on a VM to redirect startup script
+	// output logs.
+	StartupLogs = "/var/log/roachprod_startup.log"
 )
 
+// UnimplementedError is returned when a method is not implemented by a
+// provider. An error is returned instead of panicking to isolate failures to a
+// single test (in the context of `roachtest`), otherwise the entire test run
+// would fail.
+var UnimplementedError = errors.New("unimplemented")
+
 type CPUArch string
+
+// ParseArch parses a string into a CPUArch using a simple, non-exhaustive heuristic.
+// Supported input values were extracted from the following CLI tools/binaries: file, gcloud, aws
+func ParseArch(s string) CPUArch {
+	if s == "" {
+		return ArchUnknown
+	}
+	arch := strings.ToLower(s)
+
+	if strings.Contains(arch, "amd64") || strings.Contains(arch, "x86_64") ||
+		strings.Contains(arch, "intel") {
+		return ArchAMD64
+	}
+	if strings.Contains(arch, "arm64") || strings.Contains(arch, "aarch64") ||
+		strings.Contains(arch, "ampere") || strings.Contains(arch, "graviton") {
+		return ArchARM64
+	}
+	if strings.Contains(arch, "fips") {
+		return ArchFIPS
+	}
+	return ArchUnknown
+}
 
 // GetDefaultLabelMap returns a label map for a common set of labels.
 func GetDefaultLabelMap(opts CreateOpts) map[string]string {
@@ -100,7 +142,11 @@ type VM struct {
 	// their public or private IP.
 	VPC         string `json:"vpc"`
 	MachineType string `json:"machine_type"`
-	Zone        string `json:"zone"`
+	// When available, either vm.ArchAMD64 or vm.ArchARM64.
+	CPUArch CPUArch `json:"cpu_architecture"`
+	// When available, 'Haswell', 'Skylake', etc.
+	CPUFamily string `json:"cpu_family"`
+	Zone      string `json:"zone"`
 	// Project represents the project to which this vm belongs, if the VM is in a
 	// cloud that supports project (i.e. GCE). Empty otherwise.
 	Project string `json:"project"`
@@ -111,12 +157,20 @@ type VM struct {
 	// NonBootAttachedVolumes are the non-bootable, _persistent_ volumes attached to the VM.
 	NonBootAttachedVolumes []Volume `json:"non_bootable_volumes"`
 
+	// BootVolume is the bootable, _persistent_ volume attached to the VM.
+	BootVolume Volume `json:"bootable_volume"`
+
 	// LocalDisks are the ephemeral SSD disks attached to the VM.
 	LocalDisks []Volume `json:"local_disks"`
 
 	// CostPerHour is the estimated cost per hour of this VM, in US dollars. 0 if
 	//there is no estimate available.
 	CostPerHour float64
+
+	// EmptyCluster indicates that the VM does not exist. Azure allows for empty
+	// clusters, but roachprod does not allow VM-less clusters except when deleting them.
+	// A fake VM will be used in this scenario.
+	EmptyCluster bool
 }
 
 // Name generates the name for the i'th node in a cluster.
@@ -299,10 +353,6 @@ type ProviderOpts interface {
 	// ConfigureCreateFlags configures a FlagSet with any options relevant to the
 	// `create` command.
 	ConfigureCreateFlags(*pflag.FlagSet)
-	// ConfigureClusterFlags configures a FlagSet with any options relevant to
-	// cluster manipulation commands (`create`, `destroy`, `list`, `sync` and
-	// `gc`).
-	ConfigureClusterFlags(*pflag.FlagSet, MultipleProjectsOption)
 }
 
 // VolumeSnapshot is an abstract representation of a specific volume snapshot.
@@ -382,29 +432,63 @@ type VolumeCreateOpts struct {
 }
 
 type ListOptions struct {
+	Username             string // if set, <username>-.* clusters are detected as 'mine'
 	IncludeVolumes       bool
+	IncludeEmptyClusters bool
 	ComputeEstimatedCost bool
+	IncludeProviders     []string
+}
+
+type PreemptedVM struct {
+	Name        string
+	PreemptedAt time.Time
+}
+
+// CreatePreemptedVMs returns a list of PreemptedVM created from given list of vmNames
+func CreatePreemptedVMs(vmNames []string) []PreemptedVM {
+	preemptedVMs := make([]PreemptedVM, len(vmNames))
+	for i, name := range vmNames {
+		preemptedVMs[i] = PreemptedVM{Name: name}
+	}
+	return preemptedVMs
+}
+
+// ServiceAddress stores the IP and port of a service.
+type ServiceAddress struct {
+	IP   string
+	Port int
 }
 
 // A Provider is a source of virtual machines running on some hosting platform.
 type Provider interface {
+	// ConfigureProviderFlags is used to specify flags that apply to the provider
+	// instance and should be used for all clusters managed by the provider.
+	ConfigureProviderFlags(*pflag.FlagSet, MultipleProjectsOption)
+
+	// ConfigureClusterCleanupFlags configures a FlagSet with any options
+	// relevant to commands (`gc`)
+	ConfigureClusterCleanupFlags(*pflag.FlagSet)
+
 	CreateProviderOpts() ProviderOpts
 	CleanSSH(l *logger.Logger) error
 
 	// ConfigSSH takes a list of zones and configures SSH for machines in those
 	// zones for the given provider.
 	ConfigSSH(l *logger.Logger, zones []string) error
-	Create(l *logger.Logger, names []string, opts CreateOpts, providerOpts ProviderOpts) error
+	Create(l *logger.Logger, names []string, opts CreateOpts, providerOpts ProviderOpts) (List, error)
+	Grow(l *logger.Logger, vms List, clusterName string, names []string) (List, error)
+	Shrink(l *logger.Logger, vmsToRemove List, clusterName string) error
 	Reset(l *logger.Logger, vms List) error
 	Delete(l *logger.Logger, vms List) error
 	Extend(l *logger.Logger, vms List, lifetime time.Duration) error
 	// Return the account name associated with the provider
 	FindActiveAccount(l *logger.Logger) (string, error)
 	List(l *logger.Logger, opts ListOptions) (List, error)
-	// The name of the Provider, which will also surface in the top-level Providers map.
-
+	// AddLabels adds (or updates) the given labels to the given VMs.
+	// N.B. If a VM contains a label with the same key, its value will be updated.
 	AddLabels(l *logger.Logger, vms List, labels map[string]string) error
 	RemoveLabels(l *logger.Logger, vms List, labels []string) error
+	// The name of the Provider, which will also surface in the top-level Providers map.
 	Name() string
 
 	// Active returns true if the provider is properly installed and capable of
@@ -437,6 +521,29 @@ type Provider interface {
 	ListVolumeSnapshots(l *logger.Logger, vslo VolumeSnapshotListOpts) ([]VolumeSnapshot, error)
 	// DeleteVolumeSnapshots permanently deletes the given snapshots.
 	DeleteVolumeSnapshots(l *logger.Logger, snapshot ...VolumeSnapshot) error
+
+	// SpotVM related APIs.
+
+	// SupportsSpotVMs returns if the provider supports spot VMs.
+	SupportsSpotVMs() bool
+	// GetPreemptedSpotVMs returns a list of Spot VMs that were preempted since the time specified.
+	// Returns nil, nil when SupportsSpotVMs() is false.
+	GetPreemptedSpotVMs(l *logger.Logger, vms List, since time.Time) ([]PreemptedVM, error)
+	// GetHostErrorVMs returns a list of VMs that had host error since the time specified.
+	GetHostErrorVMs(l *logger.Logger, vms List, since time.Time) ([]string, error)
+	// GetVMSpecs returns a map from VM.Name to a map of VM attributes, according to a specific cloud provider.
+	GetVMSpecs(l *logger.Logger, vms List) (map[string]map[string]interface{}, error)
+
+	// CreateLoadBalancer creates a load balancer, for a specific port, that
+	// delegates to the given cluster.
+	CreateLoadBalancer(l *logger.Logger, vms List, port int) error
+
+	// DeleteLoadBalancer deletes a load balancers created for a specific port.
+	DeleteLoadBalancer(l *logger.Logger, vms List, port int) error
+
+	// ListLoadBalancers returns a list of load balancer IPs and ports that are currently
+	// routing to services for the given VMs.
+	ListLoadBalancers(l *logger.Logger, vms List) ([]ServiceAddress, error)
 }
 
 // DeleteCluster is an optional capability for a Provider which can
@@ -489,15 +596,12 @@ func FanOut(list List, action func(Provider, List) error) error {
 
 	var g errgroup.Group
 	for name, vms := range m {
-		// capture loop variables
-		n := name
-		v := vms
 		g.Go(func() error {
-			p, ok := Providers[n]
+			p, ok := Providers[name]
 			if !ok {
-				return errors.Errorf("unknown provider name: %s", n)
+				return errors.Errorf("unknown provider name: %s", name)
 			}
-			return action(p, v)
+			return action(p, vms)
 		})
 	}
 
@@ -518,7 +622,9 @@ func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 		err := ProvidersSequential(AllProviderNames(), func(p Provider) error {
 			account, err := p.FindActiveAccount(l)
 			if err != nil {
-				return err
+				l.Printf("WARN: provider=%q has no active account", p.Name())
+				//nolint:returnerrcheck
+				return nil
 			}
 			if len(account) > 0 {
 				source[p.Name()] = account
@@ -557,10 +663,8 @@ func ForProvider(named string, action func(Provider) error) error {
 func ProvidersParallel(named []string, action func(Provider) error) error {
 	var g errgroup.Group
 	for _, name := range named {
-		// capture loop variable
-		n := name
 		g.Go(func() error {
-			return ForProvider(n, action)
+			return ForProvider(name, action)
 		})
 	}
 	return g.Wait()
@@ -626,36 +730,57 @@ func ExpandZonesFlag(zoneFlag []string) (zones []string, err error) {
 	return zones, nil
 }
 
-// DNSSafeAccount takes a string and returns a cleaned version of the string that can be used in DNS entries.
+// DNSSafeName takes a string and returns a cleaned version of the string that can be used in DNS entries.
 // Unsafe characters are dropped. No length check is performed.
-func DNSSafeAccount(account string) string {
+func DNSSafeName(name string) string {
 	safe := func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z':
 			return r
 		case r >= 'A' && r <= 'Z':
 			return unicode.ToLower(r)
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-':
+			return r
 		default:
 			// Negative value tells strings.Map to drop the rune.
 			return -1
 		}
 	}
-	return strings.Map(safe, account)
+	name = strings.Map(safe, name)
+
+	// DNS entries cannot start or end with hyphens.
+	name = strings.Trim(name, "-")
+
+	// Consecutive hyphens are allowed in DNS entries, but disallow it for readability.
+	return regexp.MustCompile(`-+`).ReplaceAllString(name, "-")
 }
 
-// SanitizeLabel returns a version of the string that can be used as a label.
+// SanitizeLabel returns a version of the string that can be used as a (resource) label.
+// This takes the lowest common denominator of the label requirements;
+// GCE: "The value can only contain lowercase letters, numeric characters, underscores and dashes.
+// The value can be at most 63 characters long"
 func SanitizeLabel(label string) string {
 	// Replace any non-alphanumeric characters with hyphens
 	re := regexp.MustCompile("[^a-zA-Z0-9]+")
 	label = re.ReplaceAllString(label, "-")
-
-	// Remove any leading or trailing hyphens
-	label = strings.Trim(label, "-")
+	label = strings.ToLower(label)
 
 	// Truncate the label to 63 characters (the maximum allowed by GCP)
 	if len(label) > 63 {
 		label = label[:63]
 	}
-
+	// Remove any leading or trailing hyphens
+	label = strings.Trim(label, "-")
 	return label
+}
+
+// SanitizeLabelValues returns the same set of keys with sanitized values.
+func SanitizeLabelValues(labels map[string]string) map[string]string {
+	sanitized := map[string]string{}
+	for k, v := range labels {
+		sanitized[k] = SanitizeLabel(v)
+	}
+	return sanitized
 }

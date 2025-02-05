@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -31,9 +26,11 @@ func TestTenantZip(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t, "test too slow under race")
+	skip.UnderDeadlock(t, "this test takes cpu profiles")
 
 	tenants := []struct {
 		testName      string
+		preZip        func(*testing.T, TestCLI)
 		addTenantArgs func(params TestCLIParams) TestCLIParams
 	}{
 		{
@@ -60,6 +57,20 @@ func TestTenantZip(t *testing.T) {
 				return params
 			},
 		},
+		{
+			testName: "testzip shared process virtualization with default tenant",
+			addTenantArgs: func(params TestCLIParams) TestCLIParams {
+				params.SharedProcessTenantArgs = &base.TestSharedProcessTenantArgs{
+					TenantName: "test-tenant",
+					TenantID:   serverutils.TestTenantID(),
+				}
+				params.UseSystemTenant = true
+				return params
+			},
+			preZip: func(_ *testing.T, c TestCLI) {
+				c.RunWithArgs([]string{"sql", "-e", "SET CLUSTER SETTING server.controller.default_target_cluster = 'test-tenant'"})
+			},
+		},
 	}
 
 	for _, tenant := range tenants {
@@ -75,6 +86,10 @@ func TestTenantZip(t *testing.T) {
 				Insecure: true,
 			}))
 			defer c.Cleanup()
+
+			if tenant.preZip != nil {
+				tenant.preZip(t, c)
+			}
 
 			out, err := c.RunWithCapture("debug zip --concurrency=1 --cpu-profile-duration=1s " + os.DevNull)
 			if err != nil {

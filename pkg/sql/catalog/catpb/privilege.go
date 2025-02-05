@@ -1,19 +1,13 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catpb
 
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -41,6 +35,11 @@ const (
 	// These descriptors should have all the correct privileges and the owner field
 	// explicitly set. These descriptors should be strictly validated.
 	Version21_2
+
+	// Version23_2 corresponds to descriptors created in 23.2 and onwards. These
+	// descriptors that are function descriptions should have EXECUTE privileges
+	// for the public role.
+	Version23_2
 )
 
 // Owner accesses the owner field.
@@ -123,7 +122,7 @@ func NewCustomSuperuserPrivilegeDescriptor(
 				WithGrantOption: priv.ToBitField(),
 			},
 		},
-		Version: Version21_2,
+		Version: Version23_2,
 	}
 }
 
@@ -162,7 +161,7 @@ func NewPrivilegeDescriptor(
 				WithGrantOption: grantOption.ToBitField(),
 			},
 		},
-		Version: Version21_2,
+		Version: Version23_2,
 	}
 }
 
@@ -186,15 +185,13 @@ func NewBaseDatabasePrivilegeDescriptor(owner username.SQLUsername) *PrivilegeDe
 }
 
 // NewPublicSchemaPrivilegeDescriptor is used to construct a privilege
-// descriptor owned by the admin user which has CREATE and USAGE privilege for
-// the public role, and ALL privileges for superusers. It is used for the
-// public schema.
-func NewPublicSchemaPrivilegeDescriptor(includeCreatePriv bool) *PrivilegeDescriptor {
-	// In postgres, the user "postgres" is the owner of the public schema in a
-	// newly created db. In CockroachDB, admin is our substitute for the postgres
-	// user.
-	p := NewBasePrivilegeDescriptor(username.AdminRoleName())
-
+// descriptor owned by the given user which has USAGE privilege, and optionally
+// CREATE privilege, for the public role, and ALL privileges for superusers. It
+// is used for the public schema.
+func NewPublicSchemaPrivilegeDescriptor(
+	owner username.SQLUsername, includeCreatePriv bool,
+) *PrivilegeDescriptor {
+	p := NewBasePrivilegeDescriptor(owner)
 	if includeCreatePriv {
 		p.Grant(username.PublicRoleName(), privilege.List{privilege.CREATE, privilege.USAGE}, false)
 	} else {
@@ -203,14 +200,19 @@ func NewPublicSchemaPrivilegeDescriptor(includeCreatePriv bool) *PrivilegeDescri
 	return p
 }
 
+// NewBaseFunctionPrivilegeDescriptor returns a privilege descriptor
+// with default privileges for a function descriptor.
+func NewBaseFunctionPrivilegeDescriptor(owner username.SQLUsername) *PrivilegeDescriptor {
+	p := NewBasePrivilegeDescriptor(owner)
+	p.Grant(username.PublicRoleName(), privilege.List{privilege.EXECUTE}, false)
+	return p
+}
+
 // CheckGrantOptions returns false if the user tries to grant a privilege that
 // it does not possess grant options for
 func (p *PrivilegeDescriptor) CheckGrantOptions(
 	user username.SQLUsername, privList privilege.List,
 ) bool {
-	if p.Owner() == user {
-		return true
-	}
 	userPriv, exists := p.FindUser(user)
 	if !exists {
 		return false
@@ -376,7 +378,7 @@ func (p PrivilegeDescriptor) ValidateSuperuserPrivileges(
 			return fmt.Errorf(
 				"user %s must have exactly %s privileges on %s",
 				user,
-				allowedSuperuserPrivileges,
+				allowedSuperuserPrivileges.SortedDisplayNames(),
 				privilegeObject(parentID, objectType, objectName),
 			)
 		}
@@ -413,7 +415,7 @@ func (p PrivilegeDescriptor) Validate(
 		return errors.AssertionFailedf(
 			"user %s must not have %s privileges on %s",
 			u.User(),
-			privList,
+			privList.SortedDisplayNames(),
 			privilegeObject(parentID, objectType, objectName),
 		)
 	}
@@ -483,7 +485,7 @@ func (p PrivilegeDescriptor) Show(
 			return nil, err
 		}
 		sort.Slice(privileges, func(i, j int) bool {
-			return strings.Compare(privileges[i].Kind.String(), privileges[j].Kind.String()) < 0
+			return privileges[i].Kind.DisplayName() < privileges[j].Kind.DisplayName()
 		})
 		ret = append(ret, UserPrivilege{
 			User:       userPriv.User(),

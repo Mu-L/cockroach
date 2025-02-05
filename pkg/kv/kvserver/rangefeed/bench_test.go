@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rangefeed
 
@@ -22,18 +17,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/future"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
 
 type benchmarkRangefeedOpts struct {
-	opType           opType
-	numRegistrations int
-	budget           int64
+	rangefeedTestType rangefeedTestType
+	opType            opType
+	numRegistrations  int
+	budget            int64
 }
 
 type opType string
@@ -47,16 +41,19 @@ const (
 // BenchmarkRangefeed benchmarks the processor and registrations, by submitting
 // a set of events and waiting until they are all emitted.
 func BenchmarkRangefeed(b *testing.B) {
-	for _, opType := range []opType{writeOpType, commitOpType, closedTSOpType} {
-		for _, numRegistrations := range []int{1, 10, 100} {
-			name := fmt.Sprintf("opType=%s/numRegs=%d", opType, numRegistrations)
-			b.Run(name, func(b *testing.B) {
-				runBenchmarkRangefeed(b, benchmarkRangefeedOpts{
-					opType:           opType,
-					numRegistrations: numRegistrations,
-					budget:           math.MaxInt64,
+	for _, procType := range testTypes {
+		for _, opType := range []opType{writeOpType, commitOpType, closedTSOpType} {
+			for _, numRegistrations := range []int{1, 10, 100} {
+				name := fmt.Sprintf("procType=%s/opType=%s/numRegs=%d", procType, opType, numRegistrations)
+				b.Run(name, func(b *testing.B) {
+					runBenchmarkRangefeed(b, benchmarkRangefeedOpts{
+						rangefeedTestType: procType,
+						opType:            opType,
+						numRegistrations:  numRegistrations,
+						budget:            math.MaxInt64,
+					})
 				})
-			})
+			}
 		}
 	}
 }
@@ -85,8 +82,6 @@ func BenchmarkRangefeedBudget(b *testing.B) {
 func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
 
 	var budget *FeedBudget
 	if opts.budget > 0 {
@@ -94,28 +89,23 @@ func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 	}
 	span := roachpb.RSpan{Key: roachpb.RKey("a"), EndKey: roachpb.RKey("z")}
 
-	// Set up processor.
-	p := NewProcessor(Config{
-		AmbientContext:   log.MakeTestingAmbientContext(nil),
-		Clock:            hlc.NewClockForTesting(nil),
-		Metrics:          NewMetrics(),
-		Span:             span,
-		MemBudget:        budget,
-		EventChanCap:     b.N,
-		EventChanTimeout: time.Hour,
-	})
-	require.NoError(b, p.Start(stopper, nil))
+	p, h, stopper := newTestProcessor(b, withSpan(span), withBudget(budget), withChanCap(b.N),
+		withEventTimeout(time.Hour), withRangefeedTestType(opts.rangefeedTestType))
+	defer stopper.Stop(ctx)
 
 	// Add registrations.
 	streams := make([]*noopStream, opts.numRegistrations)
-	futures := make([]*future.ErrorFuture, opts.numRegistrations)
 	for i := 0; i < opts.numRegistrations; i++ {
 		// withDiff does not matter for these benchmarks, since the previous value
 		// is fetched and populated during Raft application.
 		const withDiff = false
-		streams[i] = &noopStream{ctx: ctx}
-		futures[i] = &future.ErrorFuture{}
-		ok, _ := p.Register(span, hlc.MinTimestamp, nil, withDiff, streams[i], nil, futures[i])
+		// withFiltering does not matter for these benchmarks because doesn't fetch
+		// extra data.
+		const withFiltering = false
+		streams[i] = &noopStream{ctx: ctx, done: make(chan *kvpb.Error, 1)}
+		ok, _, _ := p.Register(ctx, span, hlc.MinTimestamp, nil,
+			withDiff, withFiltering, false, /* withOmitRemote */
+			streams[i])
 		require.True(b, ok)
 	}
 
@@ -152,7 +142,7 @@ func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 			binary.BigEndian.PutUint32(key[len(prefix):], uint32(i))
 			ts := hlc.Timestamp{WallTime: int64(i + 1)}
 			logicalOps[i] = writeIntentOpWithKey(txnID, key, isolation.Serializable, ts)
-			logicalOps[b.N+i] = commitIntentOpWithKV(txnID, key, ts, value)
+			logicalOps[b.N+i] = commitIntentOpWithKV(txnID, key, ts, value, false /* omitInRangefeeds */, 0 /* originID */)
 		}
 
 	case closedTSOpType:
@@ -166,7 +156,7 @@ func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 	}
 
 	// Wait for catchup scans and flush checkpoint events.
-	syncEventAndRegistrations(p)
+	h.syncEventAndRegistrations()
 
 	// Run the benchmark. We accounted for b.N when constructing events.
 	b.ResetTimer()
@@ -181,17 +171,16 @@ func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 			b.Fatal("failed to forward closed timestamp")
 		}
 	}
-	syncEventAndRegistrations(p)
+	h.syncEventAndRegistrations()
 
 	// Check that all registrations ended successfully, and emitted the expected
 	// number of events.
 	b.StopTimer()
 	p.Stop()
 
-	for i, f := range futures {
-		regErr, err := future.Wait(ctx, f)
-		require.NoError(b, err)
-		require.NoError(b, regErr)
+	for i, s := range streams {
+		// p.Stop() sends a nil error to all streams to signal completion.
+		require.NoError(b, s.WaitForError(b))
 		require.Equal(b, b.N, streams[i].events-1) // ignore checkpoint after catchup
 	}
 }
@@ -200,13 +189,34 @@ func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 type noopStream struct {
 	ctx    context.Context
 	events int
+	done   chan *kvpb.Error
 }
 
-func (s *noopStream) Context() context.Context {
-	return s.ctx
-}
-
-func (s *noopStream) Send(*kvpb.RangeFeedEvent) error {
+func (s *noopStream) SendUnbuffered(*kvpb.RangeFeedEvent) error {
 	s.events++
 	return nil
+}
+
+// Note that SendUnbuffered itself is not thread-safe, but it is written to be
+// used only in a single threaded environment in this test, ensuring
+// thread-safety.
+func (s *noopStream) SendUnbufferedIsThreadSafe() {}
+
+// SendError implements the Stream interface. It mocks the disconnect behavior
+// by sending the error to the done channel.
+func (s *noopStream) SendError(error *kvpb.Error) {
+	s.done <- error
+}
+
+// WaitForError waits for the rangefeed to complete and returns the error sent
+// to the done channel. It fails the test if rangefeed cannot complete within 30
+// seconds.
+func (s *noopStream) WaitForError(b *testing.B) error {
+	select {
+	case err := <-s.done:
+		return err.GoError()
+	case <-time.After(testutils.DefaultSucceedsSoonDuration):
+		b.Fatalf("time out waiting for rangefeed completion")
+		return nil
+	}
 }

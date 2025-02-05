@@ -1,13 +1,8 @@
 // Copyright 2013 Google Inc. All Rights Reserved.
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code originated in the github.com/golang/glog package.
 
@@ -410,7 +405,7 @@ func TestGetLogReader(t *testing.T) {
 	// Validate and apply the config.
 	require.NoError(t, config.Validate(&sc.logDir))
 	TestingResetActive()
-	cleanupFn, err := ApplyConfig(config)
+	cleanupFn, err := ApplyConfig(config, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	require.NoError(t, err)
 	defer cleanupFn()
 
@@ -586,17 +581,23 @@ func TestFatalStacktraceStderr(t *testing.T) {
 			if !strings.Contains(cont, "clog_test") {
 				t.Fatalf("stack trace does not contain file name: %s", cont)
 			}
+
+			// NB: the string "!goroutine" is used here in order to match the
+			// goroutine headers in the formatted output. The stacktrace
+			// itself can sometimes contain the string `goroutine` if one
+			// goroutine is spawned from another due to
+			// https://github.com/golang/go/commit/51225f6fc648ba3e833f3493700c2996a816bdaa
 			switch traceback {
 			case tracebackNone:
-				if strings.Count(cont, "goroutine ") > 0 {
+				if strings.Count(cont, "!goroutine ") > 0 {
 					t.Fatalf("unexpected stack trace:\n%s", cont)
 				}
 			case tracebackSingle:
-				if strings.Count(cont, "goroutine ") != 1 {
+				if strings.Count(cont, "!goroutine ") != 1 {
 					t.Fatalf("stack trace contains too many goroutines: %s", cont)
 				}
 			case tracebackAll:
-				if strings.Count(cont, "goroutine ") < 2 {
+				if strings.Count(cont, "!goroutine ") < 2 {
 					t.Fatalf("stack trace contains less than two goroutines: %s", cont)
 				}
 			}
@@ -616,7 +617,7 @@ func TestFd2Capture(t *testing.T) {
 		t.Fatal(err)
 	}
 	TestingResetActive()
-	cleanupFn, err := ApplyConfig(cfg)
+	cleanupFn, err := ApplyConfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +652,7 @@ func TestFileSeverityFilter(t *testing.T) {
 	Infof(context.Background(), "test1")
 	Errorf(context.Background(), "test2")
 
-	Flush()
+	FlushFiles()
 
 	debugFileSink := debugFileSinkInfo.sink.(*fileSink)
 	contents, err := os.ReadFile(debugFileSink.getFileName(t))
@@ -743,8 +744,8 @@ func TestLogEntryPropagation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = f.Close() }()
-	defer func(prevStderr *os.File) { OrigStderr = prevStderr }(OrigStderr)
-	OrigStderr = f
+	require.NoError(t, hijackStderr(f))
+	defer func() { require.NoError(t, hijackStderr(OrigStderr)) }()
 
 	const specialMessage = `CAPTAIN KIRK`
 
@@ -821,5 +822,26 @@ func BenchmarkEventf_WithVerboseTraceSpan(b *testing.B) {
 				Eventf(ctx, "%s %s %s", "foo", "bar", "baz")
 			}
 		})
+	}
+}
+
+// BenchmarkExpensiveLogEnabled measures the overhead of checking whether
+// expensive logging is enabled.
+//
+// Results with go1.21.4 on a Mac with an Apple M1 Pro processor:
+//
+// name                    time/op
+// ExpensiveLogEnabled-10  13.5ns ± 1%
+func BenchmarkExpensiveLogEnabled(b *testing.B) {
+	ctx := context.Background()
+	// Add a few values to the context, to make sure ctx.Value is not
+	// unrealistically cheap.
+	for i := 0; i < 10; i++ {
+		type key int // avoid lint warning
+		ctx = context.WithValue(ctx, key(i), i)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ExpensiveLogEnabled(ctx, 2)
 	}
 }

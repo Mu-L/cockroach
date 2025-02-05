@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2022 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -euo pipefail
 
 dir="$(dirname $(dirname $(dirname $(dirname $(dirname "${0}")))))"
@@ -21,7 +27,7 @@ if [[ ! -f ~/.ssh/id_rsa.pub ]]; then
   ssh-keygen -q -N "" -f ~/.ssh/id_rsa
 fi
 
-artifacts=$PWD/artifacts/$(date +"%%Y%%m%%d")-${TC_BUILD_ID}
+artifacts=$PWD/artifacts/$(date +"%Y%m%d")-${TC_BUILD_ID}
 mkdir -p "$artifacts"
 
 if [[ ${FIPS_ENABLED:-0} == 1 ]]; then
@@ -37,8 +43,9 @@ curl -f -s -S -o- "https://storage.googleapis.com/cockroach-builds-artifacts-pro
 chmod +x cockroach
 
 run_bazel <<'EOF'
-bazel build --config ci --config crosslinux //pkg/cmd/workload //pkg/cmd/roachtest //pkg/cmd/roachprod
-BAZEL_BIN=$(bazel info bazel-bin --config ci --config crosslinux)
+bazel build --config crosslinux //pkg/cmd/workload //pkg/cmd/roachtest //pkg/cmd/roachprod
+BAZEL_BIN=$(bazel info bazel-bin --config crosslinux)
+mkdir -p bin
 cp $BAZEL_BIN/pkg/cmd/roachprod/roachprod_/roachprod bin
 cp $BAZEL_BIN/pkg/cmd/roachtest/roachtest_/roachtest bin
 cp $BAZEL_BIN/pkg/cmd/workload/workload_/workload    bin
@@ -55,7 +62,7 @@ EOF
 # by default. This reserves us-east1-b (the roachprod default zone) for use
 # by manually created clusters.
 timeout -s INT $((7800*60)) bin/roachtest run \
-  tag:release_qualification \
+  --suite release_qualification \
   --cluster-id "${TC_BUILD_ID}" \
   --zones "us-central1-b,us-west1-b,europe-west2-b" \
   --cockroach "$PWD/cockroach" \

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2021 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 # This command is used by bazel as the workspace_status_command
 # to implement build stamping with git information.
 
@@ -66,7 +72,11 @@ else
     shift 1
 fi
 
-BUILD_REV=$(git describe --match="" --always --abbrev=40 --dirty)
+BUILD_REV=$(git describe --match="" --always --abbrev=40)
+if [[ -n "$(git status -s --ignore-submodules --untracked-files=no)" ]]; then
+    BUILD_REV=$BUILD_REV-dirty
+fi
+
 BUILD_UTCTIME=$(date -u '+%Y/%m/%d %H:%M:%S')
 
 

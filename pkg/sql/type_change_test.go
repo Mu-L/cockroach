@@ -1,25 +1,24 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -134,6 +133,68 @@ CREATE TYPE d.t AS ENUM();
 	}
 }
 
+// TestFailedTypeSchemaChangeIgnoresDrops when a type schema change notices
+// a dropped descriptor during a rollback that is treated as a non-retriable
+// error.
+func TestFailedTypeSchemaChangeIgnoresDrops(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := createTestServerParams()
+	startDrop := make(chan struct{})
+	dropFinished := make(chan struct{})
+	cancelled := atomic.Bool{}
+	params.Knobs.SQLTypeSchemaChanger = &sql.TypeSchemaChangerTestingKnobs{
+		RunBeforeExec: func() error {
+			if cancelled.Swap(true) == false {
+				// Kick off a DROP DATABASE job to clean up this descriptor.
+				close(startDrop)
+				<-dropFinished
+				// Fail this schema change so that the rollback logic executes.
+				return jobs.MarkAsPermanentJobError(errors.New("yikes"))
+			} else {
+				return nil
+			}
+		},
+	}
+	// Decrease the adopt loop interval so that retries happen quickly.
+	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
+
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	grp := ctxgroup.WithContext(ctx)
+	grp.Go(func() error {
+		defer close(dropFinished)
+		<-startDrop
+		conn, err := sqlDB.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = conn.ExecContext(ctx, "SET use_declarative_schema_changer = 'off';")
+		if err != nil {
+			return err
+		}
+		_, err = conn.ExecContext(ctx, "DROP DATABASE d CASCADE")
+		return err
+	})
+
+	// Create a type.
+	_, err := sqlDB.Exec(`
+SET use_declarative_schema_changer = 'off';
+CREATE DATABASE d;
+CREATE TYPE d.t AS ENUM('a', 'b', 'c');
+`)
+	require.NoError(t, err)
+
+	// The initial drop should fail.
+	_, err = sqlDB.Exec(`ALTER TYPE d.t DROP VALUE 'c'`)
+	testutils.IsError(err, "yikes")
+
+	require.NoError(t, grp.Wait())
+}
+
 func TestAddDropValuesInTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -165,6 +226,7 @@ INSERT INTO use_greetings VALUES(1, 'yo');
 	}{
 		{
 			`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 ALTER TYPE greetings DROP VALUE 'hello'; 
 ALTER TYPE greetings ADD VALUE 'howdy'; 
 ALTER TYPE greetings DROP VALUE 'yo'; 
@@ -180,6 +242,7 @@ COMMIT`,
 		},
 		{
 			`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 ALTER TYPE greetings ADD VALUE 'sup'; 
 ALTER TYPE greetings ADD VALUE 'howdy'; 
 ALTER TYPE greetings DROP VALUE 'yo'; 
@@ -195,6 +258,7 @@ COMMIT`,
 		},
 		{
 			`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 ALTER TYPE greetings DROP VALUE 'hi'; 
 ALTER TYPE greetings DROP VALUE 'hello'; 
 ALTER TYPE greetings DROP VALUE 'yo'; 
@@ -209,6 +273,7 @@ COMMIT`,
 		},
 		{
 			`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 ALTER TYPE greetings ADD VALUE 'sup'; 
 ALTER TYPE greetings ADD VALUE 'howdy'; 
 ALTER TYPE greetings DROP VALUE 'hello'; 
@@ -225,6 +290,7 @@ COMMIT`,
 		{
 			// This test works on a type created in the same txn that modifies it.
 			`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 CREATE TYPE abc AS ENUM ('a', 'b', 'c');
 ALTER TYPE abc ADD VALUE 'd';
 ALTER TYPE abc DROP VALUE 'c';
@@ -316,7 +382,10 @@ CREATE TYPE ab AS ENUM ('a', 'b')`,
 	}
 
 	go func() {
-		_, err := sqlDB.Exec(`BEGIN; ALTER TYPE ab DROP VALUE 'a'; ALTER TYPE ab ADD VALUE 'c'; COMMIT`)
+		_, err := sqlDB.Exec(`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
+ALTER TYPE ab DROP VALUE 'a'; ALTER TYPE ab ADD VALUE 'c';
+COMMIT`)
 		if err != nil {
 			t.Error(err)
 		}
@@ -334,7 +403,11 @@ CREATE TYPE ab AS ENUM ('a', 'b')`,
 			}
 			mu.Unlock()
 		}
-		_, err := sqlDB.Exec(`BEGIN; ALTER TYPE ab DROP VALUE 'b'; ALTER TYPE ab ADD VALUE 'd'; COMMIT`)
+		_, err := sqlDB.Exec(`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
+ALTER TYPE ab DROP VALUE 'b';
+ALTER TYPE ab ADD VALUE 'd';
+COMMIT`)
 		if err == nil {
 			t.Error("expected error, found nil")
 		}
@@ -402,17 +475,17 @@ func TestTypeChangeJobCancelSemantics(t *testing.T) {
 		},
 		{
 			"txn add drop",
-			"BEGIN; ALTER TYPE db.greetings ADD VALUE 'sup'; ALTER TYPE db.greetings DROP VALUE 'yo'; COMMIT",
+			"BEGIN; SET LOCAL autocommit_before_ddl = false; ALTER TYPE db.greetings ADD VALUE 'sup'; ALTER TYPE db.greetings DROP VALUE 'yo'; COMMIT",
 			true,
 		},
 		{
 			"txn add add",
-			"BEGIN; ALTER TYPE db.greetings ADD VALUE 'sup'; ALTER TYPE db.greetings ADD VALUE 'hello'; COMMIT",
+			"BEGIN; SET LOCAL autocommit_before_ddl = false; ALTER TYPE db.greetings ADD VALUE 'sup'; ALTER TYPE db.greetings ADD VALUE 'hello'; COMMIT",
 			false,
 		},
 		{
 			"txn drop drop",
-			"BEGIN; ALTER TYPE db.greetings DROP VALUE 'yo'; ALTER TYPE db.greetings DROP VALUE 'hi'; COMMIT",
+			"BEGIN; SET LOCAL autocommit_before_ddl = false; ALTER TYPE db.greetings DROP VALUE 'yo'; ALTER TYPE db.greetings DROP VALUE 'hi'; COMMIT",
 			true,
 		},
 	}
@@ -501,5 +574,233 @@ WHERE
 			close(blockTypeSchemaChange)
 			<-finishedSchemaChange
 		})
+	}
+}
+
+func TestAddDropEnumValues(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
+	ctx := context.Background()
+
+	params, _ := createTestServerParams()
+	// Decrease the adopt loop interval so that retries happen quickly.
+	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
+
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	// Set up schema necessary to execute all unit test cases below. We
+	// execute the schema setup statements within a single, implicit txn
+	// to ensure all the necessary schema elements required for the subsequent
+	// test cases have been set up successfully.
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE d;
+USE d;
+CREATE TYPE e1 AS ENUM('check', 'enum', 'value', 'reference', 'cases', 'unused value');
+-- case 1: enum value referenced within a UDF with language = SQL.
+CREATE FUNCTION f1() RETURNS e1 LANGUAGE SQL AS $$ SELECT 'check'::e1 $$;
+-- case 2: enum value referenced within a UDF with language = PLPGSQL.
+CREATE FUNCTION f2() RETURNS e1 AS $$                                                                                                                          
+  begin                                                                              
+  	select 'enum'::e1;                                                                     
+  end $$                                                                               
+  language plpgsql;
+-- case 3: array type alias for enum referenced within a UDF with language = SQL.
+CREATE TYPE e2 AS ENUM('check', 'array', 'type', 'usage', 'cases', 'within', 'udfs', 'unused value');
+CREATE FUNCTION f3() RETURNS _e2 LANGUAGE SQL AS $$ SELECT '{check, array, type}'::_e2; $$;
+CREATE FUNCTION f4() RETURNS e2[] LANGUAGE SQL AS $$ SELECT ARRAY['usage'::e2, 'cases'::e2]; $$;
+-- case 4: array type alias for enum referenced within a UDF with language = PLPGSQL.
+CREATE FUNCTION f5() RETURNS e2[] AS $$
+	declare
+		b e2[] := ARRAY['within'::e2, 'udfs'::e2];
+  begin                                                                              
+  	return b;                                                                     
+  end $$                                                                               
+  language plpgsql;
+-- case 5: enum value referenced with a view query.
+CREATE TYPE e3 AS ENUM('check', 'enum', 'type', 'usage', 'cases', 'within', 'views', 'unused value');
+CREATE VIEW v1 AS (SELECT 'check'::e3);
+-- case 7: array type alias for enum referenced within a view query
+CREATE VIEW v2 AS (SELECT '{enum, type, usage}'::_e3);
+-- case 6: enum value referenced within a table.
+CREATE TYPE e4 AS ENUM('check', 'enum', 'type', 'usage', 'cases', 'within', 'tables', 'invalid value', 'unused value');
+CREATE TABLE t1(use_enum e4 CHECK (use_enum != 'invalid value'::e4), use_enum_computed e4 AS (IF (use_enum = 'check'::e4, 'type'::e4, 'cases'::e4)) STORED);
+INSERT INTO t1 VALUES('check'::e4);
+INSERT INTO t1 VALUES('enum'::e4);
+-- case 8: array type alias for enum referenced within a table
+CREATE TABLE t2(use_enum_arr e4[]);
+INSERT INTO t2 VALUES(ARRAY['usage'::e4, 'cases'::e4]);
+INSERT INTO t2 VALUES('{within, tables}'::_e4);
+-- Add default column, on update expr, indexes
+CREATE TYPE e5 AS ENUM('usage', 'in', 'default column', 'update expr');
+CREATE TABLE t3(id int, enum_arr_default e5[] DEFAULT ARRAY['default column'::e5]);
+CREATE TABLE t4(id int, enum_val e5 DEFAULT 'usage'::e5 ON UPDATE 'update expr'::e5);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		query   string
+		success bool
+		err     string
+	}{
+		{
+			`ALTER TYPE e1 DROP VALUE 'check'`,
+			false,
+			"could not remove enum value \"check\" as it is being used in a routine \"f1\"",
+		},
+		{
+			`ALTER TYPE e1 DROP VALUE 'enum'`,
+			false,
+			"could not remove enum value \"enum\" as it is being used in a routine \"f2\"",
+		},
+		{
+			`ALTER TYPE e1 DROP VALUE 'unused value'`,
+			true,
+			"",
+		},
+		{
+			`DROP FUNCTION f1; ALTER TYPE e1 DROP VALUE 'check'`,
+			true,
+			"",
+		},
+		{
+			`DROP FUNCTION f2; ALTER TYPE e1 DROP VALUE 'enum'`,
+			true,
+			"",
+		},
+		{
+			`ALTER TYPE e2 DROP VALUE 'check'`,
+			false,
+			"could not remove enum value \"check\" as it is being used in a routine \"f3\"",
+		},
+		{
+			`ALTER TYPE e2 DROP VALUE 'usage'`,
+			false,
+			"could not remove enum value \"usage\" as it is being used in a routine \"f4\"",
+		},
+		{
+			`ALTER TYPE e2 DROP VALUE 'within'`,
+			false,
+			"could not remove enum value \"within\" as it is being used in a routine \"f5\"",
+		},
+		{
+			`ALTER TYPE e2 DROP VALUE 'unused value'`,
+			true,
+			"",
+		},
+		{
+			`DROP FUNCTION f3; ALTER TYPE e2 DROP VALUE 'check'`,
+			true,
+			"",
+		},
+		{
+			`DROP FUNCTION f4; ALTER TYPE e2 DROP VALUE 'usage'`,
+			true,
+			"",
+		},
+		{
+			`DROP FUNCTION f5; ALTER TYPE e2 DROP VALUE 'within'`,
+			true,
+			"",
+		},
+		{
+			`ALTER TYPE e3 DROP VALUE 'check'`,
+			false,
+			"could not remove enum value \"check\" as it is being used in view \"v1\"",
+		},
+		{
+			`ALTER TYPE e3 DROP VALUE 'enum'`,
+			false,
+			"could not remove enum value \"enum\" as it is being used in view \"v2\"",
+		},
+		{
+			`ALTER TYPE e3 DROP VALUE 'unused value'`,
+			true,
+			"",
+		},
+		{
+			`DROP VIEW v1; ALTER TYPE e3 DROP VALUE 'check'`,
+			true,
+			"",
+		},
+		{
+			`DROP VIEW v2; ALTER TYPE e3 DROP VALUE 'enum'`,
+			true,
+			"",
+		},
+		{
+			`ALTER TYPE e4 DROP VALUE 'enum'`,
+			false,
+			"could not remove enum value \"enum\" as it is being used by \"t1\" in row: use_enum='enum', use_enum_computed='cases'",
+		},
+		{
+			`ALTER TYPE e4 DROP VALUE 'usage'`,
+			false,
+			"could not remove enum value \"usage\" as it is being used by table \"d.public.t2\"",
+		},
+		{
+			`ALTER TYPE e4 DROP VALUE 'type'`,
+			false,
+			"could not remove enum value \"type\" as it is being used in a computed column of \"t1\"",
+		},
+		{
+			`ALTER TYPE e4 DROP VALUE 'tables'`,
+			false,
+			"could not remove enum value \"tables\" as it is being used by table \"d.public.t2\"",
+		},
+		{
+			`ALTER TYPE e4 DROP VALUE 'invalid value'`,
+			false,
+			"could not remove enum value \"invalid value\" as it is being used in a check constraint of \"t1\"",
+		},
+		{
+			`ALTER TYPE e4 DROP VALUE 'unused value'`,
+			true,
+			"",
+		},
+		{
+			`ALTER TYPE e5 DROP VALUE 'default column'`,
+			false,
+			"could not remove enum value \"default column\" as it is being used in a default expresion of \"t3\"",
+		},
+		{
+			`ALTER TYPE e5 DROP VALUE 'update expr'`,
+			false,
+			" could not remove enum value \"update expr\" as it is being used in an ON UPDATE expression of \"t4\"",
+		},
+		{
+			`DROP TABLE t1; ALTER TYPE e4 DROP VALUE 'enum'; ALTER TYPE e4 DROP VALUE 'type'`,
+			true,
+			"",
+		},
+		{
+			`DROP TABLE t2; ALTER TYPE e4 DROP VALUE 'usage'; ALTER TYPE e4 DROP VALUE 'tables'`,
+			true,
+			"",
+		},
+		{
+			`DROP TABLE t3; ALTER TYPE e5 DROP VALUE 'default column'`,
+			true,
+			"",
+		},
+		{
+			`DROP TABLE t4; ALTER TYPE e5 DROP VALUE 'update expr'`,
+			true,
+			"",
+		},
+	}
+
+	for i, tc := range testCases {
+		_, err := sqlDB.Exec(tc.query)
+		if tc.success {
+			require.NoErrorf(t, err, "#%d: unexpected error while executing query: %v", i, err)
+		} else {
+			require.Errorf(t, err, "#%d: expected error %s, but got no error", i, tc.err)
+			if !strings.Contains(err.Error(), tc.err) {
+				t.Fatalf("#%d: expected error %s, got error %s", i, tc.err, err)
+			}
+		}
 	}
 }

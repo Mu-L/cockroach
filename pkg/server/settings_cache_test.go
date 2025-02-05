@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,8 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -47,7 +46,7 @@ func TestCachedSettingsStoreAndLoad(t *testing.T) {
 	ctx := context.Background()
 	engine, err := storage.Open(ctx, storage.InMemory(),
 		cluster.MakeClusterSettings(),
-		storage.MaxSize(512<<20 /* 512 MiB */),
+		storage.MaxSizeBytes(512<<20 /* 512 MiB */),
 		storage.ForTesting)
 	require.NoError(t, err)
 	defer engine.Close()
@@ -64,7 +63,7 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stickyVFSRegistry := NewStickyVFSRegistry()
+	stickyVFSRegistry := fs.NewStickyRegistry()
 
 	serverArgs := base.TestServerArgs{
 		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
@@ -77,11 +76,12 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 			},
 		},
 	}
-	var settingsCache []roachpb.KeyValue
+	var expectedSettingsCache []roachpb.KeyValue
 	ts := serverutils.StartServerOnly(t, serverArgs)
 	closedts.TargetDuration.Override(ctx, &ts.ClusterSettings().SV, 10*time.Millisecond)
 	closedts.SideTransportCloseInterval.Override(ctx, &ts.ClusterSettings().SV, 10*time.Millisecond)
 	kvserver.RangeFeedRefreshInterval.Override(ctx, &ts.ClusterSettings().SV, 10*time.Millisecond)
+	const expectedSettingsCount = 3
 	testutils.SucceedsSoon(t, func() error {
 		store, err := ts.GetStores().(*kvserver.Stores).GetStore(1)
 		if err != nil {
@@ -91,10 +91,18 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(settings) == 0 {
-			return errors.New("empty settings loaded from store")
+
+		// Previously, we checked if len(settings) > 0, which led to a race
+		// condition where, in rare cases (under --race), the settings watcher
+		// had not yet received some settings through rangefeed. If we exit this
+		// function and assign expectedSettingsCount with those incomplete
+		// settings, the settings watcher may receive the remaining settings
+		// before we stop the server. See issue #124419 for more details.
+		if len(settings) < expectedSettingsCount {
+			return errors.Newf("unexpected count of settings: expected %d, found %d",
+				expectedSettingsCount, len(settings))
 		}
-		settingsCache = settings
+		expectedSettingsCache = settings
 		return nil
 	})
 	ts.Stopper().Stop(context.Background())
@@ -109,12 +117,13 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 	{
 		getDialOpts := s.RPCContext().GRPCDialOptions
 
-		initConfig := newInitServerConfig(ctx, s.(*testServer).topLevelServer.cfg, getDialOpts)
+		cfg := s.SystemLayer().(*testServer).topLevelServer.cfg
+		initConfig := newInitServerConfig(ctx, cfg, getDialOpts)
 		inspectState, err := inspectEngines(
 			context.Background(),
 			s.Engines(),
-			s.ClusterSettings().Version.BinaryVersion(),
-			s.ClusterSettings().Version.BinaryMinSupportedVersion(),
+			s.ClusterSettings().Version.LatestVersion(),
+			s.ClusterSettings().Version.MinSupportedVersion(),
 		)
 		require.NoError(t, err)
 
@@ -136,11 +145,79 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 		if initialBoot {
 			return errors.New("server should not require initialization")
 		}
-		if !assert.ObjectsAreEqual(state.initialSettingsKVs, settingsCache) {
+		if !assert.ObjectsAreEqual(expectedSettingsCache, state.initialSettingsKVs) {
 			return errors.Newf(`initial state settings KVs does not match expected settings
 Expected: %+v
 Actual:   %+v
-`, settingsCache, state.initialSettingsKVs)
+`, expectedSettingsCache, state.initialSettingsKVs)
+		}
+		return nil
+	})
+}
+
+func TestCachedSettingDeletionIsPersisted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	hasKey := func(kvs []roachpb.KeyValue, key string) bool {
+		for _, kv := range kvs {
+			if strings.Contains(string(kv.Key), key) {
+				return true
+			}
+		}
+		return false
+	}
+
+	ctx := context.Background()
+
+	ts, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
+	defer ts.Stopper().Stop(ctx)
+	db := sqlutils.MakeSQLRunner(sqlDB)
+
+	// Make the test faster.
+	st := ts.ClusterSettings()
+	factor := 1
+	if util.RaceEnabled {
+		// Under race, all the goroutines are generally slower. If we
+		// accelerate the rangefeeds and the closed ts framework too much,
+		// it can start overwhelming the scheduler and starve everything
+		// of CPU time. So give everything some breathing time in that
+		// case.
+		//
+		// TODO(knz): Replace this by the change in #111753.
+		factor = 4
+	}
+	closedts.TargetDuration.Override(ctx, &st.SV, 10*time.Millisecond*time.Duration(factor))
+	closedts.SideTransportCloseInterval.Override(ctx, &st.SV, 10*time.Millisecond*time.Duration(factor))
+	kvserver.RangeFeedRefreshInterval.Override(ctx, &st.SV, 10*time.Millisecond*time.Duration(factor))
+
+	// Customize a setting.
+	db.Exec(t, `SET CLUSTER SETTING ui.display_timezone = 'America/New_York'`)
+	// The setting won't propagate to the store until the setting watcher caches
+	// up with the rangefeed, which might take a while.
+	testutils.SucceedsSoon(t, func() error {
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(1)
+		require.NoError(t, err)
+		settings, err := loadCachedSettingsKVs(context.Background(), store.TODOEngine())
+		require.NoError(t, err)
+		if !hasKey(settings, `ui.display_timezone`) {
+			return errors.New("cached setting not found")
+		}
+		return nil
+	})
+
+	// Reset the setting.
+	db.Exec(t, `RESET CLUSTER SETTING ui.display_timezone`)
+	// Check that the setting is eventually deleted from the store.
+	testutils.SucceedsSoon(t, func() error {
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(1)
+		require.NoError(t, err)
+		settings, err := loadCachedSettingsKVs(context.Background(), store.TODOEngine())
+		require.NoError(t, err)
+		if hasKey(settings, `ui.display_timezone`) {
+			return errors.New("cached setting was still found")
 		}
 		return nil
 	})

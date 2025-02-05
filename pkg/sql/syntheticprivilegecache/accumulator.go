@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package syntheticprivilegecache
 
@@ -29,7 +24,9 @@ type accumulator struct {
 // newAccumulator initializes a Accumulator.
 func newAccumulator(objectType privilege.ObjectType, path string) *accumulator {
 	return &accumulator{
-		desc:       &catpb.PrivilegeDescriptor{},
+		desc: &catpb.PrivilegeDescriptor{
+			OwnerProto: username.NodeUserName().EncodeProto(),
+		},
 		objectType: objectType,
 		path:       path,
 	}
@@ -50,11 +47,11 @@ func (s *accumulator) addRow(path, user tree.DString, privArr, grantOptionArr *t
 	for _, elem := range grantOptionArr.Array {
 		grantOptionStrings = append(grantOptionStrings, string(tree.MustBeDString(elem)))
 	}
-	privs, err := privilege.ListFromStrings(privilegeStrings)
+	privs, err := privilege.ListFromStrings(privilegeStrings, privilege.OriginFromSystemTable)
 	if err != nil {
 		return err
 	}
-	grantOptions, err := privilege.ListFromStrings(grantOptionStrings)
+	grantOptions, err := privilege.ListFromStrings(grantOptionStrings, privilege.OriginFromSystemTable)
 	if err != nil {
 		return err
 	}

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /*
 	Package storage_test provides a means of testing store
@@ -103,6 +98,16 @@ func incrementArgs(key roachpb.Key, inc int64) *kvpb.IncrementRequest {
 	}
 }
 
+// delRangeArgs returns a DeleteRangeRequest for the specified span.
+func delRangeArgs(
+	key roachpb.Key, endKey roachpb.Key, useRangeTombstone bool,
+) *kvpb.DeleteRangeRequest {
+	return &kvpb.DeleteRangeRequest{
+		RequestHeader:     kvpb.RequestHeader{Key: key, EndKey: endKey},
+		UseRangeTombstone: useRangeTombstone,
+	}
+}
+
 func truncateLogArgs(index kvpb.RaftIndex, rangeID roachpb.RangeID) *kvpb.TruncateLogRequest {
 	return &kvpb.TruncateLogRequest{
 		Index:   index,
@@ -188,12 +193,15 @@ func assertRecomputedStats(
 ) {
 	t.Helper()
 
-	ms, err := rditer.ComputeStatsForRange(desc, r, nowNanos)
+	ms, err := rditer.ComputeStatsForRange(context.Background(), desc, r, nowNanos)
 	require.NoError(t, err)
 
 	// When used with a real wall clock these will not be the same, since it
 	// takes time to load stats.
 	expMS.AgeTo(ms.LastUpdateNanos)
+	// Recomputing stats always has ContainsEstimates = 0, while on-disk stats may
+	// have a non-zero value. ContainsEstimates should be asserted separately.
+	ms.ContainsEstimates = expMS.ContainsEstimates
 	require.Equal(t, expMS, ms, "%s: recomputed stats diverge", name)
 }
 

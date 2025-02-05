@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { defaultTimeScaleOptions, TimeScale } from "@cockroachlabs/cluster-ui";
-import * as timeScale from "./timeScale";
 import moment from "moment-timezone";
+
+import * as timeScale from "./timeScale";
 
 describe("time scale reducer", function () {
   describe("actions", function () {
@@ -49,8 +45,8 @@ describe("time scale reducer", function () {
         timeScale.timeScaleReducer(undefined, { type: "unknown" }),
       ).toEqual(new timeScale.TimeScaleState());
       expect(new timeScale.TimeScaleState().scale).toEqual({
-        ...defaultTimeScaleOptions["Past 10 Minutes"],
-        key: "Past 10 Minutes",
+        ...defaultTimeScaleOptions["Past Hour"],
+        key: "Past Hour",
         fixedWindowEnd: false,
       });
     });

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -124,6 +119,11 @@ SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';
 			}
 			tx, err := db.BeginTx(ctx, nil)
 			if err != nil {
+				return err
+			}
+			_, err = tx.Exec("SET LOCAL autocommit_before_ddl = false")
+			if err != nil {
+				_ = tx.Rollback()
 				return err
 			}
 			for _, stmt := range testC.stmts {
@@ -346,19 +346,6 @@ SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';
 			},
 			validations: commonValidations,
 		},
-		{
-			name: "alter column type",
-			setupStmts: []string{
-				commonCreateTable,
-				commonPopulateData,
-				`SET enable_experimental_alter_column_type_general = true`,
-			},
-			truncateStmt: "TRUNCATE TABLE t",
-			stmts: []string{
-				`ALTER TABLE t ALTER COLUMN j TYPE STRING`,
-			},
-			expErrRE: `pq: unimplemented: cannot perform TRUNCATE on "t" which has an ongoing column type change`,
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) { run(t, tc) })
@@ -398,10 +385,7 @@ func TestTruncatePreservesSplitPoints(t *testing.T) {
 			defer tc.Stopper().Stop(ctx)
 			s := tc.ApplicationLayer(0)
 			tenantSettings := s.ClusterSettings()
-			conn := s.SQLConn(t, "defaultdb")
-			// Ensure that if we're running with the test tenant, it can split
-			// the table below.
-			sql.SecondaryTenantSplitAtEnabled.Override(ctx, &tenantSettings.SV, true)
+			conn := s.SQLConn(t, serverutils.DBName("defaultdb"))
 
 			{
 				// This test asserts on KV-internal effects (i.e. range splits
@@ -409,9 +393,8 @@ func TestTruncatePreservesSplitPoints(t *testing.T) {
 				// installed splits. To ensure it works with the span configs
 				// infrastructure quickly enough, we set a low closed timestamp
 				// target duration.
-				sysDB := sqlutils.MakeSQLRunner(tc.SystemLayer(0).SQLConn(t, ""))
+				sysDB := sqlutils.MakeSQLRunner(tc.SystemLayer(0).SQLConn(t))
 				sysDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
-				sysDB.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
 			}
 
 			var err error

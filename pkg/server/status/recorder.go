@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package status
 
@@ -56,6 +51,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
 	prometheusgo "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 )
 
 const (
@@ -88,7 +84,7 @@ type storeMetrics interface {
 
 // ChildMetricsEnabled enables exporting of additional prometheus time series with extra labels
 var ChildMetricsEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable, "server.child_metrics.enabled",
+	settings.ApplicationLevel, "server.child_metrics.enabled",
 	"enables the exporting of child metrics, additional prometheus time series with extra labels",
 	false,
 	settings.WithPublic)
@@ -131,9 +127,17 @@ type MetricsRecorder struct {
 	mu struct {
 		syncutil.RWMutex
 		sync.Once
-		// nodeRegistry contains, as subregistries, the multiple component-specific
-		// registries which are recorded as "node level" metrics.
+		// nodeRegistry holds metrics that are specific to the storage and KV layer.
+		// Do not use this for metrics that could possibly be reported by secondary
+		// tenants, i.e. those also registered in server/tenant.go per tenant server.
 		nodeRegistry *metric.Registry
+		// appRegistry holds application-level metrics. These are the metrics
+		// that are also registered in tenant.go anew for each tenant.
+		appRegistry *metric.Registry
+		// sysRegistry holds process-level metrics. These are metrics
+		// that are collected once per process and are not specific to
+		// any particular tenant.
+		sysRegistry *metric.Registry
 		// logRegistry contains the global metrics registry used by the logging
 		// package. NB: The underlying metrics are global, but each server gets
 		// its own separate registry to avoid things such as colliding labels.
@@ -194,11 +198,13 @@ func (mr *MetricsRecorder) AddTenantRegistry(tenantID roachpb.TenantID, rec *met
 
 	if !disableNodeAndTenantLabels {
 		// If there are no in-process tenants running, we don't set the
-		// tenant label on the system tenant metrics until a seconary
+		// tenant label on the system tenant metrics until a secondary
 		// tenant is initialized.
 		mr.mu.Do(func() {
 			mr.mu.nodeRegistry.AddLabel("tenant", catconstants.SystemTenantName)
+			mr.mu.appRegistry.AddLabel("tenant", catconstants.SystemTenantName)
 			mr.mu.logRegistry.AddLabel("tenant", catconstants.SystemTenantName)
+			mr.mu.sysRegistry.AddLabel("tenant", catconstants.SystemTenantName)
 		})
 	}
 	mr.mu.tenantRegistries[tenantID] = rec
@@ -212,10 +218,23 @@ func (mr *MetricsRecorder) RemoveTenantRegistry(tenantID roachpb.TenantID) {
 	delete(mr.mu.tenantRegistries, tenantID)
 }
 
-// AddNode adds the Registry from an initialized node, along with its descriptor
-// and start time. It also adds the logging registry.
+// AppRegistry returns the metric registry for application-level metrics.
+func (mr *MetricsRecorder) AppRegistry() *metric.Registry {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	return mr.mu.appRegistry
+}
+
+// AddNode adds various metric registries an initialized server, along
+// with its descriptor and start time.
+// The registries are:
+//
+// - node registry - storage/KV metrics relating to a KV node.
+// - app registry - application-level metrics relating to a SQL/HTTP service.
+// - log registry - metrics from the logging system.
+// - sys registry - metrics about system-wide properties.
 func (mr *MetricsRecorder) AddNode(
-	nodeReg, logReg *metric.Registry,
+	nodeReg, appReg, logReg, sysReg *metric.Registry,
 	desc roachpb.NodeDescriptor,
 	startedAt int64,
 	advertiseAddr, httpAddr, sqlAddr string,
@@ -223,7 +242,9 @@ func (mr *MetricsRecorder) AddNode(
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
 	mr.mu.nodeRegistry = nodeReg
+	mr.mu.appRegistry = appReg
 	mr.mu.logRegistry = logReg
+	mr.mu.sysRegistry = sysReg
 	mr.mu.desc = desc
 	mr.mu.startedAt = startedAt
 
@@ -246,6 +267,8 @@ func (mr *MetricsRecorder) AddNode(
 		nodeIDInt := int(desc.NodeID)
 		if nodeIDInt != 0 {
 			nodeReg.AddLabel("node_id", strconv.Itoa(int(desc.NodeID)))
+			sysReg.AddLabel("node_id", strconv.Itoa(int(desc.NodeID)))
+			appReg.AddLabel("node_id", strconv.Itoa(int(desc.NodeID)))
 			logReg.AddLabel("node_id", strconv.Itoa(int(desc.NodeID)))
 			for _, s := range mr.mu.storeRegistries {
 				s.AddLabel("node_id", strconv.Itoa(int(desc.NodeID)))
@@ -253,6 +276,8 @@ func (mr *MetricsRecorder) AddNode(
 		}
 		if mr.tenantNameContainer != nil && mr.tenantNameContainer.String() != catconstants.SystemTenantName {
 			nodeReg.AddLabel("tenant", mr.tenantNameContainer)
+			sysReg.AddLabel("tenant", mr.tenantNameContainer)
+			appReg.AddLabel("tenant", mr.tenantNameContainer)
 			logReg.AddLabel("tenant", mr.tenantNameContainer)
 		}
 	}
@@ -312,7 +337,9 @@ func (mr *MetricsRecorder) ScrapeIntoPrometheus(pm *metric.PrometheusExporter) {
 	}
 	includeChildMetrics := ChildMetricsEnabled.Get(&mr.settings.SV)
 	pm.ScrapeRegistry(mr.mu.nodeRegistry, includeChildMetrics)
+	pm.ScrapeRegistry(mr.mu.appRegistry, includeChildMetrics)
 	pm.ScrapeRegistry(mr.mu.logRegistry, includeChildMetrics)
+	pm.ScrapeRegistry(mr.mu.sysRegistry, includeChildMetrics)
 	for _, reg := range mr.mu.storeRegistries {
 		pm.ScrapeRegistry(reg, includeChildMetrics)
 	}
@@ -324,9 +351,9 @@ func (mr *MetricsRecorder) ScrapeIntoPrometheus(pm *metric.PrometheusExporter) {
 // PrintAsText writes the current metrics values as plain-text to the writer.
 // We write metrics to a temporary buffer which is then copied to the writer.
 // This is to avoid hanging requests from holding the lock.
-func (mr *MetricsRecorder) PrintAsText(w io.Writer) error {
+func (mr *MetricsRecorder) PrintAsText(w io.Writer, contentType expfmt.Format) error {
 	var buf bytes.Buffer
-	if err := mr.prometheusExporter.ScrapeAndPrintAsText(&buf, mr.ScrapeIntoPrometheus); err != nil {
+	if err := mr.prometheusExporter.ScrapeAndPrintAsText(&buf, contentType, mr.ScrapeIntoPrometheus); err != nil {
 		return err
 	}
 	_, err := buf.WriteTo(w)
@@ -363,7 +390,7 @@ func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 	lastDataCount := atomic.LoadInt64(&mr.lastDataCount)
 	data := make([]tspb.TimeSeriesData, 0, lastDataCount)
 
-	// Record time series from node-level registries for system tenant.
+	// Record time series from node-level registries.
 	now := mr.clock.Now()
 	recorder := registryRecorder{
 		registry:       mr.mu.nodeRegistry,
@@ -372,11 +399,17 @@ func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 		timestampNanos: now.UnixNano(),
 	}
 	recorder.record(&data)
+	// Now record the app metrics for the system tenant.
+	recorder.registry = mr.mu.appRegistry
+	recorder.record(&data)
 	// Now record the log metrics.
 	recorder.registry = mr.mu.logRegistry
 	recorder.record(&data)
+	// Now record the system metrics.
+	recorder.registry = mr.mu.sysRegistry
+	recorder.record(&data)
 
-	// Record time series from node-level registries for secondary tenants.
+	// Record time series from app-level registries for secondary tenants.
 	for tenantID, r := range mr.mu.tenantRegistries {
 		tenantRecorder := registryRecorder{
 			registry:       r,
@@ -419,7 +452,15 @@ func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 
 // GetMetricsMetadata returns the metadata from all metrics tracked in the node's
 // nodeRegistry and a randomly selected storeRegistry.
-func (mr *MetricsRecorder) GetMetricsMetadata() map[string]metric.Metadata {
+//
+// If the argument is true, both node-level and app-level metrics are
+// combined in the first return value.
+//
+// The third return value combines all process-wide metrics (log and
+// system metrics).
+func (mr *MetricsRecorder) GetMetricsMetadata(
+	combined bool,
+) (nodeMetrics, appMetrics, srvMetrics map[string]metric.Metadata) {
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
 
@@ -428,30 +469,66 @@ func (mr *MetricsRecorder) GetMetricsMetadata() map[string]metric.Metadata {
 		if log.V(1) {
 			log.Warning(context.TODO(), "MetricsRecorder.GetMetricsMetadata() called before NodeID allocation")
 		}
-		return nil
+		return nil, nil, nil
 	}
 
-	metrics := make(map[string]metric.Metadata)
-
-	mr.mu.nodeRegistry.WriteMetricsMetadata(metrics)
-	mr.mu.logRegistry.WriteMetricsMetadata(metrics)
-
-	// Get a random storeID.
-	var sID roachpb.StoreID
-
-	storeFound := false
-	for storeID := range mr.mu.storeRegistries {
-		sID = storeID
-		storeFound = true
-		break
+	nodeMetrics = make(map[string]metric.Metadata)
+	if combined {
+		appMetrics = nodeMetrics
+		srvMetrics = nodeMetrics
+	} else {
+		appMetrics = make(map[string]metric.Metadata)
+		srvMetrics = make(map[string]metric.Metadata)
 	}
 
-	// Get metric metadata from that store because all stores have the same metadata.
-	if storeFound {
-		mr.mu.storeRegistries[sID].WriteMetricsMetadata(metrics)
+	mr.mu.nodeRegistry.WriteMetricsMetadata(nodeMetrics)
+	mr.mu.appRegistry.WriteMetricsMetadata(appMetrics)
+	mr.mu.logRegistry.WriteMetricsMetadata(srvMetrics)
+	mr.mu.sysRegistry.WriteMetricsMetadata(srvMetrics)
+
+	mr.writeStoreMetricsMetadata(nodeMetrics)
+	return nodeMetrics, appMetrics, srvMetrics
+}
+
+// GetRecordedMetricNames takes a map of metric metadata and returns a map
+// of the metadata name to the name the metric is recorded with in tsdb.
+func (mr *MetricsRecorder) GetRecordedMetricNames(
+	allMetadata map[string]metric.Metadata,
+) map[string]string {
+	storeMetricsMap := make(map[string]metric.Metadata)
+	tsDbMetricNames := make(map[string]string, len(allMetadata))
+	mr.writeStoreMetricsMetadata(storeMetricsMap)
+	for metricName, metadata := range allMetadata {
+		prefix := nodeTimeSeriesPrefix
+		if _, ok := storeMetricsMap[metricName]; ok {
+			prefix = storeTimeSeriesPrefix
+		}
+		if metadata.MetricType == prometheusgo.MetricType_HISTOGRAM {
+			for _, metricComputer := range metric.HistogramMetricComputers {
+				computedMetricName := metricName + metricComputer.Suffix
+				tsDbMetricNames[computedMetricName] = fmt.Sprintf(prefix, computedMetricName)
+			}
+		} else {
+			tsDbMetricNames[metricName] = fmt.Sprintf(prefix, metricName)
+		}
+
+	}
+	return tsDbMetricNames
+}
+
+// writeStoreMetricsMetadata Gets a store from mr.mu.storeRegistries and writes
+// the metrics metadata to the provided map.
+func (mr *MetricsRecorder) writeStoreMetricsMetadata(metricsMetadata map[string]metric.Metadata) {
+	if len(mr.mu.storeRegistries) == 0 {
+		return
 	}
 
-	return metrics
+	// All store registries should have the same metadata, so only the metadata
+	// from the first store is used to write to metricsMetadata.
+	for _, registry := range mr.mu.storeRegistries {
+		registry.WriteMetricsMetadata(metricsMetadata)
+		return
+	}
 }
 
 // getNetworkActivity produces a map of network activity from this node to all
@@ -524,7 +601,13 @@ func (mr *MetricsRecorder) GenerateNodeStatus(ctx context.Context) *statuspb.Nod
 	eachRecordableValue(mr.mu.nodeRegistry, func(name string, val float64) {
 		nodeStat.Metrics[name] = val
 	})
+	eachRecordableValue(mr.mu.appRegistry, func(name string, val float64) {
+		nodeStat.Metrics[name] = val
+	})
 	eachRecordableValue(mr.mu.logRegistry, func(name string, val float64) {
+		nodeStat.Metrics[name] = val
+	})
+	eachRecordableValue(mr.mu.sysRegistry, func(name string, val float64) {
 		nodeStat.Metrics[name] = val
 	})
 
@@ -624,21 +707,26 @@ type registryRecorder struct {
 	timestampNanos int64
 }
 
+// extractValue extracts the metric value(s) for the given metric and passes it, along with the metric name, to the
+// provided callback function.
 func extractValue(name string, mtr interface{}, fn func(string, float64)) error {
 	switch mtr := mtr.(type) {
 	case metric.WindowedHistogram:
-		// Use cumulative stats here
-		count, sum := mtr.Total()
-		fn(name+"-count", float64(count))
-		fn(name+"-sum", sum)
-		// Use windowed stats for avg and quantiles
-		avg := mtr.MeanWindowed()
-		if math.IsNaN(avg) || math.IsInf(avg, +1) || math.IsInf(avg, -1) {
-			avg = 0
+		// Use cumulative stats here. Count and Sum must be calculated against the cumulative histogram.
+		cumulative, ok := mtr.(metric.CumulativeHistogram)
+		if !ok {
+			return errors.Newf(`extractValue called on histogram metric %q that does not implement the
+				CumulativeHistogram interface. All histogram metrics are expected to implement this interface`, name)
 		}
-		fn(name+"-avg", avg)
-		for _, pt := range metric.RecordHistogramQuantiles {
-			fn(name+pt.Suffix, mtr.ValueAtQuantileWindowed(pt.Quantile))
+		cumulativeSnapshot := cumulative.CumulativeSnapshot()
+		// Use windowed stats for avg and quantiles
+		windowedSnapshot := mtr.WindowedSnapshot()
+		for _, c := range metric.HistogramMetricComputers {
+			if c.IsSummaryMetric {
+				fn(name+c.Suffix, c.ComputedMetric(windowedSnapshot))
+			} else {
+				fn(name+c.Suffix, c.ComputedMetric(cumulativeSnapshot))
+			}
 		}
 	case metric.PrometheusExportable:
 		// NB: this branch is intentionally at the bottom since all metrics implement it.
@@ -648,6 +736,10 @@ func extractValue(name string, mtr interface{}, fn func(string, float64)) error 
 		} else if m.Counter != nil {
 			fn(name, *m.Counter.Value)
 		}
+	case metric.PrometheusVector:
+		// NOOP - We don't record metric.PrometheusVector into TSDB. These metrics
+		// are only exported as prometheus metrics via metric.PrometheusExporter.
+		return nil
 
 	default:
 		return errors.Errorf("cannot extract value for type %T", mtr)

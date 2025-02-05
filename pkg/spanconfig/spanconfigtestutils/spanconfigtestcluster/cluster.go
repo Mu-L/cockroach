@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfigtestcluster
 
@@ -21,10 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqltranslator"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,6 +29,7 @@ type Handle struct {
 	tc      *testcluster.TestCluster
 	ts      map[roachpb.TenantID]*Tenant
 	scKnobs *spanconfig.TestingKnobs
+	sysDB   *sqlutils.SQLRunner
 }
 
 // NewHandle returns a new Handle.
@@ -47,6 +41,7 @@ func NewHandle(
 		tc:      tc,
 		ts:      make(map[roachpb.TenantID]*Tenant),
 		scKnobs: scKnobs,
+		sysDB:   sqlutils.MakeSQLRunner(tc.Server(0).SystemLayer().SQLConn(t)),
 	}
 }
 
@@ -56,15 +51,15 @@ func (h *Handle) InitializeTenant(ctx context.Context, tenID roachpb.TenantID) *
 	testServer := h.tc.Server(0)
 	tenantState := &Tenant{t: h.t}
 	if tenID == roachpb.SystemTenantID {
-		tenantState.ApplicationLayerInterface = testServer
-		tenantState.db = sqlutils.MakeSQLRunner(h.tc.ServerConn(0))
+		tenantState.ApplicationLayerInterface = testServer.SystemLayer()
+		tenantState.db = h.sysDB
 		tenantState.cleanup = func() {} // noop
 	} else {
-		serverGCJobKnobs := testServer.TestingKnobs().GCJob
-		tenantGCJobKnobs := sql.GCJobTestingKnobs{SkipWaitingForMVCCGC: true}
+		serverGCJobKnobs := testServer.SystemLayer().TestingKnobs().GCJob
+		// Copy the GC job knobs from the server to the tenant.
+		tenantGCJobKnobs := sql.GCJobTestingKnobs{}
 		if serverGCJobKnobs != nil {
 			tenantGCJobKnobs = *serverGCJobKnobs.(*sql.GCJobTestingKnobs)
-			tenantGCJobKnobs.SkipWaitingForMVCCGC = true
 		}
 		tenantArgs := base.TestTenantArgs{
 			TenantID: tenID,
@@ -74,10 +69,11 @@ func (h *Handle) InitializeTenant(ctx context.Context, tenID roachpb.TenantID) *
 			},
 		}
 		var err error
-		tenantState.ApplicationLayerInterface, err = testServer.StartTenant(ctx, tenantArgs)
+		tenantState.ApplicationLayerInterface, err = testServer.TenantController().StartTenant(ctx, tenantArgs)
 		require.NoError(h.t, err)
 
-		tenantSQLDB := tenantState.SQLConn(h.t, "")
+		tenantSQLDB := tenantState.SQLConn(h.t)
+		tenantSQLDB.SetMaxOpenConns(1)
 
 		tenantState.db = sqlutils.MakeSQLRunner(tenantSQLDB)
 		tenantState.cleanup = func() {}
@@ -109,39 +105,6 @@ func (h *Handle) InitializeTenant(ctx context.Context, tenID roachpb.TenantID) *
 
 	h.ts[tenID] = tenantState
 	return tenantState
-}
-
-// AllowSecondaryTenantToSetZoneConfigurations enables zone configuration
-// support for the given tenant. Given the cluster setting involved is tenant
-// read-only, the SQL statement is run as the system tenant.
-func (h *Handle) AllowSecondaryTenantToSetZoneConfigurations(t *testing.T, tenID roachpb.TenantID) {
-	_, found := h.LookupTenant(tenID)
-	require.True(t, found)
-	sqlDB := sqlutils.MakeSQLRunner(h.tc.ServerConn(0))
-	sqlDB.Exec(
-		t,
-		"ALTER TENANT [$1] SET CLUSTER SETTING sql.virtual_cluster.feature_access.zone_configs.enabled = true",
-		tenID.ToUint64(),
-	)
-}
-
-// EnsureTenantCanSetZoneConfigurationsOrFatal ensures that the tenant observes
-// a 'true' value for sql.zone_configs.allow_for_secondary_tenants.enabled. It
-// fatals if this condition doesn't evaluate within SucceedsSoonDuration.
-func (h *Handle) EnsureTenantCanSetZoneConfigurationsOrFatal(t *testing.T, tenant *Tenant) {
-	testutils.SucceedsSoon(t, func() error {
-		var val string
-		tenant.QueryRow(
-			"SHOW CLUSTER SETTING sql.virtual_cluster.feature_access.zone_configs.enabled",
-		).Scan(&val)
-
-		if val == "false" {
-			return errors.New(
-				"waiting for sql.virtual_cluster.feature_access.zone_configs.enabled to be updated",
-			)
-		}
-		return nil
-	})
 }
 
 // LookupTenant returns the relevant tenant state, if any.

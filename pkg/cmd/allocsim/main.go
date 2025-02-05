@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -538,13 +533,15 @@ func main() {
 		os.Exit(exitStatus)
 	}()
 
+	for i := 0; i < c.Cfg.NumNodes; i++ {
+		cfg := c.Cfg.PerNodeCfg[i]
+		cfg.ExtraEnv = append(cfg.ExtraEnv, "COCKROACH_DISABLE_RAFT_LOG_SYNCHRONIZATION_UNSAFE=true")
+		c.Cfg.PerNodeCfg[i] = cfg
+	}
+
 	c.Start(context.Background())
 	defer c.Close()
 	c.UpdateZoneConfig(1, 1<<20)
-	_, err := c.Nodes[0].DB().Exec("SET CLUSTER SETTING kv.raft_log.synchronization.disabled = true")
-	if err != nil {
-		log.Fatalf(context.Background(), "%v", err)
-	}
 	if len(config.Localities) != 0 {
 		a.runWithConfig(config)
 	} else {

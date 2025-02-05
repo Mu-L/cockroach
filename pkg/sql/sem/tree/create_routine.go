@@ -1,22 +1,15 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
 import (
-	"context"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -85,7 +78,7 @@ type CreateRoutine struct {
 	Replace     bool
 	Name        RoutineName
 	Params      RoutineParams
-	ReturnType  RoutineReturnType
+	ReturnType  *RoutineReturnType
 	Options     RoutineOptions
 	RoutineBody *RoutineBody
 	// BodyStatements is not assigned during initial parsing of user input. It's
@@ -111,23 +104,30 @@ func (node *CreateRoutine) Format(ctx *FmtCtx) {
 		ctx.WriteString("FUNCTION ")
 	}
 	ctx.FormatNode(&node.Name)
-	ctx.WriteString("(")
+	ctx.WriteByte('(')
 	ctx.FormatNode(node.Params)
 	ctx.WriteString(")\n\t")
-	if !node.IsProcedure {
+	if !node.IsProcedure && node.ReturnType != nil {
 		ctx.WriteString("RETURNS ")
-		if node.ReturnType.IsSet {
+		if node.ReturnType.SetOf {
 			ctx.WriteString("SETOF ")
 		}
 		ctx.FormatTypeReference(node.ReturnType.Type)
 		ctx.WriteString("\n\t")
 	}
+	var isPLpgSQL bool
 	var funcBody RoutineBodyStr
 	for _, option := range node.Options {
 		switch t := option.(type) {
 		case RoutineBodyStr:
 			funcBody = t
 			continue
+		case RoutineLeakproof, RoutineVolatility, RoutineNullInputBehavior:
+			if node.IsProcedure {
+				continue
+			}
+		case RoutineLanguage:
+			isPLpgSQL = t == RoutineLangPLpgSQL
 		}
 		ctx.FormatNode(option)
 		ctx.WriteString("\n\t")
@@ -138,12 +138,15 @@ func (node *CreateRoutine) Format(ctx *FmtCtx) {
 		ctx.WriteString("$$")
 		for i, stmt := range node.BodyStatements {
 			if i > 0 {
-				ctx.WriteString(" ")
+				ctx.WriteByte(' ')
 			}
 			oldAnn := ctx.ann
 			ctx.ann = node.BodyAnnotations[i]
 			ctx.FormatNode(stmt)
-			ctx.WriteString(";")
+			if !isPLpgSQL {
+				// PL/pgSQL statements handle printing semicolons themselves.
+				ctx.WriteByte(';')
+			}
 			ctx.ann = oldAnn
 		}
 		ctx.WriteString("$$")
@@ -151,7 +154,11 @@ func (node *CreateRoutine) Format(ctx *FmtCtx) {
 		ctx.WriteString("BEGIN ATOMIC ")
 		for _, stmt := range node.RoutineBody.Stmts {
 			ctx.FormatNode(stmt)
-			ctx.WriteString("; ")
+			if !isPLpgSQL {
+				// PL/pgSQL statements handle printing semicolons themselves.
+				ctx.WriteByte(';')
+			}
+			ctx.WriteByte(' ')
 		}
 		ctx.WriteString("END")
 	} else {
@@ -191,6 +198,7 @@ func (RoutineVolatility) routineOption()        {}
 func (RoutineLeakproof) routineOption()         {}
 func (RoutineBodyStr) routineOption()           {}
 func (RoutineLanguage) routineOption()          {}
+func (RoutineSecurity) routineOption()          {}
 
 // RoutineNullInputBehavior represent the UDF property on null parameters.
 type RoutineNullInputBehavior int
@@ -298,27 +306,40 @@ func AsRoutineLanguage(lang string) (RoutineLanguage, error) {
 	return RoutineLanguage(lang), nil
 }
 
+// RoutineSecurity indicates the mode of security that the routine will
+// be executed with.
+type RoutineSecurity int
+
+const (
+	// RoutineInvoker indicates that the routine is run with the privileges of
+	// the user invoking it. This is the default security mode if none is
+	// provided.
+	RoutineInvoker RoutineSecurity = iota
+	// RoutineDefiner indicates that the routine is run with the privileges of
+	// the user who defined it.
+	RoutineDefiner
+)
+
+// Format implements the NodeFormatter interface.
+func (node RoutineSecurity) Format(ctx *FmtCtx) {
+	ctx.WriteString("SECURITY ")
+	switch node {
+	case RoutineInvoker:
+		ctx.WriteString("INVOKER")
+	case RoutineDefiner:
+		ctx.WriteString("DEFINER")
+	default:
+		panic(pgerror.New(pgcode.InvalidParameterValue, "unknown routine option"))
+	}
+}
+
 // RoutineBodyStr is a string containing all statements in a UDF body.
 type RoutineBodyStr string
 
 // Format implements the NodeFormatter interface.
 func (node RoutineBodyStr) Format(ctx *FmtCtx) {
 	ctx.WriteString("AS ")
-	if ctx.flags.HasFlags(FmtTagDollarQuotes) {
-		ctx.WriteString("$funcbody$")
-	} else {
-		ctx.WriteString("$$")
-	}
-	if ctx.flags.HasFlags(FmtAnonymize) || ctx.flags.HasFlags(FmtHideConstants) {
-		ctx.WriteString("_")
-	} else {
-		ctx.WriteString(string(node))
-	}
-	if ctx.flags.HasFlags(FmtTagDollarQuotes) {
-		ctx.WriteString("$funcbody$")
-	} else {
-		ctx.WriteString("$$")
-	}
+	ctx.FormatStringDollarQuotes(string(node))
 }
 
 // RoutineParams represents a list of RoutineParam.
@@ -345,18 +366,18 @@ type RoutineParam struct {
 // Format implements the NodeFormatter interface.
 func (node *RoutineParam) Format(ctx *FmtCtx) {
 	switch node.Class {
+	case RoutineParamDefault:
 	case RoutineParamIn:
-		ctx.WriteString("IN")
+		ctx.WriteString("IN ")
 	case RoutineParamOut:
-		ctx.WriteString("OUT")
+		ctx.WriteString("OUT ")
 	case RoutineParamInOut:
-		ctx.WriteString("INOUT")
+		ctx.WriteString("INOUT ")
 	case RoutineParamVariadic:
-		ctx.WriteString("VARIADIC")
+		ctx.WriteString("VARIADIC ")
 	default:
 		panic(pgerror.New(pgcode.InvalidParameterValue, "unknown routine option"))
 	}
-	ctx.WriteString(" ")
 	if node.Name != "" {
 		ctx.FormatNode(&node.Name)
 		ctx.WriteString(" ")
@@ -372,8 +393,11 @@ func (node *RoutineParam) Format(ctx *FmtCtx) {
 type RoutineParamClass int
 
 const (
+	// RoutineParamDefault indicates that RoutineParamClass was unspecified
+	// (in almost all cases it is equivalent to RoutineParamIn).
+	RoutineParamDefault RoutineParamClass = iota
 	// RoutineParamIn args can only be used as input.
-	RoutineParamIn RoutineParamClass = iota
+	RoutineParamIn
 	// RoutineParamOut args can only be used as output.
 	RoutineParamOut
 	// RoutineParamInOut args can be used as both input and output.
@@ -382,37 +406,76 @@ const (
 	RoutineParamVariadic
 )
 
+// IsInParamClass returns true if the given parameter class specifies an input
+// parameter (i.e. either unspecified, IN or, INOUT).
+func IsInParamClass(class RoutineParamClass) bool {
+	switch class {
+	case RoutineParamDefault, RoutineParamIn, RoutineParamInOut:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsOutParamClass returns true if the given parameter class specifies an output
+// parameter (i.e. either OUT or INOUT).
+func IsOutParamClass(class RoutineParamClass) bool {
+	switch class {
+	case RoutineParamOut, RoutineParamInOut:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsInParam returns true if the parameter is an input parameter (i.e. either IN
+// or INOUT).
+func (node *RoutineParam) IsInParam() bool {
+	return IsInParamClass(node.Class)
+}
+
+// IsOutParam returns true if the parameter is an output parameter (i.e. either
+// OUT or INOUT).
+func (node *RoutineParam) IsOutParam() bool {
+	return IsOutParamClass(node.Class)
+}
+
 // RoutineReturnType represent the return type of UDF.
 type RoutineReturnType struct {
 	Type  ResolvableTypeReference
-	IsSet bool
+	SetOf bool
 }
 
-// DropFunction represents a DROP FUNCTION statement.
-type DropFunction struct {
+// DropRoutine represents a DROP FUNCTION or DROP PROCEDURE statement.
+type DropRoutine struct {
 	IfExists     bool
-	Functions    FuncObjs
+	Procedure    bool
+	Routines     RoutineObjs
 	DropBehavior DropBehavior
 }
 
 // Format implements the NodeFormatter interface.
-func (node *DropFunction) Format(ctx *FmtCtx) {
-	ctx.WriteString("DROP FUNCTION ")
+func (node *DropRoutine) Format(ctx *FmtCtx) {
+	if node.Procedure {
+		ctx.WriteString("DROP PROCEDURE ")
+	} else {
+		ctx.WriteString("DROP FUNCTION ")
+	}
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
 	}
-	ctx.FormatNode(node.Functions)
+	ctx.FormatNode(node.Routines)
 	if node.DropBehavior != DropDefault {
 		ctx.WriteString(" ")
 		ctx.WriteString(node.DropBehavior.String())
 	}
 }
 
-// FuncObjs is a slice of FuncObj.
-type FuncObjs []FuncObj
+// RoutineObjs is a slice of RoutineObj.
+type RoutineObjs []RoutineObj
 
 // Format implements the NodeFormatter interface.
-func (node FuncObjs) Format(ctx *FmtCtx) {
+func (node RoutineObjs) Format(ctx *FmtCtx) {
 	for i := range node {
 		if i > 0 {
 			ctx.WriteString(", ")
@@ -421,14 +484,15 @@ func (node FuncObjs) Format(ctx *FmtCtx) {
 	}
 }
 
-// FuncObj represents a function object DROP FUNCTION tries to drop.
-type FuncObj struct {
+// RoutineObj represents a routine (function or procedure) object in DROP,
+// GRANT, and REVOKE statements.
+type RoutineObj struct {
 	FuncName RoutineName
 	Params   RoutineParams
 }
 
 // Format implements the NodeFormatter interface.
-func (node *FuncObj) Format(ctx *FmtCtx) {
+func (node *RoutineObj) Format(ctx *FmtCtx) {
 	ctx.FormatNode(&node.FuncName)
 	if node.Params != nil {
 		ctx.WriteString("(")
@@ -437,28 +501,9 @@ func (node *FuncObj) Format(ctx *FmtCtx) {
 	}
 }
 
-// ParamTypes returns a slice of parameter types of the function.
-func (node FuncObj) ParamTypes(ctx context.Context, res TypeReferenceResolver) ([]*types.T, error) {
-	// TODO(chengxiong): handle INOUT, OUT and VARIADIC argument classes when we
-	// support them. This is because only IN and INOUT arg types need to be
-	// considered to match a overload.
-	var argTypes []*types.T
-	if node.Params != nil {
-		argTypes = make([]*types.T, len(node.Params))
-		for i, arg := range node.Params {
-			typ, err := ResolveType(ctx, arg.Type, res)
-			if err != nil {
-				return nil, err
-			}
-			argTypes[i] = typ
-		}
-	}
-	return argTypes, nil
-}
-
 // AlterFunctionOptions represents a ALTER FUNCTION...action statement.
 type AlterFunctionOptions struct {
-	Function FuncObj
+	Function RoutineObj
 	Options  RoutineOptions
 }
 
@@ -472,43 +517,61 @@ func (node *AlterFunctionOptions) Format(ctx *FmtCtx) {
 	}
 }
 
-// AlterFunctionRename represents a ALTER FUNCTION...RENAME statement.
-type AlterFunctionRename struct {
-	Function FuncObj
-	NewName  Name
+// AlterRoutineRename represents a ALTER FUNCTION...RENAME or
+// ALTER PROCEDURE...RENAME statement.
+type AlterRoutineRename struct {
+	Function  RoutineObj
+	NewName   Name
+	Procedure bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *AlterFunctionRename) Format(ctx *FmtCtx) {
-	ctx.WriteString("ALTER FUNCTION ")
+func (node *AlterRoutineRename) Format(ctx *FmtCtx) {
+	if node.Procedure {
+		ctx.WriteString("ALTER PROCEDURE ")
+	} else {
+		ctx.WriteString("ALTER FUNCTION ")
+	}
 	ctx.FormatNode(&node.Function)
 	ctx.WriteString(" RENAME TO ")
-	ctx.WriteString(string(node.NewName))
+	ctx.FormatNode(&node.NewName)
 }
 
-// AlterFunctionSetSchema represents a ALTER FUNCTION...SET SCHEMA statement.
-type AlterFunctionSetSchema struct {
-	Function      FuncObj
+// AlterRoutineSetSchema represents a ALTER FUNCTION...SET SCHEMA or
+// ALTER PROCEDURE...SET SCHEMA statement.
+type AlterRoutineSetSchema struct {
+	Function      RoutineObj
 	NewSchemaName Name
+	Procedure     bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *AlterFunctionSetSchema) Format(ctx *FmtCtx) {
-	ctx.WriteString("ALTER FUNCTION ")
+func (node *AlterRoutineSetSchema) Format(ctx *FmtCtx) {
+	if node.Procedure {
+		ctx.WriteString("ALTER PROCEDURE ")
+	} else {
+		ctx.WriteString("ALTER FUNCTION ")
+	}
 	ctx.FormatNode(&node.Function)
 	ctx.WriteString(" SET SCHEMA ")
-	ctx.WriteString(string(node.NewSchemaName))
+	ctx.FormatNode(&node.NewSchemaName)
 }
 
-// AlterFunctionSetOwner represents the ALTER FUNCTION...OWNER TO statement.
-type AlterFunctionSetOwner struct {
-	Function FuncObj
-	NewOwner RoleSpec
+// AlterRoutineSetOwner represents the ALTER FUNCTION...OWNER TO or
+// ALTER PROCEDURE...OWNER TO statement.
+type AlterRoutineSetOwner struct {
+	Function  RoutineObj
+	NewOwner  RoleSpec
+	Procedure bool
 }
 
 // Format implements the NodeFormatter interface.
-func (node *AlterFunctionSetOwner) Format(ctx *FmtCtx) {
-	ctx.WriteString("ALTER FUNCTION ")
+func (node *AlterRoutineSetOwner) Format(ctx *FmtCtx) {
+	if node.Procedure {
+		ctx.WriteString("ALTER PROCEDURE ")
+	} else {
+		ctx.WriteString("ALTER FUNCTION ")
+	}
 	ctx.FormatNode(&node.Function)
 	ctx.WriteString(" OWNER TO ")
 	ctx.FormatNode(&node.NewOwner)
@@ -516,7 +579,7 @@ func (node *AlterFunctionSetOwner) Format(ctx *FmtCtx) {
 
 // AlterFunctionDepExtension represents the ALTER FUNCTION...DEPENDS ON statement.
 type AlterFunctionDepExtension struct {
-	Function  FuncObj
+	Function  RoutineObj
 	Remove    bool
 	Extension Name
 }
@@ -574,6 +637,8 @@ const (
 	TTLExpirationExpr               SchemaExprContext = "TTL EXPIRATION EXPRESSION"
 	TTLDefaultExpr                  SchemaExprContext = "TTL DEFAULT"
 	TTLUpdateExpr                   SchemaExprContext = "TTL UPDATE"
+	PolicyUsingExpr                 SchemaExprContext = "POLICY USING"
+	PolicyWithCheckExpr             SchemaExprContext = "POLICY WITH CHECK"
 )
 
 func ComputedColumnExprContext(isVirtual bool) SchemaExprContext {
@@ -585,8 +650,8 @@ func ComputedColumnExprContext(isVirtual bool) SchemaExprContext {
 
 // ValidateRoutineOptions checks whether there are conflicting or redundant
 // routine options in the given slice.
-func ValidateRoutineOptions(options RoutineOptions) error {
-	var hasLang, hasBody, hasLeakProof, hasVolatility, hasNullInputBehavior bool
+func ValidateRoutineOptions(options RoutineOptions, isProc bool) error {
+	var hasLang, hasBody, hasLeakProof, hasVolatility, hasNullInputBehavior, hasSecurity bool
 	conflictingErr := func(opt RoutineOption) error {
 		return errors.Wrapf(ErrConflictingRoutineOption, "%s", AsString(opt))
 	}
@@ -603,20 +668,34 @@ func ValidateRoutineOptions(options RoutineOptions) error {
 			}
 			hasBody = true
 		case RoutineLeakproof:
+			if isProc {
+				return pgerror.Newf(pgcode.InvalidFunctionDefinition, "leakproof attribute not allowed in procedure definition")
+			}
 			if hasLeakProof {
 				return conflictingErr(option)
 			}
 			hasLeakProof = true
 		case RoutineVolatility:
+			if isProc {
+				return pgerror.Newf(pgcode.InvalidFunctionDefinition, "volatility attribute not allowed in procedure definition")
+			}
 			if hasVolatility {
 				return conflictingErr(option)
 			}
 			hasVolatility = true
 		case RoutineNullInputBehavior:
+			if isProc {
+				return pgerror.Newf(pgcode.InvalidFunctionDefinition, "null input attribute not allowed in procedure definition")
+			}
 			if hasNullInputBehavior {
 				return conflictingErr(option)
 			}
 			hasNullInputBehavior = true
+		case RoutineSecurity:
+			if hasSecurity {
+				return conflictingErr(option)
+			}
+			hasSecurity = true
 		default:
 			return pgerror.Newf(pgcode.InvalidParameterValue, "unknown function option: ", AsString(option))
 		}

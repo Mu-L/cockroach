@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package requestbatcher
 
@@ -25,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -79,6 +75,9 @@ func (g *senderGroup) Wait() error {
 }
 
 func TestBatcherSendOnSizeWithReset(t *testing.T) {
+	// Note: the timing-dependency and possible flakiness can be addressed by
+	// using a manual time(r) source, see TestBatcherSend for an example.
+
 	// This test ensures that when a single batch ends up sending due to size
 	// constrains its timer is successfully canceled and does not lead to a
 	// nil panic due to an attempt to send a batch due to the old timer.
@@ -138,17 +137,35 @@ func TestBatchesAtTheSameTime(t *testing.T) {
 	sc := make(chanSender)
 	start := timeutil.Now()
 	then := start.Add(10 * time.Millisecond)
+	mt := timeutil.NewManualTime(then)
 	b := New(Config{
-		MaxIdle: 20 * time.Millisecond,
-		Sender:  sc,
-		Stopper: stopper,
-		NowFunc: func() time.Time { return then },
+		MaxIdle:    20 * time.Millisecond,
+		Sender:     sc,
+		Stopper:    stopper,
+		manualTime: mt,
 	})
 	const N = 20
 	sendChan := make(chan Response, N)
 	for i := 0; i < N; i++ {
-		assert.Nil(t, b.SendWithChan(context.Background(), sendChan, roachpb.RangeID(i), &kvpb.GetRequest{}))
+		assert.Nil(t, b.SendWithChan(
+			context.Background(), sendChan, roachpb.RangeID(i), &kvpb.GetRequest{}, kvpb.AdmissionHeader{}))
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func(ctx context.Context) {
+		// At this point, all the requests should've made it into the
+		// batcher and have been timestamped. We want to be a real clock
+		// so that the timers fire on their own accord.
+		for {
+			select {
+			case <-time.After(5 * time.Millisecond):
+				mt.Advance(5 * time.Millisecond)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}(ctx)
 	for i := 0; i < N; i++ {
 		bs := <-sc
 		bs.respChan <- batchResp{}
@@ -159,25 +176,34 @@ func TestBackpressure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
+
+	// Note: the timing-dependency and possible flakiness can be addressed by
+	// using a manual time(r) source, see TestBatcherSend for an example.
+
 	sc := make(chanSender)
+	backpressureLimit := 3
 	b := New(Config{
 		MaxIdle:                   50 * time.Millisecond,
 		MaxWait:                   50 * time.Millisecond,
 		MaxMsgsPerBatch:           1,
 		Sender:                    sc,
 		Stopper:                   stopper,
-		InFlightBackpressureLimit: 3,
+		InFlightBackpressureLimit: func() int { return backpressureLimit },
 	})
 
 	// These 3 should all send without blocking but should put the batcher into
 	// back pressure.
 	sendChan := make(chan Response, 6)
-	assert.Nil(t, b.SendWithChan(context.Background(), sendChan, 1, &kvpb.GetRequest{}))
-	assert.Nil(t, b.SendWithChan(context.Background(), sendChan, 2, &kvpb.GetRequest{}))
-	assert.Nil(t, b.SendWithChan(context.Background(), sendChan, 3, &kvpb.GetRequest{}))
+	assert.Nil(t, b.SendWithChan(
+		context.Background(), sendChan, 1, &kvpb.GetRequest{}, kvpb.AdmissionHeader{}))
+	assert.Nil(t, b.SendWithChan(
+		context.Background(), sendChan, 2, &kvpb.GetRequest{}, kvpb.AdmissionHeader{}))
+	assert.Nil(t, b.SendWithChan(
+		context.Background(), sendChan, 3, &kvpb.GetRequest{}, kvpb.AdmissionHeader{}))
 	var sent int64
 	send := func() {
-		assert.Nil(t, b.SendWithChan(context.Background(), sendChan, 4, &kvpb.GetRequest{}))
+		assert.Nil(t, b.SendWithChan(
+			context.Background(), sendChan, 4, &kvpb.GetRequest{}, kvpb.AdmissionHeader{}))
 		atomic.AddInt64(&sent, 1)
 	}
 	go send()
@@ -190,10 +216,12 @@ func TestBackpressure(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		bs := <-sc
 		go reply(bs)
-		// We don't expect either of the calls to send to have finished yet.
+		// We don't expect any of the calls to send to have finished yet.
 		assert.Equal(t, int64(0), atomic.LoadInt64(&sent))
 	}
-	// Allow one reply to fly which should not unblock the requests.
+	// Allow one reply to fly which should not unblock the requests since the
+	// threshold to stop backpressuring is < 2, and there are still 2 in-flight
+	// requests.
 	canReply <- struct{}{}
 	runtime.Gosched() // tickle the runtime in case there might be a timing bug
 	assert.Equal(t, int64(0), atomic.LoadInt64(&sent))
@@ -209,9 +237,42 @@ func TestBackpressure(t *testing.T) {
 		}
 		return nil
 	})
+	go reply(<-sc)
+	go reply(<-sc)
+	// Now we have 3 outstanding reply() calls that we need to unblock.
+	canReply <- struct{}{}
+	canReply <- struct{}{}
+	canReply <- struct{}{}
+	// Now consume all the responses on sendChan.
+	for i := 0; i < 5; i++ {
+		<-sendChan
+	}
+
+	// Lower backpressureLimit to 1.
+	backpressureLimit = 1
+	atomic.StoreInt64(&sent, 0)
+	send()
+	// This should block.
+	go send()
+	// Try to reply to first, but reply will not happen yet.
+	go reply(<-sc)
+	runtime.Gosched() // tickle the runtime in case there might be a timing bug
+	assert.Equal(t, int64(1), atomic.LoadInt64(&sent))
+	// Allow one reply, which will unblock the request.
+	canReply <- struct{}{}
+	runtime.Gosched() // tickle the runtime in case there might be a timing bug
+	testutils.SucceedsSoon(t, func() error {
+		if numSent := atomic.LoadInt64(&sent); numSent != 2 {
+			return fmt.Errorf("expected %d to have been sent, so far %d", 2, numSent)
+		}
+		return nil
+	})
+	// Allow second reply too.
 	close(canReply)
 	reply(<-sc)
-	reply(<-sc)
+	// Now consume all the responses on sendChan.
+	<-sendChan
+	<-sendChan
 }
 
 func TestBatcherSend(t *testing.T) {
@@ -219,30 +280,74 @@ func TestBatcherSend(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 	sc := make(chanSender)
+	mt := timeutil.NewManualTime(time.Time{})
+	peekCh := make(chan *RequestBatcher) // must be unbuffered
 	b := New(Config{
+		// We're using a manual timer here, so these fire when we advance `mt`
+		// accordingly.
 		MaxIdle:         50 * time.Millisecond,
 		MaxWait:         50 * time.Millisecond,
 		MaxMsgsPerBatch: 3,
 		Sender:          sc,
 		Stopper:         stopper,
+		manualTime:      mt,
+		testingPeekCh:   peekCh,
 	})
+
 	// Send 3 requests to range 2 and 2 to range 1.
 	// The 3rd range 2 request will trigger immediate sending due to the
 	// MaxMsgsPerBatch configuration. The range 1 batch will be sent after the
-	// MaxWait timeout expires.
+	// MaxWait timeout expires (manually via `mt`).
 	g := senderGroup{b: b}
 	g.Send(1, &kvpb.GetRequest{})
 	g.Send(2, &kvpb.GetRequest{})
 	g.Send(1, &kvpb.GetRequest{})
 	g.Send(2, &kvpb.GetRequest{})
 	g.Send(2, &kvpb.GetRequest{})
-	// Wait for the range 2 request and ensure it contains 3 requests.
-	s := <-sc
-	assert.Len(t, s.ba.Requests, 3)
-	s.respChan <- batchResp{}
+
+	// We should ~immediately see the requests to r2 show up in a single
+	// batch because no timers are firing but three is the limit for when
+	// a batch is full. We should not see anything to r1 yet because this
+	// is waiting for us to fire a timer.
+	// NB: we don't actually verify that they're for r2. This could be added
+	// (noting that ba.RangeID is zero at this level of the stack, so that won't
+	// do it). But - we check that the requests to r1 are still in the batcher
+	// later in the test.
+	select {
+	case s := <-sc:
+		require.Len(t, s.ba.Requests, 3)
+		s.respChan <- batchResp{}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("requests to r2 did not show up")
+	}
+
+	// Check that r1 is queued up in entirety. This is
+	// a nice check and also assures that once we fire
+	// the timer, we can expect to see everything at once.
+	testutils.SucceedsSoon(t, func() error {
+		b := <-peekCh
+		defer func() {
+			peekCh <- b
+		}()
+		var r1waiting int
+		if r1b, ok := b.batches.get(1); ok {
+			r1waiting = len(r1b.reqs)
+		}
+		if r1waiting != 2 {
+			return errors.Errorf("expect two requests waiting on r1, not %d", r1waiting)
+		}
+		return nil
+	})
+
+	// There should be a timer at this point since we know we have the requests
+	// to r1 waiting.
+	require.Len(t, mt.Timers(), 1)
+	// Time passes and the timer is triggered.
+	mt.AdvanceTo(mt.Timers()[0])
+
 	// Wait for the range 1 request and ensure it contains 2 requests.
-	s = <-sc
-	assert.Len(t, s.ba.Requests, 2)
+	s := <-sc
+	require.Len(t, s.ba.Requests, 2)
 	s.respChan <- batchResp{}
 	// Make sure everything gets a response.
 	if err := g.Wait(); err != nil {
@@ -320,6 +425,10 @@ func TestBatchTimeout(t *testing.T) {
 	const timeout = 5 * time.Millisecond
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
+
+	// Note: the timing-dependency and possible flakiness can be addressed by
+	// using a manual time(r) source, see TestBatcherSend for an example.
+
 	testCases := []struct {
 		requestTimeout  time.Duration
 		maxTimeout      time.Duration
@@ -369,7 +478,8 @@ func TestBatchTimeout(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), tc.requestTimeout)
 				defer cancel()
 				respChan := make(chan Response, 1)
-				if err := b.SendWithChan(ctx, respChan, 1, &kvpb.GetRequest{}); err != nil {
+				if err := b.SendWithChan(
+					ctx, respChan, 1, &kvpb.GetRequest{}, kvpb.AdmissionHeader{}); err != nil {
 					testutils.IsError(err, context.DeadlineExceeded.Error())
 					return
 				}
@@ -406,7 +516,7 @@ func TestBatchTimeout(t *testing.T) {
 		ctx := context.Background()
 		respChan := make(chan Response, 1)
 		minStartTimeForFirstBatchRequest := timeutil.Now()
-		err := b.SendWithChan(ctx, respChan, 1, &kvpb.GetRequest{})
+		err := b.SendWithChan(ctx, respChan, 1, &kvpb.GetRequest{}, kvpb.AdmissionHeader{})
 		require.NoError(t, err)
 		// First call to Send.
 		s := <-sc
@@ -650,7 +760,8 @@ func TestTargetBytesPerBatchReq(t *testing.T) {
 	})
 	respChan := make(chan Response, 1)
 
-	err := b.SendWithChan(context.Background(), respChan, 1, &kvpb.GetRequest{})
+	err := b.SendWithChan(
+		context.Background(), respChan, 1, &kvpb.GetRequest{}, kvpb.AdmissionHeader{})
 	require.NoError(t, err)
 	s := <-sc
 	assert.Equal(t, int64(4<<20), s.ba.TargetBytes)

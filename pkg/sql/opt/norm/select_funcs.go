@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
@@ -21,7 +16,7 @@ import (
 // CanMapOnSetOp determines whether the filter can be mapped to either
 // side of a set operator.
 func (c *CustomFuncs) CanMapOnSetOp(filter *memo.FiltersItem) bool {
-	if memo.CanBeCompositeSensitive(c.mem.Metadata(), filter) {
+	if memo.CanBeCompositeSensitive(filter) {
 		// In general, it is not safe to remap a composite-sensitive filter.
 		// For example:
 		//  - the set operation is Except
@@ -416,4 +411,11 @@ func (c *CustomFuncs) addConjuncts(
 		filters = append(filters, c.f.ConstructFiltersItem(t))
 	}
 	return filters, true
+}
+
+// ForDuplicateRemoval returns true if the Ordinality expression was constructed
+// for the purposes of duplicate removal, and the actual values returned does
+// not matter.
+func (c *CustomFuncs) ForDuplicateRemoval(private *memo.OrdinalityPrivate) (ok bool) {
+	return private.ForDuplicateRemoval
 }

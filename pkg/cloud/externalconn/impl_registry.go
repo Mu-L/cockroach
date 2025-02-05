@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package externalconn
 
@@ -138,6 +133,24 @@ func ExternalConnectionFromURI(
 	}
 
 	return parseAndValidateFn.parseAndValidateURI(ctx, env, externalConnectionURI, defaultValidation)
+}
+
+// ProviderForURI returns the provider associated with the scheme of a given URI,
+// or UNKNOWN if none found.
+// This is useful for testing.
+func ProviderForURI(uri string) connectionpb.ConnectionProvider {
+	externalConnectionURI, err := url.Parse(uri)
+	if err != nil {
+		return connectionpb.ConnectionProvider_Unknown
+	}
+
+	// Find the parseAndValidateFn method for the ExternalConnection provider.
+	parseAndValidateFn, registered := parseAndValidateFns[externalConnectionURI.Scheme]
+	if !registered {
+		return connectionpb.ConnectionProvider_Unknown
+	}
+
+	return parseAndValidateFn.ConnectionProvider
 }
 
 // ExternalConnEnv contains parameters to be used to validate an external

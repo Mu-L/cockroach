@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package eval
 
@@ -35,6 +30,10 @@ var pgSignatureRegexp = regexp.MustCompile(`^\s*([\w\."]+)\s*\((?:(?:\s*[\w"]+\s
 
 // ParseDOid parses and returns an Oid family datum.
 func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tree.DOid, error) {
+	if t.Oid() != oid.T_oid && s == tree.UnknownOidName {
+		return tree.NewDOidWithType(tree.UnknownOidValue, t), nil
+	}
+
 	// If it is an integer in string form, convert it as an int.
 	if _, err := tree.ParseDInt(strings.TrimSpace(s)); err == nil {
 		tmpOid, err := tree.ParseDOidAsInt(s)
@@ -73,7 +72,9 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		for i := 0; i < len(substrs); i++ {
 			name.Parts[i] = substrs[len(substrs)-1-i]
 		}
-		funcDef, err := evalCtx.Planner.ResolveFunction(ctx, &name, &evalCtx.SessionData().SearchPath)
+		funcDef, err := evalCtx.Planner.ResolveFunction(
+			ctx, tree.MakeUnresolvedFunctionName(&name), &evalCtx.SessionData().SearchPath,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -100,7 +101,9 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 		}
 
 		un := fn.FuncName.ToUnresolvedObjectName().ToUnresolvedName()
-		fd, err := evalCtx.Planner.ResolveFunction(ctx, un, &evalCtx.SessionData().SearchPath)
+		fd, err := evalCtx.Planner.ResolveFunction(
+			ctx, tree.MakeUnresolvedFunctionName(un), &evalCtx.SessionData().SearchPath,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -121,17 +124,21 @@ func ParseDOid(ctx context.Context, evalCtx *Context, s string, t *types.T) (*tr
 			}
 		}
 
-		paramTypes, err := fn.ParamTypes(ctx, evalCtx.Planner)
-		if err != nil {
-			return nil, err
-		}
-		ol, err := fd.MatchOverload(paramTypes, fn.FuncName.Schema(), &evalCtx.SessionData().SearchPath)
+		ol, err := fd.MatchOverload(
+			ctx,
+			evalCtx.Planner,
+			&fn,
+			&evalCtx.SessionData().SearchPath,
+			tree.BuiltinRoutine|tree.UDFRoutine|tree.ProcedureRoutine,
+			false, /* inDropContext */
+			false, /* tryDefaultExprs */
+		)
 		if err != nil {
 			return nil, err
 		}
 		return tree.NewDOidWithTypeAndName(ol.Oid, t, fd.Name), nil
 	case oid.T_regtype:
-		parsedTyp, err := evalCtx.Planner.GetTypeFromValidSQLSyntax(s)
+		parsedTyp, err := evalCtx.Planner.GetTypeFromValidSQLSyntax(ctx, s)
 		if err == nil {
 			return tree.NewDOidWithTypeAndName(
 				parsedTyp.Oid(), t, parsedTyp.SQLStandardName(),

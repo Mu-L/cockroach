@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import _ from "lodash";
+import { util } from "@cockroachlabs/cluster-ui";
+import * as protosccl from "@cockroachlabs/crdb-protobuf-client-ccl";
+import isEmpty from "lodash/isEmpty";
 import Long from "long";
 import moment from "moment-timezone";
+import React from "react";
 
-import * as protos from "src/js/protos";
-import * as protosccl from "@cockroachlabs/crdb-protobuf-client-ccl";
 import { EncryptionStatusProps } from "oss/src/views/reports/containers/stores/encryption";
-import { util } from "@cockroachlabs/cluster-ui";
+import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
 
 const dateFormat = "Y-MM-DD HH:mm:ss";
@@ -52,14 +49,10 @@ export default class EncryptionStatus {
     );
   }
 
-  renderStoreKey(
-    key: protosccl.cockroach.ccl.storageccl.engineccl.enginepbccl.IKeyInfo,
-  ) {
+  renderStoreKey(key: protosccl.cockroach.storage.enginepb.IKeyInfo) {
     // Get the enum name from its value (eg: "AES128_CTR" for 1).
     const encryptionType =
-      protosccl.cockroach.ccl.storageccl.engineccl.enginepbccl.EncryptionType[
-        key.encryption_type
-      ];
+      protosccl.cockroach.storage.enginepb.EncryptionType[key.encryption_type];
     const createdAt = moment
       .unix(FixLong(key.creation_time).toNumber())
       .utc()
@@ -74,14 +67,10 @@ export default class EncryptionStatus {
     ];
   }
 
-  renderDataKey(
-    key: protosccl.cockroach.ccl.storageccl.engineccl.enginepbccl.IKeyInfo,
-  ) {
+  renderDataKey(key: protosccl.cockroach.storage.enginepb.IKeyInfo) {
     // Get the enum name from its value (eg: "AES128_CTR" for 1).
     const encryptionType =
-      protosccl.cockroach.ccl.storageccl.engineccl.enginepbccl.EncryptionType[
-        key.encryption_type
-      ];
+      protosccl.cockroach.storage.enginepb.EncryptionType[key.encryption_type];
     const createdAt = moment
       .unix(key.creation_time.toNumber())
       .utc()
@@ -139,7 +128,7 @@ export default class EncryptionStatus {
   getEncryptionRows() {
     const { store } = this.props;
     const rawStatus = store.encryption_status;
-    if (_.isEmpty(rawStatus)) {
+    if (isEmpty(rawStatus)) {
       return [this.renderSimpleRow("Encryption status", "Not encrypted")];
     }
 
@@ -148,9 +137,7 @@ export default class EncryptionStatus {
     // Attempt to decode protobuf.
     try {
       decodedStatus =
-        protosccl.cockroach.ccl.storageccl.engineccl.enginepbccl.EncryptionStatus.decode(
-          rawStatus,
-        );
+        protosccl.cockroach.storage.enginepb.EncryptionStatus.decode(rawStatus);
     } catch (e) {
       return [
         this.renderSimpleRow(

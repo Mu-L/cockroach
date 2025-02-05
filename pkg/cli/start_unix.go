@@ -1,15 +1,9 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build !windows
-// +build !windows
 
 package cli
 
@@ -49,6 +43,11 @@ var quitSignal os.Signal = unix.SIGQUIT
 
 // debugSignal is the signal to open a pprof debugging server.
 var debugSignal os.Signal = unix.SIGUSR2
+
+// exitAbruptlySignal is the signal to make the process exit immediately. It is
+// preferable to SIGKILL when running with coverage instrumentation because the
+// coverage profile gets dumped on exit.
+var exitAbruptlySignal os.Signal = unix.SIGUSR1
 
 func handleSignalDuringShutdown(sig os.Signal) {
 	// On Unix, a signal that was not handled gracefully by the application

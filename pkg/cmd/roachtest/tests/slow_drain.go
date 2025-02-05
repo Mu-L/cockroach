@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -33,10 +29,12 @@ func registerSlowDrain(r registry.Registry) {
 	duration := time.Minute
 
 	r.Add(registry.TestSpec{
-		Name:    fmt.Sprintf("slow-drain/duration=%s", duration),
-		Owner:   registry.OwnerKV,
-		Cluster: r.MakeClusterSpec(numNodes),
-		Leases:  registry.MetamorphicLeases,
+		Name:             fmt.Sprintf("slow-drain/duration=%s", duration),
+		Owner:            registry.OwnerKV,
+		Cluster:          r.MakeClusterSpec(numNodes),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Leases:           registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runSlowDrain(ctx, t, c, duration)
 		},
@@ -55,13 +53,10 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 
 	var verboseStoreLogRe = "failed to transfer lease.*when draining.*no suitable transfer target found"
 
-	err := c.PutE(ctx, t.L(), t.Cockroach(), "./cockroach", c.All())
-	require.NoError(t, err)
-
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
 
 	run := func(db *gosql.DB, stmt string) {
-		_, err = db.ExecContext(ctx, stmt)
+		_, err := db.ExecContext(ctx, stmt)
 		require.NoError(t, err)
 
 		t.L().Printf("run: %s\n", stmt)
@@ -76,7 +71,7 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 		run(db, fmt.Sprintf(`ALTER DATABASE system CONFIGURE ZONE USING num_replicas=%d`, replicationFactor))
 
 		// Wait for initial up-replication.
-		err := WaitForReplication(ctx, t, db, replicationFactor)
+		err := roachtestutil.WaitForReplication(ctx, t.L(), db, replicationFactor, roachtestutil.AtLeastReplicationFactor)
 		require.NoError(t, err)
 
 		// Ensure that leases are sent away from pinned node to avoid situation
@@ -120,8 +115,8 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 			drain := func(id int) error {
 				t.Status(fmt.Sprintf("draining node %d", id))
 				return c.RunE(ctx,
-					c.Node(id),
-					fmt.Sprintf("./cockroach node drain %d --insecure --drain-wait=%s", id, duration.String()),
+					option.WithNodes(c.Node(id)),
+					fmt.Sprintf("./cockroach node drain %d --drain-wait=%s --certs-dir=%s --port={pgport:%d}", id, duration.String(), install.CockroachNodeCertsDir, id),
 				)
 			}
 			return drain(id)
@@ -137,7 +132,7 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 	t.Status("checking for stalling drain logging...")
 	testutils.SucceedsWithin(t, func() error {
 		for nodeID := 2; nodeID <= numNodes; nodeID++ {
-			if err := c.RunE(ctx, c.Node(nodeID),
+			if err := c.RunE(ctx, option.WithNodes(c.Node(nodeID)),
 				fmt.Sprintf("grep -q '%s' logs/cockroach.log", verboseStoreLogRe),
 			); err == nil {
 				return nil
@@ -149,6 +144,6 @@ func runSlowDrain(ctx context.Context, t test.Test, c cluster.Cluster, duration 
 
 	// Expect the drain timeout to expire.
 	t.Status("waiting for the drain timeout to elapse...")
-	err = m.WaitE()
+	err := m.WaitE()
 	require.Error(t, err)
 }

@@ -1,4 +1,7 @@
 statement ok
+SET autocommit_before_ddl = false
+
+statement ok
 CLOSE ALL
 
 statement ok
@@ -214,6 +217,10 @@ DECLARE foo CURSOR FOR SELECT * FROM a ORDER BY a
 
 query II
 FETCH 0 foo
+----
+
+query II
+FETCH ABSOLUTE 0 foo
 ----
 
 query II
@@ -575,7 +582,7 @@ DECLARE foo CURSOR FOR SELECT teeth FROM a
 
 statement ok
 ROLLBACK;
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 DECLARE foo CURSOR FOR SELECT 1;
 FETCH foo
 
@@ -584,7 +591,7 @@ ALTER TABLE a ADD COLUMN c INT
 
 statement ok
 ROLLBACK;
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 DECLARE foo CURSOR FOR SELECT 1;
 CLOSE foo
 
@@ -718,3 +725,6 @@ FETCH 1 FROM a
 statement ok
 SET statement_timeout = 0;
 COMMIT
+
+statement ok
+RESET autocommit_before_ddl

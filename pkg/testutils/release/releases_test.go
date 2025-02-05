@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package release
 
@@ -38,6 +33,13 @@ var (
 			Withdrawn:   []string{"23.1.0"},
 			Predecessor: "22.2",
 		},
+		"23.2": {
+			Latest:      "23.2.0-beta.1", // test pre-release latest versions
+			Predecessor: "23.1",
+		},
+		"24.1": {
+			Predecessor: "23.2",
+		},
 	}
 
 	// Results rely on this constant seed.
@@ -61,8 +63,8 @@ func TestLatestAndRandomPredecessor(t *testing.T) {
 	}{
 		{
 			name:        "non-existent release",
-			v:           "v23.2.3",
-			expectedErr: `no release information for "v23.2.3" ("23.2" series)`,
+			v:           "v50.8.3",
+			expectedErr: `no release information for "v50.8.3" ("50.8" series)`,
 		},
 		{
 			name:        "no known predecessor",
@@ -80,6 +82,12 @@ func TestLatestAndRandomPredecessor(t *testing.T) {
 			v:              "v22.2.3",
 			expectedLatest: "22.1.12",
 			expectedRandom: "22.1.10",
+		},
+		{
+			name:           "latest is pre-release",
+			v:              "v24.1.0",
+			expectedLatest: "23.2.0-beta.1",
+			expectedRandom: "23.2.0-beta.1",
 		},
 	}
 
@@ -136,6 +144,13 @@ func TestLatestPredecessorHistory(t *testing.T) {
 			expectedLatest: []string{"22.1.12", "22.2.8"},
 			expectedRandom: []string{"22.1.8", "22.2.8"},
 		},
+		{
+			name:           "latest is pre-release",
+			v:              "v24.1.0",
+			k:              2,
+			expectedLatest: []string{"23.1.1", "23.2.0-beta.1"},
+			expectedRandom: []string{"23.1.1", "23.2.0-beta.1"},
+		},
 	}
 
 	oldReleaseData := releaseData
@@ -158,6 +173,61 @@ func TestLatestPredecessorHistory(t *testing.T) {
 
 			require.Equal(t, tc.expectedLatest, latestHistory)
 			require.Equal(t, tc.expectedRandom, randomHistory)
+		})
+	}
+}
+
+func TestMajorReleasesBetween(t *testing.T) {
+	oldReleaseData := releaseData
+	releaseData = testReleaseData
+	defer func() { releaseData = oldReleaseData }()
+
+	testCases := []struct {
+		name     string
+		v1       string
+		v2       string
+		expected int
+	}{
+		{
+			name:     "v1 and v2 are on the same release series",
+			v1:       "22.2.10",
+			v2:       "22.2.14",
+			expected: 0,
+		},
+		{
+			name:     "v1 and v2 are one major release apart",
+			v1:       "22.2.10",
+			v2:       "23.1.0",
+			expected: 1,
+		},
+		{
+			name:     "v1 and v2 are two major releases apart",
+			v1:       "22.2.10",
+			v2:       "23.2.4",
+			expected: 2,
+		},
+		{
+			name:     "v1 and v2 are multiple major releases apart",
+			v1:       "19.2.3",
+			v2:       "24.1.10",
+			expected: 5,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			vv1 := version.MustParse("v" + tc.v1)
+			vv2 := version.MustParse("v" + tc.v2)
+
+			// We should get the same result regardless of the order of
+			// arguments.
+			count, err := MajorReleasesBetween(vv1, vv2)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, count)
+
+			count, err = MajorReleasesBetween(vv2, vv1)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, count)
 		})
 	}
 }

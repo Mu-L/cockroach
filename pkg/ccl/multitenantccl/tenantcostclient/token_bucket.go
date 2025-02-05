@@ -1,18 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcostclient
 
 import (
 	"fmt"
 	"time"
-
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
 )
 
 // tokenBucket implements a token bucket. It is a more specialized form of
@@ -75,25 +70,29 @@ type tokenBucket struct {
 	// Protected by the AbstractPool's lock. All changes should happen either
 	// inside a Request.Acquire() method or under AbstractPool.Update().
 
-	// rate that tokens fill the bucket, in RU/s.
-	rate tenantcostmodel.RU
-	// available is the number of currently available RUs in the bucket. This can
-	// be negative if waiting debt has been subtracted from it.
-	available tenantcostmodel.RU
+	// limit is the maximum number of tokens that can be present in the bucket.
+	// Tokens beyond this limit are discarded. If limit = 0, then no limit is
+	// enforced.
+	limit float64
+	// rate that tokens fill the bucket, in tokens/s.
+	rate float64
+	// available is the number of currently available tokens in the bucket. This
+	// can be negative if waiting debt has been subtracted from it.
+	available float64
 
-	// waitingDebt is debt that will be subtracted from the available RUs over
+	// waitingDebt is debt that will be subtracted from the available tkoens over
 	// time, in order to smooth its impact.
-	waitingDebt tenantcostmodel.RU
+	waitingDebt float64
 
 	// waitingDebtRate is the rate at which "waitingDebt" is subtracted from
-	// available RUs; cannot exceed the fill rate.
-	waitingDebtRate tenantcostmodel.RU
+	// available tokens; cannot exceed the fill rate.
+	waitingDebtRate float64
 
 	lastUpdated time.Time
 }
 
 // debtApplySecs is the target number of seconds that it should take to subtract
-// waiting debt from the available RUs.
+// waiting debt from the available tokens.
 const debtApplySecs = 2
 
 func (tb *tokenBucket) Init(now time.Time) {
@@ -108,28 +107,33 @@ func (tb *tokenBucket) update(now time.Time) {
 	}
 	tb.lastUpdated = now
 	sinceSeconds := since.Seconds()
-	tb.available += tb.rate * tenantcostmodel.RU(sinceSeconds)
+	tb.available += tb.rate * sinceSeconds
 
 	// Subtract some portion of waiting debt, if there is any.
-	if tb.waitingDebt == 0 {
-		// Fast path.
-		return
+	if tb.waitingDebt != 0 {
+		debt := tb.waitingDebtRate * sinceSeconds
+		if debt > tb.waitingDebt {
+			debt = tb.waitingDebt
+		}
+		tb.waitingDebt -= debt
+		tb.available -= debt
 	}
 
-	debt := tb.waitingDebtRate * tenantcostmodel.RU(sinceSeconds)
-	if debt > tb.waitingDebt {
-		debt = tb.waitingDebt
+	tb.clampToLimit()
+}
+
+func (tb *tokenBucket) clampToLimit() {
+	if tb.limit != 0 && tb.available > tb.limit {
+		tb.available = tb.limit
 	}
-	tb.waitingDebt -= debt
-	tb.available -= debt
 }
 
 func (tb *tokenBucket) calculateDebtRate() {
 	tb.waitingDebtRate = tb.waitingDebt / debtApplySecs
 	if tb.waitingDebtRate > tb.rate {
 		// There is waiting debt that cannot be applied within debtApplySecs;
-		// immediately subtract it from available RUs (which might cause that to
-		// become negative).
+		// immediately subtract it from available tokens (which might cause that
+		// to become negative).
 		debt := (tb.waitingDebtRate - tb.rate) * debtApplySecs
 		tb.waitingDebt -= debt
 		tb.available -= debt
@@ -139,9 +143,9 @@ func (tb *tokenBucket) calculateDebtRate() {
 
 // RemoveTokens decreases the amount of tokens currently available. If there are
 // not enough tokens, this causes the token bucket to go into debt. Debt will be
-// subtracted from the available RUs over the next few seconds in order to
+// subtracted from the available tokens over the next few seconds in order to
 // smooth its impact.
-func (tb *tokenBucket) RemoveTokens(now time.Time, amount tenantcostmodel.RU) {
+func (tb *tokenBucket) RemoveTokens(now time.Time, amount float64) {
 	tb.update(now)
 	if tb.available >= amount {
 		tb.available -= amount
@@ -159,10 +163,15 @@ func (tb *tokenBucket) RemoveTokens(now time.Time, amount tenantcostmodel.RU) {
 // configuration.
 type tokenBucketReconfigureArgs struct {
 	// NewTokens is the number of tokens that should be added to the token bucket.
-	NewTokens tenantcostmodel.RU
+	NewTokens float64
 
 	// NewRate is the new token fill rate for the bucket.
-	NewRate tenantcostmodel.RU
+	NewRate float64
+
+	// MaxTokens is the maximum number of tokens that can be present in the
+	// bucket. Tokens beyond this limit are discarded. If MaxTokens = 0, then
+	// no limit is enforced.
+	MaxTokens float64
 }
 
 // Reconfigure changes the rate, optionally adjusts the available tokens and
@@ -170,11 +179,12 @@ type tokenBucketReconfigureArgs struct {
 func (tb *tokenBucket) Reconfigure(now time.Time, args tokenBucketReconfigureArgs) {
 	tb.update(now)
 	tb.rate = args.NewRate
+	tb.limit = args.MaxTokens
 	tb.addTokens(args.NewTokens)
 }
 
 // addTokens increases the number of tokens currently available.
-func (tb *tokenBucket) addTokens(amount tenantcostmodel.RU) {
+func (tb *tokenBucket) addTokens(amount float64) {
 	if tb.waitingDebt > 0 {
 		if tb.waitingDebt >= amount {
 			tb.waitingDebt -= amount
@@ -186,6 +196,7 @@ func (tb *tokenBucket) addTokens(amount tenantcostmodel.RU) {
 		tb.available += amount
 	}
 	tb.calculateDebtRate()
+	tb.clampToLimit()
 }
 
 // maxTryAgainAfterSeconds is the maximum value that can be returned from
@@ -195,7 +206,7 @@ const maxTryAgainAfterSeconds = 1000
 // TryToFulfill either removes the given amount if is available, or returns a
 // time after which the request should be retried.
 func (tb *tokenBucket) TryToFulfill(
-	now time.Time, amount tenantcostmodel.RU,
+	now time.Time, amount float64,
 ) (fulfilled bool, tryAgainAfter time.Duration) {
 	tb.update(now)
 
@@ -205,13 +216,22 @@ func (tb *tokenBucket) TryToFulfill(
 		return true, 0
 	}
 
+	// Handle edge case where amount > limit, since no amount of waiting will ever
+	// allow the request to be fulfilled. Go into debt to fulfill the request.
+	// NOTE: This case is never expected to happen, but we handle it anyway just
+	// to be sure.
+	if tb.limit != 0 && amount > tb.limit && tb.available >= tb.limit {
+		tb.RemoveTokens(now, amount)
+		return true, 0
+	}
+
 	needed := amount - tb.available
 
 	// Compute the time it will take to refill to the needed amount.
 	var timeSeconds float64
 
 	if tb.waitingDebt == 0 {
-		timeSeconds = float64(needed / tb.rate)
+		timeSeconds = needed / tb.rate
 	} else {
 		remainingRate := tb.rate - tb.waitingDebtRate
 		// There are two cases:
@@ -233,11 +253,11 @@ func (tb *tokenBucket) TryToFulfill(
 		//   needed * waitingDebtRate <= debt * remainingRate
 		if needed*tb.waitingDebtRate <= tb.waitingDebt*remainingRate {
 			// Case 1.
-			timeSeconds = float64(needed / remainingRate)
+			timeSeconds = needed / remainingRate
 		} else {
 			// Case 2.
 			debtSeconds := tb.waitingDebt / tb.waitingDebtRate
-			timeSeconds = float64(debtSeconds + (needed-debtSeconds*remainingRate)/tb.rate)
+			timeSeconds = debtSeconds + (needed-debtSeconds*remainingRate)/tb.rate
 		}
 	}
 
@@ -254,18 +274,21 @@ func (tb *tokenBucket) TryToFulfill(
 	return false, timeDelta
 }
 
-// AvailableTokens returns the current number of available RUs. This can be
-// negative if we accumulated debt.
-func (tb *tokenBucket) AvailableTokens(now time.Time) tenantcostmodel.RU {
+// AvailableTokens returns the current number of tokens that can be immediately
+// used. This can be negative if we accumulated debt.
+func (tb *tokenBucket) AvailableTokens(now time.Time) float64 {
 	tb.update(now)
 	return tb.available - tb.waitingDebt
 }
 
 func (tb *tokenBucket) String(now time.Time) string {
 	tb.update(now)
-	s := fmt.Sprintf("%.2f RU filling @ %.2f RU/s", tb.available, tb.rate)
+	s := fmt.Sprintf("%.2f tokens filling @ %.2f tokens/s", tb.available, tb.rate)
+	if tb.limit > 0 {
+		s += fmt.Sprintf(" (limited to %.2f tokens)", tb.limit)
+	}
 	if tb.waitingDebt > 0 {
-		s += fmt.Sprintf(" (%.2f waiting debt @ %.2f RU/s)", tb.waitingDebt, tb.waitingDebtRate)
+		s += fmt.Sprintf(" (%.2f waiting debt @ %.2f tokens/s)", tb.waitingDebt, tb.waitingDebtRate)
 	}
 	return s
 }

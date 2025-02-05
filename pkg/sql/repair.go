@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -37,12 +32,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 )
 
@@ -174,6 +171,22 @@ func (p *planner) UnsafeUpsertDescriptor(
 		p.Descriptors().SkipValidationOnWrite()
 	}
 
+	// If we are pushing out a brand new descriptor confirm that no leases
+	// exist before we publish it. This could happen if we did an unsafe delete,
+	// since we will not wait for all leases to expire. So, as a safety force the
+	// unsafe upserts to wait for no leases to exist on this descriptor.
+	if !force &&
+		mut.GetVersion() == 1 {
+		execCfg := p.execCfg
+		regionCache, err := regions.NewCachedDatabaseRegions(ctx, execCfg.DB, execCfg.LeaseManager)
+		if err != nil {
+			return err
+		}
+		if err := execCfg.LeaseManager.WaitForNoVersion(ctx, mut.GetID(), regionCache, retry.Options{}); err != nil {
+			return err
+		}
+	}
+
 	{
 		b := p.txn.NewBatch()
 		if err := p.Descriptors().WriteDescToBatch(
@@ -214,15 +227,14 @@ func comparePrivileges(
 	prevUserPrivileges []catpb.UserPrivileges,
 	objectType privilege.ObjectType,
 ) error {
-	computePrivilegeChanges := func(prev, cur *catpb.UserPrivileges) (granted, revoked []string, retErr error) {
+	computePrivilegeChanges := func(prev, cur *catpb.UserPrivileges) (granted, revoked privilege.List, retErr error) {
 		// User has no privileges anymore after upsert, all privileges revoked.
 		prevPrivList, err := privilege.ListFromBitField(prev.Privileges, objectType)
 		if err != nil {
 			return nil, nil, err
 		}
 		if cur == nil {
-			revoked = prevPrivList.SortedNames()
-			return nil, revoked, nil
+			return nil, prevPrivList, nil
 		}
 
 		// User privileges have not changed.
@@ -231,8 +243,8 @@ func comparePrivileges(
 		}
 
 		// Construct a set of this user's old privileges (before upsert).
-		prevPrivilegeSet := make(map[string]struct{})
-		for _, priv := range prevPrivList.SortedNames() {
+		prevPrivilegeSet := make(map[privilege.Kind]struct{})
+		for _, priv := range prevPrivList {
 			prevPrivilegeSet[priv] = struct{}{}
 		}
 
@@ -241,7 +253,7 @@ func comparePrivileges(
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, priv := range curPrivList.SortedNames() {
+		for _, priv := range curPrivList {
 			if _, ok := prevPrivilegeSet[priv]; !ok {
 				// New privileges that do not exist in the old privileges set imply that they have been granted.
 				granted = append(granted, priv)
@@ -256,7 +268,7 @@ func comparePrivileges(
 		for priv := range prevPrivilegeSet {
 			revoked = append(revoked, priv)
 		}
-		sort.Strings(revoked)
+		sort.Slice(revoked, func(i, j int) bool { return revoked[i].DisplayName() < revoked[j].DisplayName() })
 
 		return granted, revoked, nil
 	}
@@ -292,12 +304,11 @@ func comparePrivileges(
 	for i := range curUserPrivileges {
 		username := curUserPrivileges[i].User().Normalized()
 		if _, ok := curUserMap[username]; ok {
-			privList, err := privilege.ListFromBitField(curUserPrivileges[i].Privileges, objectType)
+			granted, err := privilege.ListFromBitField(curUserPrivileges[i].Privileges, objectType)
 			if err != nil {
 				return err
 			}
-			granted := privList.SortedNames()
-			if granted == nil {
+			if len(granted) == 0 {
 				continue
 			}
 			if err := logPrivilegeEvents(
@@ -316,15 +327,15 @@ func logPrivilegeEvents(
 	ctx context.Context,
 	p *planner,
 	existing catalog.MutableDescriptor,
-	grantedPrivileges []string,
-	revokedPrivileges []string,
+	grantedPrivileges privilege.List,
+	revokedPrivileges privilege.List,
 	grantee string,
 ) error {
 
 	eventDetails := eventpb.CommonSQLPrivilegeEventDetails{
 		Grantee:           grantee,
-		GrantedPrivileges: grantedPrivileges,
-		RevokedPrivileges: revokedPrivileges,
+		GrantedPrivileges: grantedPrivileges.SortedDisplayNames(),
+		RevokedPrivileges: revokedPrivileges.SortedDisplayNames(),
 	}
 
 	switch md := existing.(type) {
@@ -711,12 +722,8 @@ func checkPlannerStateForRepairFunctions(ctx context.Context, p *planner, method
 	if p.extendedEvalCtx.TxnReadOnly {
 		return readOnlyError(method)
 	}
-	hasAdmin, err := p.UserHasAdminRole(ctx, p.User())
-	if err != nil {
+	if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER); err != nil {
 		return err
-	}
-	if !hasAdmin {
-		return pgerror.Newf(pgcode.InsufficientPrivilege, "admin role required for %s", method)
 	}
 	return nil
 }
@@ -732,7 +739,7 @@ func (p *planner) ForceDeleteTableData(ctx context.Context, descID int64) error 
 
 	// Validate no descriptor exists for this table
 	id := descpb.ID(descID)
-	desc, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Table(ctx, id)
+	desc, err := p.Descriptors().ByIDWithoutLeased(p.txn).WithoutNonPublic().Get().Table(ctx, id)
 	if err != nil && pgerror.GetPGCode(err) != pgcode.UndefinedTable {
 		return err
 	}
@@ -755,18 +762,12 @@ func (p *planner) ForceDeleteTableData(ctx context.Context, descID int64) error 
 		Key: tableSpan.Key, EndKey: tableSpan.EndKey,
 	}
 	b := p.Txn().NewBatch()
-	if storage.CanUseMVCCRangeTombstones(ctx, p.execCfg.Settings) {
-		b.AddRawRequest(&kvpb.DeleteRangeRequest{
-			RequestHeader:           requestHeader,
-			UseRangeTombstone:       true,
-			IdempotentTombstone:     true,
-			UpdateRangeDeleteGCHint: true,
-		})
-	} else {
-		b.AddRawRequest(&kvpb.ClearRangeRequest{
-			RequestHeader: requestHeader,
-		})
-	}
+	b.AddRawRequest(&kvpb.DeleteRangeRequest{
+		RequestHeader:           requestHeader,
+		UseRangeTombstone:       true,
+		IdempotentTombstone:     true,
+		UpdateRangeDeleteGCHint: true,
+	})
 	if err := p.txn.DB().Run(ctx, b); err != nil {
 		return err
 	}
@@ -778,7 +779,7 @@ func (p *planner) ForceDeleteTableData(ctx context.Context, descID int64) error 
 }
 
 func (p *planner) ExternalReadFile(ctx context.Context, uri string) ([]byte, error) {
-	if err := p.RequireAdminRole(ctx, "network I/O"); err != nil {
+	if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER); err != nil {
 		return nil, err
 	}
 
@@ -795,7 +796,7 @@ func (p *planner) ExternalReadFile(ctx context.Context, uri string) ([]byte, err
 }
 
 func (p *planner) ExternalWriteFile(ctx context.Context, uri string, content []byte) error {
-	if err := p.RequireAdminRole(ctx, "network I/O"); err != nil {
+	if err := p.CheckPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER); err != nil {
 		return err
 	}
 
@@ -818,7 +819,7 @@ func (p *planner) UpsertDroppedRelationGCTTL(
 	}
 
 	// Fetch the descriptor and check that it's a dropped table.
-	tbl, err := p.Descriptors().ByID(p.txn).Get().Table(ctx, descpb.ID(id))
+	tbl, err := p.Descriptors().ByIDWithoutLeased(p.txn).Get().Table(ctx, descpb.ID(id))
 	if err != nil {
 		return err
 	}

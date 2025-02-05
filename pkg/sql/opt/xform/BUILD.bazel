@@ -7,8 +7,10 @@ go_library(
         "cycle_funcs.go",
         "explorer.go",
         "general_funcs.go",
+        "generic_funcs.go",
         "groupby_funcs.go",
         "index_scan_builder.go",
+        "insert_funcs.go",
         "join_funcs.go",
         "join_order_builder.go",
         "limit_funcs.go",
@@ -46,7 +48,10 @@ go_library(
         "//pkg/sql/opt/props/physical",
         "//pkg/sql/rowinfra",
         "//pkg/sql/sem/eval",
+        "//pkg/sql/sem/idxtype",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/volatility",
+        "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",
         "//pkg/util/buildutil",
         "//pkg/util/cancelchecker",
@@ -70,7 +75,6 @@ go_test(
         "optimizer_test.go",
         "physical_props_test.go",
     ],
-    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]) + [
         "//c-deps:libgeos",
         "//pkg/sql/opt/testutils/opttester:testfixtures",
@@ -120,7 +124,7 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ explorer $(locations //pkg/sql/opt:ops) $(locations :rules)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
     visibility = [
         ":__pkg__",
         "//pkg/gen:__pkg__",

@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith_test
 
@@ -18,9 +13,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -40,15 +33,12 @@ var (
 func TestSetups(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer ccl.TestingEnableEnterprise()()
 
 	for name, setup := range sqlsmith.Setups {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 			defer srv.Stopper().Stop(ctx)
-			sql.SecondaryTenantSplitAtEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
-			sql.SecondaryTenantScatterEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
 
 			rnd, _ := randutil.NewTestRand()
 
@@ -69,13 +59,15 @@ func TestSetups(t *testing.T) {
 func TestGenerateParse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer ccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()
 	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer srv.Stopper().Stop(ctx)
-	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
-	sql.SecondaryTenantScatterEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
+
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	rnd, seed := randutil.NewTestRand()
 	t.Log("seed:", seed)
@@ -123,11 +115,17 @@ func TestGenerateParse(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%v: %v", stmt, err)
 		}
-		stmt = sqlsmith.TestingPrettyCfg.Pretty(parsed.AST)
+		stmt, err = sqlsmith.TestingPrettyCfg.Pretty(parsed.AST)
+		if err != nil {
+			t.Fatal(err)
+		}
 		fmt.Print("STMT: ", i, "\n", stmt, ";\n\n")
 		if *flagExec {
-			db.Exec(t, `SET statement_timeout = '9s'`)
-			if _, err := sqlDB.Exec(stmt); err != nil {
+			_, err = conn.ExecContext(ctx, `SET statement_timeout = '9s'`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = conn.ExecContext(ctx, stmt); err != nil {
 				es := err.Error()
 				if !seen[es] {
 					seen[es] = true

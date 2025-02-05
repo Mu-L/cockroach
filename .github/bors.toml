@@ -2,7 +2,22 @@
 
 # List of commit statuses that must pass on the merge commit before it is
 # pushed to master.
-status = ["Bazel Essential CI (Cockroach)"]
+status = [
+       "acceptance",
+       "check_generated_code",
+       "docker_image_amd64",
+       "examples_orms",
+       "lint",
+       "linux_amd64_build",
+       "linux_amd64_fips_build",
+       "linux_arm64_build",
+       "local_roachtest",
+       "local_roachtest_fips",
+       "macos_amd64_build",
+       "macos_arm64_build",
+       "unit_tests",
+       "windows_build",
+]
 
 # List of commit statuses that must not be failing on the PR commit when it is
 # r+-ed. If it's still in progress (for e.g. if CI is still running), bors will
@@ -11,7 +26,7 @@ status = ["Bazel Essential CI (Cockroach)"]
 pr_status = ["license/cla", "blathers/release-justification-check"]
 
 # List of PR labels that may not be attached to a PR when it is r+-ed.
-block_labels = ["do-not-merge"]
+block_labels = ["do-not-merge", "backport"]
 
 # Number of seconds from when a merge commit is created to when its statuses
 # must pass.

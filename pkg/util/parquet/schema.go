@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parquet
 
@@ -161,6 +156,15 @@ func makeColumn(colName string, typ *types.T, repetitions parquet.Repetition) (d
 			return datumColumn{}, err
 		}
 		result.colWriter = scalarWriter(writePGLSN)
+		return result, nil
+	case types.RefCursorFamily:
+		result.node, err = schema.NewPrimitiveNodeLogical(colName,
+			repetitions, schema.StringLogicalType{}, parquet.Types.ByteArray,
+			defaultTypeLength, defaultSchemaFieldID)
+		if err != nil {
+			return datumColumn{}, err
+		}
+		result.colWriter = scalarWriter(writeString)
 		return result, nil
 	case types.DecimalFamily:
 		// According to PostgresSQL docs, scale or precision of 0 implies max

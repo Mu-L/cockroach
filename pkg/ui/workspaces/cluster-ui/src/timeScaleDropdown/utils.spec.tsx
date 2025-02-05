@@ -1,22 +1,18 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+import { assert } from "chai";
+import moment from "moment-timezone";
 
 import { TimeScale } from "./timeScaleTypes";
-import moment from "moment-timezone";
 import {
   defaultTimeScaleOptions,
   findClosestTimeScale,
   toDateRange,
   toRoundedDateRange,
 } from "./utils";
-import { assert } from "chai";
 
 describe("timescale utils", (): void => {
   describe("toDateRange", () => {
@@ -100,22 +96,22 @@ describe("timescale utils", (): void => {
       assert.deepEqual(
         findClosestTimeScale(
           defaultTimeScaleOptions,
-          defaultTimeScaleOptions["Past 10 Minutes"].windowSize.asSeconds(),
+          defaultTimeScaleOptions["Past Hour"].windowSize.asSeconds(),
           moment().unix(),
         ),
         {
-          ...defaultTimeScaleOptions["Past 10 Minutes"],
-          key: "Past 10 Minutes",
+          ...defaultTimeScaleOptions["Past Hour"],
+          key: "Past Hour",
         },
       );
       // `seconds` == window size of one of the default options, `startSeconds` is in the past.
       assert.deepEqual(
         findClosestTimeScale(
           defaultTimeScaleOptions,
-          defaultTimeScaleOptions["Past 10 Minutes"].windowSize.asSeconds(),
+          defaultTimeScaleOptions["Past Hour"].windowSize.asSeconds(),
           moment().subtract(1, "day").unix(),
         ),
-        { ...defaultTimeScaleOptions["Past 10 Minutes"], key: "Custom" },
+        { ...defaultTimeScaleOptions["Past Hour"], key: "Custom" },
       );
     });
   });

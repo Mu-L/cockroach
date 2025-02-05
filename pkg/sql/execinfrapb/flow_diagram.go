@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfrapb
 
@@ -21,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -177,6 +173,12 @@ func (tr *TableReaderSpec) summary() (string, []string) {
 		}
 
 		details = append(details, spanStr.String())
+	}
+
+	if tr.MaxTimestampAgeNanos != 0 {
+		details = append(details, fmt.Sprintf(
+			"Inconsistent scan (max ts age %s)", time.Duration(tr.MaxTimestampAgeNanos),
+		))
 	}
 
 	return "TableReader", details
@@ -509,12 +511,6 @@ func (c *CloudStorageTestSpec) summary() (string, []string) {
 }
 
 // summary implements the diagramCellType interface.
-func (c *SplitAndScatterSpec) summary() (string, []string) {
-	detail := fmt.Sprintf("%d chunks", len(c.Chunks))
-	return "SplitAndScatterSpec", []string{detail}
-}
-
-// summary implements the diagramCellType interface.
 func (c *ReadImportDataSpec) summary() (string, []string) {
 	ss := make([]string, 0, len(c.Uri))
 	for _, s := range c.Uri {
@@ -531,7 +527,7 @@ func (s *StreamIngestionDataSpec) summary() (string, []string) {
 	)
 
 	annotations := []string{
-		"Partitions",
+		"Partitions:",
 	}
 
 	// Sort partitions by ID for stable output.
@@ -549,17 +545,68 @@ func (s *StreamIngestionDataSpec) summary() (string, []string) {
 			break
 		}
 		p := s.PartitionSpecs[srcID]
-		var spanDesc string
-		if len(p.Spans) <= spanLimit {
-			spanDesc = fmt.Sprintf("n%s: %v", srcID, p.Spans)
-		} else {
-			spanDesc = fmt.Sprintf("n%s: %v and %d more spans",
-				srcID, p.Spans[:spanLimit], len(p.Spans)-spanLimit)
+
+		annotations = append(annotations, fmt.Sprintf("Source node %s, spans:", srcID))
+		for i, span := range p.Spans {
+			if i == spanLimit {
+				annotations = append(annotations, fmt.Sprintf("and %d more spans", len(p.Spans)-spanLimit))
+				break
+			}
+			annotations = append(annotations, fmt.Sprintf("%v", span))
 		}
-		annotations = append(annotations, spanDesc)
 	}
 
 	return "StreamIngestionData", annotations
+}
+
+func (s *LogicalReplicationWriterSpec) summary() (string, []string) {
+	const spanLimit = 9
+
+	tableNames := []string{}
+	for _, table := range s.TableMetadataByDestID {
+		tableNames = append(tableNames, table.SourceDescriptor.Name)
+	}
+
+	annotations := []string{
+		fmt.Sprintf("Tables: %s", strings.Join(tableNames, ",")),
+		fmt.Sprintf("Source node %s", s.PartitionSpec.SrcInstanceID),
+		"Spans:",
+	}
+
+	for i, span := range s.PartitionSpec.Spans {
+		if i == spanLimit {
+			annotations = append(annotations, fmt.Sprintf("and %d more spans", len(s.PartitionSpec.Spans)-spanLimit))
+			break
+		}
+		annotations = append(annotations, fmt.Sprintf("%v", span))
+	}
+
+	return "LogicalReplicationWriter", annotations
+}
+
+func (s *LogicalReplicationOfflineScanSpec) summary() (string, []string) {
+	const spanLimit = 9
+
+	srcTableIDs := []string{}
+	for _, pair := range s.Rekey {
+		srcTableIDs = append(srcTableIDs, fmt.Sprintf("%d", pair.OldID))
+	}
+
+	annotations := []string{
+		fmt.Sprintf("Src Table IDs: %s", strings.Join(srcTableIDs, ",")),
+		fmt.Sprintf("Source node %s", s.PartitionSpec.SrcInstanceID),
+		"Spans:",
+	}
+
+	for i, span := range s.PartitionSpec.Spans {
+		if i == spanLimit {
+			annotations = append(annotations, fmt.Sprintf("and %d more spans", len(s.PartitionSpec.Spans)-spanLimit))
+			break
+		}
+		annotations = append(annotations, fmt.Sprintf("%v", span))
+	}
+
+	return "LogicalReplicationOfflineScanWriter", annotations
 }
 
 // summary implements the diagramCellType interface.
@@ -614,9 +661,23 @@ func (w *WindowerSpec) summary() (string, []string) {
 
 // summary implements the diagramCellType interface.
 func (s *ChangeAggregatorSpec) summary() (string, []string) {
-	var details []string
-	for _, watch := range s.Watches {
-		details = append(details, watch.Span.String())
+	var spanStr strings.Builder
+	if len(s.Watches) > 0 {
+		spanStr.WriteString(fmt.Sprintf("Watches [%d]: ", len(s.Watches)))
+		const limit = 3
+		for i := 0; i < len(s.Watches) && i < limit; i++ {
+			if i > 0 {
+				spanStr.WriteString(", ")
+			}
+			spanStr.WriteString(s.Watches[i].Span.String())
+		}
+		if len(s.Watches) > limit {
+			spanStr.WriteString("...")
+		}
+	}
+
+	details := []string{
+		spanStr.String(),
 	}
 	return "ChangeAggregator", details
 }

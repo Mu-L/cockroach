@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlsmith
 
@@ -16,8 +11,10 @@ import (
 	"math/rand"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/randident"
@@ -59,14 +56,21 @@ const retryCount = 20
 
 // Smither is a sqlsmith generator.
 type Smither struct {
-	rnd              *rand.Rand
-	db               *gosql.DB
-	lock             syncutil.RWMutex
-	dbName           string
-	schemas          []*schemaRef
-	tables           []*tableRef
-	columns          map[tree.TableName]map[tree.Name]*tree.ColumnTableDef
-	indexes          map[tree.TableName]map[tree.Name]*tree.CreateIndex
+	rnd *rand.Rand
+	db  *gosql.DB
+	// TODO(yuzefovich): clarify which objects this lock is protecting.
+	lock      syncutil.RWMutex
+	dbName    string
+	schemas   []*schemaRef
+	tables    []*tableRef
+	sequences []*sequenceRef
+	columns   map[tree.TableName]map[tree.Name]*tree.ColumnTableDef
+	// Note: consider using getAllIndexesForTable helper if you need to iterate
+	// over all indexes for a particular table.
+	indexes map[tree.TableName]map[tree.Name]*tree.CreateIndex
+	// Only one of nameCounts and nameGens will be used. nameCounts is used when
+	// simpleNames is true.
+	nameCounts       map[string]int
 	nameGens         map[string]*nameGenInfo
 	nameGenCfg       randidentcfg.Config
 	activeSavepoints []string
@@ -80,33 +84,42 @@ type Smither struct {
 	selectStmtSampler                  *selectStatementSampler
 	scalarExprWeights, boolExprWeights []scalarExprWeight
 	scalarExprSampler, boolExprSampler *scalarExprSampler
+	plpgsqlStmtSampler                 *plpgsqlStmtSampler
+	plpgsqlStmtWeights                 []plpgsqlStatementWeight
 
-	disableWith                bool
-	disableNondeterministicFns bool
-	disableLimits              bool
-	disableWindowFuncs         bool
-	disableAggregateFuncs      bool
-	disableMutations           bool
-	simpleDatums               bool
-	avoidConsts                bool
-	outputSort                 bool
-	postgres                   bool
-	ignoreFNs                  []*regexp.Regexp
-	complexity                 float64
-	scalarComplexity           float64
-	unlikelyConstantPredicate  bool
-	favorCommonData            bool
-	unlikelyRandomNulls        bool
-	stringConstPrefix          string
-	disableJoins               bool
-	disableCrossJoins          bool
-	disableIndexHints          bool
-	lowProbWhereWithJoinTables bool
-	disableInsertSelect        bool
-	disableDivision            bool
-	disableDecimals            bool
-	disableOIDs                bool
-	disableUDFs                bool
+	disableWith                   bool
+	disableNondeterministicFns    bool
+	disableLimits                 bool
+	disableNondeterministicLimits bool
+	disableWindowFuncs            bool
+	disableAggregateFuncs         bool
+	disableMutations              bool
+	simpleDatums                  bool
+	simpleNames                   bool
+	avoidConsts                   bool
+	outputSort                    bool
+	postgres                      bool
+	ignoreFNs                     []*regexp.Regexp
+	complexity                    float64
+	scalarComplexity              float64
+	simpleScalarTypes             bool
+	unlikelyConstantPredicate     bool
+	favorCommonData               bool
+	unlikelyRandomNulls           bool
+	stringConstPrefix             string
+	disableJoins                  bool
+	disableCrossJoins             bool
+	disableIndexHints             bool
+	lowProbWhereWithJoinTables    bool
+	disableInsertSelect           bool
+	disableDivision               bool
+	disableDecimals               bool
+	disableOIDs                   bool
+	// disableUDFCreation indicates whether we're not allowed to create UDFs.
+	// It follows that if we haven't created any UDFs, we have no UDFs to invoke
+	// too.
+	disableUDFCreation     bool
+	disableIsolationChange bool
 
 	bulkSrv     *httptest.Server
 	bulkFiles   map[string][]byte
@@ -115,10 +128,11 @@ type Smither struct {
 }
 
 type (
-	statement       func(*Smither) (tree.Statement, bool)
-	tableExpr       func(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool)
-	selectStatement func(s *Smither, desiredTypes []*types.T, refs colRefs, withTables tableRefs) (tree.SelectStatement, colRefs, bool)
-	scalarExpr      func(*Smither, Context, *types.T, colRefs) (expr tree.TypedExpr, ok bool)
+	statement        func(*Smither) (tree.Statement, bool)
+	tableExpr        func(s *Smither, refs colRefs, forJoin bool) (tree.TableExpr, colRefs, bool)
+	selectStatement  func(s *Smither, desiredTypes []*types.T, refs colRefs, withTables tableRefs) (tree.SelectStatement, colRefs, bool)
+	scalarExpr       func(*Smither, Context, *types.T, colRefs) (expr tree.TypedExpr, ok bool)
+	plpgsqlStatement func(*Smither, plpgsqlBlockScope) (stmt plpgsqltree.Statement, ok bool)
 )
 
 // NewSmither creates a new Smither. db is used to populate existing tables
@@ -127,15 +141,17 @@ func NewSmither(db *gosql.DB, rnd *rand.Rand, opts ...SmitherOption) (*Smither, 
 	s := &Smither{
 		rnd:        rnd,
 		db:         db,
+		nameCounts: map[string]int{},
 		nameGens:   map[string]*nameGenInfo{},
 		nameGenCfg: randident.DefaultNameGeneratorConfig(),
 
-		stmtWeights:       allStatements,
-		alterWeights:      alters,
-		tableExprWeights:  allTableExprs,
-		selectStmtWeights: selectStmts,
-		scalarExprWeights: scalars,
-		boolExprWeights:   bools,
+		stmtWeights:        allStatements,
+		alterWeights:       alters,
+		tableExprWeights:   allTableExprs,
+		selectStmtWeights:  selectStmts,
+		scalarExprWeights:  scalars,
+		boolExprWeights:    bools,
+		plpgsqlStmtWeights: plpgsqlStmts,
 
 		complexity:       0.2,
 		scalarComplexity: 0.2,
@@ -150,6 +166,7 @@ func NewSmither(db *gosql.DB, rnd *rand.Rand, opts ...SmitherOption) (*Smither, 
 	s.selectStmtSampler = newWeightedSelectStatementSampler(s.selectStmtWeights, rnd.Int63())
 	s.scalarExprSampler = newWeightedScalarExprSampler(s.scalarExprWeights, rnd.Int63())
 	s.boolExprSampler = newWeightedScalarExprSampler(s.boolExprWeights, rnd.Int63())
+	s.plpgsqlStmtSampler = newWeightedPLpgSQLStmtSampler(s.plpgsqlStmtWeights, rnd.Int63())
 	s.enableBulkIO()
 	if s.db != nil {
 		row := s.db.QueryRow("SELECT current_database()")
@@ -190,7 +207,19 @@ func (s *Smither) Generate() string {
 			continue
 		}
 		i = 0
-		return prettyCfg.Pretty(stmt)
+
+		printCfg := prettyCfg
+		fl := tree.FmtParsable
+		if s.postgres {
+			printCfg.FmtFlags = tree.FmtPGCatalog
+			fl = tree.FmtPGCatalog
+		}
+		p, err := printCfg.Pretty(stmt)
+		if err != nil {
+			// Use simple printing if pretty-printing fails.
+			p = tree.AsStringWithFlags(stmt, fl)
+		}
+		return p
 	}
 }
 
@@ -198,6 +227,16 @@ func (s *Smither) Generate() string {
 // tables or columns.
 func (s *Smither) GenerateExpr() tree.TypedExpr {
 	return makeScalar(s, s.randScalarType(), nil)
+}
+
+// GenerateUDF returns a random CREATE FUNCTION statement.
+func (s *Smither) GenerateUDF() tree.Statement {
+	for {
+		routine, ok := s.makeCreateFunc()
+		if ok {
+			return routine
+		}
+	}
 }
 
 type nameGenInfo struct {
@@ -208,6 +247,11 @@ type nameGenInfo struct {
 func (s *Smither) name(prefix string) tree.Name {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+	if s.simpleNames {
+		s.nameCounts[prefix]++
+		count := s.nameCounts[prefix]
+		return tree.Name(fmt.Sprintf("%s_%d", prefix, count))
+	}
 	g := s.nameGens[prefix]
 	if g == nil {
 		g = &nameGenInfo{
@@ -216,7 +260,7 @@ func (s *Smither) name(prefix string) tree.Name {
 		s.nameGens[prefix] = g
 	}
 	g.count++
-	return tree.Name(g.g.GenerateOne(g.count))
+	return tree.Name(g.g.GenerateOne(strconv.Itoa(g.count)))
 }
 
 // SmitherOption is an option for the Smither client.
@@ -317,6 +361,8 @@ var DisableDDLs = simpleOption("disable DDLs", func(s *Smither) {
 		{5, makeInsert},
 		{5, makeUpdate},
 		{1, makeDelete},
+		{1, makeCreateStats},
+		{1, makeSetSessionCharacteristics},
 		// If we don't have any DDL's, allow for use of savepoints and transactions.
 		{2, makeBegin},
 		{2, makeSavepoint},
@@ -324,17 +370,21 @@ var DisableDDLs = simpleOption("disable DDLs", func(s *Smither) {
 		{2, makeRollbackToSavepoint},
 		{2, makeCommit},
 		{2, makeRollback},
+		// TODO(nvanbenschoten): add two-phase commit statements.
 	}
 })
 
 // OnlySingleDMLs causes the Smither to only emit single-statement DML (SELECT,
-// INSERT, UPDATE, DELETE).
+// INSERT, UPDATE, DELETE), CREATE STATISTICS, and SET SESSION CHARACTERISTICS
+// statements.
 var OnlySingleDMLs = simpleOption("only single DMLs", func(s *Smither) {
 	s.stmtWeights = []statementWeight{
 		{20, makeSelect},
 		{5, makeInsert},
 		{5, makeUpdate},
 		{1, makeDelete},
+		{1, makeCreateStats},
+		{1, makeSetSessionCharacteristics},
 	}
 })
 
@@ -367,6 +417,11 @@ var DisableWith = simpleOption("disable WITH", func(s *Smither) {
 	s.disableWith = true
 })
 
+// EnableWith causes the Smither to probabilistically emit WITH clauses.
+var EnableWith = simpleOption("enable WITH", func(s *Smither) {
+	s.disableWith = false
+})
+
 // DisableNondeterministicFns causes the Smither to disable nondeterministic functions.
 var DisableNondeterministicFns = simpleOption("disable nondeterministic funcs", func(s *Smither) {
 	s.disableNondeterministicFns = true
@@ -382,21 +437,36 @@ var SimpleDatums = simpleOption("simple datums", func(s *Smither) {
 	s.simpleDatums = true
 })
 
-// MutationsOnly causes the Smither to emit 80% INSERT, 10% UPDATE, and 10%
-// DELETE statements.
+// SimpleScalarTypes causes the Smither to use simpler scalar types (e.g. avoid Geometry).
+var SimpleScalarTypes = simpleOption("simple scalar types", func(s *Smither) {
+	s.simpleScalarTypes = true
+})
+
+// SimpleNames specifies that complex name generation should be disabled.
+var SimpleNames = simpleOption("simple names", func(s *Smither) {
+	s.simpleNames = true
+})
+
+// MutationsOnly causes the Smither to emit 60% INSERT, 10% UPDATE, 10% DELETE,
+// 10% CREATE STATISTICS, and 10% SET SESSION CHARACTERISTICS statements.
 var MutationsOnly = simpleOption("mutations only", func(s *Smither) {
 	s.stmtWeights = []statementWeight{
-		{8, makeInsert},
+		{6, makeInsert},
 		{1, makeUpdate},
 		{1, makeDelete},
+		{1, makeCreateStats},
+		{1, makeSetSessionCharacteristics},
 	}
 })
 
-// InsUpdOnly causes the Smither to emit 90% INSERT and 10% UPDATE statements.
+// InsUpdOnly causes the Smither to emit 70% INSERT, 10% UPDATE, 10% CREATE
+// STATISTICS, and 10% SET SESSION CHARACTERISTICS statements.
 var InsUpdOnly = simpleOption("inserts and updates only", func(s *Smither) {
 	s.stmtWeights = []statementWeight{
-		{9, makeInsert},
+		{7, makeInsert},
 		{1, makeUpdate},
+		{1, makeCreateStats},
+		{1, makeSetSessionCharacteristics},
 	}
 })
 
@@ -414,6 +484,17 @@ func IgnoreFNs(regex string) SmitherOption {
 // DisableLimits causes the Smither to disable LIMIT clauses.
 var DisableLimits = simpleOption("disable LIMIT", func(s *Smither) {
 	s.disableLimits = true
+})
+
+// DisableNondeterministicLimits causes the Smither to disable non-deterministic
+// LIMIT clauses.
+var DisableNondeterministicLimits = simpleOption("disable non-deterministic LIMIT", func(s *Smither) {
+	s.disableNondeterministicLimits = true
+})
+
+// EnableLimits causes the Smither to probabilistically emit LIMIT clauses.
+var EnableLimits = simpleOption("enable LIMIT", func(s *Smither) {
+	s.disableLimits = false
 })
 
 // AvoidConsts causes the Smither to prefer column references over generating
@@ -435,6 +516,11 @@ var DisableAggregateFuncs = simpleOption("disable aggregate funcs", func(s *Smit
 // OutputSort adds a top-level ORDER BY on all columns.
 var OutputSort = simpleOption("output sort", func(s *Smither) {
 	s.outputSort = true
+})
+
+// MaybeSortOutput probabilistically adds ORDER by clause.
+var MaybeSortOutput = simpleOption("maybe output sort", func(s *Smither) {
+	s.outputSort = s.coin()
 })
 
 // UnlikelyConstantPredicate causes the Smither to make generation of constant
@@ -500,13 +586,6 @@ var DisableInsertSelect = simpleOption("disable insert select", func(s *Smither)
 	s.disableInsertSelect = true
 })
 
-// DisableDivision disables generation of the division operator (/) and the
-// floor division operator (//).
-// TODO(mgartner): Remove this once #86790 is addressed.
-var DisableDivision = simpleOption("disable division", func(s *Smither) {
-	s.disableDivision = true
-})
-
 // DisableDecimals disables use of decimal type columns in the query.
 var DisableDecimals = simpleOption("disable decimals", func(s *Smither) {
 	s.disableDecimals = true
@@ -519,7 +598,13 @@ var DisableOIDs = simpleOption("disable OIDs", func(s *Smither) {
 
 // DisableUDFs causes the Smither to disable user-defined functions.
 var DisableUDFs = simpleOption("disable udfs", func(s *Smither) {
-	s.disableUDFs = true
+	s.disableUDFCreation = true
+})
+
+// DisableIsolationChange causes the Smither to disable stmts that modify the
+// txn isolation level.
+var DisableIsolationChange = simpleOption("disable isolation change", func(s *Smither) {
+	s.disableIsolationChange = true
 })
 
 // CompareMode causes the Smither to generate statements that have
@@ -530,7 +615,7 @@ var CompareMode = multiOption(
 	DisableNondeterministicFns(),
 	DisableCRDBFns(),
 	IgnoreFNs("^version"),
-	DisableLimits(),
+	DisableNondeterministicLimits(),
 	OutputSort(),
 )
 

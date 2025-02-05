@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -38,10 +33,6 @@ func runClockMonotonicity(
 		t.Fatal(err)
 	}
 
-	if err := c.RunE(ctx, c.Node(1), "test -x ./cockroach"); err != nil {
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-	}
-	c.Wipe(ctx, false /* preserveCerts */)
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
 	db := c.Conn(ctx, t.L(), c.Spec().NodeCount)
@@ -140,8 +131,10 @@ func registerClockMonotonicTests(r registry.Registry) {
 			Owner: registry.OwnerKV,
 			// These tests muck with NTP, therefor we don't want the cluster reused by
 			// others.
-			Cluster: r.MakeClusterSpec(1, spec.ReuseTagged("offset-injector"), spec.TerminateOnMigration()),
-			Leases:  registry.MetamorphicLeases,
+			Cluster:          r.MakeClusterSpec(1, spec.ReuseTagged("offset-injector"), spec.TerminateOnMigration()),
+			CompatibleClouds: registry.AllExceptAWS,
+			Suites:           registry.Suites(registry.Nightly),
+			Leases:           registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runClockMonotonicity(ctx, t, c, tc)
 			},

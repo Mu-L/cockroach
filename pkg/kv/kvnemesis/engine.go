@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -119,7 +115,9 @@ func (e *Engine) Put(key storage.MVCCKey, value []byte) {
 
 func (e *Engine) DeleteRange(from, to roachpb.Key, ts hlc.Timestamp, val []byte) {
 	suffix := storage.EncodeMVCCTimestampSuffix(ts)
-	if err := e.kvs.RangeKeySet(from, to, suffix, val, nil); err != nil {
+	err := e.kvs.RangeKeySet(
+		storage.EngineKey{Key: from}.Encode(), storage.EngineKey{Key: to}.Encode(), suffix, val, nil)
+	if err != nil {
 		panic(err)
 	}
 }
@@ -153,18 +151,27 @@ func (e *Engine) Iterate(
 			}
 		}
 		if iter.RangeKeyChanged() {
-			key, endKey := iter.RangeBounds()
-			e.b, key = e.b.Copy(key, 0 /* extraCap */)
-			e.b, endKey = e.b.Copy(endKey, 0 /* extraCap */)
+			keyCopy, endKeyCopy := iter.RangeBounds()
+			e.b, keyCopy = e.b.Copy(keyCopy, 0 /* extraCap */)
+			e.b, endKeyCopy = e.b.Copy(endKeyCopy, 0 /* extraCap */)
 			for _, rk := range iter.RangeKeys() {
 				ts, err := storage.DecodeMVCCTimestampSuffix(rk.Suffix)
 				if err != nil {
 					fn(nil, nil, hlc.Timestamp{}, nil, err)
 					continue
 				}
+				engineKey, ok := storage.DecodeEngineKey(keyCopy)
+				if !ok || len(engineKey.Version) > 0 {
+					fn(nil, nil, hlc.Timestamp{}, nil, errors.Errorf("invalid key %q", keyCopy))
+				}
+				engineEndKey, ok := storage.DecodeEngineKey(endKeyCopy)
+				if !ok || len(engineEndKey.Version) > 0 {
+					fn(nil, nil, hlc.Timestamp{}, nil, errors.Errorf("invalid key %q", endKeyCopy))
+				}
 
 				e.b, rk.Value = e.b.Copy(rk.Value, 0)
-				fn(key, endKey, ts, rk.Value, nil)
+
+				fn(engineKey.Key, engineEndKey.Key, ts, rk.Value, nil)
 			}
 		}
 	}

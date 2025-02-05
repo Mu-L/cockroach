@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cloud
 
@@ -25,7 +20,7 @@ import (
 type KMS interface {
 	// MasterKeyID will return the identifier used to reference the master key
 	// associated with the KMS object.
-	MasterKeyID() (string, error)
+	MasterKeyID() string
 	// Encrypt returns the ciphertext version of data after encrypting it using
 	// the KMS.
 	Encrypt(ctx context.Context, data []byte) ([]byte, error)
@@ -50,6 +45,16 @@ type KMSFromURIFactory func(ctx context.Context, uri string, env KMSEnv) (KMS, e
 
 // Mapping from KMS scheme to its registered factory method.
 var kmsFactoryMap = make(map[string]KMSFromURIFactory)
+
+var errKMSInaccessible = errors.New("kms inaccessible")
+
+func KMSInaccessible(err error) error {
+	return errors.Mark(err, errKMSInaccessible)
+}
+
+func IsKMSInaccessible(err error) bool {
+	return errors.Is(err, errKMSInaccessible)
+}
 
 // RegisterKMSFromURIFactory is used by every concrete KMS implementation to
 // register its factory method.

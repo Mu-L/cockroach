@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tracedumper
 
@@ -18,11 +13,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/server/dumpstore"
-	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/zipper"
 	"github.com/cockroachdb/errors"
 )
@@ -30,17 +22,6 @@ import (
 const (
 	jobTraceDumpPrefix = "job_trace_dump"
 	timeFormat         = "2006-01-02T15_04_05.000"
-)
-
-var (
-	totalDumpSizeLimit = settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
-		"server.job_trace.total_dump_size_limit",
-		"total size of job trace dumps to be kept. "+
-			"Dumps are GC'ed in the order of creation time. The latest dump is "+
-			"always kept even if its size exceeds the limit.",
-		500<<20, // 500MiB
-	)
 )
 
 // TraceDumper can be used to dump a zip file containing cluster wide inflight
@@ -105,21 +86,4 @@ func (t *TraceDumper) Dump(ctx context.Context, name string, traceID int64, ie i
 	if err != nil {
 		log.Errorf(ctx, "failed to dump trace %v", err)
 	}
-}
-
-// NewTraceDumper returns a TraceDumper.
-//
-// dir is the directory in which dumps are stored.
-func NewTraceDumper(ctx context.Context, dir string, st *cluster.Settings) *TraceDumper {
-	if dir == "" {
-		return nil
-	}
-
-	log.Infof(ctx, "writing job trace dumps to %s", log.SafeManaged(dir))
-
-	td := &TraceDumper{
-		currentTime: timeutil.Now,
-		store:       dumpstore.NewStore(dir, totalDumpSizeLimit, st),
-	}
-	return td
 }

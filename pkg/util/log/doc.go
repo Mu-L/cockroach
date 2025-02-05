@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright 2013 Google Inc. All Rights Reserved.
 // Copyright 2015 Cockroach Labs.
@@ -83,8 +78,10 @@
 //
 // # Output
 //
-// Log output is buffered and written periodically using Flush. Programs
-// should call Flush before exiting to guarantee all log output is written.
+// Log output is buffered and written periodically using FlushFiles.
+// Programs should call FlushFiles before exiting to guarantee all
+// log output is written to files. Note that buffered network sinks also
+// exist. If you'd like to flush these as well, call FlushAllSync.
 //
 // By default, all log statements write to files in a temporary directory.
 // This package provides several flags that modify this behavior.

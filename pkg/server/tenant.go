@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -22,16 +17,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/inspectz"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
@@ -42,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostmodel"
-	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -64,8 +59,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
@@ -98,12 +95,18 @@ type SQLServerWrapper struct {
 	clock      *hlc.Clock
 	rpcContext *rpc.Context
 	// The gRPC server on which the different RPC handlers will be registered.
-	grpc       *grpcServer
-	nodeDialer *nodedialer.Dialer
-	db         *kv.DB
-	registry   *metric.Registry
-	recorder   *status.MetricsRecorder
-	runtime    *status.RuntimeStatSampler
+	grpc         *grpcServer
+	kvNodeDialer *nodedialer.Dialer
+	db           *kv.DB
+
+	// Metric registries.
+	// See the explanatory comments in server.go and status/recorder.g o
+	// for details.
+	registry    *metric.Registry
+	sysRegistry *metric.Registry
+
+	recorder *status.MetricsRecorder
+	runtime  *status.RuntimeStatSampler
 
 	http            *httpServer
 	adminAuthzCheck privchecker.CheckerForRPCHandlers
@@ -111,9 +114,7 @@ type SQLServerWrapper struct {
 	tenantStatus    *statusServer
 	drainServer     *drainServer
 	authentication  authserver.Server
-	// eventsExporter exports data to the Observability Service.
-	eventsExporter obs.EventsExporterInterface
-	stopper        *stop.Stopper
+	stopper         *stop.Stopper
 
 	debug *debug.Server
 
@@ -167,6 +168,7 @@ func (s *SQLServerWrapper) Drain(
 // process tenant.
 type tenantServerDeps struct {
 	instanceIDContainer *base.SQLIDContainer
+	nodeIDGetter        func() roachpb.NodeID
 
 	// The following should eventually be connected to tenant
 	// capabilities.
@@ -175,7 +177,13 @@ type tenantServerDeps struct {
 }
 
 type spanLimiterFactory func(isql.Executor, *cluster.Settings, *spanconfig.TestingKnobs) spanconfig.Limiter
-type costControllerFactory func(*cluster.Settings, roachpb.TenantID, kvtenant.TokenBucketProvider) (multitenant.TenantSideCostController, error)
+type costControllerFactory func(
+	*cluster.Settings,
+	roachpb.TenantID,
+	kvtenant.TokenBucketProvider,
+	kvclient.NodeDescStore,
+	roachpb.Locality,
+) (multitenant.TenantSideCostController, error)
 
 // NewSeparateProcessTenantServer creates a tenant-specific, SQL-only
 // server against a KV backend, with defaults appropriate for a
@@ -191,7 +199,14 @@ func NewSeparateProcessTenantServer(
 	tenantNameContainer *roachpb.TenantNameContainer,
 ) (*SQLServerWrapper, error) {
 	deps := tenantServerDeps{
-		instanceIDContainer:   baseCfg.IDContainer.SwitchToSQLIDContainerForStandaloneSQLInstance(),
+		instanceIDContainer: baseCfg.IDContainer.SwitchToSQLIDContainerForStandaloneSQLInstance(),
+		// The kvcoord.DistSender uses the node ID to preferentially route
+		// requests to a local replica (if one exists). In separate-process
+		// mode, not knowing the node ID, and thus not being able to take
+		// advantage of this optimization is okay, given tenants not running
+		// in-process with KV instances have no such optimization to take
+		// advantage of to begin with.
+		nodeIDGetter:          nil,
 		costControllerFactory: NewTenantSideCostController,
 		spanLimiterFactory: func(ie isql.Executor, st *cluster.Settings, knobs *spanconfig.TestingKnobs) spanconfig.Limiter {
 			return spanconfiglimiter.New(ie, st, knobs)
@@ -220,6 +235,10 @@ func newSharedProcessTenantServer(
 
 	deps := tenantServerDeps{
 		instanceIDContainer: base.NewSQLIDContainerForNode(baseCfg.IDContainer),
+		// The kvcoord.DistSender uses the node ID to preferentially route
+		// requests to a local replica (if one exists). In shared-process mode
+		// we can easily provide that without accessing the gossip.
+		nodeIDGetter: baseCfg.IDContainer.Get,
 		// TODO(ssd): The cost controller should instead be able to
 		// read from the capability system and return immediately if
 		// the tenant is exempt. For now we are turning off the
@@ -254,6 +273,32 @@ func newTenantServer(
 		return nil, err
 	}
 
+	// Start the SQL listener early so any delay that happen from this point onward
+	// (until the server is ready) won't cause client connections to be rejected.
+	if baseCfg.SplitListenSQL && !baseCfg.DisableSQLListener {
+		sqlAddrListener, err := ListenAndUpdateAddrs(
+			ctx, &baseCfg.SQLAddr, &baseCfg.SQLAdvertiseAddr, "sql", baseCfg.AcceptProxyProtocolHeaders)
+		if err != nil {
+			return nil, err
+		}
+		baseCfg.SQLAddrListener = sqlAddrListener
+	}
+
+	// The setting of tenant id may have not been done until now. If this is the
+	// case, DelayedSetTenantID will be set and should be used to populate
+	// TenantID in the config. We call it here as we need a valid TenantID below.
+	if sqlCfg.DelayedSetTenantID != nil {
+		cfgTenantID, cfgLocality, err := sqlCfg.DelayedSetTenantID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// We need to update sqlCfg and baseCfg here explicitly since copies
+		// were passed into newTenantServer instead of the original serverCfg
+		// object.
+		sqlCfg.TenantID = cfgTenantID
+		baseCfg.Locality = cfgLocality
+	}
+	log.Ops.Infof(ctx, "server starting for tenant %q", redact.Safe(sqlCfg.TenantID))
 	// Inform the server identity provider that we're operating
 	// for a tenant server.
 	//
@@ -288,8 +333,8 @@ func newTenantServer(
 	parseNodeIDFn := func(s string) (roachpb.NodeID, bool, error) {
 		return roachpb.NodeID(0), false, errors.New("tenants cannot proxy to KV Nodes")
 	}
-	getNodeIDHTTPAddressFn := func(id roachpb.NodeID) (*util.UnresolvedAddr, error) {
-		return nil, errors.New("tenants cannot proxy to KV Nodes")
+	getNodeIDHTTPAddressFn := func(id roachpb.NodeID) (*util.UnresolvedAddr, roachpb.Locality, error) {
+		return nil, roachpb.Locality{}, errors.New("tenants cannot proxy to KV Nodes")
 	}
 	sHTTP := newHTTPServer(baseCfg, args.rpcContext, parseNodeIDFn, getNodeIDHTTPAddressFn)
 
@@ -316,6 +361,10 @@ func newTenantServer(
 	// construct the status server with a nil sqlServer, and then assign it once
 	// an SQL server gets created. We are going to assume that the status server
 	// won't require the SQL server object until later.
+	var serverKnobs TestingKnobs
+	if s, ok := baseCfg.TestingKnobs.Server.(*TestingKnobs); ok {
+		serverKnobs = *s
+	}
 	sStatus := newStatusServer(
 		baseCfg.AmbientCtx,
 		baseCfg.Settings,
@@ -331,6 +380,7 @@ func newTenantServer(
 		args.circularInternalExecutor,
 		serverIterator,
 		args.clock,
+		&serverKnobs,
 	)
 	args.sqlStatusServer = sStatus
 
@@ -361,6 +411,15 @@ func newTenantServer(
 		}
 	}
 
+	// NB: On a shared process tenant, we start cidr once per tenant.
+	// Potentially we could share this across tenants, but this breaks the
+	// tenant separation model. For a small number of tenants this is OK, but if
+	// we have a large number of tenants in shared process mode this could be a
+	// problem from a memory and network perspective.
+	if err = baseCfg.CidrLookup.Start(ctx, stopper); err != nil {
+		return nil, err
+	}
+
 	// Instantiate the SQL server proper.
 	sqlServer, err := newSQLServer(ctx, args)
 	if err != nil {
@@ -373,14 +432,14 @@ func newTenantServer(
 	sqlServer.migrationServer = tms // only for testing via testTenant
 
 	// Tell the authz server how to connect to SQL.
-	adminAuthzCheck.SetAuthzAccessorFactory(func(opName string) (sql.AuthorizationAccessor, func()) {
+	adminAuthzCheck.SetAuthzAccessorFactory(func(opName redact.SafeString) (sql.AuthorizationAccessor, func()) {
 		// This is a hack to get around a Go package dependency cycle. See comment
 		// in sql/jobs/registry.go on planHookMaker.
 		txn := args.db.NewTxn(ctx, "check-system-privilege")
 		p, cleanup := sql.NewInternalPlanner(
 			opName,
 			txn,
-			username.RootUserName(),
+			username.NodeUserName(),
 			&sql.MemoryMetrics{},
 			sqlServer.execCfg,
 			sql.NewInternalSessionData(ctx, sqlServer.execCfg.Settings, opName),
@@ -433,7 +492,6 @@ func newTenantServer(
 		args.Settings,
 		sqlServer.pgServer.HBADebugFn(),
 		sqlServer.execCfg.SQLStatusServer,
-		nil, /* serverTickleFn */
 		sqlCfg.TenantID,
 		processCapAuthz,
 	)
@@ -444,12 +502,13 @@ func newTenantServer(
 		clock:      args.clock,
 		rpcContext: args.rpcContext,
 
-		grpc:       args.grpc,
-		nodeDialer: args.nodeDialer,
-		db:         args.db,
-		registry:   args.registry,
-		recorder:   args.recorder,
-		runtime:    args.runtime,
+		grpc:         args.grpc,
+		kvNodeDialer: args.kvNodeDialer,
+		db:           args.db,
+		registry:     args.registry,
+		sysRegistry:  args.sysRegistry,
+		recorder:     args.recorder,
+		runtime:      args.runtime,
 
 		http:            sHTTP,
 		adminAuthzCheck: adminAuthzCheck,
@@ -457,7 +516,6 @@ func newTenantServer(
 		tenantStatus:    sStatus,
 		drainServer:     drainServer,
 		authentication:  sAuth,
-		eventsExporter:  args.eventsExporter,
 		stopper:         args.stopper,
 
 		debug: debugServer,
@@ -526,7 +584,12 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	// The SQL listener is returned, to start the SQL server later
 	// below when the server has initialized.
 	enableSQLListener := !s.sqlServer.cfg.DisableSQLListener
-	pgL, loopbackPgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, *s.sqlServer.cfg, s.stopper, s.grpc, enableSQLListener)
+	lf := ListenAndUpdateAddrs
+	if s.sqlServer.cfg.RPCListenerFactory != nil {
+		lf = s.sqlServer.cfg.RPCListenerFactory
+	}
+
+	pgL, loopbackPgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(ctx, workersCtx, *s.sqlServer.cfg, s.stopper, s.grpc, lf, enableSQLListener, s.cfg.AcceptProxyProtocolHeaders)
 	if err != nil {
 		return err
 	}
@@ -621,7 +684,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 
 	// Start measuring the Go scheduler latency.
 	if err := schedulerlatency.StartSampler(
-		workersCtx, s.sqlServer.cfg.Settings, s.stopper, s.registry, base.DefaultMetricsSampleInterval,
+		workersCtx, s.sqlServer.cfg.Settings, s.stopper, s.sysRegistry, base.DefaultMetricsSampleInterval,
 		nil, /* listener */
 	); err != nil {
 		return err
@@ -649,7 +712,6 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	// to add this information. See below.
 	sentry.ConfigureScope(func(scope *sentry.Scope) {
 		scope.SetTags(map[string]string{
-			"engine_type":     s.sqlServer.cfg.StorageEngine.String(),
 			"encrypted_store": strconv.FormatBool(encryptedStore),
 		})
 	})
@@ -660,10 +722,11 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		panic(errors.AssertionFailedf("nil log metrics registry at server startup"))
 	}
 
-	// We can now add the node registry.
+	// We can now connect the metric registries to the recorder.
 	s.recorder.AddNode(
+		metric.NewRegistry(), // node registry -- unused here
 		s.registry,
-		logRegistry,
+		logRegistry, s.sysRegistry,
 		roachpb.NodeDescriptor{
 			NodeID: s.rpcContext.NodeID.Get(),
 		},
@@ -702,6 +765,8 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 			s.sqlServer.cfg.CPUProfileDirName,
 			s.runtime,
 			s.tenantStatus.sessionRegistry,
+			s.sqlServer.execCfg.RootMemoryMonitor,
+			s.cfg.TestingKnobs,
 		); err != nil {
 			return err
 		}
@@ -728,14 +793,22 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 
 	log.Event(ctx, "accepting connections")
 
-	// Start garbage collecting system events.
-	if err := startSystemLogsGC(workersCtx, s.sqlServer); err != nil {
+	// Start the SQL subsystem.
+	if err := s.sqlServer.preStart(
+		workersCtx,
+		s.stopper,
+		s.sqlServer.cfg.TestingKnobs,
+		orphanedLeasesTimeThresholdNanos,
+	); err != nil {
 		return err
 	}
 
 	// Connect the HTTP endpoints. This also wraps the privileged HTTP
 	// endpoints served by gwMux by the HTTP cookie authentication
 	// check.
+	// NB: This must occur after sqlServer.preStart() which initializes
+	// the cluster version from storage as the http auth server relies on
+	// the cluster version being initialized.
 	if err := s.http.setupRoutes(ctx,
 		s.authentication,  /* authnServer */
 		s.adminAuthzCheck, /* adminAuthzCheck */
@@ -754,20 +827,16 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 			db:               s.db,
 		}), /* apiServer */
 		serverpb.FeatureFlags{
-			CanViewKvMetricDashboards:   s.rpcContext.TenantID.Equal(roachpb.SystemTenantID),
+			CanViewKvMetricDashboards: s.rpcContext.TenantID.Equal(roachpb.SystemTenantID) ||
+				s.sqlServer.serviceMode == mtinfopb.ServiceModeShared,
 			DisableKvLevelAdvancedDebug: true,
 		},
 	); err != nil {
 		return err
 	}
 
-	// Start the SQL subsystem.
-	if err := s.sqlServer.preStart(
-		workersCtx,
-		s.stopper,
-		s.sqlServer.cfg.TestingKnobs,
-		orphanedLeasesTimeThresholdNanos,
-	); err != nil {
+	// Start garbage collecting system events.
+	if err := startSystemLogsGC(workersCtx, s.sqlServer); err != nil {
 		return err
 	}
 
@@ -778,18 +847,25 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	ieMon.StartNoReserved(ctx, s.PGServer().SQLServer.GetBytesMonitor())
 	s.stopper.AddCloser(stop.CloserFn(func() { ieMon.Stop(ctx) }))
 	s.externalStorageBuilder.init(
-		ctx,
-		s.sqlCfg.ExternalIODirConfig,
+		s.cfg.EarlyBootExternalStorageAccessor,
+		s.cfg.ExternalIODirConfig,
 		s.sqlServer.cfg.Settings,
 		s.sqlServer.sqlIDContainer,
-		s.nodeDialer,
+		s.kvNodeDialer,
 		s.sqlServer.cfg.TestingKnobs,
 		false, /* allowLocalFastpath */
 		s.sqlServer.execCfg.InternalDB.
 			CloneWithMemoryMonitor(sql.MemoryMetrics{}, ieMon),
 		s.costController,
 		s.registry,
+		s.cfg.ExternalIODir,
 	)
+
+	// Start the job scheduler now that the SQL Server and
+	// external storage is initialized.
+	if err := s.initJobScheduler(ctx); err != nil {
+		return err
+	}
 
 	// If enabled, start reporting diagnostics.
 	if s.sqlServer.cfg.StartDiagnosticsReporting && !cluster.TelemetryOptOut {
@@ -806,14 +882,6 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	if instanceID == 0 {
 		log.Fatalf(ctx, "expected SQLInstanceID to be initialized after preStart")
 	}
-	s.eventsExporter.SetNodeInfo(obs.NodeInfo{
-		ClusterID:     clusterID,
-		NodeID:        int32(instanceID),
-		BinaryVersion: build.BinaryVersion(),
-	})
-	if err := s.eventsExporter.Start(ctx, s.stopper); err != nil {
-		return errors.Wrap(err, "failed to start the event exporter")
-	}
 
 	// Add more context to the Sentry reporter.
 	sentry.ConfigureScope(func(scope *sentry.Scope) {
@@ -821,6 +889,9 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 			"cluster":   clusterID.String(),
 			"instance":  instanceID.String(),
 			"server_id": fmt.Sprintf("%s-%s", clusterID.Short(), instanceID.String()),
+			// TODO(jaylim-crl): Consider using tenant names here in the future
+			// as well. See discussions in https://github.com/cockroachdb/cockroach/pull/128602.
+			"tenant_id": s.rpcContext.TenantID.String(),
 		})
 	})
 
@@ -865,10 +936,39 @@ func (s *SQLServerWrapper) serveConn(
 	}
 }
 
+// initJobScheduler starts the job scheduler. This must be called
+// after sqlServer.preStart and after our external storage providers
+// have been initialized.
+//
+// TODO(ssd): We need to clean up the ordering/ownership here. The SQL
+// server owns the job scheduler because the job scheduler needs an
+// internal executor. But, the topLevelServer owns initialization of
+// the external storage providers.
+//
+// TODO(ssd): Remove duplication with *topLevelServer.
+func (s *SQLServerWrapper) initJobScheduler(ctx context.Context) error {
+	if s.cfg.DisableSQLServer {
+		return nil
+	}
+	// The job scheduler may immediately start jobs that require
+	// external storage providers to be available. We expect the
+	// server start up ordering to ensure this. Hitting this error
+	// is a programming error somewhere in server startup.
+	if err := s.externalStorageBuilder.assertInitComplete(); err != nil {
+		return err
+	}
+	s.sqlServer.startJobScheduler(ctx, s.cfg.TestingKnobs)
+	return nil
+}
+
 // AcceptClients starts listening for incoming SQL clients over the network.
 // This mirrors the implementation of (*Server).AcceptClients.
 // TODO(knz): Find a way to implement this method only once for both.
 func (s *SQLServerWrapper) AcceptClients(ctx context.Context) error {
+	if s.sqlServer.cfg.DisableSQLServer {
+		return serverutils.PreventDisableSQLForTenantError()
+	}
+
 	if !s.sqlServer.cfg.DisableSQLListener {
 		if err := startServeSQL(
 			s.AnnotateCtx(context.Background()),
@@ -876,6 +976,7 @@ func (s *SQLServerWrapper) AcceptClients(ctx context.Context) error {
 			s.pgPreServer,
 			s.serveConn,
 			s.pgL,
+			s.ClusterSettings(),
 			&s.sqlServer.cfg.SocketFile,
 		); err != nil {
 			return err
@@ -892,7 +993,7 @@ func (s *SQLServerWrapper) AcceptClients(ctx context.Context) error {
 		return err
 	}
 
-	s.sqlServer.isReady.Set(true)
+	s.sqlServer.isReady.Store(true)
 
 	log.Event(ctx, "server ready")
 	return nil
@@ -901,6 +1002,10 @@ func (s *SQLServerWrapper) AcceptClients(ctx context.Context) error {
 // AcceptInternalClients starts listening for incoming SQL connections on the
 // internal loopback interface.
 func (s *SQLServerWrapper) AcceptInternalClients(ctx context.Context) error {
+	if s.sqlServer.cfg.DisableSQLServer {
+		return serverutils.PreventDisableSQLForTenantError()
+	}
+
 	connManager := netutil.MakeTCPServer(ctx, s.stopper)
 
 	return s.stopper.RunAsyncTaskEx(ctx,
@@ -915,6 +1020,7 @@ func (s *SQLServerWrapper) AcceptInternalClients(ctx context.Context) error {
 					log.Ops.Errorf(connCtx, "serving SQL client conn: %v", err)
 					return
 				}
+				defer status.ReleaseMemory(ctx)
 
 				if err := s.serveConn(connCtx, conn, status); err != nil {
 					log.Ops.Errorf(connCtx, "serving internal SQL client conn: %s", err)
@@ -985,6 +1091,10 @@ func makeTenantSQLServerArgs(
 ) (sqlServerArgs, error) {
 	st := baseCfg.Settings
 
+	// Ensure that the settings accessor bark if an attempt is made
+	// to use a SystemOnly setting.
+	st.SV.SpecializeForVirtualCluster()
+
 	// We want all log messages issued on behalf of this SQL instance to report
 	// the instance ID (once known) as a tag.
 	startupCtx = baseCfg.AmbientCtx.AnnotateCtx(startupCtx)
@@ -1018,6 +1128,7 @@ func makeTenantSQLServerArgs(
 	// This tenant's SQL server only serves SQL connections and SQL-to-SQL
 	// RPCs; so it should refuse to serve SQL-to-KV RPCs completely.
 	rpcCtxOpts.TenantRPCAuthorizer = tenantcapabilitiesauthorizer.NewAllowNothingAuthorizer()
+	rpcCtxOpts.Locality = baseCfg.Locality
 
 	rpcContext := rpc.NewContext(startupCtx, rpcCtxOpts)
 
@@ -1073,27 +1184,32 @@ func makeTenantSQLServerArgs(
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
+	// TODO(baptist): This call does not take into account locality addresses.
 	resolver := kvtenant.AddressResolver(tenantConnect)
-	nodeDialer := nodedialer.New(rpcContext, resolver)
+	kvNodeDialer := nodedialer.New(rpcContext, resolver)
 
 	provider := kvtenant.TokenBucketProvider(tenantConnect)
 	if tenantKnobs, ok := baseCfg.TestingKnobs.TenantTestingKnobs.(*sql.TenantTestingKnobs); ok &&
 		tenantKnobs.OverrideTokenBucketProvider != nil {
 		provider = tenantKnobs.OverrideTokenBucketProvider(provider)
 	}
-	costController, err := deps.costControllerFactory(st, sqlCfg.TenantID, provider)
+	costController, err := deps.costControllerFactory(
+		st, sqlCfg.TenantID, provider, tenantConnect, baseCfg.Locality)
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
+	registry.AddMetricStruct(costController.Metrics())
 
 	dsCfg := kvcoord.DistSenderConfig{
 		AmbientCtx:        baseCfg.AmbientCtx,
 		Settings:          st,
 		Clock:             clock,
 		NodeDescs:         tenantConnect,
+		NodeIDGetter:      deps.nodeIDGetter,
 		RPCRetryOptions:   &rpcRetryOptions,
-		RPCContext:        rpcContext,
-		NodeDialer:        nodeDialer,
+		Stopper:           stopper,
+		LatencyFunc:       rpcContext.RemoteClocks.Latency,
+		TransportFactory:  kvcoord.GRPCTransportFactory(kvNodeDialer),
 		RangeDescriptorDB: tenantConnect,
 		Locality:          baseCfg.Locality,
 		KVInterceptor:     costController,
@@ -1123,7 +1239,7 @@ func makeTenantSQLServerArgs(
 		ds,
 	)
 
-	dbCtx := kv.DefaultDBContext(stopper)
+	dbCtx := kv.DefaultDBContext(st, stopper)
 	dbCtx.NodeID = deps.instanceIDContainer
 	db := kv.NewDBWithContext(baseCfg.AmbientCtx, tcsFactory, clock, dbCtx)
 
@@ -1133,7 +1249,7 @@ func makeTenantSQLServerArgs(
 		return sqlServerArgs{}, err
 	}
 
-	sTS := ts.MakeTenantServer(baseCfg.AmbientCtx, tenantConnect, rpcContext.TenantID)
+	sTS := ts.MakeTenantServer(baseCfg.AmbientCtx, tenantConnect, rpcContext.TenantID, registry)
 
 	systemConfigWatcher := systemconfigwatcher.NewWithAdditionalProvider(
 		keys.MakeSQLCodec(sqlCfg.TenantID), clock, rangeFeedFactory, &baseCfg.DefaultZoneConfig,
@@ -1147,9 +1263,8 @@ func makeTenantSQLServerArgs(
 	circularJobRegistry := &jobs.Registry{}
 
 	// Initialize the protectedts subsystem in multi-tenant clusters.
-	var protectedTSProvider protectedts.Provider
 	protectedtsKnobs, _ := baseCfg.TestingKnobs.ProtectedTS.(*protectedts.TestingKnobs)
-	pp, err := ptprovider.New(ptprovider.Config{
+	protectedTSProvider, err := ptprovider.New(ptprovider.Config{
 		DB:       internalExecutorFactory,
 		Settings: st,
 		Knobs:    protectedtsKnobs,
@@ -1160,13 +1275,13 @@ func makeTenantSQLServerArgs(
 			jobsprotectedts.GetMetaType(jobsprotectedts.Schedules): jobsprotectedts.MakeStatusFunc(
 				circularJobRegistry, jobsprotectedts.Schedules,
 			),
+			sessionprotectedts.SessionMetaType: sessionprotectedts.MakeStatusFunc(),
 		},
 	})
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
-	registry.AddMetricStruct(pp.Metrics())
-	protectedTSProvider = pp
+	registry.AddMetricStruct(protectedTSProvider.Metrics())
 
 	recorder := status.NewMetricsRecorder(
 		sqlCfg.TenantID, tenantNameContainer, nil /* nodeLiveness */, nil, /* remoteClocks */
@@ -1178,14 +1293,15 @@ func makeTenantSQLServerArgs(
 	} else {
 		runtime = status.NewRuntimeStatSampler(startupCtx, clock.WallClock())
 	}
-	registry.AddMetricStruct(runtime)
+	sysRegistry := metric.NewRegistry()
+	sysRegistry.AddMetricStruct(runtime)
 
 	// NB: The init method will be called in (*SQLServerWrapper).PreStart().
 	esb := &externalStorageBuilder{}
 	externalStorage := esb.makeExternalStorage
 	externalStorageFromURI := esb.makeExternalStorageFromURI
 
-	grpcServer, err := newGRPCServer(rpcContext)
+	grpcServer, err := newGRPCServer(startupCtx, rpcContext)
 	if err != nil {
 		return sqlServerArgs{}, err
 	}
@@ -1199,30 +1315,6 @@ func makeTenantSQLServerArgs(
 	})
 	remoteFlowRunnerAcc := monitorAndMetrics.rootSQLMemoryMonitor.MakeBoundAccount()
 	remoteFlowRunner := flowinfra.NewRemoteFlowRunner(baseCfg.AmbientCtx, stopper, &remoteFlowRunnerAcc)
-
-	// Create the EventServer. It will be made operational later, after the
-	// cluster ID is known, with a Start() call.
-	var eventsExporter obs.EventsExporterInterface
-	if baseCfg.ObsServiceAddr != "" {
-		if baseCfg.ObsServiceAddr == base.ObsServiceEmbedFlagValue {
-			// TODO(andrei): Add support for this option for tenants - at least for
-			// shared-process tenants where the event exporting should be hooked up to
-			// the ingester running in the host process.
-			return sqlServerArgs{}, errors.New("--obsservice-addr=embed is not currently supported for tenants")
-		}
-		ee := obs.NewEventsExporter(
-			baseCfg.ObsServiceAddr,
-			timeutil.DefaultTimeSource{},
-			baseCfg.Tracer,
-			5*time.Second,                          // maxStaleness
-			1<<20,                                  // triggerSizeBytes - 1MB
-			10*1<<20,                               // maxBufferSizeBytes - 10MB
-			monitorAndMetrics.rootSQLMemoryMonitor, // memMonitor - this is not "SQL" usage, but we don't have another memory pool
-		)
-		eventsExporter = ee
-	} else {
-		eventsExporter = &obs.NoopEventsExporter{}
-	}
 
 	// TODO(irfansharif): hook up NewGrantCoordinatorSQL.
 	var noopElasticCPUGrantCoord *admission.ElasticCPUGrantCoordinator = nil
@@ -1260,10 +1352,11 @@ func makeTenantSQLServerArgs(
 		nodeDescs:                tenantConnect,
 		systemConfigWatcher:      systemConfigWatcher,
 		spanConfigAccessor:       tenantConnect,
-		nodeDialer:               nodeDialer,
+		kvNodeDialer:             kvNodeDialer,
 		distSender:               ds,
 		db:                       db,
 		registry:                 registry,
+		sysRegistry:              sysRegistry,
 		recorder:                 recorder,
 		sessionRegistry:          sessionRegistry,
 		remoteFlowRunner:         remoteFlowRunner,
@@ -1276,7 +1369,6 @@ func makeTenantSQLServerArgs(
 		costController:           costController,
 		monitorAndMetrics:        monitorAndMetrics,
 		grpc:                     grpcServer,
-		eventsExporter:           eventsExporter,
 		externalStorageBuilder:   esb,
 		admissionPacerFactory:    noopElasticCPUGrantCoord,
 		rangeDescIteratorFactory: tenantConnect,
@@ -1322,7 +1414,11 @@ var NewTenantSideCostController costControllerFactory = NewNoopTenantSideCostCon
 // NewNoopTenantSideCostController returns a noop cost
 // controller. Used by shared-process tenants.
 func NewNoopTenantSideCostController(
-	*cluster.Settings, roachpb.TenantID, kvtenant.TokenBucketProvider,
+	*cluster.Settings,
+	roachpb.TenantID,
+	kvtenant.TokenBucketProvider,
+	kvclient.NodeDescStore,
+	roachpb.Locality,
 ) (multitenant.TenantSideCostController, error) {
 	// Return a no-op implementation.
 	return noopTenantSideCostController{}, nil
@@ -1355,7 +1451,11 @@ func (noopTenantSideCostController) OnRequestWait(ctx context.Context) error {
 }
 
 func (noopTenantSideCostController) OnResponseWait(
-	ctx context.Context, req tenantcostmodel.RequestInfo, resp tenantcostmodel.ResponseInfo,
+	ctx context.Context,
+	request *kvpb.BatchRequest,
+	response *kvpb.BatchResponse,
+	targetRange *roachpb.RangeDescriptor,
+	targetReplica *roachpb.ReplicaDescriptor,
 ) error {
 	return nil
 }
@@ -1375,6 +1475,14 @@ func (noopTenantSideCostController) GetCPUMovingAvg() float64 {
 	return 0
 }
 
-func (noopTenantSideCostController) GetCostConfig() *tenantcostmodel.Config {
+func (noopTenantSideCostController) GetRequestUnitModel() *tenantcostmodel.RequestUnitModel {
 	return nil
+}
+
+func (noopTenantSideCostController) GetEstimatedCPUModel() *tenantcostmodel.EstimatedCPUModel {
+	return nil
+}
+
+func (noopTenantSideCostController) Metrics() metric.Struct {
+	return emptyMetricStruct{}
 }

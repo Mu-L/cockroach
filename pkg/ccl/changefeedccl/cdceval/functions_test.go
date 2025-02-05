@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdceval
 
@@ -40,8 +37,9 @@ func TestEvaluatesCDCFunctionOverloads(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, ""+
@@ -52,8 +50,8 @@ func TestEvaluatesCDCFunctionOverloads(t *testing.T) {
 	ctx := context.Background()
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 
-	semaCtx := tree.MakeSemaContext()
-	defer configSemaForCDC(&semaCtx)()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
+	defer configSemaForCDC(&semaCtx, hlc.Timestamp{})()
 
 	t.Run("time", func(t *testing.T) {
 		expectTSTZ := func(ts hlc.Timestamp) tree.Datum {
@@ -432,7 +430,7 @@ func newEvaluator(
 		return nil, err
 	}
 
-	defer configSemaForCDC(semaCtx)()
+	defer configSemaForCDC(semaCtx, hlc.Timestamp{})()
 	norm, err := normalizeSelectClause(context.Background(), semaCtx, sc, ed)
 	if err != nil {
 		return nil, err

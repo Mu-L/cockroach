@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package slstorage
 
@@ -22,8 +17,9 @@ import (
 
 // keyCodec manages the SessionID <-> roachpb.Key mapping.
 type keyCodec interface {
-	encode(sid sqlliveness.SessionID) (roachpb.Key, error)
+	encode(sid sqlliveness.SessionID) (roachpb.Key, string, error)
 	decode(key roachpb.Key) (sqlliveness.SessionID, error)
+	validate(session sqlliveness.SessionID) error
 
 	// indexPrefix returns the prefix for an encoded key. encode() will return
 	// something with the prefix and decode will expect a key with this prefix.
@@ -37,21 +33,25 @@ type rbrEncoder struct {
 	rbrIndex roachpb.Key
 }
 
-func (e *rbrEncoder) encode(session sqlliveness.SessionID) (roachpb.Key, error) {
-	region, _, err := UnsafeDecodeSessionID(session)
+func (e *rbrEncoder) validate(session sqlliveness.SessionID) error {
+	return ValidateSessionID(session)
+}
+
+func (e *rbrEncoder) encode(session sqlliveness.SessionID) (roachpb.Key, string, error) {
+	region, _, err := SafeDecodeSessionID(session)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(region) == 0 {
-		return nil, errors.Newf("legacy session passed to rbr table: '%s'", session.String())
+		return nil, "", errors.Newf("legacy session passed to rbr table: '%s'", session.String())
 	}
 
 	const columnFamilyID = 0
 
 	key := e.indexPrefix()
-	key = encoding.EncodeBytesAscending(key, region)
+	key = encoding.EncodeBytesAscending(key, encoding.UnsafeConvertStringToBytes(region))
 	key = encoding.EncodeBytesAscending(key, session.UnsafeBytes())
-	return keys.MakeFamilyKey(key, columnFamilyID), nil
+	return keys.MakeFamilyKey(key, columnFamilyID), region, nil
 }
 
 func (e *rbrEncoder) decode(key roachpb.Key) (sqlliveness.SessionID, error) {
@@ -75,34 +75,4 @@ func (e *rbrEncoder) decode(key roachpb.Key) (sqlliveness.SessionID, error) {
 
 func (e *rbrEncoder) indexPrefix() roachpb.Key {
 	return e.rbrIndex.Clone()
-}
-
-type rbtEncoder struct {
-	rbtIndex roachpb.Key
-}
-
-func (e *rbtEncoder) encode(id sqlliveness.SessionID) (roachpb.Key, error) {
-	const columnFamilyID = 0
-
-	key := e.indexPrefix()
-	key = encoding.EncodeBytesAscending(key, id.UnsafeBytes())
-	return keys.MakeFamilyKey(key, columnFamilyID), nil
-}
-
-func (e *rbtEncoder) decode(key roachpb.Key) (sqlliveness.SessionID, error) {
-	if !bytes.HasPrefix(key, e.rbtIndex) {
-		return "", errors.Newf("sqlliveness table key has an invalid prefix: %v", key)
-	}
-	rem := key[len(e.rbtIndex):]
-
-	rem, session, err := encoding.DecodeBytesAscending(rem, nil)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to decode region from session key")
-	}
-
-	return sqlliveness.SessionID(session), nil
-}
-
-func (e *rbtEncoder) indexPrefix() roachpb.Key {
-	return e.rbtIndex.Clone()
 }

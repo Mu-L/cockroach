@@ -1,20 +1,14 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package application_api_test
 
 import (
 	"context"
-	gosql "database/sql"
+	"encoding/json"
 	"fmt"
-	"net/url"
 	"reflect"
 	"sort"
 	"strings"
@@ -23,15 +17,19 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatstestutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -44,9 +42,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// additionalTimeoutUnderDuress is the additional timeout to use for the http
+// client if under stress.
+const additionalTimeoutUnderDuress = 30 * time.Second
+
 func TestStatusAPICombinedTransactions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	// Increase the timeout for the http client if under stress.
+	additionalTimeout := 0 * time.Second
+	if skip.Duress() {
+		additionalTimeout = additionalTimeoutUnderDuress
+	}
 
 	var params base.TestServerArgs
 	params.Knobs.SpanConfig = &spanconfig.TestingKnobs{ManagerDisableJobCreation: true} // TODO(irfansharif): #74919.
@@ -57,9 +65,6 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 	defer testCluster.Stopper().Stop(ctx)
 
 	thirdServer := testCluster.Server(2)
-	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, thirdServer.AdvSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
-	defer cleanupGoDB()
 	firstServerProto := testCluster.Server(0)
 
 	type testCase struct {
@@ -76,7 +81,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 		{query: `CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)`, count: 1, numRows: 0},
 		{
 			query:         `INSERT INTO posts VALUES (1, 'foo')`,
-			fingerprinted: `INSERT INTO posts VALUES (_, '_')`,
+			fingerprinted: `INSERT INTO posts VALUES (_, __more__)`,
 			count:         1,
 			numRows:       1,
 		},
@@ -106,10 +111,11 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 
 		// Create a brand new connection for each app, so that we don't pollute
 		// transaction stats collection with `SET application_name` queries.
-		sqlDB, err := gosql.Open("postgres", pgURL.String())
+		sqlDB, err := thirdServer.ApplicationLayer().SQLConnE()
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		if _, err := sqlDB.Exec(fmt.Sprintf(`SET application_name = "%s"`, appName)); err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +131,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 
 	// Hit query endpoint.
 	var resp serverpb.StatementsResponse
-	if err := srvtestutils.GetStatusJSONProto(firstServerProto, "combinedstmts", &resp); err != nil {
+	if err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, "combinedstmts", &resp, true, additionalTimeout); err != nil {
 		t.Fatal(err)
 	}
 
@@ -187,14 +193,14 @@ func TestStatusAPITransactions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderDeadlock(t, "test is very slow under deadlock")
+	skip.UnderRace(t, "test is too slow to run under race")
+
 	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
 
 	thirdServer := testCluster.Server(2)
-	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, thirdServer.AdvSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
-	defer cleanupGoDB()
 	firstServerProto := testCluster.Server(0)
 
 	type testCase struct {
@@ -211,7 +217,7 @@ func TestStatusAPITransactions(t *testing.T) {
 		{query: `CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)`, count: 1, numRows: 0},
 		{
 			query:         `INSERT INTO posts VALUES (1, 'foo')`,
-			fingerprinted: `INSERT INTO posts VALUES (_, _)`,
+			fingerprinted: `INSERT INTO posts VALUES (_, __more__)`,
 			count:         1,
 			numRows:       1,
 		},
@@ -239,9 +245,9 @@ func TestStatusAPITransactions(t *testing.T) {
 		appName := fmt.Sprintf("app%d", i)
 		appNameToTestCase[appName] = tc
 
-		// Create a brand new connection for each app, so that we don't pollute
+		// Create a brand-new connection for each app, so that we don't pollute
 		// transaction stats collection with `SET application_name` queries.
-		sqlDB, err := gosql.Open("postgres", pgURL.String())
+		sqlDB, err := thirdServer.ApplicationLayer().SQLConnE()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -325,7 +331,7 @@ func TestStatusAPITransactionStatementFingerprintIDsTruncation(t *testing.T) {
 	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 	testingApp := "testing"
 
@@ -380,6 +386,12 @@ func TestStatusAPIStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Increase the timeout for the http client if under stress.
+	additionalTimeout := 0 * time.Second
+	if skip.Duress() {
+		additionalTimeout = additionalTimeoutUnderDuress
+	}
+
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
 	statsKnobs := sqlstats.CreateTestingKnobs()
@@ -396,7 +408,7 @@ func TestStatusAPIStatements(t *testing.T) {
 	})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
 	statements := []struct {
@@ -408,7 +420,7 @@ func TestStatusAPIStatements(t *testing.T) {
 		{stmt: `CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)`},
 		{
 			stmt:          `INSERT INTO posts VALUES (1, 'foo')`,
-			fingerprinted: `INSERT INTO posts VALUES (_, '_')`,
+			fingerprinted: `INSERT INTO posts VALUES (_, __more__)`,
 		},
 		{stmt: `SELECT * FROM posts`},
 	}
@@ -419,21 +431,21 @@ func TestStatusAPIStatements(t *testing.T) {
 
 	// Test that non-admin without VIEWACTIVITY privileges cannot access.
 	var resp serverpb.StatementsResponse
-	err := srvtestutils.GetStatusJSONProtoWithAdminOption(firstServerProto, "statements", &resp, false)
+	err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, "statements", &resp, false, additionalTimeout)
 	if !testutils.IsError(err, "status: 403") {
 		t.Fatalf("expected privilege error, got %v", err)
 	}
 
 	testPath := func(path string, expectedStmts []string) {
 		// Hit query endpoint.
-		if err := srvtestutils.GetStatusJSONProtoWithAdminOption(firstServerProto, path, &resp, false); err != nil {
+		if err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, path, &resp, false, additionalTimeout); err != nil {
 			t.Fatal(err)
 		}
 
 		// See if the statements returned are what we executed.
 		var statementsInResponse []string
 		for _, respStatement := range resp.Statements {
-			if respStatement.Key.KeyData.Failed {
+			if respStatement.Stats.FailureCount > 0 {
 				// We ignore failed statements here as the INSERT statement can fail and
 				// be automatically retried, confusing the test success check.
 				continue
@@ -487,12 +499,182 @@ func TestStatusAPIStatements(t *testing.T) {
 	testPath(fmt.Sprintf("statements?combined=true&start=%d", aggregatedTs+60), nil)
 }
 
+type testStatement struct {
+	query                  string
+	fingerprintID          appstatspb.StmtFingerprintID
+	aggregatedTs           time.Time
+	count                  int64
+	serviceLatency         appstatspb.NumericStat
+	addStatementStatistics bool
+	addStatementActivity   bool
+}
+
+func TestStatusAPICombinedStatementsTotalLatency(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderRace(t, "test is too slow to run under race")
+	// Increase the timeout for the http client if under stress.
+	additionalTimeout := 0 * time.Second
+	if skip.Duress() {
+		additionalTimeout = additionalTimeoutUnderDuress
+	}
+
+	sqlStatsKnobs := sqlstats.CreateTestingKnobs()
+	// Start the cluster.
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Insecure: true,
+		Knobs: base.TestingKnobs{
+			SQLStatsKnobs: sqlStatsKnobs,
+		},
+	})
+
+	defer srv.Stopper().Stop(context.Background())
+	defer sqlDB.Close()
+	ts := srv.ApplicationLayer()
+	db := sqlutils.MakeSQLRunner(sqlDB)
+
+	// Disabled flush so no extra data is inserted to the system table.
+	db.Exec(t, "SET CLUSTER SETTING sql.stats.activity.flush.enabled = 'f'")
+	// Give permission to write to system tables.
+	db.Exec(t, "INSERT INTO system.users VALUES ('node', NULL, true, 3)")
+	db.Exec(t, "GRANT node TO root")
+
+	stmts := []testStatement{
+		{
+			query:                  "SELECT * FROM foo",
+			fingerprintID:          appstatspb.StmtFingerprintID(1088747230083123385),
+			aggregatedTs:           timeutil.FromUnixMicros(1704103200000000), // January 1, 2024 10:00:00
+			count:                  1,
+			serviceLatency:         appstatspb.NumericStat{Mean: 3, SquaredDiffs: 0},
+			addStatementStatistics: true,
+			addStatementActivity:   false,
+		},
+		{
+			query:                  "SELECT * FROM bar",
+			fingerprintID:          appstatspb.StmtFingerprintID(2422963415274537466),
+			aggregatedTs:           timeutil.FromUnixMicros(1704106800000000), // January 1, 2024 11:00:00
+			count:                  5,
+			serviceLatency:         appstatspb.NumericStat{Mean: 7, SquaredDiffs: 0},
+			addStatementStatistics: true,
+			addStatementActivity:   false,
+		},
+		{
+			query:                  "SELECT * FROM abc",
+			fingerprintID:          appstatspb.StmtFingerprintID(8810317408726404693),
+			aggregatedTs:           timeutil.FromUnixMicros(1704110400000000), // January 1, 2024 12:00:00
+			count:                  11,
+			serviceLatency:         appstatspb.NumericStat{Mean: 13, SquaredDiffs: 0},
+			addStatementStatistics: true,
+			addStatementActivity:   true,
+		},
+		{
+			query:                  "SELECT * FROM xyz",
+			fingerprintID:          appstatspb.StmtFingerprintID(2759320105256699956),
+			aggregatedTs:           timeutil.FromUnixMicros(1704114000000000), // January 1, 2024 13:00:00
+			count:                  17,
+			serviceLatency:         appstatspb.NumericStat{Mean: 19, SquaredDiffs: 0},
+			addStatementStatistics: true,
+			addStatementActivity:   true,
+		},
+	}
+
+	for _, stmt := range stmts {
+		s := generateStatement()
+		s.AggregatedTs = stmt.aggregatedTs
+		s.ID = stmt.fingerprintID
+		s.Key.Query = stmt.query
+		s.Key.QuerySummary = stmt.query
+		s.Stats.Count = stmt.count
+		s.Stats.ServiceLat = stmt.serviceLatency
+
+		if stmt.addStatementStatistics {
+			insertStatementIntoSystemStmtStatsTable(t, db, s)
+		}
+		if stmt.addStatementActivity {
+			insertStatementIntoSystemStmtActivityTable(t, db, s)
+		}
+	}
+
+	testCases := []struct {
+		testName     string
+		start        string
+		end          string
+		count        int
+		totalLatency float32
+		sourceTable  string
+	}{
+		{
+			testName:     "period with one statement on statement_statistics and none on statement_activity",
+			start:        "1704103200", // January 1, 2024 10:00:00
+			end:          "1704104400", // January 1, 2024 10:20:00
+			count:        1,
+			totalLatency: getTotalLatencyForStatements(stmts[0]),
+			sourceTable:  "crdb_internal.statement_statistics_persisted",
+		},
+		{
+			testName:     "period with 2 statements on statement_statistics and none on statement_activity",
+			start:        "1704103200", // January 1, 2024 10:00:00
+			end:          "1704109200", // January 1, 2024 11:40:00
+			count:        2,
+			totalLatency: getTotalLatencyForStatements(stmts[0], stmts[1]),
+			sourceTable:  "crdb_internal.statement_statistics_persisted",
+		},
+		{
+			testName:     "period with one statement on statement_activity",
+			start:        "1704110400", // January 1, 2024 12:00:00
+			end:          "1704112800", // January 1, 2024 12:40:00
+			count:        1,
+			totalLatency: getTotalLatencyForStatements(stmts[2]),
+			sourceTable:  "crdb_internal.statement_activity",
+		},
+		{
+			testName:     "period with 2 statements on statement_activity",
+			start:        "1704110400", // January 1, 2024 12:00:00
+			end:          "1704116400", // January 1, 2024 13:40:00
+			count:        2,
+			totalLatency: getTotalLatencyForStatements(stmts[2], stmts[3]),
+			sourceTable:  "crdb_internal.statement_activity",
+		},
+		{
+			testName:     "period with 2 statements on statement_activity and 4 statements on statement_statistics",
+			start:        "1704103200", // January 1, 2024 10:00:00
+			end:          "1704116400", // January 1, 2024 13:40:00
+			count:        4,
+			totalLatency: getTotalLatencyForStatements(stmts[0], stmts[1], stmts[2], stmts[3]),
+			sourceTable:  "crdb_internal.statement_statistics_persisted",
+		},
+	}
+
+	for _, tc := range testCases {
+		var resp serverpb.StatementsResponse
+		endpoint := fmt.Sprintf("combinedstmts?start=%s&end=%s", tc.start, tc.end)
+		err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(ts, endpoint, &resp, true, additionalTimeout)
+		require.NoError(t, err, fmt.Sprintf("server error on %s", tc.testName))
+		require.Equal(t, tc.sourceTable, resp.StmtsSourceTable, fmt.Sprintf("source table error on %s", tc.testName))
+		require.Equal(t, tc.count, len(resp.Statements), fmt.Sprintf("stmts length error on %s", tc.testName))
+		require.Equal(t, tc.totalLatency, resp.StmtsTotalRuntimeSecs, fmt.Sprintf("total latency on %s", tc.testName))
+	}
+
+}
+
+func getTotalLatencyForStatements(statements ...testStatement) float32 {
+	total := float32(0)
+	for _, statement := range statements {
+		total = total + float32(statement.count)*float32(statement.serviceLatency.Mean)
+	}
+	return total
+}
+
 func TestStatusAPICombinedStatementsWithFullScans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Skip under stress until we extend the timeout for the http client.
-	skip.UnderStressWithIssue(t, 109184)
+	// Increase the timeout for the http client if under stress.
+	additionalTimeout := 0 * time.Second
+	if skip.Duress() {
+		additionalTimeout = additionalTimeoutUnderDuress
+	}
+	skip.UnderRace(t, "test is too slow to run under race")
 
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
@@ -512,9 +694,10 @@ func TestStatusAPICombinedStatementsWithFullScans(t *testing.T) {
 	defer testCluster.Stopper().Stop(context.Background())
 
 	endpoint := fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs)
-	findJobQuery := "SELECT status FROM [SHOW JOBS] WHERE statement = 'CREATE INDEX idx_age ON football.public.players (age) STORING (name)';"
+	findJobQuery := "SELECT status FROM crdb_internal.jobs WHERE statement = 'CREATE INDEX idx_age ON football.public.players (age) STORING (name)';"
+	testAppName := "TestCombinedStatementsWithFullScans"
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	sqlSB := testCluster.ServerConn(0)
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
@@ -526,6 +709,7 @@ func TestStatusAPICombinedStatementsWithFullScans(t *testing.T) {
 	}
 
 	thirdServerSQL.Exec(t, fmt.Sprintf("GRANT SYSTEM VIEWACTIVITY TO %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
+	thirdServerSQL.Exec(t, fmt.Sprintf(`SET application_name = '%s'`, testAppName))
 
 	type TestCases struct {
 		stmt      string
@@ -536,12 +720,12 @@ func TestStatusAPICombinedStatementsWithFullScans(t *testing.T) {
 		count     int
 	}
 
-	// These test statements are executed before any indexes are introduced.
+	// These test statements are executed before the index is introduced.
 	statementsBeforeIndex := []TestCases{
 		{stmt: `CREATE DATABASE football`, respQuery: `CREATE DATABASE football`, fullScan: false, distSQL: false, failed: false, count: 1},
 		{stmt: `SET database = football`, respQuery: `SET database = football`, fullScan: false, distSQL: false, failed: false, count: 1},
 		{stmt: `CREATE TABLE players (id INT PRIMARY KEY, name TEXT, position TEXT, age INT,goals INT)`, respQuery: `CREATE TABLE players (id INT8 PRIMARY KEY, name STRING, "position" STRING, age INT8, goals INT8)`, fullScan: false, distSQL: false, failed: false, count: 1},
-		{stmt: `INSERT INTO players (id, name, position, age, goals) VALUES (1, 'Lionel Messi', 'Forward', 34, 672), (2, 'Cristiano Ronaldo', 'Forward', 36, 674)`, respQuery: `INSERT INTO players(id, name, "position", age, goals) VALUES (_, '_', __more1_10__), (__more1_10__)`, fullScan: false, distSQL: false, failed: false, count: 1},
+		{stmt: `INSERT INTO players (id, name, position, age, goals) VALUES (1, 'Lionel Messi', 'Forward', 34, 672), (2, 'Cristiano Ronaldo', 'Forward', 36, 674)`, respQuery: `INSERT INTO players(id, name, "position", age, goals) VALUES (_, __more__), (__more__)`, fullScan: false, distSQL: false, failed: false, count: 1},
 		{stmt: `SELECT avg(goals) FROM players`, respQuery: `SELECT avg(goals) FROM players`, fullScan: true, distSQL: true, failed: false, count: 1},
 		{stmt: `SELECT name FROM players WHERE age >= 32`, respQuery: `SELECT name FROM players WHERE age >= _`, fullScan: true, distSQL: true, failed: false, count: 1},
 	}
@@ -560,58 +744,76 @@ func TestStatusAPICombinedStatementsWithFullScans(t *testing.T) {
 		{stmt: `SELECT name FROM players WHERE age >= 32`, respQuery: `SELECT name FROM players WHERE age >= _`, fullScan: true, distSQL: true, failed: false, count: 2},
 	}
 
-	type StatementData struct {
+	type ExpectedStatementData struct {
 		count    int
 		fullScan bool
 		distSQL  bool
-		failed   bool
 	}
 
-	// Declare the map outside of the executeStatements function.
-	statementDataMap := make(map[string]StatementData)
+	// expectedStatementStatsMap maps the query response format to the associated
+	// expected statement statistics for verification.
+	expectedStatementStatsMap := make(map[string]ExpectedStatementData)
 
+	// Helper function to execute the statements and store the expected statement
 	executeStatements := func(statements []TestCases) {
-		// For each statement in the test case, execute the statement and store the
-		// expected statement data in a map.
+		// Clear the map at the start of each execution batch.
+		expectedStatementStatsMap = make(map[string]ExpectedStatementData)
 		for _, stmt := range statements {
 			thirdServerSQL.Exec(t, stmt.stmt)
-			statementDataMap[stmt.respQuery] = StatementData{
+			expectedStatementStatsMap[stmt.respQuery] = ExpectedStatementData{
 				fullScan: stmt.fullScan,
 				distSQL:  stmt.distSQL,
-				failed:   stmt.failed,
 				count:    stmt.count,
 			}
 		}
 	}
 
+	// Helper function to convert a response into a JSON string representation.
+	responseToJSON := func(resp interface{}) string {
+		bytes, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(bytes)
+	}
+
+	// Helper function to verify the combined statement statistics response.
 	verifyCombinedStmtStats := func() {
-		err := srvtestutils.GetStatusJSONProtoWithAdminOption(firstServerProto, endpoint, &resp, false)
+		err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, endpoint, &resp, false, additionalTimeout)
 		require.NoError(t, err)
 
+		// actualResponseStatsMap maps the query response format to the actual
+		// statement statistics received from the server response.
+		actualResponseStatsMap := make(map[string]serverpb.StatementsResponse_CollectedStatementStatistics)
 		for _, respStatement := range resp.Statements {
-			respQuery := respStatement.Key.KeyData.Query
-			actualCount := respStatement.Stats.Count
+			// Skip failed statements: The test app may encounter transient 40001
+			// errors that are automatically retried. Thus, we only consider
+			// statements that were that were successfully executed by the test app
+			// to avoid counting such failures. If a statement that we expect to be
+			// successful is not found in the response, the test will fail later.
+			if respStatement.Key.KeyData.App == testAppName && respStatement.Stats.FailureCount == 0 {
+				actualResponseStatsMap[respStatement.Key.KeyData.Query] = respStatement
+			}
+		}
+
+		for respQuery, expectedData := range expectedStatementStatsMap {
+			respStatement, exists := actualResponseStatsMap[respQuery]
+			require.True(t, exists, "Expected statement '%s' not found in response: %v", respQuery, responseToJSON(resp))
+
+			actualCount := respStatement.Stats.FirstAttemptCount
 			actualFullScan := respStatement.Key.KeyData.FullScan
 			actualDistSQL := respStatement.Key.KeyData.DistSQL
-			actualFailed := respStatement.Key.KeyData.Failed
-			// If the response has a query that isn't in our map, it means that it's
-			// not part of our test, so we ignore it.
-			expectedData, ok := statementDataMap[respQuery]
-			if !ok {
-				continue
-			}
 
-			require.Equal(t, expectedData.fullScan, actualFullScan)
-			require.Equal(t, expectedData.distSQL, actualDistSQL)
-			require.Equal(t, expectedData.failed, actualFailed)
-			require.Equal(t, expectedData.count, int(actualCount))
+			stmtJSONString := responseToJSON(respStatement)
+
+			require.Equal(t, expectedData.fullScan, actualFullScan, "failed for respStatement: %v", stmtJSONString)
+			require.Equal(t, expectedData.distSQL, actualDistSQL, "failed for respStatement: %v", stmtJSONString)
+			require.Equal(t, expectedData.count, int(actualCount), "failed for respStatement: %v", stmtJSONString)
 		}
 	}
 
-	// Execute the queries that will be executed before the index is created.
+	// Execute and verify the queries that will be executed before the index is created.
 	executeStatements(statementsBeforeIndex)
-
-	// Test the statements that will be executed before the index is created.
 	verifyCombinedStmtStats()
 
 	// Execute the queries that will create the index.
@@ -635,16 +837,17 @@ func TestStatusAPICombinedStatementsWithFullScans(t *testing.T) {
 		return nil
 	}, 3*time.Second)
 
-	// Execute the queries that will be executed after the index is created.
+	// Execute and verify the queries that will be executed after the index is created.
 	executeStatements(statementsAfterIndex)
-
-	// Test the statements that will be executed after the index is created.
 	verifyCombinedStmtStats()
 }
 
 func TestStatusAPICombinedStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	// Resource-intensive test, times out under stress.
+	skip.UnderRace(t, "expensive tests")
 
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
@@ -662,7 +865,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 	})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
 	statements := []struct {
@@ -674,7 +877,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 		{stmt: `CREATE TABLE posts (id INT8 PRIMARY KEY, body STRING)`},
 		{
 			stmt:          `INSERT INTO posts VALUES (1, 'foo')`,
-			fingerprinted: `INSERT INTO posts VALUES (_, '_')`,
+			fingerprinted: `INSERT INTO posts VALUES (_, __more__)`,
 		},
 		{stmt: `SELECT * FROM posts`},
 	}
@@ -700,7 +903,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 		var statementsInResponse []string
 		expectedTxnFingerprints := map[appstatspb.TransactionFingerprintID]struct{}{}
 		for _, respStatement := range resp.Statements {
-			if respStatement.Key.KeyData.Failed {
+			if respStatement.Stats.FailureCount > 0 {
 				// We ignore failed statements here as the INSERT statement can fail and
 				// be automatically retried, confusing the test success check.
 				continue
@@ -723,6 +926,9 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 		for _, respTxn := range resp.Transactions {
 			delete(expectedTxnFingerprints, respTxn.StatsData.TransactionFingerprintID)
 		}
+		// We set the default value of Transaction Fingerprint as 0 for some cases,
+		// so this also needs to be removed from the list.
+		delete(expectedTxnFingerprints, 0)
 
 		sort.Strings(expectedStmts)
 		sort.Strings(statementsInResponse)
@@ -814,7 +1020,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	// The liveness session might expire before the stress race can finish.
-	skip.UnderStressRace(t, "expensive tests")
+	skip.UnderRace(t, "expensive tests")
 
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
@@ -832,7 +1038,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
 	statements := []string{
@@ -850,9 +1056,8 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 		thirdServerSQL.Exec(t, stmt)
 	}
 
-	query := `INSERT INTO posts VALUES (_, '_')`
-	fingerprintID := appstatspb.ConstructStatementFingerprintID(query,
-		false, true, `roachblog`)
+	query := `INSERT INTO posts VALUES (_, __more__)`
+	fingerprintID := appstatspb.ConstructStatementFingerprintID(query, true, `roachblog`)
 	path := fmt.Sprintf(`stmtdetails/%v`, fingerprintID)
 
 	var resp serverpb.StatementDetailsResponse
@@ -1045,8 +1250,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	}
 
 	selectQuery := "SELECT _, _, _, _"
-	fingerprintID = appstatspb.ConstructStatementFingerprintID(selectQuery, false,
-		true, "defaultdb")
+	fingerprintID = appstatspb.ConstructStatementFingerprintID(selectQuery, true, "defaultdb")
 
 	testPath(
 		fmt.Sprintf(`stmtdetails/%v`, fingerprintID),
@@ -1071,7 +1275,7 @@ func TestUnprivilegedUserResetIndexUsageStats(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	sqlConn := sqlutils.MakeSQLRunner(conn)
-	sqlConn.Exec(t, "CREATE USER nonAdminUser")
+	sqlConn.Exec(t, "CREATE USER non_admin_user")
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 
@@ -1080,10 +1284,579 @@ func TestUnprivilegedUserResetIndexUsageStats(t *testing.T) {
 		"test-reset-index-usage-stats-as-non-admin-user",
 		nil, /* txn */
 		sessiondata.InternalExecutorOverride{
-			User: username.MakeSQLUsernameFromPreNormalizedString("nonAdminUser"),
+			User: username.MakeSQLUsernameFromPreNormalizedString("non_admin_user"),
 		},
 		"SELECT crdb_internal.reset_index_usage_stats()",
 	)
 
-	require.Contains(t, err.Error(), "requires admin privilege")
+	require.Contains(t, err.Error(), "user non_admin_user does not have REPAIRCLUSTER system privilege")
+}
+
+// TestCombinedStatementUsesCorrectSourceTable tests that requests read from
+// the expected crdb_internal table given the table states. We have a lot of
+// different tables that requests could potentially read from (in-memory, cached,
+// system tables etc.), so we should sanity check that we are using the expected ones.
+// given some simple table states.
+func TestCombinedStatementUsesCorrectSourceTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	// Disable flushing sql stats so we can manually set the table states
+	// without worrying about unexpected stats appearing.
+	settings := cluster.MakeTestingClusterSettings()
+	statsKnobs := sqlstats.CreateTestingKnobs()
+	defaultMockInsertedAggTs := timeutil.Unix(1696906800, 0)
+	statsKnobs.StubTimeNow = func() time.Time { return defaultMockInsertedAggTs }
+	persistedsqlstats.SQLStatsFlushEnabled.Override(ctx, &settings.SV, false)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Settings: settings,
+		Knobs: base.TestingKnobs{
+			SQLStatsKnobs: statsKnobs,
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	conn := sqlutils.MakeSQLRunner(srv.ApplicationLayer().SQLConn(t))
+	conn.Exec(t, "SET application_name = $1", server.CrdbInternalStmtStatsCombined)
+	conn.Exec(t, "SET CLUSTER SETTING sql.stats.activity.flush.enabled = 'f'")
+	// Clear the in-memory stats so we only have the above app name.
+	// Then populate it with 1 query.
+	conn.Exec(t, "SELECT crdb_internal.reset_sql_stats()")
+	conn.Exec(t, "SELECT 1")
+
+	type testCase struct {
+		name               string
+		tableSetupFn       func() error
+		expectedStmtsTable string
+		expectedTxnsTable  string
+		reqs               []serverpb.CombinedStatementsStatsRequest
+		isEmpty            bool
+		returnInternal     bool
+	}
+
+	ie := srv.InternalExecutor().(*sql.InternalExecutor)
+
+	defaultMockOneEach := func() error {
+		startTs := defaultMockInsertedAggTs
+		stmt := sqlstatstestutil.GetRandomizedCollectedStatementStatisticsForTest(t)
+		stmt.ID = 1
+		stmt.AggregatedTs = startTs
+		stmt.Key.App = server.CrdbInternalStmtStatsPersisted
+		stmt.Key.TransactionFingerprintID = 1
+		require.NoError(t, sqlstatstestutil.InsertMockedIntoSystemStmtStats(ctx, ie, []appstatspb.CollectedStatementStatistics{stmt}, 1))
+
+		stmt.Key.App = server.CrdbInternalStmtStatsCached
+		require.NoError(t, sqlstatstestutil.InsertMockedIntoSystemStmtActivity(ctx, ie, &stmt, nil))
+
+		txn := sqlstatstestutil.GetRandomizedCollectedTransactionStatisticsForTest(t)
+		txn.StatementFingerprintIDs = []appstatspb.StmtFingerprintID{1}
+		txn.TransactionFingerprintID = 1
+		txn.AggregatedTs = startTs
+		txn.App = server.CrdbInternalTxnStatsPersisted
+		require.NoError(t, sqlstatstestutil.InsertMockedIntoSystemTxnStats(ctx, ie, []appstatspb.CollectedTransactionStatistics{txn}, 1))
+		txn.App = server.CrdbInternalTxnStatsCached
+		require.NoError(t, sqlstatstestutil.InsertMockedIntoSystemTxnActivity(ctx, ie, &txn, nil))
+
+		return nil
+	}
+	testCases := []testCase{
+		{
+			name:         "activity and persisted tables empty",
+			tableSetupFn: func() error { return nil },
+			// We should attempt to read from the in-memory tables, since
+			// they are the last resort.
+			expectedStmtsTable: server.CrdbInternalStmtStatsCombined,
+			expectedTxnsTable:  server.CrdbInternalTxnStatsCombined,
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{FetchMode: createTxnFetchMode(0)},
+			},
+			returnInternal: false,
+		},
+		{
+			name:               "all tables have data in selected range",
+			tableSetupFn:       defaultMockOneEach,
+			expectedStmtsTable: server.CrdbInternalStmtStatsCached,
+			expectedTxnsTable:  server.CrdbInternalTxnStatsCached,
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{Start: defaultMockInsertedAggTs.Unix()},
+				{
+					Start: defaultMockInsertedAggTs.Unix(),
+					End:   defaultMockInsertedAggTs.Unix(),
+				},
+			},
+			returnInternal: false,
+		},
+		{
+			name:         "all tables have data but no start range is provided",
+			tableSetupFn: defaultMockOneEach,
+			// When no date range is provided, we should default to reading from
+			// persisted or in-memory (whichever has data first). In this case the
+			// persisted table has data.
+			expectedStmtsTable: server.CrdbInternalStmtStatsPersisted,
+			expectedTxnsTable:  server.CrdbInternalTxnStatsPersisted,
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{},
+				{End: defaultMockInsertedAggTs.Unix()},
+			},
+			returnInternal: false,
+		},
+		{
+			name:               "all tables have data but not in the selected range",
+			tableSetupFn:       defaultMockOneEach,
+			expectedStmtsTable: server.CrdbInternalStmtStatsCombined,
+			expectedTxnsTable:  server.CrdbInternalTxnStatsCombined,
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{Start: defaultMockInsertedAggTs.Add(time.Hour).Unix()},
+				{End: defaultMockInsertedAggTs.Truncate(time.Hour * 2).Unix()},
+			},
+			isEmpty:        true,
+			returnInternal: false,
+		},
+		{
+			name:         "activity table has data in range with specified sort, fetchmode=txns",
+			tableSetupFn: defaultMockOneEach,
+			// For txn mode, we should not use the activity table for stmts.
+			expectedStmtsTable: server.CrdbInternalStmtStatsPersisted,
+			expectedTxnsTable:  server.CrdbInternalTxnStatsCached,
+			// These sort options do exist on the activity table.
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(0)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(1)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(2)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(4)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(5)},
+			},
+			returnInternal: false,
+		},
+		{
+			name:               "activity table has data in range with specified sort, fetchmode=stmts",
+			tableSetupFn:       defaultMockOneEach,
+			expectedStmtsTable: server.CrdbInternalStmtStatsCached,
+			expectedTxnsTable:  "",
+			// These sort options do exist on the activity table.
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(0)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(1)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(2)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(4)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(5)},
+			},
+			returnInternal: false,
+		},
+		{
+			name:               "activity table has data in range, but selected sort is not on it, fetchmode=txns",
+			tableSetupFn:       defaultMockOneEach,
+			expectedStmtsTable: server.CrdbInternalStmtStatsPersisted,
+			expectedTxnsTable:  server.CrdbInternalTxnStatsPersisted,
+			// These sort options do not exist on the activity table.
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(8)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(9)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(10)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(11)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(12)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(13)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createTxnFetchMode(14)},
+			},
+			returnInternal: false,
+		},
+		{
+			name:               "activity table has data in range, but selected sort is not on it, fetchmode=stmts",
+			tableSetupFn:       defaultMockOneEach,
+			expectedStmtsTable: server.CrdbInternalStmtStatsPersisted,
+			expectedTxnsTable:  "",
+			// These sort options do not exist on the activity table.
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(6)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(7)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(8)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(9)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(10)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(11)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(12)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(13)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(14)},
+			},
+			returnInternal: false,
+		},
+		{
+			name:               "activity table has data in range with specified sort, fetchmode=stmts",
+			tableSetupFn:       defaultMockOneEach,
+			expectedStmtsTable: server.CrdbInternalStmtStatsPersisted,
+			expectedTxnsTable:  "",
+			// These sort options do exist on the activity table.
+			reqs: []serverpb.CombinedStatementsStatsRequest{
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(0)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(1)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(2)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(4)},
+				{Start: defaultMockInsertedAggTs.Unix(), FetchMode: createStmtFetchMode(5)},
+			},
+			returnInternal: true,
+		},
+	}
+
+	client := srv.ApplicationLayer().GetStatusClient(t)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, tc.tableSetupFn())
+
+			defer func() {
+				// Reset tables.
+				conn.Exec(t, "SELECT crdb_internal.reset_sql_stats()")
+				conn.Exec(t, "SELECT crdb_internal.reset_activity_tables()")
+				conn.Exec(t, "SELECT 1")
+			}()
+
+			for _, r := range tc.reqs {
+				conn.Exec(t, fmt.Sprintf("SET CLUSTER SETTING sql.stats.response.show_internal.enabled=%v", tc.returnInternal))
+				resp, err := client.CombinedStatementStats(ctx, &r)
+				require.NoError(t, err)
+
+				require.Equal(t, tc.expectedStmtsTable, resp.StmtsSourceTable, "req: %v", r)
+				require.Equal(t, tc.expectedTxnsTable, resp.TxnsSourceTable, "req: %v", r)
+
+				if tc.isEmpty {
+					continue
+				}
+
+				require.NotZero(t, len(resp.Statements), "req: %v", r)
+				// Verify we used the correct queries to return data.
+				require.Equal(t, tc.expectedStmtsTable, resp.Statements[0].Key.KeyData.App, "req: %v", r)
+				if tc.expectedTxnsTable == server.CrdbInternalTxnStatsCombined {
+					// For the combined query, we're using in-mem data and we set the
+					// app name there to the in-memory stmts table.
+					require.Equal(t, server.CrdbInternalStmtStatsCombined, resp.Transactions[0].StatsData.App, "req: %v", r)
+				} else if tc.expectedTxnsTable != "" {
+					require.NotZero(t, len(resp.Transactions))
+					require.Equal(t, tc.expectedTxnsTable, resp.Transactions[0].StatsData.App, "req: %v", r)
+				}
+			}
+
+		})
+	}
+}
+
+func createStmtFetchMode(
+	sort serverpb.StatsSortOptions,
+) *serverpb.CombinedStatementsStatsRequest_FetchMode {
+	return &serverpb.CombinedStatementsStatsRequest_FetchMode{
+		StatsType: serverpb.CombinedStatementsStatsRequest_StmtStatsOnly,
+		Sort:      sort,
+	}
+}
+func createTxnFetchMode(
+	sort serverpb.StatsSortOptions,
+) *serverpb.CombinedStatementsStatsRequest_FetchMode {
+	return &serverpb.CombinedStatementsStatsRequest_FetchMode{
+		StatsType: serverpb.CombinedStatementsStatsRequest_TxnStatsOnly,
+		Sort:      sort,
+	}
+}
+
+func generateStatement() appstatspb.CollectedStatementStatistics {
+	return appstatspb.CollectedStatementStatistics{
+		AggregatedTs:        timeutil.FromUnixNanos(1704103200), // January 1, 2024 10:00:00
+		ID:                  appstatspb.StmtFingerprintID(1088747230083123385),
+		AggregationInterval: time.Hour,
+		Key: appstatspb.StatementStatisticsKey{
+			App:                      "test_app",
+			Database:                 "test_database",
+			DistSQL:                  true,
+			FullScan:                 true,
+			ImplicitTxn:              true,
+			PlanHash:                 uint64(200),
+			Query:                    "SELECT * FROM foo",
+			QuerySummary:             "SELECT * FROM foo",
+			TransactionFingerprintID: appstatspb.TransactionFingerprintID(50),
+			Vec:                      true,
+		},
+
+		Stats: appstatspb.StatementStatistics{
+			Count:         10,
+			Indexes:       []string{"15@4"},
+			LastErrorCode: "",
+			MaxRetries:    0,
+			Nodes:         []int64{1},
+			PlanGists:     []string{"AgEeCADnAwIAAAMHEgUUIR4AAA=="},
+			Regions:       []string{"us-east1"},
+			SQLType:       "TypeDDL",
+		},
+	}
+}
+func generateStatisticsColumn(
+	t *testing.T, statement appstatspb.CollectedStatementStatistics,
+) string {
+	// Create execution Statistics JSON
+	executionStats := struct {
+		Cnt            int                    `json:"cnt"`
+		ContentionTime appstatspb.NumericStat `json:"contentionTime"`
+		CpuSQLNanos    appstatspb.NumericStat `json:"cpuSQLNanos"`
+		MaxDiskUsage   appstatspb.NumericStat `json:"maxDiskUsage"`
+		MaxMemUsage    appstatspb.NumericStat `json:"maxMemUsage"`
+		NetworkBytes   appstatspb.NumericStat `json:"networkBytes"`
+		NetworkMsgs    appstatspb.NumericStat `json:"networkMsgs"`
+	}{
+		Cnt: 3,
+		ContentionTime: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		CpuSQLNanos: appstatspb.NumericStat{
+			Mean:         5,
+			SquaredDiffs: 0,
+		},
+		MaxDiskUsage: appstatspb.NumericStat{
+			Mean:         10,
+			SquaredDiffs: 0,
+		},
+		MaxMemUsage: appstatspb.NumericStat{
+			Mean:         10,
+			SquaredDiffs: 0,
+		},
+		NetworkBytes: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		NetworkMsgs: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+	}
+	executionStatsBytes, err := json.Marshal(executionStats)
+	require.NoError(t, err)
+
+	// Create stats JSON
+	stats := struct {
+		BytesRead        appstatspb.NumericStat `json:"bytesRead"`
+		Cnt              int64                  `json:"cnt"`
+		FirstAttemptCnt  int64                  `json:"firstAttemptCnt"`
+		IdleLat          appstatspb.NumericStat `json:"idleLat"`
+		Indexes          []string               `json:"indexes"`
+		LastErrorCode    string                 `json:"lastErrorCode"`
+		LastExecAt       time.Time              `json:"lastExecAt"`
+		MaxRetries       int                    `json:"maxRetries"`
+		Nodes            []int64                `json:"nodes"`
+		KVNodeIDs        []int32                `json:"kvNodeIds"`
+		NumRows          appstatspb.NumericStat `json:"numRows"`
+		OvhLat           appstatspb.NumericStat `json:"ovhLat"`
+		ParseLat         appstatspb.NumericStat `json:"parseLat"`
+		PlanGists        []string               `json:"planGists"`
+		PlanLat          appstatspb.NumericStat `json:"planLat"`
+		Regions          []string               `json:"regions"`
+		UsedFollowerRead bool                   `json:"usedFollowerRead"`
+		RowsRead         appstatspb.NumericStat `json:"rowsRead"`
+		RowsWritten      appstatspb.NumericStat `json:"rowsWritten"`
+		RunLat           appstatspb.NumericStat `json:"runLat"`
+		SvcLat           appstatspb.NumericStat `json:"svcLat"`
+	}{
+		BytesRead: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		Cnt:             statement.Stats.Count,
+		FirstAttemptCnt: statement.Stats.Count,
+		IdleLat: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		Indexes:       statement.Stats.Indexes,
+		LastErrorCode: statement.Stats.LastErrorCode,
+		LastExecAt:    statement.AggregatedTs.Add(time.Minute * 10),
+		MaxRetries:    0,
+		Nodes:         statement.Stats.Nodes,
+		KVNodeIDs:     statement.Stats.KVNodeIDs,
+		NumRows: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		OvhLat: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		ParseLat: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		PlanGists: statement.Stats.PlanGists,
+		PlanLat: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		Regions:          statement.Stats.Regions,
+		UsedFollowerRead: statement.Stats.UsedFollowerRead,
+		RowsRead: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		RowsWritten: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		RunLat: appstatspb.NumericStat{
+			Mean:         0,
+			SquaredDiffs: 0,
+		},
+		SvcLat: statement.Stats.ServiceLat,
+	}
+	statsBytes, err := json.Marshal(stats)
+	require.NoError(t, err)
+
+	return fmt.Sprintf("{\"execution_statistics\": %s, \"statistics\": %s"+
+		", \"index_recommendations\": []} ", string(executionStatsBytes), string(statsBytes))
+}
+
+func insertStatementIntoSystemStmtStatsTable(
+	t *testing.T, db *sqlutils.SQLRunner, statement appstatspb.CollectedStatementStatistics,
+) {
+	// Create metadata JSON
+	metadata := struct {
+		Database     string `json:"db"`
+		DistSQL      bool   `json:"distsql"`
+		FullScan     bool   `json:"fullScan"`
+		ImplicitTxn  bool   `json:"implicitTxn"`
+		Query        string `json:"query"`
+		QuerySummary string `json:"querySummary"`
+		StmtType     string `json:"stmtType"`
+		Vec          bool   `json:"vec"`
+	}{
+		Database:     statement.Key.Database,
+		DistSQL:      statement.Key.DistSQL,
+		FullScan:     statement.Key.FullScan,
+		ImplicitTxn:  statement.Key.ImplicitTxn,
+		Query:        statement.Key.Query,
+		QuerySummary: statement.Key.QuerySummary,
+		StmtType:     statement.Stats.SQLType,
+		Vec:          statement.Key.Vec,
+	}
+	metadataBytes, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	statistics := generateStatisticsColumn(t, statement)
+
+	query := `INSERT INTO system.statement_statistics (
+  aggregated_ts,
+  fingerprint_id,
+  transaction_fingerprint_id,
+  plan_hash,
+  app_name,
+  node_id,
+  agg_interval,
+  metadata,
+  statistics,
+  plan,
+  index_recommendations
+)
+VALUES (
+  $1,
+  $2,
+  $3,
+  $4,
+  $5,
+  1,
+  $6,
+  $7,
+  $8::JSONB,
+  '{"Children": [], "Name": ""}',
+  ARRAY['creation : CREATE INDEX t3_k_i_f ON t3(k, i, f)']
+)`
+	args := []interface{}{
+		statement.AggregatedTs,
+		statement.ID,
+		statement.Key.TransactionFingerprintID,
+		statement.Key.PlanHash,
+		statement.Key.App,
+		statement.AggregationInterval,
+		string(metadataBytes),
+		statistics,
+	}
+
+	db.Exec(t, query, args...)
+}
+
+func insertStatementIntoSystemStmtActivityTable(
+	t *testing.T, db *sqlutils.SQLRunner, statement appstatspb.CollectedStatementStatistics,
+) {
+	// Create metadata JSON
+	metadata := struct {
+		AppNames      []string `json:"appNames"`
+		Database      []string `json:"db"`
+		DistSQLCount  int      `json:"distSQLCount"`
+		FailedCount   int      `json:"failedCount"`
+		FullScanCount int      `json:"fullScanCount"`
+		ImplicitTxn   bool     `json:"implicitTxn"`
+		Query         string   `json:"query"`
+		QuerySummary  string   `json:"querySummary"`
+		StmtType      string   `json:"stmtType"`
+		VecCount      int      `json:"vecCount"`
+	}{
+		AppNames:      []string{statement.Key.App},
+		Database:      []string{statement.Key.Database},
+		DistSQLCount:  1,
+		FailedCount:   0,
+		FullScanCount: 1,
+		ImplicitTxn:   statement.Key.ImplicitTxn,
+		Query:         statement.Key.Query,
+		QuerySummary:  statement.Key.QuerySummary,
+		StmtType:      statement.Stats.SQLType,
+		VecCount:      1,
+	}
+	metadataBytes, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	statistics := generateStatisticsColumn(t, statement)
+
+	query := `INSERT INTO system.statement_activity (
+  aggregated_ts,
+  fingerprint_id,
+  transaction_fingerprint_id,
+  plan_hash,
+  app_name,
+  agg_interval,
+  metadata,
+  statistics,
+  plan,
+  index_recommendations,
+  execution_count,
+	execution_total_seconds,
+	execution_total_cluster_seconds,
+	contention_time_avg_seconds,
+	cpu_sql_avg_nanos,
+	service_latency_avg_seconds,
+	service_latency_p99_seconds
+)
+VALUES (
+  $1,
+  $2,
+  $3,
+  $4,
+  $5,
+  $6,
+  $7,
+  $8::JSONB,
+  '{"Children": [], "Name": ""}',
+  ARRAY['creation : CREATE INDEX t3_k_i_f ON t3(k, i, f)'],
+	$9,
+	$10,
+	$10,
+	0,
+	5,
+	10,
+	7
+)`
+
+	args := []interface{}{
+		statement.AggregatedTs,
+		statement.ID,
+		statement.Key.TransactionFingerprintID,
+		statement.Key.PlanHash,
+		statement.Key.App,
+		statement.AggregationInterval,
+		string(metadataBytes),
+		statistics,
+		statement.Stats.Count,
+		float64(statement.Stats.Count) * statement.Stats.ServiceLat.Mean,
+	}
+	db.Exec(t, query, args...)
 }

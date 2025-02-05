@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -19,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
@@ -29,9 +25,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -181,7 +179,8 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 	repl, err := store.GetReplica(desc.RangeID)
 	require.NoError(t, err)
 	testutils.SucceedsSoon(t, func() error {
-		trace, processErr, err := store.Enqueue(ctx, "raftsnapshot", repl, true /* skipShouldQueue */, false /* async */)
+		traceCtx, rec := tracing.ContextWithRecordingSpan(ctx, store.GetStoreConfig().Tracer(), "trace-enqueue")
+		processErr, err := store.Enqueue(traceCtx, "raftsnapshot", repl, true /* skipShouldQueue */, false /* async */)
 		if err != nil {
 			return err
 		}
@@ -189,7 +188,7 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 			return processErr
 		}
 		const msg = `skipping snapshot; replica is likely a LEARNER in the process of being added: (n2,s2):2LEARNER`
-		formattedTrace := trace.String()
+		formattedTrace := rec().String()
 		if !strings.Contains(formattedTrace, msg) {
 			return errors.Errorf(`expected "%s" in trace got:\n%s`, msg, formattedTrace)
 		}
@@ -241,7 +240,7 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 	blockApplicationCh := make(chan struct{})
 
 	// We're going to be migrating from startV to endV.
-	startV := roachpb.Version{Major: 1000041}
+	startV := clusterversion.Latest.Version()
 	endV := roachpb.Version{Major: 1000042}
 
 	ctx := context.Background()
@@ -251,8 +250,18 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 			Settings: cluster.MakeTestingClusterSettingsWithVersions(endV, startV, false),
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					BinaryVersionOverride:          startV,
+					ClusterVersionOverride:         startV,
 					DisableAutomaticVersionUpgrade: make(chan struct{}),
+				},
+				UpgradeManager: &upgradebase.TestingKnobs{
+					ListBetweenOverride: func(from, to roachpb.Version) []roachpb.Version {
+						res := clusterversion.ListBetween(from, to)
+						// Pretend endV is a valid version.
+						if from.Less(endV) && to.AtLeast(endV) {
+							res = append(res, endV)
+						}
+						return res
+					},
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
@@ -281,7 +290,7 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 
 		repl := store.LookupReplica(roachpb.RKey(k))
 		require.NotNil(t, repl)
-		require.Equal(t, repl.Version(), startV)
+		require.Equal(t, startV, repl.Version())
 	}
 
 	desc := tc.LookupRangeOrFatal(t, k)

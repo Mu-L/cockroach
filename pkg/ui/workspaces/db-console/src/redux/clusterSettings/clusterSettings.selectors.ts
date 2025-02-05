@@ -1,18 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { createSelector } from "reselect";
-import { AdminUIState } from "src/redux/state";
-import { cockroach } from "src/js/protos";
-import moment from "moment-timezone";
 import { CoordinatedUniversalTime, util } from "@cockroachlabs/cluster-ui";
+import moment from "moment-timezone";
+import { createSelector } from "reselect";
+
+import { cockroach } from "src/js/protos";
+import { AdminUIState } from "src/redux/state";
+import { indexUnusedDuration } from "src/util/constants";
 
 export const selectClusterSettings = createSelector(
   (state: AdminUIState) => state.cachedData.settings?.data,
@@ -63,17 +60,6 @@ export const selectAutomaticStatsCollectionEnabled = createSelector(
   },
 );
 
-export const selectCrossClusterReplicationEnabled = createSelector(
-  selectClusterSettings,
-  (settings): boolean | undefined => {
-    if (!settings) {
-      return undefined;
-    }
-    const value = settings["cross_cluster_replication.enabled"]?.value;
-    return value === "true";
-  },
-);
-
 export const selectIndexRecommendationsEnabled = createSelector(
   selectClusterSettings,
   (settings): boolean => {
@@ -110,10 +96,11 @@ export const selectDropUnusedIndexDuration = createSelector(
   selectClusterSettings,
   (settings): string => {
     if (!settings) {
-      return "168h";
+      return indexUnusedDuration;
     }
     return (
-      settings["sql.index_recommendation.drop_unused_duration"]?.value || "168h"
+      settings["sql.index_recommendation.drop_unused_duration"]?.value ||
+      indexUnusedDuration
     );
   },
 );

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opt
 
@@ -22,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -210,9 +206,14 @@ type TableMeta struct {
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
 
-	// notVisibleIndexMap stores information about index invisibility which maps
-	// from index ordinal to index invisibility.
-	notVisibleIndexMap map[cat.IndexOrdinal]bool
+	// indexVisibility caches the ordinals of indexes which are not-visible. This
+	// avoids re-computation and ensures a consistent answer within the query for
+	// indexes with fractional visibility. The maps are stored as pointers to
+	// ensure that copying the TableMeta doesn't cause the maps to diverge.
+	indexVisibility struct {
+		cached     *intsets.Fast
+		notVisible *intsets.Fast
+	}
 }
 
 // IsIndexNotVisible returns true if the given index is not visible, and false
@@ -223,12 +224,12 @@ type TableMeta struct {
 // is fully visible (to this query). IsIndexNotVisible caches the result so that
 // it always returns the same value for a given index.
 func (tm *TableMeta) IsIndexNotVisible(indexOrd cat.IndexOrdinal, rng *rand.Rand) bool {
-	if tm.notVisibleIndexMap == nil {
-		tm.notVisibleIndexMap = make(map[cat.IndexOrdinal]bool)
+	if tm.indexVisibility.cached == nil {
+		tm.indexVisibility.cached = &intsets.Fast{}
+		tm.indexVisibility.notVisible = &intsets.Fast{}
 	}
-	// See if the visibility is already cached.
-	if val, ok := tm.notVisibleIndexMap[indexOrd]; ok {
-		return val
+	if tm.indexVisibility.cached.Contains(indexOrd) {
+		return tm.indexVisibility.notVisible.Contains(indexOrd)
 	}
 	// Otherwise, roll the dice to assign index visibility.
 	indexInvisibility := tm.Table.Index(indexOrd).GetInvisibility()
@@ -254,7 +255,10 @@ func (tm *TableMeta) IsIndexNotVisible(indexOrd cat.IndexOrdinal, rng *rand.Rand
 			isNotVisible = true
 		}
 	}
-	tm.notVisibleIndexMap[indexOrd] = isNotVisible
+	tm.indexVisibility.cached.Add(indexOrd)
+	if isNotVisible {
+		tm.indexVisibility.notVisible.Add(indexOrd)
+	}
 	return isNotVisible
 }
 
@@ -437,7 +441,7 @@ func (tm *TableMeta) OrigCheckConstraintsStats(
 // CacheIndexPartitionLocalities caches locality prefix sorters in the table
 // metadata for indexes that have a mix of local and remote partitions. It can
 // be called multiple times if necessary to update with new indexes.
-func (tm *TableMeta) CacheIndexPartitionLocalities(evalCtx *eval.Context) {
+func (tm *TableMeta) CacheIndexPartitionLocalities(ctx context.Context, evalCtx *eval.Context) {
 	tab := tm.Table
 	if cap(tm.indexPartitionLocalities) < tab.IndexCount() {
 		tm.indexPartitionLocalities = make([]partition.PrefixSorter, tab.IndexCount())
@@ -446,7 +450,7 @@ func (tm *TableMeta) CacheIndexPartitionLocalities(evalCtx *eval.Context) {
 	for indexOrd, n := 0, tab.IndexCount(); indexOrd < n; indexOrd++ {
 		index := tab.Index(indexOrd)
 		if localPartitions, ok := partition.HasMixOfLocalAndRemotePartitions(evalCtx, index); ok {
-			ps := partition.GetSortedPrefixes(index, localPartitions, evalCtx)
+			ps := partition.GetSortedPrefixes(ctx, index, localPartitions, evalCtx)
 			tm.indexPartitionLocalities[indexOrd] = ps
 		}
 	}

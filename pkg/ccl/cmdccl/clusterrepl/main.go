@@ -1,10 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -12,32 +9,29 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
 	"os/signal"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 )
 
 var (
 	uri    = flag.String("uri", "", "sql uri")
 	tenant = flag.String("tenant", "", "tenant name")
 
-	parallelScan       = flag.Int("scans", 16, "parallel scan count")
 	batchSize          = flag.Int("batch-size", 1<<20, "batch size")
 	checkpointInterval = flag.Duration("checkpoint-iterval", 10*time.Second, "checkpoint interval")
 	statsInterval      = flag.Duration("stats-interval", 5*time.Second, "period over which to measure throughput")
@@ -77,29 +71,29 @@ func main() {
 		fatalf("tenant name required")
 	}
 
-	streamAddr, err := url.Parse(*uri)
+	uri, err := streamclient.ParseClusterUri(*uri)
 	if err != nil {
 		fatalf("parse: %s", err)
 	}
 
 	ctx := cancelOnShutdown(context.Background())
-	if err := streamPartition(ctx, streamAddr); err != nil {
+	if err := streamPartition(ctx, uri); err != nil {
 		if errors.Is(err, context.Canceled) {
 			exit.WithCode(exit.Interrupted())
 		} else {
-			fatalf(err.Error())
+			fatalf("%s", err)
 		}
 	}
 }
 
-func streamPartition(ctx context.Context, streamAddr *url.URL) error {
+func streamPartition(ctx context.Context, uri streamclient.ClusterUri) error {
 	fmt.Println("creating producer stream")
-	client, err := streamclient.NewPartitionedStreamClient(ctx, streamAddr)
+	client, err := streamclient.NewPartitionedStreamClient(ctx, uri)
 	if err != nil {
 		return err
 	}
 
-	replicationProducerSpec, err := client.Create(ctx, roachpb.TenantName(*tenant))
+	replicationProducerSpec, err := client.CreateForTenant(ctx, roachpb.TenantName(*tenant), streampb.ReplicationProducerRequest{})
 	if err != nil {
 		return err
 	}
@@ -114,18 +108,16 @@ func streamPartition(ctx context.Context, streamAddr *url.URL) error {
 	}()
 
 	// We ignore most of this plan. But, it gives us the tenant ID.
-	plan, err := client.Plan(ctx, replicationProducerSpec.StreamID)
+	plan, err := client.PlanPhysicalReplication(ctx, replicationProducerSpec.StreamID)
 	if err != nil {
 		return err
 	}
 
-	prefix := keys.MakeTenantPrefix(plan.SourceTenantID)
-	tenantSpan := roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()}
+	tenantSpan := keys.MakeTenantSpan(plan.SourceTenantID)
 
 	var sps streampb.StreamPartitionSpec
 	sps.Config.MinCheckpointFrequency = *checkpointInterval
 	sps.Config.BatchByteSize = int64(*batchSize)
-	sps.Config.InitialScanParallelism = int32(*parallelScan)
 	sps.Spans = append(sps.Spans, tenantSpan)
 	sps.InitialScanTimestamp = replicationProducerSpec.ReplicationStartTime
 	spsBytes, err := protoutil.Marshal(&sps)
@@ -139,13 +131,13 @@ func streamPartition(ctx context.Context, streamAddr *url.URL) error {
 
 	fmt.Printf("streaming %s (%s) as of %s\n", *tenant, tenantSpan, sps.InitialScanTimestamp)
 	if *noParse {
-		return rawStream(ctx, streamAddr, replicationProducerSpec.StreamID, spsBytes)
+		return rawStream(ctx, uri, replicationProducerSpec.StreamID, spsBytes)
 	}
 
-	sub, err := client.Subscribe(ctx, replicationProducerSpec.StreamID,
+	sub, err := client.Subscribe(ctx, replicationProducerSpec.StreamID, 1, 1,
 		spsBytes,
 		sps.InitialScanTimestamp,
-		hlc.Timestamp{})
+		nil)
 	if err != nil {
 		return err
 	}
@@ -158,11 +150,11 @@ func streamPartition(ctx context.Context, streamAddr *url.URL) error {
 
 func rawStream(
 	ctx context.Context,
-	uri *url.URL,
+	uri streamclient.ClusterUri,
 	streamID streampb.StreamID,
 	spec streamclient.SubscriptionToken,
 ) error {
-	config, err := pgx.ParseConfig(uri.String())
+	config, err := pgx.ParseConfig(uri.Serialize())
 	if err != nil {
 		return err
 	}
@@ -226,7 +218,7 @@ func rawStream(
 }
 
 func subscriptionConsumer(
-	sub streamclient.Subscription, frontier *span.Frontier,
+	sub streamclient.Subscription, frontier span.Frontier,
 ) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
 		var (
@@ -236,6 +228,8 @@ func subscriptionConsumer(
 			totalEventCount    int
 			intervalEventCount int
 		)
+		defer frontier.Release()
+
 		intervalStart := timeutil.Now()
 		for {
 			var sz int
@@ -245,17 +239,18 @@ func subscriptionConsumer(
 					return sub.Err()
 				}
 				switch event.Type() {
-				case streamingccl.KVEvent:
-					kv := event.GetKV()
-					sz = kv.Size()
-				case streamingccl.SSTableEvent:
+				case crosscluster.KVEvent:
+					sz = 0
+					for _, kv := range event.GetKVs() {
+						sz += kv.Size()
+					}
+				case crosscluster.SSTableEvent:
 					ssTab := event.GetSSTable()
 					sz = ssTab.Size()
-				case streamingccl.DeleteRangeEvent:
-				case streamingccl.CheckpointEvent:
+				case crosscluster.DeleteRangeEvent:
+				case crosscluster.CheckpointEvent:
 					fmt.Printf("%s checkpoint\n", timeutil.Now().Format(time.RFC3339))
-					resolved := event.GetResolvedSpans()
-					for _, r := range resolved {
+					for _, r := range event.GetCheckpoint().ResolvedSpans {
 						_, err := frontier.Forward(r.Span, r.Timestamp)
 						if err != nil {
 							return err

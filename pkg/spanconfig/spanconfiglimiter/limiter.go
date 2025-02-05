@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package spanconfiglimiter is used to limit how many span configs are
 // installed by tenants.
@@ -30,7 +25,7 @@ var _ spanconfig.Limiter = &Limiter{}
 // tenantLimitSetting controls how many span configs a secondary tenant is
 // allowed to install. It's settable only by the system tenant.
 var tenantLimitSetting = settings.RegisterIntSetting(
-	settings.TenantReadOnly,
+	settings.SystemVisible,
 	"spanconfig.tenant_limit",
 	"limit on the number of span configs that can be set up by a virtual cluster",
 	5000,
@@ -75,7 +70,7 @@ DO UPDATE SET span_count = system.span_count.span_count + $1
 RETURNING span_count
 `
 	datums, err := l.ie.QueryRowEx(ctx, "update-span-count", txn,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		updateSpanCountStmt, delta)
 	if err != nil {
 		return false, err

@@ -12,12 +12,15 @@ go_library(
     deps = [
         "//pkg/clusterversion",
         "//pkg/jobs/jobspb",
+        "//pkg/security/username",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/catprivilege",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/funcinfo",
         "//pkg/sql/parser",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",
         "//pkg/sql/schemachanger/scpb",
         "//pkg/sql/sem/catid",
@@ -36,7 +39,6 @@ go_library(
 go_test(
     name = "funcdesc_test",
     srcs = ["func_desc_test.go"],
-    args = ["-test.timeout=295s"],
     deps = [
         ":funcdesc",
         "//pkg/clusterversion",

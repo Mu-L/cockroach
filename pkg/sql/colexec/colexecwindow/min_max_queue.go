@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecwindow
 
@@ -14,6 +9,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/errors"
 )
+
+var errEmptyGetFirst = errors.AssertionFailedf("getting first from empty minMaxQueue")
 
 func newMinMaxQueue(maxLength int) minMaxQueue {
 	return minMaxQueue{maxLength: maxLength, empty: true}
@@ -66,7 +63,7 @@ func (q *minMaxQueue) get(pos int) uint32 {
 // gcassert:inline
 func (q *minMaxQueue) getFirst() uint32 {
 	if q.empty {
-		colexecerror.InternalError(errors.AssertionFailedf("getting first from empty minMaxQueue"))
+		colexecerror.InternalError(errEmptyGetFirst)
 	}
 	return q.buffer[q.head]
 }

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvpb
 
@@ -95,7 +90,7 @@ func (ba *BatchRequest) SetActiveTimestamp(clock *hlc.Clock) error {
 // request in the batch operates on a time span such as ExportRequest or
 // RevertRangeRequest, which both specify the start of that span in their
 // arguments while using ba.Timestamp to indicate the upper bound of that span.
-func (ba BatchRequest) EarliestActiveTimestamp() hlc.Timestamp {
+func (ba *BatchRequest) EarliestActiveTimestamp() hlc.Timestamp {
 	ts := ba.Timestamp
 	for _, ru := range ba.Requests {
 		switch t := ru.GetInner().(type) {
@@ -213,6 +208,12 @@ func (ba *BatchRequest) IsUnsplittable() bool {
 // IsSingleRequest returns true iff the BatchRequest contains a single request.
 func (ba *BatchRequest) IsSingleRequest() bool {
 	return len(ba.Requests) == 1
+}
+
+// IsSingleBarrierRequest returns true iff the batch contains a single request,
+// and that request is a Barrier.
+func (ba *BatchRequest) IsSingleBarrierRequest() bool {
+	return ba.isSingleRequestWithMethod(Barrier)
 }
 
 // IsSingleSkipsLeaseCheckRequest returns true iff the batch contains a single
@@ -344,12 +345,18 @@ func (ba *BatchRequest) IsSingleExportRequest() bool {
 	return ba.isSingleRequestWithMethod(Export)
 }
 
+// IsSingleAddSSTableRequest returns true iff the batch contains a single
+// request, and that request is an ExportRequest.
+func (ba *BatchRequest) IsSingleAddSSTableRequest() bool {
+	return ba.isSingleRequestWithMethod(AddSSTable)
+}
+
 // RequiresConsensus returns true iff the batch contains a request that should
 // always force replication and proposal through raft, even if evaluation is
 // a no-op. The Barrier request requires consensus even though its evaluation
 // is a no-op.
 func (ba *BatchRequest) RequiresConsensus() bool {
-	return ba.isSingleRequestWithMethod(Barrier) || ba.isSingleRequestWithMethod(Probe)
+	return ba.IsSingleBarrierRequest() || ba.IsSingleProbeRequest()
 }
 
 // IsCompleteTransaction determines whether a batch contains every write in a
@@ -395,35 +402,28 @@ func (ba *BatchRequest) IsCompleteTransaction() bool {
 		}
 	}
 	// Unreachable.
-	var sb strings.Builder
-	for i, args := range ba.Requests {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		sb.WriteString(args.String())
-	}
-	panic(fmt.Sprintf("unreachable. Batch requests: %s", sb.String()))
+	panic(fmt.Sprintf("unreachable. Batch requests: %s", TruncatedRequestsString(ba.Requests, 1024)))
 }
 
-// hasFlag returns true iff one of the requests within the batch contains the
-// specified flag.
-func (ba *BatchRequest) hasFlag(flag flag) bool {
+// hasFlag returns true iff at least one of the requests within the batch
+// contains at least one of the specified flags.
+func (ba *BatchRequest) hasFlag(flags flag) bool {
 	for _, union := range ba.Requests {
-		if (union.GetInner().flags() & flag) != 0 {
+		if (union.GetInner().flags() & flags) != 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// hasFlagForAll returns true iff all of the requests within the batch contains
-// the specified flag.
-func (ba *BatchRequest) hasFlagForAll(flag flag) bool {
+// hasFlagForAll returns true iff all of the requests within the batch contain
+// all of the specified flags.
+func (ba *BatchRequest) hasFlagForAll(flags flag) bool {
 	if len(ba.Requests) == 0 {
 		return false
 	}
 	for _, union := range ba.Requests {
-		if (union.GetInner().flags() & flag) == 0 {
+		if (union.GetInner().flags() & flags) != flags {
 			return false
 		}
 	}
@@ -469,25 +469,47 @@ func (br *BatchResponse) String() string {
 	return strings.Join(str, ", ")
 }
 
-// LockSpanIterate calls the passed method with the key ranges of the
-// transactional locks contained in the batch. Usually the key spans
-// contained in the requests are used, but when a response contains a
-// ResumeSpan the ResumeSpan is subtracted from the request span to
-// provide a more minimal span of keys affected by the request.
-func (ba *BatchRequest) LockSpanIterate(br *BatchResponse, fn func(roachpb.Span, lock.Durability)) {
+// LockSpanIterate calls LockSpanIterate for each request in the batch.
+func (ba *BatchRequest) LockSpanIterate(
+	br *BatchResponse, fn func(roachpb.Span, lock.Durability),
+) error {
 	for i, arg := range ba.Requests {
 		req := arg.GetInner()
-		if !IsLocking(req) {
-			continue
-		}
 		var resp Response
 		if br != nil {
 			resp = br.Responses[i].GetInner()
 		}
-		if span, ok := ActualSpan(req, resp); ok {
-			fn(span, LockingDurability(req))
+		if err := LockSpanIterate(req, resp, fn); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// LockSpanIterate calls the passed function with the keys or key spans of the
+// transactional locks acquired by the request. Usually the full key span that
+// is addressed by the request is used. However, a more minimal span of keys can
+// be provided in the following cases:
+//   - the request operates over a range of keys but the response includes the
+//     specific set of keys that were locked. In these cases, the provided
+//     function is called with each individual locked key.
+//   - the request operates over a range of keys but the response contains a
+//     ResumeSpan signifying the key spans not reached by the request. In these
+//     cases, the ResumeSpan is subtracted from the request span.
+func LockSpanIterate(req Request, resp Response, fn func(roachpb.Span, lock.Durability)) error {
+	if !IsLocking(req) {
+		return nil
+	}
+	dur := LockingDurability(req)
+	if canIterateResponseKeys(req, resp) {
+		return ResponseKeyIterate(req, resp, func(key roachpb.Key) {
+			fn(roachpb.Span{Key: key}, dur)
+		})
+	}
+	if span, ok := actualSpan(req, resp); ok {
+		fn(span, dur)
+	}
+	return nil
 }
 
 // RefreshSpanIterate calls the passed function with the key spans of
@@ -508,7 +530,7 @@ func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(roachpb.Sp
 		if br != nil {
 			resp = br.Responses[i].GetInner()
 		}
-		if ba.WaitPolicy == lock.WaitPolicy_SkipLocked && CanSkipLocked(req) {
+		if ba.WaitPolicy == lock.WaitPolicy_SkipLocked && CanSkipLocked(req) && resp != nil {
 			if ba.IndexFetchSpec != nil {
 				return errors.AssertionFailedf("unexpectedly IndexFetchSpec is set with SKIP LOCKED wait policy")
 			}
@@ -531,7 +553,7 @@ func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(roachpb.Sp
 			}
 		} else {
 			// Otherwise, call the function with the span which was operated on.
-			if span, ok := ActualSpan(req, resp); ok {
+			if span, ok := actualSpan(req, resp); ok {
 				fn(span)
 			}
 		}
@@ -539,10 +561,10 @@ func (ba *BatchRequest) RefreshSpanIterate(br *BatchResponse, fn func(roachpb.Sp
 	return nil
 }
 
-// ActualSpan returns the actual request span which was operated on,
+// actualSpan returns the actual request span which was operated on,
 // according to the existence of a resume span in the response. If
 // nothing was operated on, returns false.
-func ActualSpan(req Request, resp Response) (roachpb.Span, bool) {
+func actualSpan(req Request, resp Response) (roachpb.Span, bool) {
 	h := req.Header()
 	if resp != nil {
 		resumeSpan := resp.Header().ResumeSpan
@@ -562,6 +584,25 @@ func ActualSpan(req Request, resp Response) (roachpb.Span, bool) {
 	return h.Span(), true
 }
 
+// canIterateResponseKeys returns whether the response to the given request
+// contains keys that can be iterated over using ResponseKeyIterate.
+func canIterateResponseKeys(req Request, resp Response) bool {
+	if resp == nil {
+		return false
+	}
+	switch v := req.(type) {
+	case *GetRequest:
+		return true
+	case *ScanRequest:
+		return v.ScanFormat != COL_BATCH_RESPONSE
+	case *ReverseScanRequest:
+		return v.ScanFormat != COL_BATCH_RESPONSE
+	case *DeleteRangeRequest:
+		return v.ReturnKeys
+	}
+	return false
+}
+
 // ResponseKeyIterate calls the passed function with the keys returned
 // in the provided request's response. If no keys are being returned,
 // the function will not be called.
@@ -569,7 +610,7 @@ func ActualSpan(req Request, resp Response) (roachpb.Span, bool) {
 // COL_BATCH_RESPONSE scan format.
 func ResponseKeyIterate(req Request, resp Response, fn func(roachpb.Key)) error {
 	if resp == nil {
-		return nil
+		return errors.Errorf("cannot iterate over response keys of %s request with nil response", req.Method())
 	}
 	switch v := resp.(type) {
 	case *GetResponse:
@@ -636,6 +677,14 @@ func ResponseKeyIterate(req Request, resp Response, fn func(roachpb.Key)) error 
 			if len(v.ColBatches.ColBatches) > 0 {
 				return errors.AssertionFailedf("unexpectedly non-empty ColBatches")
 			}
+		}
+	case *DeleteRangeResponse:
+		if !req.(*DeleteRangeRequest).ReturnKeys {
+			return errors.AssertionFailedf("cannot iterate over response keys of DeleteRange " +
+				"request when ReturnKeys=false")
+		}
+		for _, k := range v.Keys {
+			fn(k)
 		}
 	default:
 		return errors.Errorf("cannot iterate over response keys of %s request", req.Method())
@@ -709,7 +758,7 @@ func (ba *BatchRequest) Methods() []Method {
 // work for read requests due to how the timestamp-aware latching works (i.e. a
 // read that acquired a latch @ ts10 can't simply be bumped to ts 20 because
 // there might have been overlapping writes in the 10..20 window).
-func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
+func (ba *BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 	compatible := func(exFlags, newFlags flag) bool {
 		// isAlone requests are never compatible.
 		if (exFlags&isAlone) != 0 || (newFlags&isAlone) != 0 {
@@ -745,11 +794,12 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 		}
 		return (mask & exFlags) == (mask & newFlags)
 	}
+	reqs := ba.Requests
 	var parts [][]RequestUnion
-	for len(ba.Requests) > 0 {
-		part := ba.Requests
+	for len(reqs) > 0 {
+		part := reqs
 		var gFlags, hFlags flag = -1, -1
-		for i, union := range ba.Requests {
+		for i, union := range reqs {
 			args := union.GetInner()
 			flags := args.flags()
 			method := args.Method()
@@ -760,7 +810,7 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 				// quadratic behavior for repeat isPrefix requests. We avoid
 				// this by caching first non-header request's flags in hFlags.
 				if hFlags == -1 {
-					for _, nUnion := range ba.Requests[i+1:] {
+					for _, nUnion := range reqs[i+1:] {
 						nArgs := nUnion.GetInner()
 						nFlags := nArgs.flags()
 						nMethod := nArgs.Method()
@@ -788,21 +838,21 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 				gFlags = flags
 			} else {
 				if !compatible(gFlags, cmpFlags) {
-					part = ba.Requests[:i]
+					part = reqs[:i]
 					break
 				}
 				gFlags |= flags
 			}
 		}
 		parts = append(parts, part)
-		ba.Requests = ba.Requests[len(part):]
+		reqs = reqs[len(part):]
 	}
 	return parts
 }
 
 // SafeFormat implements redact.SafeFormatter.
 // It gives a brief summary of the contained requests and keys in the batch.
-func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
+func (ba *BatchRequest) SafeFormat(s redact.SafePrinter, verb rune) {
 	for count, arg := range ba.Requests {
 		// Limit the strings to provide just a summary. Without this limit
 		// a log message with a BatchRequest can be very long.
@@ -817,41 +867,16 @@ func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 		}
 
 		req := arg.GetInner()
-		if et, ok := req.(*EndTxnRequest); ok {
-			h := req.Header()
-			s.Printf("%s(", req.Method())
-			if et.Commit {
-				if et.IsParallelCommit() {
-					s.Printf("parallel commit")
-				} else {
-					s.Printf("commit")
-				}
-			} else {
-				s.Printf("abort")
-			}
-			if et.InternalCommitTrigger != nil {
-				s.Printf(" %s", et.InternalCommitTrigger.Kind())
-			}
-			s.Printf(") [%s]", h.Key)
-		} else if rt, ok := req.(*RecoverTxnRequest); ok {
-			h := req.Header()
-			s.Printf("%s(%s, ", req.Method(), rt.Txn.Short())
-			if rt.ImplicitlyCommitted {
-				s.Printf("commit")
-			} else {
-				s.Printf("abort")
-			}
-			s.Printf(") [%s]", h.Key)
+		if safeFormatterReq, ok := req.(SafeFormatterRequest); ok {
+			safeFormatterReq.SafeFormat(s, verb)
 		} else {
-			h := req.Header()
-			if req.Method() == PushTxn {
-				pushReq := req.(*PushTxnRequest)
-				s.Printf("PushTxn(%s,%s->%s)",
-					pushReq.PushType, pushReq.PusherTxn.Short(), pushReq.PusheeTxn.Short())
-			} else {
-				s.Print(req.Method())
-			}
+			s.Print(req.Method())
+		}
+		h := req.Header()
+		if len(h.EndKey) > 0 {
 			s.Printf(" [%s,%s)", h.Key, h.EndKey)
+		} else {
+			s.Printf(" [%s]", h.Key)
 		}
 	}
 	{
@@ -861,6 +886,15 @@ func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 	}
 	if ba.WaitPolicy != lock.WaitPolicy_Block {
 		s.Printf(", [wait-policy: %s]", ba.WaitPolicy)
+	}
+	if ba.LockTimeout != 0 {
+		s.Printf(", [lock-timeout: %s]", ba.LockTimeout)
+	}
+	if ba.DeadlockTimeout != 0 {
+		s.Printf(", [deadlock-timeout: %s]", ba.DeadlockTimeout)
+	}
+	if ba.AmbiguousReplayProtection {
+		s.Printf(", [protect-ambiguous-replay]")
 	}
 	if ba.CanForwardReadTimestamp {
 		s.Printf(", [can-forward-ts]")
@@ -875,15 +909,21 @@ func (ba BatchRequest) SafeFormat(s redact.SafePrinter, _ rune) {
 		}
 		s.Printf("]")
 	}
+	if ba.MaxSpanRequestKeys != 0 || ba.TargetBytes != 0 {
+		s.Printf(", [max_span_request_keys: %d], [target_bytes: %d]", ba.MaxSpanRequestKeys, ba.TargetBytes)
+	}
+	if ba.AllowEmpty {
+		s.Print(", [allow-empty]")
+	}
 }
 
-func (ba BatchRequest) String() string {
+func (ba *BatchRequest) String() string {
 	return redact.StringWithoutMarkers(ba)
 }
 
 // ValidateForEvaluation performs sanity checks on the batch when it's received
 // by the "server" for evaluation.
-func (ba BatchRequest) ValidateForEvaluation() error {
+func (ba *BatchRequest) ValidateForEvaluation() error {
 	if ba.RangeID == 0 {
 		return errors.AssertionFailedf("batch request missing range ID")
 	} else if ba.Replica.StoreID == 0 {

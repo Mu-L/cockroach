@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package interceptor_test
 
@@ -14,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/interceptor"
+	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/jackc/pgproto3/v2"
 	"github.com/stretchr/testify/require"
@@ -23,8 +21,10 @@ import (
 // the internal interceptor in base_test.go.
 func TestPGConn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
-	q := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+	q, err := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+	require.NoError(t, err)
 
 	t.Run("net.Conn/Write", func(t *testing.T) {
 		external, proxy := net.Pipe()
@@ -62,8 +62,10 @@ func TestPGConn(t *testing.T) {
 
 func TestPGConn_ToFrontendConn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
-	q := (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(nil)
+	q, err := (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(nil)
+	require.NoError(t, err)
 
 	external, proxy := net.Pipe()
 	errCh := writeAsync(t, external, q)
@@ -81,8 +83,10 @@ func TestPGConn_ToFrontendConn(t *testing.T) {
 
 func TestPGConn_ToBackendConn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	testutilsccl.ServerlessOnly(t)
 
-	q := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+	q, err := (&pgproto3.Query{String: "SELECT 1"}).Encode(nil)
+	require.NoError(t, err)
 
 	external, proxy := net.Pipe()
 	errCh := writeAsync(t, external, q)

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cliflags
 
@@ -125,7 +120,23 @@ including fewer. For example:
 <PRE>
 
   --locality=cloud=gce,region=us-west1,zone=us-west-1b
-  --locality=cloud=aws,region=us-east,zone=us-east-2</PRE>`,
+  --locality=cloud=aws,region=us-east,zone=us-east-2
+
+</PRE>
+This flag is incompatible with --locality-file.`,
+	}
+
+	LocalityFile = FlagInfo{
+		Name: "locality-file",
+		Description: `
+File name to read locality data from. Using this flag has the same effect as
+providing the file's contents directly via the --locality flag. Any leading or
+trailing whitespace characters, as defined by Unicode, will be automatically
+trimmed.
+<PRE>
+
+</PRE>
+This flag is incompatible with --locality.`,
 	}
 
 	Background = FlagInfo{
@@ -144,9 +155,12 @@ accept requests.`,
 
 	// TODO(knz): Remove this once https://github.com/cockroachdb/cockroach/issues/84604
 	// is addressed.
-	SecondaryTenantPortOffset = FlagInfo{
-		Name:        "secondary-tenant-port-offset",
-		Description: "TCP port number offset to use for the secondary in-memory tenant.",
+	ApplicationInternalRPCPortRange = FlagInfo{
+		Name: "internal-rpc-port-range",
+		Description: `
+TCP port range to use for the internal RPC service for application-level servers.
+This service is used for node-to-node RPC traffic and to serve data for 'debug zip'.
+`,
 	}
 
 	SQLMem = FlagInfo{
@@ -186,6 +200,18 @@ individual nodes have very limited memory available. This can constrain
 the ability of the DB Console to process time-series queries used to render
 metrics for the entire cluster. This capacity constraint does not affect
 SQL query execution.`,
+	}
+
+	GoGCPercent = FlagInfo{
+		Name: "go-gc-percent",
+		Description: `
+Garbage collection target percentage set on the Go runtime (which is also
+configurable via the GOGC environment variable, but --go-gc-percent has higher
+precedence if both are set). A garbage collection is triggered when the ratio of
+freshly allocated data to live data remaining after the previous collection
+reaches this percentage. If left unspecified, defaults to 300%. If set to a
+negative value, disables the target percentage garbage collection heuristic,
+leaving only the soft memory limit heuristic to trigger garbage collection.`,
 	}
 
 	SQLTempStorage = FlagInfo{
@@ -381,8 +407,8 @@ shell. This flag may be specified multiple times.`,
 	TableDisplayFormat = FlagInfo{
 		Name: "format",
 		Description: `
-Selects how to display table rows in results. Possible values: tsv,
-csv, table, records, sql, raw, html. If left unspecified, defaults to
+Selects how to display table rows in results. Possible values: tsv, csv,
+table, records, ndjson, json, sql, html, raw. If left unspecified, defaults to
 tsv for non-interactive sessions and table for interactive sessions.`,
 	}
 
@@ -663,6 +689,21 @@ apply. This flag is experimental.
 `,
 	}
 
+	AcceptProxyProtocolHeaders = FlagInfo{
+		Name: "accept-proxy-protocol-headers",
+		Description: `
+Allows CockroachDB to parse proxy protocol headers. Proxy protocol is used by
+some proxies to retain the original client IP information after the proxy has
+rewritten the source IP address of forwarded packets.
+<PRE>
+
+</PRE>
+When using this flag, ensure all traffic to CockroachDB flows through a proxy
+which adds proxy protocol headers, to prevent spoofing of client IP address
+information.
+`,
+	}
+
 	LocalityAdvertiseAddr = FlagInfo{
 		Name: "locality-advertise-addr",
 		Description: `
@@ -777,8 +818,8 @@ Disable use of "external" IO, such as to S3, GCS, or the file system (nodelocal)
 	ExternalIOEnableNonAdminImplicitAndArbitraryOutbound = FlagInfo{
 		Name: "external-io-enable-non-admin-implicit-access",
 		Description: `
-Allow non-admin users to specify arbitrary network addressses (e.g. https:// URIs or custom endpoints in s3:// URIs) and 
-implicit credentials (machine account/role providers) when running operations like IMPORT/EXPORT/BACKUP/etc. 
+Allow non-admin users to specify arbitrary network addressses (e.g. https:// URIs or custom endpoints in s3:// URIs) and
+implicit credentials (machine account/role providers) when running operations like IMPORT/EXPORT/BACKUP/etc.
 Note: that --external-io-disable-http or --external-io-disable-implicit-credentials still apply, this only removes the admin-user requirement.`,
 	}
 
@@ -812,6 +853,14 @@ This flag is optional. When omitted, the certificate is not scoped; i.e.
 it can be used with all tenants.`,
 	}
 
+	TenantScopeByNames = FlagInfo{
+		Name: "tenant-name-scope",
+		Description: `Assign a tenant scope using tenant names to the certificate.
+This will restrict the certificate to only be valid for the specified tenants.
+This flag is optional. When omitted, the certificate is not scoped; i.e.
+it can be used with all tenants.`,
+	}
+
 	GeneratePKCS8Key = FlagInfo{
 		Name:        "also-generate-pkcs8-key",
 		Description: `Also write the key in pkcs8 format to <certs-dir>/client.<username>.key.pk8.`,
@@ -827,36 +876,6 @@ certificate can only be used if an identity map has been configured server-side.
 	Password = FlagInfo{
 		Name:        "password",
 		Description: `Prompt for the new user's password.`,
-	}
-
-	InitToken = FlagInfo{
-		Name: "init-token",
-		Description: `Shared token for initialization of node TLS certificates.
-
-This flag is optional for the 'start' command. When omitted, the 'start'
-command expects the operator to prepare TLS certificates beforehand using
-the 'cert' command.
-
-This flag must be combined with --num-expected-initial-nodes.`,
-	}
-
-	NumExpectedInitialNodes = FlagInfo{
-		Name: "num-expected-initial-nodes",
-		Description: `Number of expected nodes during TLS certificate creation,
-including the node where the connect command is run.
-
-This flag must be combined with --init-token.`,
-	}
-
-	SingleNode = FlagInfo{
-		Name: "single-node",
-		Description: `Prepare the certificates for a subsequent 'start-single-node'
-command. The 'connect' command only runs cursory checks on the network
-configuration and does not wait for peers to auto-negotiate a common
-set of credentials.
-
-The --single-node flag is exclusive with the --init-num-peers and --init-token
-flags.`,
 	}
 
 	CertsDir = FlagInfo{
@@ -885,6 +904,26 @@ principal not specified in the map is passed through as-is via the identity
 function. A cert is allowed to authenticate a DB principal if the DB principal
 name is contained in the mapped CommonName or DNS-type SubjectAlternateName
 fields. It is permissible for the <cert-principal> string to contain colons.
+`,
+	}
+
+	RootCertDistinguishedName = FlagInfo{
+		Name: "root-cert-distinguished-name",
+		Description: `
+A string of comma separated list of distinguished-name
+<attribute-type>=<attribute-value> mappings in accordance with RFC4514 for the root
+user. This strictly needs to match the DN subject in the client certificate
+provided for root user if this flag is set.
+`,
+	}
+
+	NodeCertDistinguishedName = FlagInfo{
+		Name: "node-cert-distinguished-name",
+		Description: `
+A string of comma separated list of distinguished-name
+<attribute-type>=<attribute-value> mappings in accordance with RFC4514 for the node
+user. This strictly needs to match the DN subject in the client certificate
+provided for node user if this flag is set.
 `,
 	}
 
@@ -1016,12 +1055,68 @@ which use 'cockroach-data-tenant-X' for tenant 'X')
 `,
 	}
 
-	StorageEngine = FlagInfo{
-		Name: "storage-engine",
+	WALFailover = FlagInfo{
+		Name:   "wal-failover",
+		EnvVar: "COCKROACH_WAL_FAILOVER",
 		Description: `
-Storage engine to use for all stores on this cockroach node. The only option is pebble. Deprecated;
-only present for backward compatibility.
+Configures the use and behavior of WAL failover. WAL failover enables
+automatic failover to another directory if a WAL write does not complete
+within the configured threshold. Defaults to "disabled". Possible values
+depend on the number of stores a node is configured to use.
+
+If a node has multiple stores, the value "among-stores" enables automatic
+failover to another store's data directory. CockroachDB will automatically
+assign each store a secondary to serve as its WAL failover destination.
+For example:
+<PRE>
+
+  --wal-failover=among-stores
+
+</PRE>
+
+If a node has a single store, the value "path=<path>" enables automatic
+failover to the provided path. After this setting is used, changing the
+configuration to a new path or disabling requires providing the previous
+path as ",prev_path=<path>". For example:
+
+<PRE>
+
+    --wal-failover=path=/mnt/data2
+    --wal-failover=path=/mnt/data3,prev_path=/mnt/data2
+    --wal-failover=disabled,prev_path=/mnt/data3
+
+</PRE>
+
+See the storage.wal_failover.unhealthy_op_threshold cluster setting.
 `,
+	}
+
+	StorageEngine = FlagInfo{
+		Name:        "storage-engine",
+		Description: "Deprecated: only present for backward compatibility.",
+	}
+
+	SecondaryCache = FlagInfo{
+		Name: "experimental-secondary-cache",
+		Description: `
+Enables the use of a secondary cache to store objects from shared storage (see
+--experimental-shared-storage) inside local paths for each store. A size must
+be specified with this flag, which will be the maximum size for the secondary
+cache on each store on this node:
+<PRE>
+
+  --experimental-secondary-cache=20GiB
+
+</PRE>
+The size can be given in various ways:
+<PRE>
+
+  --experimental-secondary-cache=10000000000     -> 10000000000 bytes
+  --experimental-secondary-cache=20GB            -> 20000000000 bytes
+  --experimental-secondary-cache=20GiB           -> 21474836480 bytes
+  --experimental-secondary-cache=20%             -> 20% of available space
+  --experimental-secondary-cache=0.2             -> 20% of available space
+  --experimental-secondary-cache=.2              -> 20% of available space</PRE>`,
 	}
 
 	SharedStorage = FlagInfo{
@@ -1288,7 +1383,12 @@ status, without actually decommissioning the node.`,
 	NodeDrainSelf = FlagInfo{
 		Name: "self",
 		Description: `Use the node ID of the node connected to via --host
-as target of the drain or quit command.`,
+as target of the drain command.`,
+	}
+
+	NodeDrainShutdown = FlagInfo{
+		Name:        "shutdown",
+		Description: `Shutdown the target node after it is drained.`,
 	}
 
 	SQLFmtLen = FlagInfo{
@@ -1447,12 +1547,6 @@ If set to false, overrides the default demo behavior of enabling rangefeeds.`,
 		Description: `
 Disable the creation of a default dataset in the demo shell.
 This makes 'cockroach demo' faster to start.`,
-	}
-
-	ConfigProfile = FlagInfo{
-		Name:        "config-profile",
-		EnvVar:      "COCKROACH_CONFIG_PROFILE",
-		Description: `Select a configuration profile to apply.`,
 	}
 
 	GeoLibsDir = FlagInfo{
@@ -1624,7 +1718,7 @@ this flag is applied.`,
 	ZipRedactLogs = FlagInfo{
 		Name: "redact-logs",
 		Description: `
-DEPRECATED: Redact text that may contain confidential data or PII from 
+DEPRECATED: Redact text that may contain confidential data or PII from
 retrieved log entries.
 <PRE>
 
@@ -1647,8 +1741,37 @@ necessary to support CockroachDB.
 	ZipIncludeRangeInfo = FlagInfo{
 		Name: "include-range-info",
 		Description: `
-Include information about each individual range in nodes/*/ranges/*.json files.
-For large clusters, this can dramatically increase debug zip size/file count.
+Include one file per node with information about the KV ranges stored on that node,
+in nodes/{node ID}/ranges.json. Additionally, include problem ranges information.
+This information can be vital when debugging issues that involve the KV storage layer,
+such as data placement, load balancing, performance or other behaviors. In certain situations,
+on large clusters with large numbers of ranges, these files can be omitted if and only if the
+issue being investigated is already known to be in another layer of the system (for example,
+an error message about an unsupported feature or incompatible value in a SQL schema change or
+statement). Note however many higher-level issues are ultimately related to the underlying KV
+storage layer described by these files so only set this to false if directed to do so by Cockroach
+Labs support.
+`,
+	}
+
+	ZipIncludeGoroutineStacks = FlagInfo{
+		Name: "include-goroutine-stacks",
+		Description: `
+Fetch stack traces for all goroutines running on each targeted node in nodes/*/stacks.txt
+and nodes/*/stacks_with_labels.txt files. Note that fetching stack traces for all goroutines is
+a "stop-the-world" operation, which can momentarily have negative impacts on SQL service
+latency. Note that any periodic goroutine dumps previously taken on the node will still be
+included in nodes/*/goroutines/*.txt.gz, as these would have already been generated and don't
+require any additional stop-the-world operations to be collected.
+`,
+	}
+
+	ZipIncludeRunningJobTraces = FlagInfo{
+		Name: "include-running-job-traces",
+		Description: `
+Include information about each running, traceable job in jobs/*/*/trace.zip
+files. This involves collecting cluster-wide traces for each running job in the
+cluster.
 `,
 	}
 
@@ -1690,7 +1813,7 @@ dependencies on other tables.
 	ImportMaxRowSize = FlagInfo{
 		Name: "max-row-size",
 		Description: `
-Override limits on line size when importing Postgres dump files. This setting 
+Override limits on line size when importing Postgres dump files. This setting
 may need to be tweaked if the Postgres dump file has extremely long lines.
 `,
 	}
@@ -1786,15 +1909,6 @@ commands, WARNING for client commands.`,
 		Description: `--sql-audit-dir=XXX is an alias for --log='sinks: {file-groups: {sql-audit: {channels: SENSITIVE_ACCESS, dir: ...}}}'.`,
 	}
 
-	ObsServiceAddr = FlagInfo{
-		Name:   "obsservice-addr",
-		EnvVar: "",
-		Description: `Address of an OpenTelemetry OTLP sink such as the
-Observability Service or the OpenTelemetry Collector. If set, telemetry
-events are exported to this address. The special value "embed" causes
-the Cockroach node to run the Observability Service internally.`,
-	}
-
 	BuildTag = FlagInfo{
 		Name: "build-tag",
 		Description: `
@@ -1811,7 +1925,7 @@ without any other details.
 	ExportDestination = FlagInfo{
 		Name: "destination",
 		Description: `
-The destination to export data. 
+The destination to export data.
 If the export format is readable and this flag left unspecified,
 defaults to display the exported data in the terminal output.
 `,
@@ -1820,7 +1934,7 @@ defaults to display the exported data in the terminal output.
 	ExportTableFormat = FlagInfo{
 		Name: "format",
 		Description: `
-Selects the format to export table rows from backups. 
+Selects the format to export table rows from backups.
 Only csv is supported at the moment.
 `,
 	}
@@ -1833,9 +1947,9 @@ Only csv is supported at the moment.
 	StartKey = FlagInfo{
 		Name: "start-key",
 		Description: `
-Start key and format as [<format>:]<key>. Supported formats: raw, hex, bytekey. 
+Start key and format as [<format>:]<key>. Supported formats: raw, hex, bytekey.
 The raw format supports escaped text. For example, "raw:\x01k" is
-the prefix for range local keys. 
+the prefix for range local keys.
 The bytekey format does not require table-key prefix.`,
 	}
 
@@ -1870,7 +1984,7 @@ host, or a full well-formed URI.
 </PRE>
 If a destination is not specified, the default URI scheme and host will be used,
 and the basename from the source will be used as the destination directory.
-For example: 'userfile://defaultdb.public.userfiles_root/yourdirectory' 
+For example: 'userfile://defaultdb.public.userfiles_root/yourdirectory'
 <PRE>
 
 </PRE>
@@ -1942,5 +2056,31 @@ from node to node and previous application or staging attempt failed.
 		Description: `
 Maximum number of characters in printed keys and spans. If key representation
 exceeds this value, it is truncated. Set to 0 to disable truncation.`,
+	}
+	// Attrs and others store the static information for CLI flags.
+
+	EnterpriseEncryption = FlagInfo{
+		Name: "enterprise-encryption",
+		Description: `
+<PRE>Specify encryption options for one of the stores on a node. If multiple
+stores exist, the flag must be specified for each store.
+
+A valid enterprise license is required to use this functionality.
+
+Key files should be generated by "cockroach gen encryption-key".
+
+Valid fields:
+
+* path    (required): must match the path of one of the stores, or the special
+                      value "*" to match all stores
+* key     (required): path to the current key file, or "plain"
+* old-key (required): path to the previous key file, or "plain"
+* rotation-period   : amount of time after which data keys should be rotated
+
+</PRE>
+example:
+<PRE>
+  --enterprise-encryption=path=cockroach-data,key=/keys/aes-128.key,old-key=plain</PRE>
+`,
 	}
 )

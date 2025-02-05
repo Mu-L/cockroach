@@ -18,6 +18,7 @@ go_library(
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/bitarray",
+        "//pkg/util/buildutil",
         "//pkg/util/duration",
         "//pkg/util/encoding",
         "//pkg/util/ipaddr",
@@ -34,10 +35,10 @@ go_library(
 go_test(
     name = "keyside_test",
     srcs = ["keyside_test.go"],
-    args = ["-test.timeout=295s"],
     deps = [
         ":keyside",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/colinfo",
         "//pkg/sql/randgen",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",

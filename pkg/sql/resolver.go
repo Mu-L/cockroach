@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -36,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/errors"
 )
 
@@ -63,35 +58,6 @@ func (p *planner) ResolveMutableTableDescriptor(
 	}
 
 	return prefix, desc, nil
-}
-
-// TODO(ajwerner): Remove this and things like it to use more generic
-// functionality. We really need to centralize the privilege checking.
-func (p *planner) resolveUncachedTableDescriptor(
-	ctx context.Context, tn *tree.TableName, required bool, requiredType tree.RequiredTableKind,
-) (table catalog.TableDescriptor, err error) {
-	var prefix catalog.ResolvedObjectPrefix
-	var desc catalog.Descriptor
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		lookupFlags := tree.ObjectLookupFlags{
-			Required:             required,
-			DesiredObjectKind:    tree.TableObject,
-			DesiredTableDescKind: requiredType,
-		}
-		desc, prefix, err = resolver.ResolveExistingObject(
-			ctx, p, tn.ToUnresolvedObjectName(), lookupFlags,
-		)
-	})
-	if err != nil || desc == nil {
-		return nil, err
-	}
-	table = desc.(catalog.TableDescriptor)
-	// Ensure that the current user can access the target schema.
-	if err := p.canResolveDescUnderSchema(ctx, prefix.Schema, table); err != nil {
-		return nil, err
-	}
-
-	return table, nil
 }
 
 func (p *planner) ResolveTargetObject(
@@ -304,7 +270,7 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 	const required = true
 	if targets.Databases != nil {
 		if len(targets.Databases) == 0 {
-			return nil, errNoDatabase
+			return nil, sqlerrors.ErrNoDatabase
 		}
 		descs := make([]DescriptorWithObjectType, 0, len(targets.Databases))
 		for _, database := range targets.Databases {
@@ -318,14 +284,14 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 			})
 		}
 		if len(descs) == 0 {
-			return nil, errNoMatch
+			return nil, sqlerrors.ErrNoMatch
 		}
 		return descs, nil
 	}
 
 	if targets.Types != nil {
 		if len(targets.Types) == 0 {
-			return nil, errNoType
+			return nil, sqlerrors.ErrNoType
 		}
 		descs := make([]DescriptorWithObjectType, 0, len(targets.Types))
 		for _, typ := range targets.Types {
@@ -341,19 +307,29 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 		}
 
 		if len(descs) == 0 {
-			return nil, errNoMatch
+			return nil, sqlerrors.ErrNoMatch
 		}
 		return descs, nil
 	}
 
-	if targets.Functions != nil {
-		if len(targets.Functions) == 0 {
-			return nil, errNoFunction
+	if targets.Functions != nil || targets.Procedures != nil {
+		targetRoutines := targets.Functions
+		isFuncs := true
+		routineType := tree.UDFRoutine
+		if targets.Functions == nil {
+			targetRoutines = targets.Procedures
+			isFuncs = false
+			routineType = tree.ProcedureRoutine
 		}
-		descs := make([]DescriptorWithObjectType, 0, len(targets.Functions))
+		if len(targetRoutines) == 0 {
+			return nil, sqlerrors.ErrNoFunction
+		}
+		descs := make([]DescriptorWithObjectType, 0, len(targetRoutines))
 		fnResolved := catalog.DescriptorIDSet{}
-		for _, f := range targets.Functions {
-			overload, err := p.matchUDF(ctx, &f, true /* required */)
+		for _, f := range targetRoutines {
+			overload, err := p.matchRoutine(
+				ctx, &f, true /* required */, routineType, false, /* inDropContext */
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -366,9 +342,17 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 			if err != nil {
 				return nil, err
 			}
+			if isFuncs == fnDesc.IsProcedure() {
+				arg := "function"
+				if fnDesc.IsProcedure() {
+					arg = "procedure"
+				}
+				return nil, pgerror.Newf(pgcode.WrongObjectType, "%q is not a %s",
+					fnDesc.Name, arg)
+			}
 			descs = append(descs, DescriptorWithObjectType{
 				descriptor: fnDesc,
-				objectType: privilege.Function,
+				objectType: privilege.Routine,
 			})
 		}
 		return descs, nil
@@ -376,7 +360,7 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 
 	if targets.Schemas != nil {
 		if len(targets.Schemas) == 0 {
-			return nil, errNoSchema
+			return nil, sqlerrors.ErrNoSchema
 		}
 		if targets.AllTablesInSchema || targets.AllSequencesInSchema {
 			// Get all the descriptors for the tables in the specified schemas.
@@ -410,7 +394,7 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 									descs,
 									DescriptorWithObjectType{
 										descriptor: mut,
-										objectType: privilege.Table,
+										objectType: mut.GetObjectType(),
 									})
 							}
 						}
@@ -435,7 +419,11 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 			}
 
 			return descs, nil
-		} else if targets.AllFunctionsInSchema {
+		} else if targets.AllFunctionsInSchema || targets.AllProceduresInSchema {
+			isProcs := true
+			if targets.AllFunctionsInSchema {
+				isProcs = false
+			}
 			var descs []DescriptorWithObjectType
 			for _, scName := range targets.Schemas {
 				dbName := p.CurrentDatabase()
@@ -455,9 +443,14 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 					if err != nil {
 						return err
 					}
+					if isProcs != fn.IsProcedure() {
+						// Skip functions if ALL PROCEDURES was specified, and
+						// skip procedures if ALL FUNCTIONS was specified.
+						return nil
+					}
 					descs = append(descs, DescriptorWithObjectType{
 						descriptor: fn,
-						objectType: privilege.Function,
+						objectType: privilege.Routine,
 					})
 					return nil
 				})
@@ -515,7 +508,7 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 	}
 
 	if len(targets.Tables.TablePatterns) == 0 {
-		return nil, errNoTable
+		return nil, sqlerrors.ErrNoTable
 	}
 	descs := make([]DescriptorWithObjectType, 0, len(targets.Tables.TablePatterns))
 	for _, tableTarget := range targets.Tables.TablePatterns {
@@ -545,6 +538,8 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 							objectType: privilege.Sequence,
 						},
 					)
+				} else if targets.Tables.SequenceOnly {
+					return nil, pgerror.Newf(pgcode.WrongObjectType, "%s is not a sequence", tableDesc.GetName())
 				} else {
 					descs = append(
 						descs,
@@ -558,7 +553,7 @@ func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
 		}
 	}
 	if len(descs) == 0 {
-		return nil, errNoMatch
+		return nil, sqlerrors.ErrNoMatch
 	}
 	return descs, nil
 }
@@ -569,7 +564,7 @@ func (p *planner) getFullyQualifiedNamesFromIDs(
 	ctx context.Context, ids []descpb.ID,
 ) (fullyQualifiedNames []string, _ error) {
 	for _, id := range ids {
-		desc, err := p.Descriptors().ByID(p.txn).Get().Desc(ctx, id)
+		desc, err := p.Descriptors().ByIDWithoutLeased(p.txn).Get().Desc(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -596,7 +591,7 @@ func (p *planner) getFullyQualifiedNamesFromIDs(
 func (p *planner) getQualifiedSchemaName(
 	ctx context.Context, desc catalog.SchemaDescriptor,
 ) (*tree.ObjectNamePrefix, error) {
-	dbDesc, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
+	dbDesc, err := p.Descriptors().ByIDWithoutLeased(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +608,7 @@ func (p *planner) getQualifiedSchemaName(
 func (p *planner) getQualifiedTypeName(
 	ctx context.Context, desc catalog.TypeDescriptor,
 ) (*tree.TypeName, error) {
-	dbDesc, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
+	dbDesc, err := p.Descriptors().ByIDWithoutLeased(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return nil, err
 	}
@@ -858,7 +853,7 @@ func (l *internalLookupCtx) GetSchemaName(
 	return schemaName, found, nil
 }
 
-var metamorphicDefaultUseIndexLookupForDescriptorsInDatabase = util.ConstantWithMetamorphicTestBool(
+var metamorphicDefaultUseIndexLookupForDescriptorsInDatabase = metamorphic.ConstantWithTestBool(
 	`use-index-lookup-for-descriptors-in-database`, true,
 )
 
@@ -866,7 +861,7 @@ var metamorphicDefaultUseIndexLookupForDescriptorsInDatabase = util.ConstantWith
 // namespace table should be used to fetch the set of descriptors needed to
 // materialize most system tables.
 var useIndexLookupForDescriptorsInDatabase = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.catalog.virtual_tables.use_index_lookup_for_descriptors_in_database.enabled",
 	"if enabled, virtual tables will do a lookup against the namespace table to"+
 		" find the descriptors in a database instead of scanning all descriptors",
@@ -966,8 +961,8 @@ func (l *internalLookupCtx) getTableByID(id descpb.ID) (catalog.TableDescriptor,
 func (l *internalLookupCtx) getTypeByID(id descpb.ID) (catalog.TypeDescriptor, error) {
 	typ, ok := l.typDescs[id]
 	if !ok {
-		return nil, sqlerrors.NewUndefinedRelationError(
-			tree.NewUnqualifiedTableName(tree.Name(fmt.Sprintf("[%d]", id))))
+		return nil, sqlerrors.NewUndefinedTypeError(
+			tree.NewUnqualifiedTypeName(fmt.Sprintf("[%d]", id)))
 	}
 	return typ, nil
 }

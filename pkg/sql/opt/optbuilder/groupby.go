@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -459,7 +454,8 @@ func (b *Builder) analyzeHaving(having *tree.Where, fromScope *scope) tree.Typed
 	// in case we are recursively called within a subquery context.
 	defer b.semaCtx.Properties.Restore(b.semaCtx.Properties)
 	b.semaCtx.Properties.Require(
-		exprKindHaving.String(), tree.RejectWindowApplications|tree.RejectGenerators,
+		exprKindHaving.String(),
+		tree.RejectWindowApplications|tree.RejectGenerators|tree.RejectProcedures,
 	)
 	fromScope.context = exprKindHaving
 	return fromScope.resolveAndRequireType(having.Expr, types.Bool)
@@ -891,6 +887,14 @@ func (b *Builder) constructAggregate(name string, args []opt.ScalarExpr) opt.Sca
 		return b.factory.ConstructJsonObjectAgg(args[0], args[1])
 	case "jsonb_object_agg":
 		return b.factory.ConstructJsonbObjectAgg(args[0], args[1])
+	case "merge_stats_metadata":
+		return b.factory.ConstructMergeStatsMetadata(args[0])
+	case "merge_statement_stats":
+		return b.factory.ConstructMergeStatementStats(args[0])
+	case "merge_transaction_stats":
+		return b.factory.ConstructMergeTransactionStats(args[0])
+	case "merge_aggregated_stmt_metadata":
+		return b.factory.ConstructMergeAggregatedStmtMetadata(args[0])
 	}
 
 	panic(errors.AssertionFailedf("unhandled aggregate: %s", name))
@@ -985,7 +989,7 @@ func (b *Builder) allowImplicitGroupingColumn(colID opt.ColumnID, g *groupby) bo
 	// Check UNIQUE INDEX constraints.
 	for i := 1; i < tab.IndexCount(); i++ {
 		index := tab.Index(i)
-		if !index.IsUnique() || index.IsInverted() {
+		if !index.IsUnique() || !index.Type().CanBeUnique() {
 			continue
 		}
 		// If any of the key columns is nullable, uniqueCols is suffixed with the

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,7 +10,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 )
 
 func init() {
@@ -33,16 +30,24 @@ func Increment(
 	reply := resp.(*kvpb.IncrementResponse)
 
 	opts := storage.MVCCWriteOptions{
-		Txn:            h.Txn,
-		LocalTimestamp: cArgs.Now,
-		Stats:          cArgs.Stats,
+		Txn:                            h.Txn,
+		LocalTimestamp:                 cArgs.Now,
+		Stats:                          cArgs.Stats,
+		ReplayWriteTimestampProtection: h.AmbiguousReplayProtection,
+		OmitInRangefeeds:               cArgs.OmitInRangefeeds,
+		OriginID:                       h.WriteOptions.GetOriginID(),
+		OriginTimestamp:                h.WriteOptions.GetOriginTimestamp(),
+		MaxLockConflicts:               storage.MaxConflictsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
+		TargetLockConflictBytes:        storage.TargetBytesPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV),
+		Category:                       fs.BatchEvalReadCategory,
 	}
 
 	var err error
-	reply.NewValue, err = storage.MVCCIncrement(
+	var acq roachpb.LockAcquisition
+	reply.NewValue, acq, err = storage.MVCCIncrement(
 		ctx, readWriter, args.Key, h.Timestamp, opts, args.Increment)
 	if err != nil {
 		return result.Result{}, err
 	}
-	return result.FromAcquiredLocks(h.Txn, args.Key), nil
+	return result.WithAcquiredLocks(acq), nil
 }

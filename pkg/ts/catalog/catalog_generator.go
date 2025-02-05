@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catalog
 
@@ -32,20 +27,36 @@ import (
 // the metrics in any useful way.
 //
 // No new uses of this endpoint should be added.
-func GenerateCatalog(metadata map[string]metric.Metadata) ([]ChartSection, error) {
+func GenerateCatalog(nodeMd, appMd, srvMd map[string]metric.Metadata) ([]ChartSection, error) {
 	var sl []ChartSection
+	sl = generateInternal(nodeMd, sl, MetricLayer_STORAGE)
+	sl = generateInternal(appMd, sl, MetricLayer_APPLICATION)
+	sl = generateInternal(srvMd, sl, MetricLayer_SERVER)
+	return sl, nil
+}
+
+func generateInternal(
+	metadata map[string]metric.Metadata, sl []ChartSection, metricLayer MetricLayer,
+) []ChartSection {
 	avgAgg := tspb.TimeSeriesQueryAggregator_AVG
 	for name, meta := range metadata {
 		der := tspb.TimeSeriesQueryDerivative_NONE
 		if meta.MetricType == prometheusgo.MetricType_COUNTER {
 			der = tspb.TimeSeriesQueryDerivative_NON_NEGATIVE_DERIVATIVE
 		}
+		origUnit := meta.Unit.String()
+		dstUnit := AxisUnits_UNSET_UNITS
+		if candidate, ok := AxisUnits_value[origUnit]; ok {
+			dstUnit = AxisUnits(candidate)
+		}
+
 		sl = append(sl, ChartSection{
 			Title:           name,
 			LongTitle:       name,
 			CollectionTitle: name,
 			Description:     name,
 			Level:           0,
+			MetricLayer:     metricLayer,
 			Charts: []*IndividualChart{{
 				Title:           name,
 				LongTitle:       name,
@@ -53,19 +64,19 @@ func GenerateCatalog(metadata map[string]metric.Metadata) ([]ChartSection, error
 				Downsampler:     &avgAgg,
 				Aggregator:      &avgAgg,
 				Derivative:      &der,
-				Units:           AxisUnits_UNSET_UNITS,
+				Units:           dstUnit,
 				AxisLabel:       meta.Measurement,
 				Metrics: []ChartMetric{
 					{
 						Name:           name,
 						Help:           meta.Help,
 						AxisLabel:      meta.Measurement,
-						PreferredUnits: AxisUnits_UNSET_UNITS,
+						PreferredUnits: dstUnit,
 						MetricType:     meta.MetricType,
 					},
 				},
 			}},
 		})
 	}
-	return sl, nil
+	return sl
 }

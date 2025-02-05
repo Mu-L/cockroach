@@ -1,19 +1,13 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sessioninit_test
 
 import (
 	"context"
 	gosql "database/sql"
-	"net/url"
 	"sync"
 	"testing"
 
@@ -24,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
@@ -35,11 +28,12 @@ func TestCacheInvalidation(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: false})
-	defer s.Stopper().Stop(ctx)
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: false})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.AdvSQLAddr(), "TestCacheInvalidation" /* prefix */, url.UserPassword("testuser", "abc"),
+	pgURL, cleanupFunc := s.PGUrl(
+		t, serverutils.CertsDirPrefix("TestCacheInvalidation"), serverutils.UserPassword("testuser", "abc"),
 	)
 	defer cleanupFunc()
 
@@ -195,11 +189,12 @@ func TestCacheSingleFlight(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
-	settings := s.ExecutorConfig().(sql.ExecutorConfig).Settings
-	c := s.ExecutorConfig().(sql.ExecutorConfig).SessionInitCache
+	settings := execCfg.Settings
+	c := execCfg.SessionInitCache
 
 	testuser := username.MakeSQLUsernameFromPreNormalizedString("test")
 

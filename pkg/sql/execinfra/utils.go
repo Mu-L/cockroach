@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfra
 
@@ -59,7 +54,7 @@ func HydrateTypesInDatumInfo(
 // This setting is defined here instead of in package 'sql' to avoid
 // a dependency cycle.
 var IncludeRUEstimateInExplainAnalyze = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.tenant_ru_estimation.enabled",
 	"determines whether EXPLAIN ANALYZE should return an estimate for the query's RU consumption",
 	true,

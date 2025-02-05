@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cluster
 
@@ -35,6 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -55,22 +52,28 @@ import (
 )
 
 const (
-	defaultImage  = "docker.io/library/ubuntu:focal-20210119"
+	// We use a docker image mirror to avoid pulling from 3rd party repos, which sometimes have reliability issues.
+	// See https://cockroachlabs.atlassian.net/wiki/spaces/devinf/pages/3462594561/Docker+image+sync for the details.
+	defaultImage  = "us-east1-docker.pkg.dev/crl-docker-sync/docker-io/library/ubuntu:focal-20210119"
 	networkPrefix = "cockroachdb_acceptance"
 )
 
 // DefaultTCP is the default SQL/RPC port specification.
-const DefaultTCP nat.Port = base.DefaultPort + "/tcp"
-const defaultHTTP nat.Port = base.DefaultHTTPPort + "/tcp"
+const (
+	DefaultTCP  nat.Port = base.DefaultPort + "/tcp"
+	defaultHTTP nat.Port = base.DefaultHTTPPort + "/tcp"
+)
 
 // CockroachBinaryInContainer is the container-side path to the CockroachDB
 // binary.
 const CockroachBinaryInContainer = "/cockroach/cockroach"
 
-var cockroachImage = flag.String("i", defaultImage, "the docker image to run")
-var cockroachEntry = flag.String("e", "", "the entry point for the image")
-var waitOnStop = flag.Bool("w", false, "wait for the user to interrupt before tearing down the cluster")
-var maxRangeBytes = *zonepb.DefaultZoneConfig().RangeMaxBytes
+var (
+	cockroachImage = flag.String("i", defaultImage, "the docker image to run")
+	cockroachEntry = flag.String("e", "", "the entry point for the image")
+	waitOnStop     = flag.Bool("w", false, "wait for the user to interrupt before tearing down the cluster")
+	maxRangeBytes  = *zonepb.DefaultZoneConfig().RangeMaxBytes
+)
 
 // CockroachBinary is the path to the host-side binary to use.
 var CockroachBinary = flag.String("b", "", "the host-side binary to run")
@@ -164,10 +167,10 @@ func CreateDocker(
 	cli.NegotiateAPIVersion(ctx)
 
 	clusterID := uuid.MakeV4()
-	clusterIDS := clusterID.Short()
+	clusterIDS := clusterID.Short().String()
 
 	if volumesDir == "" {
-		volumesDir, err = os.MkdirTemp("", fmt.Sprintf("cockroach-acceptance-%s", clusterIDS))
+		volumesDir, err = os.MkdirTemp(datapathutils.DebuggableTempDir(), fmt.Sprintf("cockroach-acceptance-%s", clusterIDS))
 		maybePanic(err)
 	} else {
 		volumesDir = filepath.Join(volumesDir, clusterIDS)
@@ -461,9 +464,13 @@ func (l *DockerCluster) createNodeCerts() {
 
 // startNode starts a Docker container to run testNode. It may be called in
 // parallel to start many nodes at once, and thus should remain threadsafe.
-func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
+func (l *DockerCluster) startNode(ctx context.Context, node *testNode, singleNode bool) {
+	startCmd := "start"
+	if singleNode {
+		startCmd = "start-single-node"
+	}
 	cmd := []string{
-		"start",
+		startCmd,
 		"--certs-dir=/certs/",
 		"--listen-addr=" + node.nodeStr,
 		"--vmodule=*=1",
@@ -478,13 +485,15 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
 	for _, store := range node.stores {
 		storeSpec := base.StoreSpec{
 			Path: store.dir,
-			Size: base.SizeSpec{InBytes: int64(store.config.MaxRanges) * maxRangeBytes},
+			Size: storagepb.SizeSpec{Capacity: int64(store.config.MaxRanges) * maxRangeBytes},
 		}
 		cmd = append(cmd, fmt.Sprintf("--store=%s", storeSpec))
 	}
 	// Append --join flag for all nodes.
-	firstNodeAddr := l.Nodes[0].nodeStr
-	cmd = append(cmd, "--join="+net.JoinHostPort(firstNodeAddr, base.DefaultPort))
+	if !singleNode {
+		firstNodeAddr := l.Nodes[0].nodeStr
+		cmd = append(cmd, "--join="+net.JoinHostPort(firstNodeAddr, base.DefaultPort))
+	}
 
 	dockerLogDir := "/logs/" + node.nodeStr
 	localLogDir := filepath.Join(l.volumesDir, "logs", node.nodeStr)
@@ -499,6 +508,9 @@ func (l *DockerCluster) startNode(ctx context.Context, node *testNode) {
 		// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
 		// Remove in v23.2.
 		"COCKROACH_FORCE_DEPRECATED_SHOW_RANGE_BEHAVIOR=false",
+		// Disable metamorphic testing for acceptance tests, since they are
+		// end-to-end tests and metamorphic constants can make them too slow.
+		"COCKROACH_INTERNAL_DISABLE_METAMORPHIC_TESTING=true",
 	}
 	l.createRoach(ctx, node, l.vols, env, cmd...)
 	maybePanic(node.Start(ctx))
@@ -663,15 +675,16 @@ func (l *DockerCluster) Start(ctx context.Context) {
 	go l.monitor(ctx, l.monitorDone)
 	var wg sync.WaitGroup
 	wg.Add(len(l.Nodes))
+	singleNode := len(l.Nodes) == 1
 	for _, node := range l.Nodes {
 		go func(node *testNode) {
 			defer wg.Done()
-			l.startNode(ctx, node)
+			l.startNode(ctx, node, singleNode)
 		}(node)
 	}
 	wg.Wait()
 
-	if l.config.InitMode == INIT_COMMAND && len(l.Nodes) > 0 {
+	if l.config.InitMode == INIT_COMMAND && len(l.Nodes) > 1 {
 		l.RunInitCommand(ctx, 0)
 	}
 }

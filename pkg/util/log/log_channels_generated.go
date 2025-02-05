@@ -121,13 +121,13 @@ type ChannelLogger interface {
 	Shoutf(ctx context.Context, sev Severity, format string, args ...interface{})
 
 	// VEvent either logs a message to the channel (which also outputs to the
-	// active trace or event log) or to the trace/event log alone, depending on
-	// whether the specified verbosity level is active.
+	// active trace) or to the trace alone, depending on whether the specified
+	// verbosity level is active.
 	VEvent(ctx context.Context, level Level, msg string)
 
 	// VEventf either logs a message to the channel (which also outputs to the
-	// active trace or event log) or to the trace/event log alone, depending on
-	// whether the specified verbosity level is active.
+	// active trace) or to the trace alone, depending on whether the specified
+	// verbosity level is active.
 	VEventf(ctx context.Context, level Level, format string, args ...interface{})
 
 	// VEventfDepth performs the same as VEventf but checks the verbosity level
@@ -958,8 +958,8 @@ func (loggerDev) Shoutf(ctx context.Context, sev Severity, format string, args .
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `DEV` channel is used during development to collect log
 // details useful for troubleshooting that fall outside the
 // scope of other channels. It is also the default logging
@@ -972,12 +972,12 @@ func (loggerDev) Shoutf(ctx context.Context, sev Severity, format string, args .
 // sensitive operational data.
 // See [Configure logs](configure-logs.html#dev-channel).
 func (loggerDev) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.DEV, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.DEV, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `DEV` channel is used during development to collect log
 // details useful for troubleshooting that fall outside the
 // scope of other channels. It is also the default logging
@@ -1490,8 +1490,8 @@ func (loggerOps) Shoutf(ctx context.Context, sev Severity, format string, args .
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `OPS` channel is used to report "point" operational events,
 // initiated by user operators or automation:
 //
@@ -1504,12 +1504,12 @@ func (loggerOps) Shoutf(ctx context.Context, sev Severity, format string, args .
 //   - [Cluster setting](cluster-settings.html) changes
 //   - [Zone configuration](configure-replication-zones.html) changes
 func (loggerOps) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.OPS, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.OPS, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `OPS` channel is used to report "point" operational events,
 // initiated by user operators or automation:
 //
@@ -1928,8 +1928,8 @@ func (loggerHealth) Shoutf(ctx context.Context, sev Severity, format string, arg
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `HEALTH` channel is used to report "background" operational
 // events, initiated by CockroachDB or reporting on automatic processes:
 //
@@ -1939,12 +1939,12 @@ func (loggerHealth) Shoutf(ctx context.Context, sev Severity, format string, arg
 //   - Range and table leasing events
 //   - Up- and down-replication, range unavailability
 func (loggerHealth) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.HEALTH, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.HEALTH, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `HEALTH` channel is used to report "background" operational
 // events, initiated by CockroachDB or reporting on automatic processes:
 //
@@ -2243,17 +2243,17 @@ func (loggerStorage) Shoutf(ctx context.Context, sev Severity, format string, ar
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `STORAGE` channel is used to report low-level storage
 // layer events (RocksDB/Pebble).
 func (loggerStorage) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.STORAGE, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.STORAGE, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `STORAGE` channel is used to report low-level storage
 // layer events (RocksDB/Pebble).
 func (loggerStorage) VEventf(ctx context.Context, level Level, format string, args ...interface{}) {
@@ -2692,8 +2692,8 @@ func (loggerSessions) Shoutf(ctx context.Context, sev Severity, format string, a
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SESSIONS` channel is used to report client network activity when enabled via
 // the `server.auth_log.sql_connections.enabled` and/or
 // `server.auth_log.sql_sessions.enabled` [cluster setting](cluster-settings.html):
@@ -2705,12 +2705,12 @@ func (loggerSessions) Shoutf(ctx context.Context, sev Severity, format string, a
 // This is typically configured in "audit" mode, with event
 // numbering and synchronous writes.
 func (loggerSessions) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.SESSIONS, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.SESSIONS, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SESSIONS` channel is used to report client network activity when enabled via
 // the `server.auth_log.sql_connections.enabled` and/or
 // `server.auth_log.sql_sessions.enabled` [cluster setting](cluster-settings.html):
@@ -3222,8 +3222,8 @@ func (loggerSqlSchema) Shoutf(ctx context.Context, sev Severity, format string, 
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_SCHEMA` channel is used to report changes to the
 // SQL logical schema, excluding privilege and ownership changes
 // (which are reported separately on the `PRIVILEGES` channel) and
@@ -3238,12 +3238,12 @@ func (loggerSqlSchema) Shoutf(ctx context.Context, sev Severity, format string, 
 // `SQL_SCHEMA` events generally comprise changes to the schema that affect the
 // functional behavior of client apps using stored objects.
 func (loggerSqlSchema) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.SQL_SCHEMA, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.SQL_SCHEMA, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_SCHEMA` channel is used to report changes to the
 // SQL logical schema, excluding privilege and ownership changes
 // (which are reported separately on the `PRIVILEGES` channel) and
@@ -3704,8 +3704,8 @@ func (loggerUserAdmin) Shoutf(ctx context.Context, sev Severity, format string, 
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `USER_ADMIN` channel is used to report changes
 // in users and roles, including:
 //
@@ -3717,12 +3717,12 @@ func (loggerUserAdmin) Shoutf(ctx context.Context, sev Severity, format string, 
 // This is typically configured in "audit" mode, with event
 // numbering and synchronous writes.
 func (loggerUserAdmin) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.USER_ADMIN, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.USER_ADMIN, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `USER_ADMIN` channel is used to report changes
 // in users and roles, including:
 //
@@ -4139,8 +4139,8 @@ func (loggerPrivileges) Shoutf(ctx context.Context, sev Severity, format string,
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `PRIVILEGES` channel is used to report data
 // authorization changes, including:
 //
@@ -4150,12 +4150,12 @@ func (loggerPrivileges) Shoutf(ctx context.Context, sev Severity, format string,
 // This is typically configured in "audit" mode, with event
 // numbering and synchronous writes.
 func (loggerPrivileges) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.PRIVILEGES, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.PRIVILEGES, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `PRIVILEGES` channel is used to report data
 // authorization changes, including:
 //
@@ -4192,6 +4192,8 @@ type loggerSensitiveAccess struct{}
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4215,6 +4217,8 @@ var _ ChannelLogger = SensitiveAccess
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4238,6 +4242,8 @@ func (loggerSensitiveAccess) Infof(ctx context.Context, format string, args ...i
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4261,6 +4267,8 @@ func (loggerSensitiveAccess) VInfof(ctx context.Context, level Level, format str
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4283,6 +4291,8 @@ func (loggerSensitiveAccess) Info(ctx context.Context, msg string) {
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4304,6 +4314,8 @@ func (loggerSensitiveAccess) InfofDepth(ctx context.Context, depth int, format s
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4327,6 +4339,8 @@ func (loggerSensitiveAccess) Warningf(ctx context.Context, format string, args .
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4350,6 +4364,8 @@ func (loggerSensitiveAccess) VWarningf(ctx context.Context, level Level, format 
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4372,6 +4388,8 @@ func (loggerSensitiveAccess) Warning(ctx context.Context, msg string) {
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4393,6 +4411,8 @@ func (loggerSensitiveAccess) WarningfDepth(ctx context.Context, depth int, forma
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4417,6 +4437,8 @@ func (loggerSensitiveAccess) Errorf(ctx context.Context, format string, args ...
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4441,6 +4463,8 @@ func (loggerSensitiveAccess) VErrorf(ctx context.Context, level Level, format st
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4464,6 +4488,8 @@ func (loggerSensitiveAccess) Error(ctx context.Context, msg string) {
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4486,6 +4512,8 @@ func (loggerSensitiveAccess) ErrorfDepth(ctx context.Context, depth int, format 
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4510,6 +4538,8 @@ func (loggerSensitiveAccess) Fatalf(ctx context.Context, format string, args ...
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4534,6 +4564,8 @@ func (loggerSensitiveAccess) VFatalf(ctx context.Context, level Level, format st
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4557,6 +4589,8 @@ func (loggerSensitiveAccess) Fatal(ctx context.Context, msg string) {
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4578,6 +4612,8 @@ func (loggerSensitiveAccess) FatalfDepth(ctx context.Context, depth int, format 
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4596,6 +4632,8 @@ func (loggerSensitiveAccess) Shout(ctx context.Context, sev Severity, msg string
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4606,30 +4644,34 @@ func (loggerSensitiveAccess) Shoutf(ctx context.Context, sev Severity, format st
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SENSITIVE_ACCESS` channel is used to report SQL
 // data access to sensitive data:
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
 // This is typically configured in "audit" mode, with event
 // numbering and synchronous writes.
 func (loggerSensitiveAccess) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.SENSITIVE_ACCESS, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.SENSITIVE_ACCESS, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SENSITIVE_ACCESS` channel is used to report SQL
 // data access to sensitive data:
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -4646,6 +4688,8 @@ func (loggerSensitiveAccess) VEventf(ctx context.Context, level Level, format st
 //
 //   - Data access audit events (when table audit is enabled via
 //     [ALTER TABLE ... EXPERIMENTAL_AUDIT](alter-table.html#experimental_audit))
+//   - Data access audit events (when role-based audit is enabled via
+//     [`sql.log.user_audit` cluster setting](role-based-audit-logging.html#syntax-of-audit-settings))
 //   - SQL statements executed by users with the admin role
 //   - Operations that write to system tables
 //
@@ -5003,8 +5047,8 @@ func (loggerSqlExec) Shoutf(ctx context.Context, sev Severity, format string, ar
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_EXEC` channel is used to report SQL execution on
 // behalf of client connections:
 //
@@ -5012,12 +5056,12 @@ func (loggerSqlExec) Shoutf(ctx context.Context, sev Severity, format string, ar
 //     `sql.log.all_statements.enabled` [cluster setting](cluster-settings.html))
 //   - uncaught Go panic errors during the execution of a SQL statement.
 func (loggerSqlExec) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.SQL_EXEC, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.SQL_EXEC, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_EXEC` channel is used to report SQL execution on
 // behalf of client connections:
 //
@@ -5445,8 +5489,8 @@ func (loggerSqlPerf) Shoutf(ctx context.Context, sev Severity, format string, ar
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_PERF` channel is used to report SQL executions
 // that are marked as "out of the ordinary"
 // to facilitate performance investigations.
@@ -5457,12 +5501,12 @@ func (loggerSqlPerf) Shoutf(ctx context.Context, sev Severity, format string, ar
 // with versions prior to v21.1, where the corresponding events
 // were redirected to separate files.
 func (loggerSqlPerf) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.SQL_PERF, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.SQL_PERF, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_PERF` channel is used to report SQL executions
 // that are marked as "out of the ordinary"
 // to facilitate performance investigations.
@@ -5801,19 +5845,19 @@ func (loggerSqlInternalPerf) Shoutf(ctx context.Context, sev Severity, format st
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_INTERNAL_PERF` channel is like the `SQL_PERF` channel, but is aimed at
 // helping developers of CockroachDB itself. It exists as a separate
 // channel so as to not pollute the `SQL_PERF` logging output with
 // internal troubleshooting details.
 func (loggerSqlInternalPerf) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.SQL_INTERNAL_PERF, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.SQL_INTERNAL_PERF, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `SQL_INTERNAL_PERF` channel is like the `SQL_PERF` channel, but is aimed at
 // helping developers of CockroachDB itself. It exists as a separate
 // channel so as to not pollute the `SQL_PERF` logging output with
@@ -6123,18 +6167,18 @@ func (loggerTelemetry) Shoutf(ctx context.Context, sev Severity, format string, 
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `TELEMETRY` channel reports telemetry events. Telemetry events describe
 // feature usage within CockroachDB and anonymizes any application-
 // specific data.
 func (loggerTelemetry) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.TELEMETRY, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.TELEMETRY, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `TELEMETRY` channel reports telemetry events. Telemetry events describe
 // feature usage within CockroachDB and anonymizes any application-
 // specific data.
@@ -6442,18 +6486,18 @@ func (loggerKvDistribution) Shoutf(ctx context.Context, sev Severity, format str
 }
 
 // VEvent either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `KV_DISTRIBUTION` channel is used to report data distribution events, such as moving
 // replicas between stores in the cluster, or adding (removing) replicas to
 // ranges.
 func (loggerKvDistribution) VEvent(ctx context.Context, level Level, msg string) {
-	vEventf(ctx, false /* isErr */, 1, level, channel.KV_DISTRIBUTION, msg)
+	vEvent(ctx, false /* isErr */, 1, level, channel.KV_DISTRIBUTION, msg)
 }
 
 // VEventf either logs a message to the channel (which also outputs to the
-// active trace or event log) or to the trace/event log alone, depending on
-// whether the specified verbosity level is active.
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 // The `KV_DISTRIBUTION` channel is used to report data distribution events, such as moving
 // replicas between stores in the cluster, or adding (removing) replicas to
 // ranges.

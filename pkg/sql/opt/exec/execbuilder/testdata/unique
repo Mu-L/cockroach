@@ -599,125 +599,271 @@ vectorized: true
 
 # Combine unique checks with foreign keys.
 query T
-EXPLAIN INSERT INTO uniq_fk_parent VALUES (1, 1, 1), (2, 2, 2)
+EXPLAIN ANALYZE INSERT INTO uniq_fk_parent VALUES (1, 1, 1), (2, 2, 2)
 ----
-distribution: local
-vectorized: true
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 4 (32 B, 8 KVs, 4 gRPC calls)
+maximum memory usage: <hidden>
+network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
 ·
 • root
 │
 ├── • insert
+│   │ sql nodes: <hidden>
+│   │ regions: <hidden>
+│   │ actual row count: 2
 │   │ into: uniq_fk_parent(a, b, c, rowid)
 │   │
 │   └── • buffer
+│       │ sql nodes: <hidden>
+│       │ regions: <hidden>
+│       │ actual row count: 2
 │       │ label: buffer 1
 │       │
 │       └── • render
 │           │
 │           └── • values
+│                 sql nodes: <hidden>
+│                 regions: <hidden>
+│                 actual row count: 2
 │                 size: 3 columns, 2 rows
 │
 ├── • constraint-check
 │   │
 │   └── • error if rows
+│       │ sql nodes: <hidden>
+│       │ regions: <hidden>
+│       │ actual row count: 0
 │       │
 │       └── • hash join (right semi)
+│           │ sql nodes: <hidden>
+│           │ regions: <hidden>
+│           │ actual row count: 0
+│           │ estimated max memory allocated: 0 B
+│           │ estimated max sql temp disk usage: 0 B
 │           │ equality: (a) = (column1)
 │           │ pred: rowid_default != rowid
 │           │
 │           ├── • scan
+│           │     sql nodes: <hidden>
+│           │     kv nodes: <hidden>
+│           │     regions: <hidden>
+│           │     actual row count: 2
+│           │     KV time: 0µs
+│           │     KV contention time: 0µs
+│           │     KV rows decoded: 2
+│           │     KV pairs read: 4
+│           │     KV bytes read: 16 B
+│           │     KV gRPC calls: 2
+│           │     estimated max memory allocated: 0 B
 │           │     missing stats
 │           │     table: uniq_fk_parent@uniq_fk_parent_pkey
 │           │     spans: FULL SCAN
 │           │
 │           └── • scan buffer
+│                 sql nodes: <hidden>
+│                 regions: <hidden>
+│                 actual row count: 2
 │                 estimated row count: 2
 │                 label: buffer 1
 │
 └── • constraint-check
     │
     └── • error if rows
+        │ sql nodes: <hidden>
+        │ regions: <hidden>
+        │ actual row count: 0
         │
         └── • hash join (right semi)
+            │ sql nodes: <hidden>
+            │ regions: <hidden>
+            │ actual row count: 0
+            │ estimated max memory allocated: 0 B
+            │ estimated max sql temp disk usage: 0 B
             │ equality: (b, c) = (column2, column3)
             │ pred: rowid_default != rowid
             │
             ├── • scan
+            │     sql nodes: <hidden>
+            │     kv nodes: <hidden>
+            │     regions: <hidden>
+            │     actual row count: 2
+            │     KV time: 0µs
+            │     KV contention time: 0µs
+            │     KV rows decoded: 2
+            │     KV pairs read: 4
+            │     KV bytes read: 16 B
+            │     KV gRPC calls: 2
+            │     estimated max memory allocated: 0 B
             │     missing stats
             │     table: uniq_fk_parent@uniq_fk_parent_pkey
             │     spans: FULL SCAN
             │
             └── • scan buffer
+                  sql nodes: <hidden>
+                  regions: <hidden>
+                  actual row count: 2
                   estimated row count: 2
                   label: buffer 1
 
 # Combine unique checks with foreign keys. There should be two foreign key
 # checks and one uniqueness check.
 query T
-EXPLAIN INSERT INTO uniq_fk_child VALUES (1, 1, 1), (2, 2, 2)
+EXPLAIN ANALYZE INSERT INTO uniq_fk_child VALUES (1, 1, 1), (2, 2, 2)
 ----
-distribution: local
-vectorized: true
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 6 (48 B, 12 KVs, 6 gRPC calls)
+maximum memory usage: <hidden>
+network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
 ·
 • root
 │
 ├── • insert
+│   │ sql nodes: <hidden>
+│   │ regions: <hidden>
+│   │ actual row count: 2
 │   │ into: uniq_fk_child(a, b, c, rowid)
 │   │
 │   └── • buffer
+│       │ sql nodes: <hidden>
+│       │ regions: <hidden>
+│       │ actual row count: 2
 │       │ label: buffer 1
 │       │
 │       └── • render
 │           │
 │           └── • values
+│                 sql nodes: <hidden>
+│                 regions: <hidden>
+│                 actual row count: 2
 │                 size: 3 columns, 2 rows
 │
 ├── • constraint-check
 │   │
 │   └── • error if rows
+│       │ sql nodes: <hidden>
+│       │ regions: <hidden>
+│       │ actual row count: 0
 │       │
 │       └── • hash join (right semi)
+│           │ sql nodes: <hidden>
+│           │ regions: <hidden>
+│           │ actual row count: 0
+│           │ estimated max memory allocated: 0 B
+│           │ estimated max sql temp disk usage: 0 B
 │           │ equality: (c) = (column3)
 │           │ pred: rowid_default != rowid
 │           │
 │           ├── • scan
+│           │     sql nodes: <hidden>
+│           │     kv nodes: <hidden>
+│           │     regions: <hidden>
+│           │     actual row count: 2
+│           │     KV time: 0µs
+│           │     KV contention time: 0µs
+│           │     KV rows decoded: 2
+│           │     KV pairs read: 4
+│           │     KV bytes read: 16 B
+│           │     KV gRPC calls: 2
+│           │     estimated max memory allocated: 0 B
 │           │     missing stats
 │           │     table: uniq_fk_child@uniq_fk_child_pkey
 │           │     spans: FULL SCAN
 │           │
 │           └── • scan buffer
+│                 sql nodes: <hidden>
+│                 regions: <hidden>
+│                 actual row count: 2
 │                 estimated row count: 2
 │                 label: buffer 1
 │
 ├── • constraint-check
 │   │
 │   └── • error if rows
+│       │ sql nodes: <hidden>
+│       │ regions: <hidden>
+│       │ actual row count: 0
 │       │
 │       └── • hash join (right anti)
+│           │ sql nodes: <hidden>
+│           │ regions: <hidden>
+│           │ actual row count: 0
+│           │ estimated max memory allocated: 0 B
 │           │ equality: (b, c) = (column2, column3)
 │           │
 │           ├── • scan
+│           │     sql nodes: <hidden>
+│           │     kv nodes: <hidden>
+│           │     regions: <hidden>
+│           │     actual row count: 2
+│           │     KV time: 0µs
+│           │     KV contention time: 0µs
+│           │     KV rows decoded: 2
+│           │     KV pairs read: 4
+│           │     KV bytes read: 16 B
+│           │     KV gRPC calls: 2
+│           │     estimated max memory allocated: 0 B
 │           │     missing stats
 │           │     table: uniq_fk_parent@uniq_fk_parent_pkey
 │           │     spans: FULL SCAN
 │           │
 │           └── • scan buffer
+│                 sql nodes: <hidden>
+│                 regions: <hidden>
+│                 actual row count: 2
 │                 estimated row count: 2
 │                 label: buffer 1
 │
 └── • constraint-check
     │
     └── • error if rows
+        │ sql nodes: <hidden>
+        │ regions: <hidden>
+        │ actual row count: 0
         │
         └── • hash join (right anti)
+            │ sql nodes: <hidden>
+            │ regions: <hidden>
+            │ actual row count: 0
+            │ estimated max memory allocated: 0 B
             │ equality: (a) = (column1)
             │
             ├── • scan
+            │     sql nodes: <hidden>
+            │     kv nodes: <hidden>
+            │     regions: <hidden>
+            │     actual row count: 2
+            │     KV time: 0µs
+            │     KV contention time: 0µs
+            │     KV rows decoded: 2
+            │     KV pairs read: 4
+            │     KV bytes read: 16 B
+            │     KV gRPC calls: 2
+            │     estimated max memory allocated: 0 B
             │     missing stats
             │     table: uniq_fk_parent@uniq_fk_parent_pkey
             │     spans: FULL SCAN
             │
             └── • scan buffer
+                  sql nodes: <hidden>
+                  regions: <hidden>
+                  actual row count: 2
                   estimated row count: 2
                   label: buffer 1
 
@@ -1339,7 +1485,7 @@ vectorized: true
                     │ columns: (column1, column2, column3, column4)
                     │ estimated row count: 0
                     │ table: uniq_partial_enum@uniq_partial_enum_pkey
-                    │ equality: (column1, column2) = (r,a)
+                    │ equality: (column1, column2) = (r, a)
                     │ equality cols are key
                     │
                     └── • values
@@ -2350,8 +2496,11 @@ vectorized: true
 
 # Combine unique checks with foreign keys.
 # The cascade here affects the unique column in uniq_fk_child.
+
+# Note that in EXPLAIN variant (as opposed to EXPLAIN ANALYZE) the hard-coded
+# number of estimated rows is used in "scan buffer" in the fk-cascade plan.
 query T
-EXPLAIN UPDATE uniq_fk_parent SET c = 1
+EXPLAIN UPDATE uniq_fk_parent SET c = c + 1
 ----
 distribution: local
 vectorized: true
@@ -2374,8 +2523,66 @@ vectorized: true
 │                 locking strength: for update
 │
 ├── • fk-cascade
-│     fk: uniq_fk_child_b_c_fkey
-│     input: buffer 1
+│   │ fk: uniq_fk_child_b_c_fkey
+│   │
+│   └── • root
+│       │
+│       ├── • update
+│       │   │ table: uniq_fk_child
+│       │   │ set: b, c
+│       │   │
+│       │   └── • buffer
+│       │       │ label: buffer 1
+│       │       │
+│       │       └── • hash join
+│       │           │ equality: (b, c) = (b, c)
+│       │           │
+│       │           ├── • scan
+│       │           │     missing stats
+│       │           │     table: uniq_fk_child@uniq_fk_child_pkey
+│       │           │     spans: FULL SCAN
+│       │           │
+│       │           └── • filter
+│       │               │ estimated row count: 33
+│       │               │ filter: (b IS DISTINCT FROM b) OR (c IS DISTINCT FROM c_new)
+│       │               │
+│       │               └── • scan buffer
+│       │                     estimated row count: 100
+│       │                     label: buffer 1000000
+│       │
+│       ├── • constraint-check
+│       │   │
+│       │   └── • error if rows
+│       │       │
+│       │       └── • hash join (right semi)
+│       │           │ equality: (c) = (c_new)
+│       │           │ pred: rowid != rowid
+│       │           │
+│       │           ├── • scan
+│       │           │     missing stats
+│       │           │     table: uniq_fk_child@uniq_fk_child_pkey
+│       │           │     spans: FULL SCAN
+│       │           │
+│       │           └── • scan buffer
+│       │                 label: buffer 1
+│       │
+│       └── • constraint-check
+│           │
+│           └── • error if rows
+│               │
+│               └── • hash join (right anti)
+│                   │ equality: (b, c) = (b, c_new)
+│                   │
+│                   ├── • scan
+│                   │     missing stats
+│                   │     table: uniq_fk_parent@uniq_fk_parent_pkey
+│                   │     spans: FULL SCAN
+│                   │
+│                   └── • filter
+│                       │ filter: (b IS NOT NULL) AND (c_new IS NOT NULL)
+│                       │
+│                       └── • scan buffer
+│                             label: buffer 1
 │
 └── • constraint-check
     │
@@ -2389,6 +2596,229 @@ vectorized: true
             │     label: buffer 1
             │
             └── • scan
+                  missing stats
+                  table: uniq_fk_parent@uniq_fk_parent_pkey
+                  spans: FULL SCAN
+
+query T
+EXPLAIN ANALYZE UPDATE uniq_fk_parent SET c = c + 1
+----
+planning time: 10µs
+execution time: 100µs
+distribution: <hidden>
+vectorized: <hidden>
+plan type: custom
+rows decoded from KV: 10 (80 B, 20 KVs, 10 gRPC calls)
+maximum memory usage: <hidden>
+network usage: <hidden>
+regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
+·
+• root
+│
+├── • update
+│   │ sql nodes: <hidden>
+│   │ regions: <hidden>
+│   │ actual row count: 2
+│   │ table: uniq_fk_parent
+│   │ set: c
+│   │
+│   └── • buffer
+│       │ sql nodes: <hidden>
+│       │ regions: <hidden>
+│       │ actual row count: 2
+│       │ label: buffer 1
+│       │
+│       └── • render
+│           │
+│           └── • scan
+│                 sql nodes: <hidden>
+│                 kv nodes: <hidden>
+│                 regions: <hidden>
+│                 actual row count: 2
+│                 KV time: 0µs
+│                 KV contention time: 0µs
+│                 KV rows decoded: 2
+│                 KV pairs read: 4
+│                 KV bytes read: 16 B
+│                 KV gRPC calls: 2
+│                 estimated max memory allocated: 0 B
+│                 missing stats
+│                 table: uniq_fk_parent@uniq_fk_parent_pkey
+│                 spans: FULL SCAN
+│                 locking strength: for update
+│
+├── • fk-cascade
+│   │ fk: uniq_fk_child_b_c_fkey
+│   │
+│   └── • root
+│       │
+│       ├── • update
+│       │   │ sql nodes: <hidden>
+│       │   │ regions: <hidden>
+│       │   │ actual row count: 0
+│       │   │ table: uniq_fk_child
+│       │   │ set: b, c
+│       │   │
+│       │   └── • buffer
+│       │       │ sql nodes: <hidden>
+│       │       │ regions: <hidden>
+│       │       │ actual row count: 2
+│       │       │ label: buffer 1
+│       │       │
+│       │       └── • hash join
+│       │           │ sql nodes: <hidden>
+│       │           │ regions: <hidden>
+│       │           │ actual row count: 2
+│       │           │ estimated max memory allocated: 0 B
+│       │           │ equality: (b, c) = (b, c)
+│       │           │
+│       │           ├── • scan
+│       │           │     sql nodes: <hidden>
+│       │           │     kv nodes: <hidden>
+│       │           │     regions: <hidden>
+│       │           │     actual row count: 2
+│       │           │     KV time: 0µs
+│       │           │     KV contention time: 0µs
+│       │           │     KV rows decoded: 2
+│       │           │     KV pairs read: 4
+│       │           │     KV bytes read: 16 B
+│       │           │     KV gRPC calls: 2
+│       │           │     estimated max memory allocated: 0 B
+│       │           │     missing stats
+│       │           │     table: uniq_fk_child@uniq_fk_child_pkey
+│       │           │     spans: FULL SCAN
+│       │           │
+│       │           └── • filter
+│       │               │ sql nodes: <hidden>
+│       │               │ regions: <hidden>
+│       │               │ actual row count: 2
+│       │               │ estimated row count: 1
+│       │               │ filter: (b IS DISTINCT FROM b) OR (c IS DISTINCT FROM c_new)
+│       │               │
+│       │               └── • scan buffer
+│       │                     sql nodes: <hidden>
+│       │                     regions: <hidden>
+│       │                     actual row count: 2
+│       │                     estimated row count: 2
+│       │                     label: buffer 1000000
+│       │
+│       ├── • constraint-check
+│       │   │
+│       │   └── • error if rows
+│       │       │ sql nodes: <hidden>
+│       │       │ regions: <hidden>
+│       │       │ actual row count: 0
+│       │       │
+│       │       └── • hash join (right semi)
+│       │           │ sql nodes: <hidden>
+│       │           │ regions: <hidden>
+│       │           │ actual row count: 0
+│       │           │ estimated max memory allocated: 0 B
+│       │           │ estimated max sql temp disk usage: 0 B
+│       │           │ equality: (c) = (c_new)
+│       │           │ pred: rowid != rowid
+│       │           │
+│       │           ├── • scan
+│       │           │     sql nodes: <hidden>
+│       │           │     kv nodes: <hidden>
+│       │           │     regions: <hidden>
+│       │           │     actual row count: 2
+│       │           │     KV time: 0µs
+│       │           │     KV contention time: 0µs
+│       │           │     KV rows decoded: 2
+│       │           │     KV pairs read: 4
+│       │           │     KV bytes read: 16 B
+│       │           │     KV gRPC calls: 2
+│       │           │     estimated max memory allocated: 0 B
+│       │           │     missing stats
+│       │           │     table: uniq_fk_child@uniq_fk_child_pkey
+│       │           │     spans: FULL SCAN
+│       │           │
+│       │           └── • scan buffer
+│       │                 sql nodes: <hidden>
+│       │                 regions: <hidden>
+│       │                 actual row count: 2
+│       │                 label: buffer 1
+│       │
+│       └── • constraint-check
+│           │
+│           └── • error if rows
+│               │ sql nodes: <hidden>
+│               │ regions: <hidden>
+│               │ actual row count: 0
+│               │
+│               └── • hash join (right anti)
+│                   │ sql nodes: <hidden>
+│                   │ regions: <hidden>
+│                   │ actual row count: 0
+│                   │ estimated max memory allocated: 0 B
+│                   │ equality: (b, c) = (b, c_new)
+│                   │
+│                   ├── • scan
+│                   │     sql nodes: <hidden>
+│                   │     kv nodes: <hidden>
+│                   │     regions: <hidden>
+│                   │     actual row count: 2
+│                   │     KV time: 0µs
+│                   │     KV contention time: 0µs
+│                   │     KV rows decoded: 2
+│                   │     KV pairs read: 4
+│                   │     KV bytes read: 16 B
+│                   │     KV gRPC calls: 2
+│                   │     estimated max memory allocated: 0 B
+│                   │     missing stats
+│                   │     table: uniq_fk_parent@uniq_fk_parent_pkey
+│                   │     spans: FULL SCAN
+│                   │
+│                   └── • filter
+│                       │ sql nodes: <hidden>
+│                       │ regions: <hidden>
+│                       │ actual row count: 2
+│                       │ filter: (b IS NOT NULL) AND (c_new IS NOT NULL)
+│                       │
+│                       └── • scan buffer
+│                             sql nodes: <hidden>
+│                             regions: <hidden>
+│                             actual row count: 2
+│                             label: buffer 1
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │ sql nodes: <hidden>
+        │ regions: <hidden>
+        │ actual row count: 0
+        │
+        └── • hash join (semi)
+            │ sql nodes: <hidden>
+            │ regions: <hidden>
+            │ actual row count: 0
+            │ estimated max memory allocated: 0 B
+            │ estimated max sql temp disk usage: 0 B
+            │ equality: (b, c_new) = (b, c)
+            │ pred: rowid != rowid
+            │
+            ├── • scan buffer
+            │     sql nodes: <hidden>
+            │     regions: <hidden>
+            │     actual row count: 2
+            │     label: buffer 1
+            │
+            └── • scan
+                  sql nodes: <hidden>
+                  kv nodes: <hidden>
+                  regions: <hidden>
+                  actual row count: 2
+                  KV time: 0µs
+                  KV contention time: 0µs
+                  KV rows decoded: 2
+                  KV pairs read: 4
+                  KV bytes read: 16 B
+                  KV gRPC calls: 2
+                  estimated max memory allocated: 0 B
                   missing stats
                   table: uniq_fk_parent@uniq_fk_parent_pkey
                   spans: FULL SCAN
@@ -3348,25 +3778,27 @@ vectorized: true
 │       │
 │       └── • render
 │           │
-│           └── • hash join (left outer)
-│               │ equality: (v) = (v)
+│           └── • lookup join (left outer)
+│               │ table: uniq@uniq_pkey
+│               │ equality: (k) = (k)
+│               │ equality cols are key
 │               │
-│               ├── • distinct
-│               │   │ distinct on: v
-│               │   │ nulls are distinct
-│               │   │ error on duplicate
-│               │   │
-│               │   └── • render
-│               │       │
-│               │       └── • scan
-│               │             missing stats
-│               │             table: other@other_pkey
-│               │             spans: FULL SCAN
-│               │
-│               └── • scan
-│                     missing stats
-│                     table: uniq@uniq_pkey
-│                     spans: FULL SCAN
+│               └── • lookup join (left outer)
+│                   │ table: uniq@uniq_v_key
+│                   │ equality: (v) = (v)
+│                   │ equality cols are key
+│                   │
+│                   └── • distinct
+│                       │ distinct on: v
+│                       │ nulls are distinct
+│                       │ error on duplicate
+│                       │
+│                       └── • render
+│                           │
+│                           └── • scan
+│                                 missing stats
+│                                 table: other@other_pkey
+│                                 spans: FULL SCAN
 │
 ├── • constraint-check
 │   │
@@ -3509,17 +3941,13 @@ vectorized: true
     │
     └── • error if rows
         │
-        └── • hash join (semi)
+        └── • lookup join (semi)
+            │ table: uniq_overlaps_pk@uniq_overlaps_pk_pkey
             │ equality: (k) = (a)
             │ pred: v != b
             │
-            ├── • scan buffer
-            │     label: buffer 1
-            │
-            └── • scan
-                  missing stats
-                  table: uniq_overlaps_pk@uniq_overlaps_pk_pkey
-                  spans: FULL SCAN
+            └── • scan buffer
+                  label: buffer 1
 
 # Upsert with non-constant input.
 # Add inequality filters for the hidden primary key column.
@@ -3628,8 +4056,66 @@ vectorized: true
 │                             size: 3 columns, 2 rows
 │
 ├── • fk-cascade
-│     fk: uniq_fk_child_b_c_fkey
-│     input: buffer 1
+│   │ fk: uniq_fk_child_b_c_fkey
+│   │
+│   └── • root
+│       │
+│       ├── • update
+│       │   │ table: uniq_fk_child
+│       │   │ set: b, c
+│       │   │
+│       │   └── • buffer
+│       │       │ label: buffer 1
+│       │       │
+│       │       └── • hash join
+│       │           │ equality: (b, c) = (b, c)
+│       │           │
+│       │           ├── • scan
+│       │           │     missing stats
+│       │           │     table: uniq_fk_child@uniq_fk_child_pkey
+│       │           │     spans: FULL SCAN
+│       │           │
+│       │           └── • filter
+│       │               │ estimated row count: 33
+│       │               │ filter: (b IS DISTINCT FROM column2) OR (c IS DISTINCT FROM column3)
+│       │               │
+│       │               └── • scan buffer
+│       │                     estimated row count: 100
+│       │                     label: buffer 1000000
+│       │
+│       ├── • constraint-check
+│       │   │
+│       │   └── • error if rows
+│       │       │
+│       │       └── • hash join (right semi)
+│       │           │ equality: (c) = (column3)
+│       │           │ pred: rowid != rowid
+│       │           │
+│       │           ├── • scan
+│       │           │     missing stats
+│       │           │     table: uniq_fk_child@uniq_fk_child_pkey
+│       │           │     spans: FULL SCAN
+│       │           │
+│       │           └── • scan buffer
+│       │                 label: buffer 1
+│       │
+│       └── • constraint-check
+│           │
+│           └── • error if rows
+│               │
+│               └── • hash join (right anti)
+│                   │ equality: (b, c) = (column2, column3)
+│                   │
+│                   ├── • scan
+│                   │     missing stats
+│                   │     table: uniq_fk_parent@uniq_fk_parent_pkey
+│                   │     spans: FULL SCAN
+│                   │
+│                   └── • filter
+│                       │ filter: (column2 IS NOT NULL) AND (column3 IS NOT NULL)
+│                       │
+│                       └── • scan buffer
+│                             label: buffer 1
 │
 ├── • constraint-check
 │   │
@@ -3807,7 +4293,7 @@ vectorized: true
 │                       │ columns: (column1, column2, column3, column4, r, s, i, j)
 │                       │ estimated row count: 2 (missing stats)
 │                       │ table: uniq_enum@uniq_enum_pkey
-│                       │ equality: (column1, column3) = (r,i)
+│                       │ equality: (column1, column3) = (r, i)
 │                       │ equality cols are key
 │                       │ locking strength: for update
 │                       │
@@ -4436,7 +4922,7 @@ vectorized: true
 │                       │ columns: (column1, column2, column3, column4, r, a, b, c)
 │                       │ estimated row count: 2
 │                       │ table: uniq_partial_enum@uniq_partial_enum_pkey
-│                       │ equality: (column1, column2) = (r,a)
+│                       │ equality: (column1, column2) = (r, a)
 │                       │ equality cols are key
 │                       │ locking strength: for update
 │                       │
@@ -4518,7 +5004,7 @@ vectorized: true
             │ columns: (arbiter_unique_b_distinct, column1, column2, column3, column4, r, a, b, c)
             │ estimated row count: 2
             │ table: uniq_partial_enum@uniq_partial_enum_pkey
-            │ equality: (r, a) = (r,a)
+            │ equality: (r, a) = (r, a)
             │ equality cols are key
             │
             └── • lookup join (left outer)
@@ -4783,6 +5269,609 @@ vectorized: true
             └── • scan buffer
                   estimated row count: 1
                   label: buffer 1
+
+subtest insertFastPathUniqueChecks
+
+statement ok
+CREATE TABLE t1 (
+  pk int PRIMARY KEY,
+  pk2 int,
+  a int,
+  b int,
+  j JSON,
+  INDEX (a),
+  UNIQUE WITHOUT INDEX(b, a),
+  INDEX (b,a) STORING(pk2, j),
+  INVERTED INDEX (j),
+  FAMILY (pk, pk2, a, b)
+)
+
+# Insert of multi-row VALUES into table with UNIQUE WITHOUT INDEX and a
+# usable index on a prefix of those columns cannot currently use insert
+# fast-path.
+query T
+EXPLAIN
+INSERT INTO t1 (pk, pk2, a, b, j) VALUES
+   (2, 2, 1, 3, '{"a": "b"}'), (4, 5, 6, 7, '{"a": "b"}');
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: t1(pk, pk2, a, b, j)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • values
+│             size: 5 columns, 2 rows
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (semi)
+            │ table: t1@t1_b_a_idx
+            │ equality: (column4, column3) = (b, a)
+            │ pred: column1 != pk
+            │
+            └── • scan buffer
+                  estimated row count: 2
+                  label: buffer 1
+
+# Insert of single-row VALUES into table with UNIQUE WITHOUT INDEX and a
+# usable index on a prefix of those columns can use insert fast-path.
+query T
+EXPLAIN
+INSERT INTO t1 (pk, pk2, a, b, j) VALUES
+   (2, 2, 1, 3, '{"a": "b"}');
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: t1(pk, pk2, a, b, j)
+  auto commit
+  uniqueness check: t1@t1_b_a_idx
+  size: 5 columns, 1 row
+
+statement ok
+CREATE TABLE users (
+  id UUID DEFAULT gen_random_uuid(),
+  name STRING NOT NULL,
+  email STRING NOT NULL,
+  UNIQUE WITHOUT INDEX (email) WHERE email != name,
+  PRIMARY KEY (email, id)
+)
+
+# Verify a partial UNIQUE WITHOUT INDEX with a predicate similar to the PK
+# values check created in `buildInsertionCheck` to prevent rows from matching
+# themselves doesn't mistakenly allow insert fast path.
+query T
+EXPLAIN INSERT INTO users (name, email)
+VALUES ('Craig Roacher', 'craig@cockroachlabs.com')
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: users(id, name, email)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • values
+│             size: 3 columns, 1 row
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (semi)
+            │ table: users@users_pkey
+            │ equality: (column2) = (email)
+            │ pred: (id_default != id) AND (email != name)
+            │
+            └── • filter
+                │ estimated row count: 0
+                │ filter: column2 != column1
+                │
+                └── • scan buffer
+                      estimated row count: 1
+                      label: buffer 1
+
+statement ok
+CREATE TABLE multiple_uniq (
+  a INT,
+  b INT,
+  c INT,
+  d INT,
+  UNIQUE WITHOUT INDEX (b, c),
+  UNIQUE WITHOUT INDEX (a, b, d),
+  UNIQUE WITHOUT INDEX (a),
+  INDEX (a, b, d),
+  INDEX (b, c),
+  FAMILY (a),
+  FAMILY (b),
+  FAMILY (c),
+  FAMILY (d)
+)
+
+# A table with multiple unique without index checks is not currently eligible
+# for multi-row insert fast path.
+query T
+EXPLAIN INSERT INTO multiple_uniq
+VALUES (1,1,1,1), (2,2,2,2)
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: multiple_uniq(a, b, c, d, rowid)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • render
+│           │
+│           └── • values
+│                 size: 4 columns, 2 rows
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_b_c_idx
+│           │ equality: (column2, column3) = (b, c)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_a_b_d_idx
+│           │ equality: (column1, column2, column4) = (a, b, d)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (semi)
+            │ table: multiple_uniq@multiple_uniq_a_b_d_idx
+            │ equality: (column1) = (a)
+            │ pred: rowid_default != rowid
+            │
+            └── • scan buffer
+                  estimated row count: 2
+                  label: buffer 1
+
+# A table with multiple unique without index checks is eligible for insert fast
+# path of a single row.
+query T
+EXPLAIN INSERT INTO multiple_uniq
+VALUES (1,1,1,1)
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: multiple_uniq(a, b, c, d, rowid)
+  auto commit
+  uniqueness check: multiple_uniq@multiple_uniq_b_c_idx
+  uniqueness check: multiple_uniq@multiple_uniq_a_b_d_idx
+  uniqueness check: multiple_uniq@multiple_uniq_a_b_d_idx
+  size: 5 columns, 1 row
+
+statement ok
+ALTER TABLE multiple_uniq ADD CONSTRAINT uniq_fk FOREIGN KEY (d) REFERENCES uniq (k) ON DELETE CASCADE;
+
+# A table with multiple unique without index checks and an FK constraint is
+# not currently eligible for multi-row insert fast path.
+query T
+EXPLAIN INSERT INTO multiple_uniq
+VALUES (1,1,1,1), (2,2,2,2)
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: multiple_uniq(a, b, c, d, rowid)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • render
+│           │
+│           └── • values
+│                 size: 4 columns, 2 rows
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_b_c_idx
+│           │ equality: (column2, column3) = (b, c)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_a_b_d_idx
+│           │ equality: (column1, column2, column4) = (a, b, d)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_a_b_d_idx
+│           │ equality: (column1) = (a)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (anti)
+            │ table: uniq@uniq_pkey
+            │ equality: (column4) = (k)
+            │ equality cols are key
+            │
+            └── • scan buffer
+                  estimated row count: 2
+                  label: buffer 1
+
+# A table with multiple unique without index checks and an FK constraint is
+# eligible for insert fast path of a single row.
+query T
+EXPLAIN INSERT INTO multiple_uniq
+VALUES (1,1,1,1)
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: multiple_uniq(a, b, c, d, rowid)
+  auto commit
+  FK check: uniq@uniq_pkey
+  uniqueness check: multiple_uniq@multiple_uniq_b_c_idx
+  uniqueness check: multiple_uniq@multiple_uniq_a_b_d_idx
+  uniqueness check: multiple_uniq@multiple_uniq_a_b_d_idx
+  size: 5 columns, 1 row
+
+statement ok
+PREPARE e1 AS EXPLAIN INSERT INTO multiple_uniq
+VALUES ($1, $1, $1, $1), ($2, $2, $2, $2)
+
+# A table with multiple unique without index checks and an FK constraint is
+# not currently eligible for parameterized multi-row insert fast path.
+query T nosort
+EXECUTE e1(1, 2)
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: multiple_uniq(a, b, c, d, rowid)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • render
+│           │
+│           └── • values
+│                 size: 4 columns, 2 rows
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_b_c_idx
+│           │ equality: (column2, column3) = (b, c)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_a_b_d_idx
+│           │ equality: (column1, column2, column4) = (a, b, d)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • lookup join (semi)
+│           │ table: multiple_uniq@multiple_uniq_a_b_d_idx
+│           │ equality: (column1) = (a)
+│           │ pred: rowid_default != rowid
+│           │
+│           └── • scan buffer
+│                 estimated row count: 2
+│                 label: buffer 1
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • lookup join (anti)
+            │ table: uniq@uniq_pkey
+            │ equality: (column4) = (k)
+            │ equality cols are key
+            │
+            └── • scan buffer
+                  estimated row count: 2
+                  label: buffer 1
+
+statement ok
+PREPARE e2 AS EXPLAIN INSERT INTO multiple_uniq
+VALUES ($1, $1, $1, $1)
+
+# A table with multiple unique without index checks and an FK constraint is
+# eligible for parameterized single-row insert fast path.
+query T nosort
+EXECUTE e2(1)
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: multiple_uniq(a, b, c, d, rowid)
+  auto commit
+  FK check: uniq@uniq_pkey
+  uniqueness check: multiple_uniq@multiple_uniq_b_c_idx
+  uniqueness check: multiple_uniq@multiple_uniq_a_b_d_idx
+  uniqueness check: multiple_uniq@multiple_uniq_a_b_d_idx
+  size: 5 columns, 1 row
+
+statement ok
+CREATE TABLE multiple_uniq_partial (
+  a INT,
+  b INT,
+  c INT,
+  d INT,
+  UNIQUE WITHOUT INDEX (b, c),
+  UNIQUE WITHOUT INDEX (a, b, d),
+  UNIQUE WITHOUT INDEX (a),
+  INDEX (a, b, d) WHERE a > 0,
+  INDEX (b, c) WHERE b > 0,
+  FAMILY (a),
+  FAMILY (b),
+  FAMILY (c),
+  FAMILY (d)
+)
+
+# A table with multiple unique without index checks and only partial indexes
+# to cover them is eligible for insert fast path if it can be statically
+# determined legal to use the indexes.
+query T
+EXPLAIN INSERT INTO multiple_uniq_partial
+VALUES (1,1,1,1)
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: multiple_uniq_partial(a, b, c, d, rowid)
+  auto commit
+  uniqueness check: multiple_uniq_partial@multiple_uniq_partial_b_c_idx
+  uniqueness check: multiple_uniq_partial@multiple_uniq_partial_a_b_d_idx
+  uniqueness check: multiple_uniq_partial@multiple_uniq_partial_a_b_d_idx
+  size: 7 columns, 1 row
+
+# A table with multiple unique without index checks and only partial indexes
+# to cover them is eligible for insert fast path if it is determined,
+# given the insert row, illegal to use the indexes.
+query T
+EXPLAIN INSERT INTO multiple_uniq_partial
+VALUES (0,0,0,0)
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: multiple_uniq_partial(a, b, c, d, rowid)
+│   │
+│   └── • buffer
+│       │ label: buffer 1
+│       │
+│       └── • values
+│             size: 7 columns, 1 row
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • hash join (right semi)
+│           │ equality: (b, c) = (column2, column3)
+│           │ right cols are key
+│           │ pred: rowid_default != rowid
+│           │
+│           ├── • scan
+│           │     missing stats
+│           │     table: multiple_uniq_partial@multiple_uniq_partial_pkey
+│           │     spans: FULL SCAN
+│           │
+│           └── • scan buffer
+│                 estimated row count: 1
+│                 label: buffer 1
+│
+├── • constraint-check
+│   │
+│   └── • error if rows
+│       │
+│       └── • hash join (right semi)
+│           │ equality: (a, b, d) = (column1, column2, column4)
+│           │ right cols are key
+│           │ pred: rowid_default != rowid
+│           │
+│           ├── • scan
+│           │     missing stats
+│           │     table: multiple_uniq_partial@multiple_uniq_partial_pkey
+│           │     spans: FULL SCAN
+│           │
+│           └── • scan buffer
+│                 estimated row count: 1
+│                 label: buffer 1
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • hash join (right semi)
+            │ equality: (a) = (column1)
+            │ right cols are key
+            │ pred: rowid_default != rowid
+            │
+            ├── • scan
+            │     missing stats
+            │     table: multiple_uniq_partial@multiple_uniq_partial_pkey
+            │     spans: FULL SCAN
+            │
+            └── • scan buffer
+                  estimated row count: 1
+                  label: buffer 1
+
+statement ok
+CREATE TABLE t (
+  k INT PRIMARY KEY,
+  r STRING NOT NULL,
+  a INT,
+  b INT,
+  UNIQUE (r, a),
+  UNIQUE WITHOUT INDEX (a) WHERE k != 1,
+  CHECK (r IN ('east', 'west'))
+)
+
+statement ok
+CREATE TABLE tt (
+  k INT PRIMARY KEY,
+  r STRING NOT NULL,
+  a INT,
+  b INT,
+  UNIQUE (r, a) WHERE k != 1,
+  UNIQUE WITHOUT INDEX (a) WHERE k != 1,
+  CHECK (r IN ('east', 'west'))
+)
+
+# This case cannot use insert fast path because of the partial unique without
+# index.
+query T
+EXPLAIN
+INSERT INTO tt VALUES (2, 'east', 10, 100)
+----
+distribution: local
+vectorized: true
+·
+• root
+│
+├── • insert
+│   │ into: tt(k, r, a, b)
+│   │
+│   └── • values
+│         size: 6 columns, 1 row
+│
+└── • constraint-check
+    │
+    └── • error if rows
+        │
+        └── • cross join
+            │
+            ├── • values
+            │     size: 1 column, 1 row
+            │
+            └── • limit
+                │ count: 1
+                │
+                └── • filter
+                    │ filter: k != 2
+                    │
+                    └── • scan
+                          missing stats
+                          table: tt@tt_r_a_key (partial index)
+                          spans: [/'east'/10 - /'east'/10] [/'west'/10 - /'west'/10]
+
+# Mimic a REGIONAL BY ROW table using a CHECK constraint.
+statement ok
+CREATE TABLE t11 (
+  pk int PRIMARY KEY,
+  pk2 int,
+  a int,
+  b int CHECK (b IN (1,2,3,4,5)),
+  j JSON,
+  INDEX (a),
+  UNIQUE WITHOUT INDEX(a),
+  UNIQUE INDEX (b,a) STORING(pk2, j),
+  INVERTED INDEX (j),
+  FAMILY (pk, pk2, a, b)
+)
+
+# Insert of single-row VALUES into table with UNIQUE WITHOUT INDEX which
+# mimics a REGIONAL BY ROW table with a CHECK constraint can use insert
+# fast-path.
+query T
+EXPLAIN
+INSERT INTO t11 (pk, pk2, a, b, j) VALUES
+   (2, 2, 1, 3, '{"a": "b"}');
+----
+distribution: local
+vectorized: true
+·
+• insert fast path
+  into: t11(pk, pk2, a, b, j)
+  auto commit
+  uniqueness check: t11@t11_a_idx
+  size: 6 columns, 1 row
 
 statement ok
 SET CLUSTER SETTING sql.optimizer.uniqueness_checks_for_gen_random_uuid.enabled = false

@@ -1,19 +1,11 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package bootstrap
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -39,23 +31,16 @@ func TestSupportedReleases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	expected := make(map[roachpb.Version]struct{})
-	earliest := clusterversion.ByKey(clusterversion.BinaryMinSupportedVersionKey)
-	latest := clusterversion.ByKey(clusterversion.BinaryVersionKey)
-	var incumbent roachpb.Version
-	for _, v := range clusterversion.ListBetween(earliest, latest) {
-		if v.Major != incumbent.Major && v.Minor != incumbent.Minor {
-			incumbent = roachpb.Version{
-				Major: v.Major,
-				Minor: v.Minor,
-			}
-			expected[incumbent] = struct{}{}
-		}
+	// Verify that the current version has an entry.
+	require.Contains(t, initialValuesFactoryByKey, clusterversion.Latest)
+
+	// Verify that all previously supported versions have an entry.
+	for _, key := range clusterversion.SupportedPreviousReleases() {
+		require.Contains(t, initialValuesFactoryByKey, key)
 	}
-	expected[latest] = struct{}{}
-	actual := make(map[roachpb.Version]struct{})
+
+	// Verify that all entries work.
 	for k := range initialValuesFactoryByKey {
-		actual[clusterversion.ByKey(k)] = struct{}{}
 		opts := InitialValuesOpts{
 			DefaultZoneConfig:       zonepb.DefaultZoneConfigRef(),
 			DefaultSystemZoneConfig: zonepb.DefaultZoneConfigRef(),
@@ -68,10 +53,6 @@ func TestSupportedReleases(t *testing.T) {
 		_, _, err = opts.GenerateInitialValues()
 		require.NoErrorf(t, err, "error generating initial values for non-system codec in version %s", k)
 	}
-	require.Truef(t, reflect.DeepEqual(actual, expected),
-		"expected supported releases %v, actual %v\n"+
-			"see comments in test definition if this message appears",
-		expected, actual)
 }
 
 func TestInitialValuesToString(t *testing.T) {
@@ -80,24 +61,18 @@ func TestInitialValuesToString(t *testing.T) {
 
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-			codec := keys.SystemSQLCodec
+			var tenantID uint64
 			switch d.Cmd {
 			case "system":
-				break
-
 			case "tenant":
-				const dummyTenantID = 12345
-				codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(dummyTenantID))
-
+				tenantID = 12345
 			default:
 				t.Fatalf("unexpected command %q", d.Cmd)
 			}
 			var expectedHash string
 			d.ScanArgs(t, "hash", &expectedHash)
-			ms := MakeMetadataSchema(codec, zonepb.DefaultZoneConfigRef(), zonepb.DefaultSystemZoneConfigRef())
-			result := InitialValuesToString(ms)
-			h := sha256.Sum256([]byte(result))
-			if actualHash := hex.EncodeToString(h[:]); expectedHash != actualHash {
+			initialValues, actualHash := GetAndHashInitialValuesToString(tenantID)
+			if expectedHash != actualHash {
 				t.Errorf(`Unexpected hash value %s for %s.
 If you're seeing this error message, this means that the bootstrapped system
 schema has changed. Assuming that this is expected:
@@ -109,7 +84,8 @@ schema has changed. Assuming that this is expected:
   hardcoded literals in the main development branch as well as any subsequent
   release branches that need to be updated also.`, actualHash, d.Cmd)
 			}
-			return result
+
+			return initialValues
 		})
 	})
 }
@@ -122,11 +98,11 @@ func TestRoundTripInitialValuesStringRepresentation(t *testing.T) {
 		roundTripInitialValuesStringRepresentation(t, 0 /* tenantID */)
 	})
 	t.Run("tenant", func(t *testing.T) {
-		const dummyTenantID = 54321
+		const dummyTenantID = 109
 		roundTripInitialValuesStringRepresentation(t, dummyTenantID)
 	})
 	t.Run("tenants", func(t *testing.T) {
-		const dummyTenantID1, dummyTenantID2 = 54321, 12345
+		const dummyTenantID1, dummyTenantID2 = 109, 255
 		require.Equal(t,
 			InitialValuesToString(makeMetadataSchema(dummyTenantID1)),
 			InitialValuesToString(makeMetadataSchema(dummyTenantID2)),

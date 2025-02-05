@@ -1,19 +1,13 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package asof
 
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	apd "github.com/cockroachdb/apd/v3"
@@ -26,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 // FollowerReadTimestampFunctionName is the name of the function which can be
@@ -138,6 +133,14 @@ func Eval(
 	defer scalarProps.Restore(*scalarProps)
 	scalarProps.Require("AS OF SYSTEM TIME", tree.RejectSpecial|tree.RejectSubqueries)
 
+	// Disable type resolution. Since type resolution requires a transaction, but
+	// this expression is being evaluated before a transaction begins, resolving
+	// any type should result in an error. There is no valid AS OF SYSTEM TIME
+	// expression that requires type resolution.
+	origTypeResolver := semaCtx.GetTypeResolver()
+	semaCtx.TypeResolver = &asOfTypeResolver{errFactory: newInvalidExprError}
+	defer func() { semaCtx.TypeResolver = origTypeResolver }()
+
 	var ret eval.AsOfSystemTime
 
 	// In order to support the follower reads feature we permit this expression
@@ -210,6 +213,29 @@ func Eval(
 	return ret, nil
 }
 
+// asOfTypeResolver is a type resolver that always returns an error. It is used
+// to block type resolution while evaluating the AS OF SYSTEM TIME expression.
+type asOfTypeResolver struct {
+	// errFactory is a function that returns the error to be returned by the
+	// type resolver. Using a closure lets us avoid instantiating the error
+	// unless something actually tries to resolve a type.
+	errFactory func() error
+}
+
+var _ tree.TypeReferenceResolver = (*asOfTypeResolver)(nil)
+
+// ResolveType implements the tree.TypeReferenceResolver interface.
+func (r *asOfTypeResolver) ResolveType(
+	ctx context.Context, name *tree.UnresolvedObjectName,
+) (*types.T, error) {
+	return nil, r.errFactory()
+}
+
+// ResolveTypeByOID implements the tree.TypeReferenceResolver interface.
+func (r *asOfTypeResolver) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T, error) {
+	return nil, r.errFactory()
+}
+
 // DatumToHLCUsage specifies which statement DatumToHLC() is used for.
 type DatumToHLCUsage int64
 
@@ -226,6 +252,13 @@ const (
 	// ReplicationCutover is when the DatumToHLC() is used for an
 	// ALTER VIRTUAL CLUSTER ... COMPLETE REPLICATION statement.
 	ReplicationCutover
+
+	// ShowTenantFingerprint is when the DatumToHLC() is used for an SHOW
+	// EXPERIMENTAL_FINGERPRINTS FROM TENANT ... WITH START TIMESTAMP statement.
+	//
+	// ShowTenantFingerprint has the same constraints as AsOf, and so we use the
+	// same value.
+	ShowTenantFingerprint = AsOf
 )
 
 // DatumToHLC performs the conversion from a Datum to an HLC timestamp.
@@ -237,37 +270,31 @@ func DatumToHLC(
 	switch d := d.(type) {
 	case *tree.DString:
 		s := string(*d)
-		// Parse synthetic flag.
-		syn := false
-		if strings.HasSuffix(s, "?") {
-			s = s[:len(s)-1]
-			syn = true
-		}
 		// Attempt to parse as timestamp.
-		if dt, _, err := tree.ParseDTimestampTZ(evalCtx, s, time.Nanosecond); err == nil {
-			ts.WallTime = dt.Time.UnixNano()
-			ts.Synthetic = syn
+		//
+		// Disable error annotation since we don't care what the error is if it
+		// occurs.
+		defer func(origValue bool) {
+			evalCtx.GetDateHelper().SkipErrorAnnotation = origValue
+		}(evalCtx.GetDateHelper().SkipErrorAnnotation)
+		evalCtx.GetDateHelper().SkipErrorAnnotation = true
+		if t, _, err := tree.ParseTimestampTZ(evalCtx, s, time.Nanosecond); err == nil {
+			ts.WallTime = t.UnixNano()
 			break
 		}
 		// Attempt to parse as a decimal.
 		if dec, _, err := apd.NewFromString(s); err == nil {
 			ts, convErr = hlc.DecimalToHLC(dec)
-			ts.Synthetic = syn
 			break
 		}
 		// Attempt to parse as an interval.
-		if iv, err := tree.ParseDInterval(evalCtx.GetIntervalStyle(), s); err == nil {
-			if (iv.Duration == duration.Duration{}) {
+		if iv, err := tree.ParseIntervalWithTypeMetadata(evalCtx.GetIntervalStyle(), s, types.DefaultIntervalTypeMetadata); err == nil {
+			if (iv == duration.Duration{}) {
 				convErr = errors.Errorf("interval value %v too small, absolute value must be >= %v", d, time.Microsecond)
-			} else if (usage == AsOf && iv.Duration.Compare(duration.Duration{}) > 0 && !syn) {
-				convErr = errors.Errorf("interval value %v too large, AS OF interval must be <= -%v", d, time.Microsecond)
-			} else if (usage == Split && iv.Duration.Compare(duration.Duration{}) < 0) {
-				// Do we need to consider if the timestamp is synthetic (see
-				// hlc.Timestamp.Synthetic), as for AS OF stmt?
+			} else if (usage == Split && iv.Compare(duration.Duration{}) < 0) {
 				convErr = errors.Errorf("interval value %v too small, SPLIT AT interval must be >= %v", d, time.Microsecond)
 			}
-			ts.WallTime = duration.Add(stmtTimestamp, iv.Duration).UnixNano()
-			ts.Synthetic = syn
+			ts.WallTime = duration.Add(stmtTimestamp, iv).UnixNano()
 			break
 		}
 		convErr = errors.Errorf("value is neither timestamp, decimal, nor interval")
@@ -280,9 +307,7 @@ func DatumToHLC(
 	case *tree.DDecimal:
 		ts, convErr = hlc.DecimalToHLC(&d.Decimal)
 	case *tree.DInterval:
-		if (usage == AsOf && d.Duration.Compare(duration.Duration{}) > 0) {
-			convErr = errors.Errorf("interval value %v too large, AS OF interval must be <= -%v", d, time.Microsecond)
-		} else if (usage == Split && d.Duration.Compare(duration.Duration{}) < 0) {
+		if (usage == Split && d.Duration.Compare(duration.Duration{}) < 0) {
 			convErr = errors.Errorf("interval value %v too small, SPLIT interval must be >= %v", d, time.Microsecond)
 		}
 		ts.WallTime = duration.Add(stmtTimestamp, d.Duration).UnixNano()
@@ -295,7 +320,7 @@ func DatumToHLC(
 		return ts, convErr
 	}
 	zero := hlc.Timestamp{}
-	if ts.EqOrdering(zero) {
+	if ts == zero {
 		return ts, errors.Errorf("zero timestamp is invalid")
 	} else if ts.Less(zero) {
 		return ts, errors.Errorf("timestamp before 1970-01-01T00:00:00Z is invalid")

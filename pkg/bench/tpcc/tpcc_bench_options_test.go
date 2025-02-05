@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tpcc
 
@@ -16,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 )
 
 type option interface {
@@ -45,6 +41,7 @@ func (o options) apply(cfg *benchmarkConfig) {
 type benchmarkConfig struct {
 	workloadFlags []string
 	argsGenerator serverArgs
+	setupServer   []func(b testing.TB, s serverutils.TestServerInterface)
 	setupStmts    []string
 }
 
@@ -80,4 +77,20 @@ func setupStmt(stmt string) option {
 	return setupStmtOption(stmt)
 }
 
+var _ = setupStmt // silence unused linter
+
 func (s setupStmtOption) String() string { return string(s) }
+
+func setupServer(fn func(tb testing.TB, s serverutils.TestServerInterface)) option {
+	return setupServerOption{fn}
+}
+
+type setupServerOption struct {
+	fn func(tb testing.TB, s serverutils.TestServerInterface)
+}
+
+func (s setupServerOption) apply(cfg *benchmarkConfig) {
+	cfg.setupServer = append(cfg.setupServer, s.fn)
+}
+
+func (s setupServerOption) String() string { return "setup server" }

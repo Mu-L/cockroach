@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package roachpb
 
@@ -45,6 +40,17 @@ var emptySpanConfig = &SpanConfig{}
 // IsEmpty returns true if s is an empty SpanConfig.
 func (s *SpanConfig) IsEmpty() bool {
 	return s.Equal(emptySpanConfig)
+}
+
+// HasConfigurationChange is true if there is a change to this SpanConfig that
+// is initiated by the end user (directly or indirectly) rather than by a
+// background system process (like a PTS update).
+func (s *SpanConfig) HasConfigurationChange(other SpanConfig) bool {
+	this := *s
+	// Clear out the protection policies from both SpanConfigs.
+	this.GCPolicy.ProtectionPolicies = nil
+	other.GCPolicy.ProtectionPolicies = nil
+	return !this.Equal(other)
 }
 
 // TTL returns the implies TTL as a time.Duration.

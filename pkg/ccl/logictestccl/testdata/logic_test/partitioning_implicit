@@ -161,6 +161,8 @@ TABLE t
  ├── j jsonb
  ├── crdb_internal_mvcc_timestamp decimal [hidden] [system]
  ├── tableoid oid [hidden] [system]
+ ├── crdb_internal_origin_id int4 [hidden] [system]
+ ├── crdb_internal_origin_timestamp decimal [hidden] [system]
  ├── j_inverted_key encodedkey not null [inverted]
  ├── FAMILY fam_0_pk_a_b_c_d_j (pk, a, b, c, d, j)
  ├── PRIMARY INDEX t_pkey
@@ -355,13 +357,13 @@ FROM pg_index
 WHERE indrelid = (SELECT oid FROM pg_class WHERE relname = 't')
 ORDER BY 1,2,3
 ----
-indexrelid  indrelid  indkey  indclass  indoption  indcollation
-3428148192  107       5       0         2          0
-3428148194  107       2 3 4   0 0 0     2 2 2      0 0 0
-3428148195  107       6       0         2          0
-3428148196  107       3       0         2          0
-3428148197  107       4       0         2          0
-3428148199  107       1       0         2          0
+indexrelid  indrelid  indkey   indclass  indoption  indcollation
+3428148192  107       2 5      0 0       2 2        0 0
+3428148194  107       5 2 3 4  0 0 0 0   2 2 2 2    0 0 0 0
+3428148195  107       2 6      0 0       2 2        0 0
+3428148196  107       2 3      0 0       2 2        0 0
+3428148197  107       2 4      0 0       2 2        0 0
+3428148199  107       2 1      0 0       2 2        0 0
 
 query TTB colnames
 SELECT index_name, column_name, implicit FROM crdb_internal.index_columns
@@ -599,7 +601,6 @@ CREATE TABLE public.t (
   u STRING NULL,
   e INT8 NOT NULL,
   CONSTRAINT t_pkey PRIMARY KEY (pk2 ASC),
-  UNIQUE INDEX t_pk_key (pk ASC),
   UNIQUE INDEX t_u_key (u ASC),
   INDEX t_a_idx (a ASC),
   UNIQUE INDEX t_b_key (b ASC),
@@ -608,12 +609,14 @@ CREATE TABLE public.t (
   INDEX created_idx (c ASC),
   UNIQUE INDEX t_e_key (e ASC),
   UNIQUE INDEX unique_c_d (c ASC, d ASC),
+  UNIQUE INDEX t_pk_key (pk ASC),
   FAMILY fam_0_pk_pk2_partition_by_a_b_c_d_j_u (pk, pk2, partition_by, a, b, c, d, j, u, e)
 ) PARTITION ALL BY LIST (partition_by) (
   PARTITION one VALUES IN ((1)),
   PARTITION two VALUES IN ((2))
 )
 -- Warning: Partitioned table with no zone configurations.
+
 
 query TTB colnames
 SELECT index_name, column_name, implicit FROM crdb_internal.index_columns
@@ -849,7 +852,7 @@ vectorized: true
             │
             └── • lookup join
                 │ table: t@t_pkey
-                │ equality: (partition_by, pk) = (partition_by,pk)
+                │ equality: (partition_by, pk) = (partition_by, pk)
                 │ equality cols are key
                 │
                 └── • hash join

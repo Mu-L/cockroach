@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -20,6 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -108,8 +105,11 @@ func newFileUploadMachine(
 	c.parsingEvalCtx = c.p.EvalContext()
 
 	if n.Table.Table() == NodelocalFileUploadTable {
-		if err := c.p.RequireAdminRole(ctx, "upload to nodelocal"); err != nil {
+		if hasAdmin, err := p.HasAdminRole(ctx); err != nil {
 			return nil, err
+		} else if !hasAdmin {
+			return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with the admin role are allowed to upload to nodelocal")
 		}
 	}
 
@@ -211,6 +211,5 @@ func (f *fileUploadMachine) writeFile(ctx context.Context, finalBatch bool) erro
 	if err != nil {
 		return err
 	}
-	f.c.insertedRows += f.c.rows.Len()
-	return f.c.rows.UnsafeReset(ctx)
+	return f.c.doneWithRows(ctx)
 }

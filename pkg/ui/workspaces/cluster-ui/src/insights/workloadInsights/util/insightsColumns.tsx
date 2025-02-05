@@ -1,20 +1,17 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React, { ReactElement } from "react";
 import { Tooltip } from "@cockroachlabs/ui-components";
-import { InsightExecEnum } from "src/insights";
-import { contentModifiers } from "../../../statsTableUtil/statsTableUtil";
-import { Anchor } from "../../../anchor";
-import { contentionTime, readFromDisk, writtenToDisk } from "../../../util";
+import React, { ReactElement } from "react";
+
+import { InsightExecEnum } from "src/insights/types";
 import { Timezone } from "src/timestamp";
+
+import { Anchor } from "../../../anchor";
+import { contentModifiers } from "../../../statsTableUtil/statsTableUtil";
+import { contentionTime, readFromDisk, writtenToDisk } from "../../../util";
 
 export const insightsColumnLabels = {
   executionID: "Execution ID",
@@ -38,7 +35,7 @@ export const insightsColumnLabels = {
   databaseName: "Database Name",
   tableName: "Table Name",
   indexName: "Index Name",
-  cpu: "CPU Time",
+  cpu: "SQL CPU Time",
 };
 
 export type InsightsTableColumnKeys = keyof typeof insightsColumnLabels;
@@ -123,7 +120,7 @@ export const insightsTableTitles: InsightsTableTitleType = {
   },
   query: (execType: InsightExecEnum) => {
     let tooltipText = `The ${execType} query.`;
-    if (execType == InsightExecEnum.TRANSACTION) {
+    if (execType === InsightExecEnum.TRANSACTION) {
       tooltipText = "The queries attempted in the transaction.";
     }
     return makeToolTip(<p>{tooltipText}</p>, "query", execType);
@@ -238,7 +235,8 @@ export const insightsTableTitles: InsightsTableTitleType = {
   },
   cpu: (_: InsightExecEnum) => {
     return makeToolTip(
-      <p>{`CPU Time spent executing within the specified time interval.`}</p>,
+      <p>{`SQL CPU Time spent executing within the specified time interval. It
+      does not include SQL planning time nor KV execution time.`}</p>,
       "cpu",
     );
   },

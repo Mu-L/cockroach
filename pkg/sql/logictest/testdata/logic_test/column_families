@@ -76,6 +76,33 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE
 message LIKE 'fetched: /t/t_pkey/%'
 ORDER BY message
 ----
-fetched: /t/t_pkey/1/2.00/x -> /1.00
-fetched: /t/t_pkey/1/2/y -> /2.00
-fetched: /t/t_pkey/1/2/z -> /1
+fetched: /t/t_pkey/1/2.00/x:cf=2 -> /1.00
+fetched: /t/t_pkey/1/2/y:cf=1 -> /2.00
+fetched: /t/t_pkey/1/2/z:cf=0 -> /1
+
+# Regression test for #131860.
+
+statement ok
+CREATE TABLE abc (a INT NOT NULL, b FLOAT NOT NULL, c INT, FAMILY (a), FAMILY (b), FAMILY (c))
+
+statement ok
+INSERT INTO abc VALUES (4, -0, 6)
+
+statement ok
+ALTER TABLE abc ADD PRIMARY KEY (a, b)
+
+statement ok
+UPDATE abc SET c = NULL WHERE a = 4 AND b = -0
+
+query IFI
+SELECT * FROM abc
+----
+4  -0  NULL
+
+statement ok
+UPDATE abc SET b = 0 WHERE a = 4 AND b = -0;
+
+query IFI
+SELECT * FROM abc
+----
+4  0  NULL

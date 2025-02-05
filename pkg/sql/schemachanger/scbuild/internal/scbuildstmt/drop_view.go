@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scbuildstmt
 
@@ -83,10 +78,7 @@ func maybePanicOnDependentView(b BuildCtx, ns *scpb.Namespace, backrefs ElementR
 	}
 	_, _, nsDep := scpb.FindNamespace(b.QueryByID(depView.ViewID))
 	if nsDep.DatabaseID != ns.DatabaseID {
-		panic(errors.WithHintf(sqlerrors.NewDependentObjectErrorf("cannot drop relation %q because view %q depends on it",
-			ns.Name, qualifiedName(b, depView.ViewID)),
-			"you can drop %s instead.", nsDep.Name))
+		panic(sqlerrors.NewDependentBlocksOpError("drop", "relation", ns.Name, "view", qualifiedName(b, depView.ViewID)))
 	}
-	panic(sqlerrors.NewDependentObjectErrorf("cannot drop relation %q because view %q depends on it",
-		ns.Name, nsDep.Name))
+	panic(sqlerrors.NewDependentBlocksOpError("drop", "relation", ns.Name, "view", nsDep.Name))
 }

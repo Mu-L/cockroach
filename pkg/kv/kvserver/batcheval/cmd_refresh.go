@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -15,13 +10,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	RegisterReadOnlyCommand(kvpb.Refresh, DefaultDeclareKeys, Refresh)
+	// Depending on the cluster version, Refresh requests  may or may not declare locks.
+	// See DeclareKeysForRefresh for details.
+	RegisterReadOnlyCommand(kvpb.Refresh, DeclareKeysForRefresh, Refresh)
 }
 
 // Refresh checks whether the key has any values written in the interval
@@ -57,6 +57,7 @@ func Refresh(
 	res, err := storage.MVCCGet(ctx, reader, args.Key, refreshTo, storage.MVCCGetOptions{
 		Inconsistent: true,
 		Tombstones:   true,
+		ReadCategory: fs.BatchEvalReadCategory,
 	})
 
 	if err != nil {
@@ -71,7 +72,14 @@ func Refresh(
 	// Check if an intent which is not owned by this transaction was written
 	// at or beneath the refresh timestamp.
 	if res.Intent != nil && res.Intent.Txn.ID != h.Txn.ID {
-		return result.Result{}, kvpb.NewRefreshFailedError(ctx, kvpb.RefreshFailedError_REASON_INTENT, res.Intent.Key, res.Intent.Txn.WriteTimestamp, kvpb.WithConflictingTxn(&res.Intent.Txn))
+		// TODO(mira): Remove after V23_2_RemoveLockTableWaiterTouchPush is deleted.
+		if h.WaitPolicy == lock.WaitPolicy_Error {
+			// Return a LockConflictError, which will be handled by
+			// the concurrency manager's HandleLockConflictError.
+			return result.Result{}, &kvpb.LockConflictError{Locks: []roachpb.Lock{res.Intent.AsLock()}}
+		} else {
+			return result.Result{}, kvpb.NewRefreshFailedError(ctx, kvpb.RefreshFailedError_REASON_INTENT, res.Intent.Key, res.Intent.Txn.WriteTimestamp, kvpb.WithConflictingTxn(&res.Intent.Txn))
+		}
 	}
 
 	return result.Result{}, nil

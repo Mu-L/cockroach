@@ -1004,7 +1004,7 @@ distribution: local
 vectorized: true
 ·
 • virtual table
-  columns: (attrelid, attname, atttypid, attstattarget, attlen, attnum, attndims, attcacheoff, atttypmod, attbyval, attstorage, attalign, attnotnull, atthasdef, attidentity, attgenerated, attisdropped, attislocal, attinhcount, attcollation, attacl, attoptions, attfdwoptions, atthasmissing, attmissingval)
+  columns: (attrelid, attname, atttypid, attstattarget, attlen, attnum, attndims, attcacheoff, atttypmod, attbyval, attstorage, attalign, attnotnull, atthasdef, attidentity, attgenerated, attisdropped, attislocal, attinhcount, attcollation, attacl, attoptions, attfdwoptions, atthasmissing, attmissingval, attishidden)
   estimated row count: 10 (missing stats)
   table: pg_attribute@pg_attribute_attrelid_idx
   spans: [/t - /t]
@@ -1016,7 +1016,7 @@ distribution: local
 vectorized: true
 ·
 • virtual table
-  columns: (oid, proname, pronamespace, proowner, prolang, procost, prorows, provariadic, protransform, proisagg, proiswindow, prosecdef, proleakproof, proisstrict, proretset, provolatile, proparallel, pronargs, pronargdefaults, prorettype, proargtypes, proallargtypes, proargmodes, proargnames, proargdefaults, protrftypes, prosrc, probin, proconfig, proacl, prokind, prosupport)
+  columns: (oid, proname, pronamespace, proowner, prolang, procost, prorows, provariadic, prosupport, prokind, prosecdef, proleakproof, proisstrict, proretset, provolatile, proparallel, pronargs, pronargdefaults, prorettype, proargtypes, proallargtypes, proargmodes, proargnames, proargdefaults, protrftypes, prosrc, probin, prosqlbody, proconfig, proacl)
   estimated row count: 10 (missing stats)
   table: pg_proc@pg_proc_oid_idx
   spans: [/array_agg - /array_agg]
@@ -1028,7 +1028,7 @@ distribution: local
 vectorized: true
 ·
 • virtual table
-  columns: (oid, proname, pronamespace, proowner, prolang, procost, prorows, provariadic, protransform, proisagg, proiswindow, prosecdef, proleakproof, proisstrict, proretset, provolatile, proparallel, pronargs, pronargdefaults, prorettype, proargtypes, proallargtypes, proargmodes, proargnames, proargdefaults, protrftypes, prosrc, probin, proconfig, proacl, prokind, prosupport)
+  columns: (oid, proname, pronamespace, proowner, prolang, procost, prorows, provariadic, prosupport, prokind, prosecdef, proleakproof, proisstrict, proretset, provolatile, proparallel, pronargs, pronargdefaults, prorettype, proargtypes, proallargtypes, proargmodes, proargnames, proargdefaults, protrftypes, prosrc, probin, prosqlbody, proconfig, proacl)
   estimated row count: 10 (missing stats)
   table: pg_proc@pg_proc_oid_idx
   spans: [/12345 - /12345]
@@ -1221,7 +1221,6 @@ vectorized: true
     │
     └── • sort
         │ columns: (generate_series)
-        │ ordering: -generate_series
         │ estimated row count: 10
         │ order: -generate_series
         │
@@ -1257,7 +1256,6 @@ vectorized: true
         │
         └── • sort
             │ columns: (a, b)
-            │ ordering: +b
             │ estimated row count: 1,000 (missing stats)
             │ order: +b
             │
@@ -1285,8 +1283,13 @@ vectorized: true
 
 # Regression test for #57959. This should not cause an error due to
 # "comparison overload not found".
-query T
+query error pq: incompatible value type: cannot determine type of empty array. Consider casting to the desired type, for example ARRAY[]::int[]
 EXPLAIN (VERBOSE) SELECT * FROM t0 WHERE (CASE WHEN (t0.c0) IN (t0.c0) THEN ARRAY[NULL] ELSE ARRAY[] END) IS NULL
+
+# TODO(rytaft): On Postgres this case returns ERROR: cannot determine type of
+# empty array.
+query T
+EXPLAIN (VERBOSE) SELECT * FROM t0 WHERE (CASE WHEN (t0.c0) IN (t0.c0) THEN ARRAY[] ELSE ARRAY[NULL] END) IS NULL
 ----
 distribution: local
 vectorized: true
@@ -1294,7 +1297,7 @@ vectorized: true
 • filter
 │ columns: (c0)
 │ estimated row count: 333 (missing stats)
-│ filter: CASE WHEN (c0 IS DISTINCT FROM CAST(NULL AS DECIMAL)) OR CAST(NULL AS BOOL) THEN ARRAY[NULL] ELSE ARRAY[] END IS NULL
+│ filter: CASE WHEN (c0 IS DISTINCT FROM CAST(NULL AS DECIMAL)) OR CAST(NULL AS BOOL) THEN ARRAY[] ELSE ARRAY[NULL] END IS NULL
 │
 └── • scan
       columns: (c0)

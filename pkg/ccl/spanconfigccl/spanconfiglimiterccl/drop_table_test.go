@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfiglimiterccl
 
@@ -35,14 +32,14 @@ func TestDropTableLowersSpanCount(t *testing.T) {
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantProbabilistic,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	}})
 
 	defer tc.Stopper().Stop(ctx)
 	ts := tc.Server(0)
 
 	tenantID := roachpb.MustMakeTenantID(10)
-	tenant, err := ts.StartTenant(ctx, base.TestTenantArgs{
+	tenant, err := ts.TenantController().StartTenant(ctx, base.TestTenantArgs{
 		TenantID: tenantID,
 		TestingKnobs: base.TestingKnobs{
 			GCJob: &sql.GCJobTestingKnobs{
@@ -56,7 +53,7 @@ func TestDropTableLowersSpanCount(t *testing.T) {
 	zoneConfig.GC.TTLSeconds = 1
 	config.TestingSetupZoneConfigHook(tc.Stopper())
 
-	tenantSQLDB := tenant.SQLConn(t, "")
+	tenantSQLDB := tenant.SQLConn(t)
 	tenantDB := sqlutils.MakeSQLRunner(tenantSQLDB)
 
 	tenantDB.Exec(t, `CREATE TABLE t(k INT PRIMARY KEY)`)

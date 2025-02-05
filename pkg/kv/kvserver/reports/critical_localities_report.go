@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -272,14 +267,13 @@ func makeCriticalLocalitiesVisitor(
 	nodeChecker nodeChecker,
 ) criticalLocalitiesVisitor {
 	allLocalities := expandLocalities(nodeLocalities)
-	v := criticalLocalitiesVisitor{
+	return criticalLocalitiesVisitor{
 		allLocalities: allLocalities,
 		cfg:           cfg,
 		storeResolver: storeResolver,
 		nodeChecker:   nodeChecker,
+		report:        make(LocalityReport),
 	}
-	v.reset(ctx)
-	return v
 }
 
 // expandLocalities expands each locality in its input into multiple localities,
@@ -316,17 +310,6 @@ func (v *criticalLocalitiesVisitor) failed() bool {
 // calls.
 func (v *criticalLocalitiesVisitor) Report() LocalityReport {
 	return v.report
-}
-
-// reset is part of the rangeVisitor interface.
-func (v *criticalLocalitiesVisitor) reset(ctx context.Context) {
-	*v = criticalLocalitiesVisitor{
-		allLocalities: v.allLocalities,
-		cfg:           v.cfg,
-		storeResolver: v.storeResolver,
-		nodeChecker:   v.nodeChecker,
-		report:        make(LocalityReport, len(v.report)),
-	}
 }
 
 // visitNewZone is part of the rangeVisitor interface.

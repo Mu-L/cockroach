@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tracing_test
 
@@ -20,7 +15,6 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl" // For tenant functionality.
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -106,11 +100,12 @@ func TestTraceForTenantWithLocalKVServer(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	st := cluster.MakeTestingClusterSettings()
-	server.RedactServerTracesForSecondaryTenants.Override(ctx, &st.SV, false)
-	args := base.TestServerArgs{Settings: st}
-	s := serverutils.StartServerOnly(t, args)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
+
+	server.RedactServerTracesForSecondaryTenants.Override(ctx, &s.SystemLayer().ClusterSettings().SV, false)
 
 	// Create our own test tenant with a known name.
 	const tenantName = "test-tenant"
@@ -118,7 +113,7 @@ func TestTraceForTenantWithLocalKVServer(t *testing.T) {
 	testStmt := "SELECT 1 FROM t WHERE id=1"
 	var testStmtTrace tracingpb.Recording
 
-	_, tenantDB, err := s.StartSharedProcessTenant(ctx,
+	_, tenantDB, err := s.TenantController().StartSharedProcessTenant(ctx,
 		base.TestSharedProcessTenantArgs{
 			TenantName:  tenantName,
 			UseDatabase: "test",

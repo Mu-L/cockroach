@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlstatsutil
 
@@ -20,21 +15,9 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
-
-// GetRandomizedCollectedStatementStatisticsForTest returns a
-// appstatspb.CollectedStatementStatistics with its fields randomly filled.
-func GetRandomizedCollectedStatementStatisticsForTest(
-	t *testing.T,
-) (result appstatspb.CollectedStatementStatistics) {
-	data := genRandomData()
-	fillObject(t, reflect.ValueOf(&result), &data)
-
-	return result
-}
 
 type randomData struct {
 	Bool        bool
@@ -42,13 +25,14 @@ type randomData struct {
 	Int64       int64
 	Float       float64
 	IntArray    []int64
+	Int32Array  []int32
 	StringArray []string
 	Time        time.Time
 }
 
 var alphabet = []rune("abcdefghijklmkopqrstuvwxyz")
 
-func genRandomData() randomData {
+func GenRandomData() randomData {
 	r := randomData{}
 	r.Bool = rand.Float64() > 0.5
 
@@ -76,8 +60,10 @@ func genRandomData() randomData {
 
 	// Generate a randomized array of length 5.
 	r.IntArray = make([]int64, arrLen)
+	r.Int32Array = make([]int32, arrLen)
 	for i := 0; i < arrLen; i++ {
 		r.IntArray[i] = rand.Int63()
+		r.Int32Array[i] = rand.Int31()
 	}
 
 	r.Time = timeutil.Now()
@@ -89,6 +75,13 @@ func fillTemplate(t *testing.T, tmplStr string, data randomData) string {
 		strArr := make([]string, len(arr))
 		for i, val := range arr {
 			strArr[i] = strconv.FormatInt(val, 10)
+		}
+		return strings.Join(strArr, ",")
+	}
+	joinInt32s := func(arr []int32) string {
+		strArr := make([]string, len(arr))
+		for i, val := range arr {
+			strArr[i] = strconv.FormatInt(int64(val), 10)
 		}
 		return strings.Join(strArr, ",")
 	}
@@ -108,6 +101,7 @@ func fillTemplate(t *testing.T, tmplStr string, data randomData) string {
 		New("").
 		Funcs(template.FuncMap{
 			"joinInts":      joinInts,
+			"joinInt32s":    joinInt32s,
 			"joinStrings":   joinStrings,
 			"stringifyTime": stringifyTime,
 		}).
@@ -134,7 +128,7 @@ var fieldBlacklist = map[string]struct{}{
 	"AggregationInterval":     {},
 }
 
-func fillObject(t *testing.T, val reflect.Value, data *randomData) {
+func FillObject(t *testing.T, val reflect.Value, data *randomData) {
 	// Do not set the fields that are not being encoded as json.
 	if val.Kind() != reflect.Ptr {
 		t.Fatal("not a pointer type")
@@ -163,6 +157,10 @@ func fillObject(t *testing.T, val reflect.Value, data *randomData) {
 			for _, randInt := range data.IntArray {
 				val.Set(reflect.Append(val, reflect.ValueOf(randInt)))
 			}
+		case "[]int32":
+			for _, randInt32 := range data.Int32Array {
+				val.Set(reflect.Append(val, reflect.ValueOf(randInt32)))
+			}
 		}
 	case reflect.Struct:
 		switch val.Type().Name() {
@@ -179,7 +177,7 @@ func fillObject(t *testing.T, val reflect.Value, data *randomData) {
 					continue
 				}
 
-				fillObject(t, fieldAddr, data)
+				FillObject(t, fieldAddr, data)
 			}
 		}
 	default:

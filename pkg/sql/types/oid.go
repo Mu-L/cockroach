@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package types
 
@@ -62,7 +57,7 @@ var OidToType = map[oid.Oid]*T{
 	oid.T_anyelement: Any,
 	oid.T_bit:        typeBit,
 	oid.T_bool:       Bool,
-	oid.T_bpchar:     typeBpChar,
+	oid.T_bpchar:     BPChar,
 	oid.T_bytea:      Bytes,
 	oid.T_char:       QChar,
 	oid.T_date:       Date,
@@ -85,6 +80,7 @@ var OidToType = map[oid.Oid]*T{
 	oid.T_oidvector:    OidVector,
 	oid.T_pg_lsn:       PGLSN,
 	oid.T_record:       AnyTuple,
+	oid.T_refcursor:    RefCursor,
 	oid.T_regclass:     RegClass,
 	oid.T_regnamespace: RegNamespace,
 	oid.T_regproc:      RegProc,
@@ -96,6 +92,7 @@ var OidToType = map[oid.Oid]*T{
 	oid.T_timetz:       TimeTZ,
 	oid.T_timestamp:    Timestamp,
 	oid.T_timestamptz:  TimestampTZ,
+	oid.T_trigger:      Trigger,
 	oid.T_tsquery:      TSQuery,
 	oid.T_tsvector:     TSVector,
 	oid.T_unknown:      Unknown,
@@ -107,6 +104,7 @@ var OidToType = map[oid.Oid]*T{
 	oidext.T_geometry:  Geometry,
 	oidext.T_geography: Geography,
 	oidext.T_box2d:     Box2D,
+	oidext.T_pgvector:  PGVector,
 }
 
 // oidToArrayOid maps scalar type Oids to their corresponding array type Oid.
@@ -133,6 +131,7 @@ var oidToArrayOid = map[oid.Oid]oid.Oid{
 	oid.T_oidvector:    oid.T__oidvector,
 	oid.T_pg_lsn:       oid.T__pg_lsn,
 	oid.T_record:       oid.T__record,
+	oid.T_refcursor:    oid.T__refcursor,
 	oid.T_regclass:     oid.T__regclass,
 	oid.T_regnamespace: oid.T__regnamespace,
 	oid.T_regproc:      oid.T__regproc,
@@ -153,6 +152,7 @@ var oidToArrayOid = map[oid.Oid]oid.Oid{
 	oidext.T_geometry:  oidext.T__geometry,
 	oidext.T_geography: oidext.T__geography,
 	oidext.T_box2d:     oidext.T__box2d,
+	oidext.T_pgvector:  oidext.T__pgvector,
 }
 
 // familyToOid maps each type family to a default OID value that is used when
@@ -172,6 +172,7 @@ var familyToOid = map[Family]oid.Oid{
 	CollatedStringFamily: oid.T_text,
 	OidFamily:            oid.T_oid,
 	PGLSNFamily:          oid.T_pg_lsn,
+	RefCursorFamily:      oid.T_refcursor,
 	UnknownFamily:        oid.T_unknown,
 	UuidFamily:           oid.T_uuid,
 	ArrayFamily:          oid.T_anyarray,
@@ -188,6 +189,7 @@ var familyToOid = map[Family]oid.Oid{
 	GeometryFamily:  oidext.T_geometry,
 	GeographyFamily: oidext.T_geography,
 	Box2DFamily:     oidext.T_box2d,
+	PGVectorFamily:  oidext.T_pgvector,
 }
 
 // ArrayOids is a set of all oids which correspond to an array type.

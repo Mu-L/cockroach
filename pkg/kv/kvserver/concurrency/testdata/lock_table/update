@@ -63,7 +63,7 @@ start-waiting: true
 
 guard-state r=req2
 ----
-new: state=waitForDistinguished txn=txn1 key="a" held=true guard-strength=None
+new: state=waitFor txn=txn1 key="a" held=true guard-strength=None
 
 scan r=req3
 ----
@@ -97,17 +97,15 @@ num=1
    waiting readers:
     req: 4, txn: none
     req: 2, txn: 00000000-0000-0000-0000-000000000002
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 2
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 metrics
 ----
 locks: 1
 locksheld: 1
 totallockholddurationnanos: 0
-lockswithreservation: 0
 lockswithwaitqueues: 1
 waiters: 4
 waitingreaders: 2
@@ -204,10 +202,9 @@ num=1
    waiting readers:
     req: 4, txn: none
     req: 2, txn: 00000000-0000-0000-0000-000000000002
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 2
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 # -------------------------------------------------------------
 # Update lock timestamp to 13,1 - the transactional read at
@@ -222,10 +219,9 @@ num=1
   holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 0, iso: Serializable, ts: 13.000000000,1, info: unrepl [(str: Exclusive seq: 0)]
    waiting readers:
     req: 4, txn: none
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 4
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 guard-state r=req2
 ----
@@ -242,10 +238,9 @@ num=1
   holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 0, iso: Serializable, ts: 13.000000000,1, info: unrepl [(str: Exclusive seq: 0)]
    waiting readers:
     req: 4, txn: none
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 4
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 # -------------------------------------------------------------
 # Update lock timestamp to 10,1 - noop since lock is already at
@@ -259,10 +254,9 @@ num=1
   holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 0, iso: Serializable, ts: 13.000000000,1, info: unrepl [(str: Exclusive seq: 0)]
    waiting readers:
     req: 4, txn: none
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 4
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 # -------------------------------------------------------------
 # Update lock timestamp to 15,1 - nothing moves
@@ -275,10 +269,9 @@ num=1
   holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 0, iso: Serializable, ts: 15.000000000,1, info: unrepl [(str: Exclusive seq: 0)]
    waiting readers:
     req: 4, txn: none
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 4
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 # -------------------------------------------------------------
 # Update lock timestamp to 17,1 - the transactional read at
@@ -291,10 +284,9 @@ update txn=txn1 ts=17,1 epoch=0 span=a
 num=1
  lock: "a"
   holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 0, iso: Serializable, ts: 17.000000000,1, info: unrepl [(str: Exclusive seq: 0)]
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 3
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 guard-state r=req4
 ----
@@ -309,10 +301,9 @@ dequeue r=req4
 num=1
  lock: "a"
   holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 0, iso: Serializable, ts: 17.000000000,1, info: unrepl [(str: Exclusive seq: 0)]
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 3
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 # -------------------------------------------------------------
 # Update lock timestamp to 19,1 - nothing moves
@@ -323,10 +314,9 @@ update txn=txn1 ts=19,1 epoch=0 span=a
 num=1
  lock: "a"
   holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 0, iso: Serializable, ts: 19.000000000,1, info: unrepl [(str: Exclusive seq: 0)]
-   queued writers:
-    active: true req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 3
+   queued locking requests:
+    active: true req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 # -------------------------------------------------------------
 # Update lock epoch to 1 - the lock is dropped and the transactional
@@ -339,10 +329,9 @@ update txn=txn1 ts=19,1 epoch=1 span=a
 ----
 num=1
  lock: "a"
-   queued writers:
-    active: false req: 3, txn: 00000000-0000-0000-0000-000000000003
-    active: true req: 5, txn: none
-   distinguished req: 5
+   queued locking requests:
+    active: false req: 3, strength: Intent, txn: 00000000-0000-0000-0000-000000000003
+    active: true req: 5, strength: Intent, txn: none
 
 guard-state r=req3
 ----
@@ -354,7 +343,7 @@ start-waiting: false
 
 guard-state r=req5
 ----
-new: state=waitForDistinguished txn=txn3 key="a" held=false guard-strength=Intent
+new: state=waitFor txn=txn3 key="a" held=false guard-strength=Intent
 
 dequeue r=req3
 ----
@@ -384,6 +373,12 @@ new-lock-table maxlocks=10000
 ----
 
 new-txn txn=txn1 ts=10 epoch=1 seq=1
+----
+
+new-txn txn=txn2 ts=12,1 epoch=0
+----
+
+new-txn txn=txn3 ts=14,1 epoch=0
 ----
 
 new-request r=req1 txn=txn1 ts=10 spans=exclusive@a
@@ -489,3 +484,66 @@ num=1
 update txn=txn1 ts=10 epoch=1 span=a ignored-seqs=1
 ----
 num=0
+
+# ------------------------------------------------------------------------------
+# Tests where both an exclusive lock and a (replicated) intent exists on a key,
+# and the intent is forgotten because of a lock update, we correctly let some
+# waiting requests through.
+# ------------------------------------------------------------------------------
+
+clear
+----
+num=0
+
+new-request r=req5 txn=txn1 ts=10 spans=exclusive@a
+----
+
+scan r=req5
+----
+start-waiting: false
+
+acquire r=req5 k=a durability=u strength=exclusive
+----
+num=1
+ lock: "a"
+  holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 1, iso: Serializable, ts: 10.000000000,0, info: unrepl [(str: Exclusive seq: 10)]
+
+new-request r=req6 txn=txn2 ts=10 spans=none@a
+----
+
+scan r=req6
+----
+start-waiting: true
+
+add-discovered k=a durability=r strength=intent txn=txn1 r=req6
+----
+num=1
+ lock: "a"
+  holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 1, iso: Serializable, ts: 10.000000000,0, info: repl [Intent], unrepl [(str: Exclusive seq: 10)]
+   waiting readers:
+    req: 2, txn: 00000000-0000-0000-0000-000000000002
+
+new-request r=req7 txn=txn3 ts=10 spans=shared@a
+----
+
+scan r=req7
+----
+start-waiting: true
+
+print
+----
+num=1
+ lock: "a"
+  holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 1, iso: Serializable, ts: 10.000000000,0, info: repl [Intent], unrepl [(str: Exclusive seq: 10)]
+   waiting readers:
+    req: 2, txn: 00000000-0000-0000-0000-000000000002
+   queued locking requests:
+    active: true req: 3, strength: Shared, txn: 00000000-0000-0000-0000-000000000003
+
+update txn=txn1 ts=11,0 epoch=0 span=a
+----
+num=1
+ lock: "a"
+  holder: txn: 00000000-0000-0000-0000-000000000001 epoch: 1, iso: Serializable, ts: 11.000000000,0, info: unrepl [(str: Exclusive seq: 10)]
+   queued locking requests:
+    active: true req: 3, strength: Shared, txn: 00000000-0000-0000-0000-000000000003

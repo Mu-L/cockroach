@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -18,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
 	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -77,6 +73,10 @@ func withReadResultTS(op Operation, value string, ts int) Operation {
 		get.Result.Value = roachpb.MakeValueFromString(value).RawBytes
 	}
 	return op
+}
+
+func withScanResult(op Operation, kvs ...KeyValue) Operation {
+	return withScanResultTS(op, 0, kvs...)
 }
 
 func withScanResultTS(op Operation, ts int, kvs ...KeyValue) Operation {
@@ -200,7 +200,6 @@ func TestValidate(t *testing.T) {
 	makeAddSSTable := func(seq kvnemesisutil.Seq, kvs []sstKV) Operation {
 		f := &storage.MemObject{}
 		st := cluster.MakeTestingClusterSettings()
-		storage.ValueBlocksEnabled.Override(ctx, &st.SV, true)
 		w := storage.MakeIngestionSSTWriter(ctx, st, f)
 		defer w.Close()
 
@@ -684,6 +683,22 @@ func TestValidate(t *testing.T) {
 			kvs: kvs(kv(k1, t2, s1)),
 		},
 		{
+			name: "one for update read before write",
+			steps: []Step{
+				step(withReadResultTS(getForUpdate(k1), ``, t1)),
+				step(withResultTS(put(k1, s1), t2)),
+			},
+			kvs: kvs(kv(k1, t2, s1)),
+		},
+		{
+			name: "one for share read before write",
+			steps: []Step{
+				step(withReadResultTS(getForShare(k1), ``, t1)),
+				step(withResultTS(put(k2, s1), t2)),
+			},
+			kvs: kvs(kv(k2, t2, s1)),
+		},
+		{
 			name: "one read before delete",
 			steps: []Step{
 				step(withReadResultTS(get(k1), ``, t1)),
@@ -695,6 +710,15 @@ func TestValidate(t *testing.T) {
 			name: "one read before write and delete",
 			steps: []Step{
 				step(withReadResultTS(get(k1), ``, t1)),
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(del(k1, s2), t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1), tombstone(k1, t2, s2)),
+		},
+		{
+			name: "one for update read before write and delete",
+			steps: []Step{
+				step(withReadResultTS(getForUpdate(k1), ``, t1)),
 				step(withResultTS(put(k1, s1), t1)),
 				step(withResultTS(del(k1, s2), t2)),
 			},
@@ -713,6 +737,22 @@ func TestValidate(t *testing.T) {
 			steps: []Step{
 				step(withResultTS(put(k1, s1), t1)),
 				step(withReadResultTS(get(k1), v1, t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one for update read after write",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getForUpdate(k1), v1, t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one for share read after write",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getForShare(k1), v1, t2)),
 			},
 			kvs: kvs(kv(k1, t1, s1)),
 		},
@@ -767,8 +807,8 @@ func TestValidate(t *testing.T) {
 				step(withResultTS(put(k2, s2), t2)),
 				step(withResultTS(batch(
 					withReadResult(get(k1), v1),
-					withReadResult(get(k2), v2),
-					withReadResult(get(k3), ``),
+					withReadResult(getForUpdate(k2), v2),
+					withReadResult(getForShare(k3), ``),
 				), t3)),
 			},
 			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
@@ -1898,6 +1938,408 @@ func TestValidate(t *testing.T) {
 				kv(k3, t1, s1),
 				kv(k4, t1, s1),
 			),
+		},
+		{
+			name: "one read skip locked after write",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getSkipLocked(k1), v1, t1)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one read skip locked after write returning wrong value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getSkipLocked(k1), v2, t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one read skip locked after write returning no value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withReadResultTS(getSkipLocked(k1), ``, t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one scan skip locked after writes",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t4, scanKV(k1, v1), scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one scan skip locked after writes returning wrong value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t3, scanKV(k1, v3), scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one scan skip locked after writes returning no values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one scan skip locked after writes returning some values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(scanSkipLocked(k1, k3), t3, scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3, scanKV(k2, v2), scanKV(k1, v1))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes returning wrong value",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3, scanKV(k2, v2), scanKV(k1, v3))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes returning no values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "one reverse scan skip locked after writes returning some values",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withScanResultTS(reverseScanSkipLocked(k1, k3), t3, scanKV(k2, v2))),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "weak isolation transaction with non-atomic writes",
+			steps: []Step{
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withResultOK(put(k1, s1)),
+					withResultOK(put(k2, s2)),
+				), t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k2, t2, s2)),
+		},
+		{
+			name: "weak isolation transaction with atomic writes",
+			steps: []Step{
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withResultOK(put(k1, s1)),
+					withResultOK(put(k2, s2)),
+				), t2)),
+			},
+			kvs: kvs(kv(k1, t2, s1), kv(k2, t2, s2)), // difference: t2 instead of t1
+		},
+		{
+			name: "weak isolation transaction with non-atomic non-locking get",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withReadResult(get(k1), v1),
+					withResult(put(k3, s3)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k3, t3, s3)),
+		},
+		{
+			name: "weak isolation transaction with non-atomic locking (unreplicated) get",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withReadResult(getForShare(k1), v1),
+					withResult(put(k3, s3)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k3, t3, s3)),
+		},
+		{
+			name: "weak isolation transaction with non-atomic locking (replicated) get",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withReadResult(getForShareGuaranteedDurability(k1), v1),
+					withResult(put(k3, s3)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k3, t3, s3)),
+		},
+		{
+			name: "weak isolation transaction with atomic locking (replicated) get",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withReadResult(getForShareGuaranteedDurability(k1), v2), // difference: v2 instead of v1
+					withResult(put(k3, s3)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k3, t3, s3)),
+		},
+		{
+			name: "weak isolation transaction with atomic locking (replicated) get and missing key",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withReadResult(getForShareGuaranteedDurability(k1), ``), // difference: no value instead of v1
+					withResult(put(k3, s3)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k3, t3, s3)),
+		},
+		{
+			name: "weak isolation transaction with non-atomic non-locking scan",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(put(k2, s3), t1)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withScanResult(scan(k1, k3), scanKV(k1, v1), scanKV(k2, v3)),
+					withResult(put(k3, s4)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k2, t1, s3), kv(k3, t3, s4)),
+		},
+		{
+			name: "weak isolation transaction with non-atomic locking (unreplicated) scan",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(put(k2, s3), t1)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withScanResult(scanForShare(k1, k3), scanKV(k1, v1), scanKV(k2, v3)),
+					withResult(put(k3, s4)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k2, t1, s3), kv(k3, t3, s4)),
+		},
+		{
+			name: "weak isolation transaction with non-atomic locking (replicated) scan",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(put(k2, s3), t1)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withScanResult(scanForShareGuaranteedDurability(k1, k3), scanKV(k1, v1), scanKV(k2, v3)),
+					withResult(put(k3, s4)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k2, t1, s3), kv(k3, t3, s4)),
+		},
+		{
+			name: "weak isolation transaction with atomic locking (replicated) scan",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(put(k2, s3), t1)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withScanResult(scanForShareGuaranteedDurability(k1, k3), scanKV(k1, v2), scanKV(k2, v3)), // difference: v2 instead of v1
+					withResult(put(k3, s4)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k2, t1, s3), kv(k3, t3, s4)),
+		},
+		{
+			name: "weak isolation transaction with atomic locking (replicated) scan and missing key",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k1, s2), t2)),
+				step(withResultTS(put(k2, s3), t1)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withScanResult(scanForShareGuaranteedDurability(k1, k3), scanKV(k1, v2)), // difference: k2 not returned
+					withResult(put(k3, s4)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t2, s2), kv(k2, t1, s3), kv(k3, t3, s4)),
+		},
+		{
+			name: "weak isolation transaction with non-atomic deleterange",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(put(k2, s2), t2)),
+				step(withResultTS(put(k3, s3), t1)),
+				step(withResultTS(closureTxn(ClosureTxnType_Commit, isolation.Snapshot,
+					withDeleteRangeResult(delRange(k1, k4, s4), noTS, roachpb.Key(k1), roachpb.Key(k3)),
+				), t3)),
+			},
+			kvs: kvs(kv(k1, t1, s1), kv(k1, t3, s4), kv(k2, t2, s2), kv(k3, t1, s3), kv(k3, t3, s4)),
+		},
+		{
+			name: "one savepoint and one put",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(put(k1, s1)),
+					withResult(createSavepoint(2)),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "one savepoint and release",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(put(k1, s1)),
+					withResult(createSavepoint(2)),
+					withResult(put(k1, s2)),
+					withResult(releaseSavepoint(2)),
+					withReadResult(get(k1), v2),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s2)),
+		},
+		{
+			name: "nested savepoint release",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(put(k1, s1)),
+					withResult(createSavepoint(2)),
+					withResult(put(k1, s2)),
+					withResult(createSavepoint(4)),
+					withResult(put(k1, s3)),
+					withResult(releaseSavepoint(2)),
+					withReadResult(get(k1), v3),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s3)),
+		},
+		{
+			name: "one savepoint and rollback",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(put(k1, s1)),
+					withResult(createSavepoint(2)),
+					withResult(put(k1, s2)),
+					withReadResult(get(k1), v2),
+					withResult(rollbackSavepoint(2)),
+					withReadResult(get(k1), v1),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "two nested savepoint rollbacks",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(put(k1, s1)),
+					withResult(createSavepoint(2)),
+					withResult(put(k1, s2)),
+					withReadResult(get(k1), v2),
+					withResult(createSavepoint(5)),
+					withResult(put(k1, s3)),
+					withReadResult(get(k1), v3),
+					withResult(rollbackSavepoint(2)),
+					withReadResult(get(k1), v1),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "two closed nested savepoint rollbacks",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(put(k1, s1)),
+					withResult(createSavepoint(2)),
+					withResult(put(k1, s2)),
+					withReadResult(get(k1), v2),
+					withResult(createSavepoint(5)),
+					withResult(put(k1, s3)),
+					withReadResult(get(k1), v3),
+					withResult(rollbackSavepoint(5)),
+					withResult(rollbackSavepoint(2)),
+					withReadResult(get(k1), v1),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "two non-nested savepoints rollbacks",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(createSavepoint(0)),
+					withResult(put(k1, s1)),
+					withReadResult(get(k1), v1),
+					withResult(rollbackSavepoint(0)),
+					withResult(put(k1, s2)),
+					withResult(createSavepoint(5)),
+					withResult(put(k1, s3)),
+					withReadResult(get(k1), v3),
+					withResult(rollbackSavepoint(5)),
+					withReadResult(get(k1), v2),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s2)),
+		},
+		{
+			name: "savepoint release and rollback",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(put(k1, s1)),
+					withResult(createSavepoint(2)),
+					withResult(put(k1, s2)),
+					withReadResult(get(k1), v2),
+					withResult(createSavepoint(5)),
+					withResult(put(k1, s3)),
+					withReadResult(get(k1), v3),
+					withResult(releaseSavepoint(5)),
+					withResult(rollbackSavepoint(2)),
+					withReadResult(get(k1), v1),
+				), t1)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
+		},
+		{
+			name: "savepoint with no last write",
+			steps: []Step{
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(createSavepoint(0)),
+					withResult(put(k1, s1)),
+					withReadResult(get(k1), v1),
+					withResult(rollbackSavepoint(0)),
+				), t1)),
+			},
+			kvs: nil,
+		},
+		{
+			name: "savepoint with no last write and existing write",
+			steps: []Step{
+				step(withResultTS(put(k1, s1), t1)),
+				step(withResultTS(closureTxnSSI(ClosureTxnType_Commit,
+					withResult(createSavepoint(1)),
+					withResult(put(k1, s2)),
+					withReadResult(get(k1), v2),
+					withResult(rollbackSavepoint(1)),
+					withReadResult(get(k1), v1),
+				), t2)),
+			},
+			kvs: kvs(kv(k1, t1, s1)),
 		},
 	}
 

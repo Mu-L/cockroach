@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -24,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -69,7 +64,7 @@ func TestCopyLogging(t *testing.T) {
 
 			// We have to start a new connection every time to exercise all possible paths.
 			t.Run("success during COPY FROM", func(t *testing.T) {
-				db := s.SQLConn(t, "")
+				db := s.SQLConn(t)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -101,7 +96,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error in statement", func(t *testing.T) {
-				db := s.SQLConn(t, "")
+				db := s.SQLConn(t)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -113,7 +108,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error during COPY FROM", func(t *testing.T) {
-				db := s.SQLConn(t, "")
+				db := s.SQLConn(t)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -129,7 +124,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error in statement during COPY FROM", func(t *testing.T) {
-				db := s.SQLConn(t, "")
+				db := s.SQLConn(t)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -141,7 +136,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error during insert phase of COPY FROM", func(t *testing.T) {
-				db := s.SQLConn(t, "")
+				db := s.SQLConn(t)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -170,7 +165,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error during copy during COPY FROM", func(t *testing.T) {
-				db := s.SQLConn(t, "")
+				db := s.SQLConn(t)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs_test
 
@@ -18,6 +13,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
@@ -41,11 +37,15 @@ func TestTxnWithStepping(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
 
 	db := s.InternalDB().(descs.DB)
-	scratchKey, err := s.ScratchRange()
+
+	scratchKey := append(s.Codec().TenantPrefix(), keys.ScratchRangeMin...)
+	_, _, err := srv.StorageLayer().SplitRange(scratchKey)
 	require.NoError(t, err)
 	// Write a key, read in the transaction without stepping, ensure we
 	// do not see the value, step the transaction, then ensure that we do.
@@ -64,7 +64,7 @@ func TestTxnWithStepping(t *testing.T) {
 				return errors.AssertionFailedf("expected no value, got %v", got)
 			}
 		}
-		if err := txn.KV().Step(ctx); err != nil {
+		if err := txn.KV().Step(ctx, true /* allowReadTimestampStep */); err != nil {
 			return err
 		}
 		{

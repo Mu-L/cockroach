@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sessiondatapb
 
@@ -133,13 +128,20 @@ const (
 	// can impact performance negatively.
 	SerialUsesSQLSequences SerialNormalizationMode = 2
 	// SerialUsesCachedSQLSequences is identical to SerialUsesSQLSequences with
-	// the exception that nodes can cache sequence values. This significantly
+	// the exception that sessions can cache sequence values. This significantly
 	// reduces contention and distributed calls to kv, which results in better
 	// performance. Gaps between sequences may be larger as a result of cached
 	// values being lost to errors and/or node failures.
 	SerialUsesCachedSQLSequences SerialNormalizationMode = 3
 	// SerialUsesUnorderedRowID means use INT NOT NULL DEFAULT unordered_unique_rowid().
 	SerialUsesUnorderedRowID SerialNormalizationMode = 4
+	// SerialUsesCachedNodeSQLSequences is identical to
+	// SerialUsesCachedSQLSequences, except the sequence values are cached per
+	// node instead of per session.
+	SerialUsesCachedNodeSQLSequences SerialNormalizationMode = 5
+	// maxSerialNormalizationMode should always be one larger than the last
+	// public value.
+	maxSerialNormalizationMode = 6
 )
 
 func (m SerialNormalizationMode) String() string {
@@ -154,6 +156,8 @@ func (m SerialNormalizationMode) String() string {
 		return "sql_sequence"
 	case SerialUsesCachedSQLSequences:
 		return "sql_sequence_cached"
+	case SerialUsesCachedNodeSQLSequences:
+		return "sql_sequence_cached_node"
 	default:
 		return fmt.Sprintf("invalid (%d)", m)
 	}
@@ -172,6 +176,8 @@ func SerialNormalizationModeFromString(val string) (_ SerialNormalizationMode, o
 		return SerialUsesSQLSequences, true
 	case "SQL_SEQUENCE_CACHED":
 		return SerialUsesCachedSQLSequences, true
+	case "SQL_SEQUENCE_CACHED_NODE":
+		return SerialUsesCachedNodeSQLSequences, true
 	default:
 		return 0, false
 	}
@@ -279,13 +285,10 @@ const (
 	// session default_transaction_quality_of_service value.
 	SystemLow = QoSLevel(admissionpb.LowPri)
 
-	// TTLStatsLow denotes a QoS level used internally by the TTL feature, which
-	// is not settable as a session default_transaction_quality_of_service value.
-	TTLStatsLow = QoSLevel(admissionpb.TTLLowPri)
-
-	// TTLLow denotes a QoS level used internally by the TTL feature, which is not
-	// settable as a session default_transaction_quality_of_service value.
-	TTLLow = QoSLevel(admissionpb.TTLLowPri)
+	// BulkLow denotes a QoS level used internally by the bulk operations (like
+	// LDR ingestion and TTL), which is not settable as a session
+	// default_transaction_quality_of_service value.
+	BulkLow = QoSLevel(admissionpb.BulkLowPri)
 
 	// UserLow denotes an end user QoS level lower than the default.
 	UserLow = QoSLevel(admissionpb.UserLowPri)
@@ -293,12 +296,16 @@ const (
 	// Normal denotes an end user QoS level unchanged from the default.
 	Normal = QoSLevel(admissionpb.NormalPri)
 
+	// LockingNormal denotes an internal increased priority for normal
+	// transactions that are acquiring locks.
+	LockingNormal = QoSLevel(admissionpb.LockingNormalPri)
+
 	// UserHigh denotes an end user QoS level higher than the default.
 	UserHigh = QoSLevel(admissionpb.UserHighPri)
 
-	// Locking denotes an internal increased priority for transactions that are
-	// acquiring locks.
-	Locking = QoSLevel(admissionpb.LockingPri)
+	// LockingHigh denotes an internal increased priority for UserHigh
+	// transactions that are acquiring locks.
+	LockingHigh = QoSLevel(admissionpb.LockingUserHighPri)
 
 	// SystemHigh denotes the maximum system QoS level, which is not settable as a
 	// session default_transaction_quality_of_service value.
@@ -326,31 +333,59 @@ const (
 	// QoS level.
 	SystemLowName = "minimum"
 
-	// TTLLowName is the string value to display indicating a TTLLow QoS level.
-	TTLLowName = "ttl_low"
+	// BulkLowName is the string value to display indicating a BulkLow QoS level.
+	BulkLowName = "bulk_low"
 
-	// LockingName is the string value to display indicating a Locking QoS level.
-	LockingName = "locking"
+	// LockingNormalName is the string value to display indicating a
+	// LockingNormal QoS level.
+	LockingNormalName = "locking-normal"
+
+	// LockingHighName is the string value to display indicating a LockingHigh
+	// QoS level.
+	LockingHighName = "locking-high"
+)
+
+// When providing SessionData overrides to the internal executor,
+// we need to use pointers to specify the QoSLevel. Since we can't
+// use pointers to constants, we define these variables to use in
+// those cases.
+var (
+	SystemLowQoS = SystemLow
+	BulkLowQoS   = BulkLow
+	UserLowQoS   = UserLow
 )
 
 var qosLevelsDict = map[QoSLevel]string{
-	SystemLow:  SystemLowName,
-	TTLLow:     TTLLowName,
-	UserLow:    UserLowName,
-	Normal:     NormalName,
-	UserHigh:   UserHighName,
-	Locking:    LockingName,
-	SystemHigh: SystemHighName,
+	SystemLow:     SystemLowName,
+	BulkLow:       BulkLowName,
+	UserLow:       UserLowName,
+	Normal:        NormalName,
+	LockingNormal: LockingNormalName,
+	UserHigh:      UserHighName,
+	LockingHigh:   LockingHighName,
+	SystemHigh:    SystemHighName,
+}
+
+func init() {
+	// Sanity check that all names for QoS levels use lower case (this
+	// assumption is used in ParseQoSLevelFromString).
+	for _, val := range qosLevelsDict {
+		if strings.ToLower(val) != val {
+			panic(errors.AssertionFailedf(
+				"expected only lower case letters in QoS level name %s", val,
+			))
+		}
+	}
 }
 
 // ParseQoSLevelFromString converts a string into a QoSLevel
 func ParseQoSLevelFromString(val string) (_ QoSLevel, ok bool) {
-	switch strings.ToUpper(val) {
-	case strings.ToUpper(UserHighName):
+	switch strings.ToLower(val) {
+	case UserHighName:
 		return UserHigh, true
-	case strings.ToUpper(UserLowName):
+	case UserLowName:
 		return UserLow, true
-	case strings.ToUpper(NormalName):
+	case NormalName:
 		return Normal, true
 	default:
 		return 0, false

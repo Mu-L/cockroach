@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -17,7 +12,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil"
-	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -119,7 +115,7 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 		*DeleteRangeOperation,
 		*DeleteRangeUsingTombstoneOperation,
 		*AddSSTableOperation:
-		applyClientOp(ctx, db, op, false)
+		applyClientOp(ctx, db, op, false /* inTxn */, nil /* spIDToToken */)
 	case *SplitOperation:
 		err := db.AdminSplit(ctx, o.Key, hlc.MaxTimestamp)
 		o.Result = resultInit(ctx, err)
@@ -133,15 +129,26 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 	case *TransferLeaseOperation:
 		err := db.AdminTransferLease(ctx, o.Key, o.Target)
 		o.Result = resultInit(ctx, err)
+	case *ChangeSettingOperation:
+		err := changeClusterSettingInEnv(ctx, env, o)
+		o.Result = resultInit(ctx, err)
 	case *ChangeZoneOperation:
 		err := updateZoneConfigInEnv(ctx, env, o.Type)
+		o.Result = resultInit(ctx, err)
+	case *BarrierOperation:
+		var err error
+		if o.WithLeaseAppliedIndex {
+			_, _, err = db.BarrierWithLAI(ctx, o.Key, o.EndKey)
+		} else {
+			_, err = db.Barrier(ctx, o.Key, o.EndKey)
+		}
 		o.Result = resultInit(ctx, err)
 	case *ClosureTxnOperation:
 		// Use a backoff loop to avoid thrashing on txn aborts. Don't wait between
 		// epochs of the same transaction to avoid waiting while holding locks.
 		retryOnAbort := retry.StartWithCtx(ctx, retry.Options{
 			InitialBackoff: 1 * time.Millisecond,
-			MaxBackoff:     250 * time.Millisecond,
+			MaxBackoff:     10 * time.Second,
 		})
 		var savedTxn *kv.Txn
 		txnErr := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -154,6 +161,9 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 				retryOnAbort.Next()
 			}
 			savedTxn = txn
+			// A map of a savepoint id to the corresponding savepoint token that was
+			// created after applying the savepoint op.
+			spIDToToken := make(map[int]kv.SavepointToken)
 			// First error. Because we need to mark everything that
 			// we didn't "reach" due to a prior error with errOmitted,
 			// we *don't* return eagerly on this but save it to the end.
@@ -176,7 +186,7 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 						continue
 					}
 
-					applyClientOp(ctx, txn, op, true)
+					applyClientOp(ctx, txn, op, true /* inTxn */, &spIDToToken)
 					// The KV api disallows use of a txn after an operation on it errors.
 					if r := op.Result(); r.Type == ResultType_Error {
 						err = errors.DecodeError(ctx, *r.Err)
@@ -219,6 +229,8 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 			o.Txn = savedTxn.TestingCloneTxn()
 			o.Result.OptionalTimestamp = o.Txn.WriteTimestamp
 		}
+	case *SavepointCreateOperation, *SavepointReleaseOperation, *SavepointRollbackOperation:
+		panic(errors.AssertionFailedf(`can't apply a savepoint operation %v outside of a ClosureTxnOperation`, o))
 	default:
 		panic(errors.AssertionFailedf(`unknown operation type: %T %v`, o, o))
 	}
@@ -231,12 +243,15 @@ type dbRunI interface {
 type clientI interface {
 	dbRunI
 	Get(context.Context, interface{}) (kv.KeyValue, error)
-	GetForUpdate(context.Context, interface{}) (kv.KeyValue, error)
+	GetForUpdate(context.Context, interface{}, kvpb.KeyLockingDurabilityType) (kv.KeyValue, error)
+	GetForShare(context.Context, interface{}, kvpb.KeyLockingDurabilityType) (kv.KeyValue, error)
 	Put(context.Context, interface{}, interface{}) error
 	Scan(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
-	ScanForUpdate(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
+	ScanForUpdate(context.Context, interface{}, interface{}, int64, kvpb.KeyLockingDurabilityType) ([]kv.KeyValue, error)
+	ScanForShare(context.Context, interface{}, interface{}, int64, kvpb.KeyLockingDurabilityType) ([]kv.KeyValue, error)
 	ReverseScan(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
-	ReverseScanForUpdate(context.Context, interface{}, interface{}, int64) ([]kv.KeyValue, error)
+	ReverseScanForUpdate(context.Context, interface{}, interface{}, int64, kvpb.KeyLockingDurabilityType) ([]kv.KeyValue, error)
+	ReverseScanForShare(context.Context, interface{}, interface{}, int64, kvpb.KeyLockingDurabilityType) ([]kv.KeyValue, error)
 	Del(context.Context, ...interface{}) ([]roachpb.Key, error)
 	DelRange(context.Context, interface{}, interface{}, bool) ([]roachpb.Key, error)
 }
@@ -268,15 +283,30 @@ func batchRun(
 	return ts, nil
 }
 
-func applyClientOp(ctx context.Context, db clientI, op *Operation, inTxn bool) {
+func applyClientOp(
+	ctx context.Context,
+	db clientI,
+	op *Operation,
+	inTxn bool,
+	spIDToToken *map[int]kv.SavepointToken,
+) {
 	switch o := op.GetValue().(type) {
 	case *GetOperation:
-		fn := (*kv.Batch).Get
-		if o.ForUpdate {
-			fn = (*kv.Batch).GetForUpdate
-		}
 		res, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
-			fn(b, o.Key)
+			if o.SkipLocked {
+				b.Header.WaitPolicy = lock.WaitPolicy_SkipLocked
+			}
+			dur := kvpb.BestEffort
+			if o.GuaranteedDurability {
+				dur = kvpb.GuaranteedDurability
+			}
+			if o.ForUpdate {
+				b.GetForUpdate(o.Key, dur)
+			} else if o.ForShare {
+				b.GetForShare(o.Key, dur)
+			} else {
+				b.Get(o.Key)
+			}
 		})
 		o.Result = resultInit(ctx, err)
 		if err != nil {
@@ -301,16 +331,31 @@ func applyClientOp(ctx context.Context, db clientI, op *Operation, inTxn bool) {
 		}
 		o.Result.OptionalTimestamp = ts
 	case *ScanOperation:
-		fn := (*kv.Batch).Scan
-		if o.Reverse && o.ForUpdate {
-			fn = (*kv.Batch).ReverseScanForUpdate
-		} else if o.Reverse {
-			fn = (*kv.Batch).ReverseScan
-		} else if o.ForUpdate {
-			fn = (*kv.Batch).ScanForUpdate
-		}
 		res, ts, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
-			fn(b, o.Key, o.EndKey)
+			if o.SkipLocked {
+				b.Header.WaitPolicy = lock.WaitPolicy_SkipLocked
+			}
+			dur := kvpb.BestEffort
+			if o.GuaranteedDurability {
+				dur = kvpb.GuaranteedDurability
+			}
+			if o.Reverse {
+				if o.ForUpdate {
+					b.ReverseScanForUpdate(o.Key, o.EndKey, dur)
+				} else if o.ForShare {
+					b.ReverseScanForShare(o.Key, o.EndKey, dur)
+				} else {
+					b.ReverseScan(o.Key, o.EndKey)
+				}
+			} else {
+				if o.ForUpdate {
+					b.ScanForUpdate(o.Key, o.EndKey, dur)
+				} else if o.ForShare {
+					b.ScanForShare(o.Key, o.EndKey, dur)
+				} else {
+					b.Scan(o.Key, o.EndKey)
+				}
+			}
 		})
 		o.Result = resultInit(ctx, err)
 		if err != nil {
@@ -393,9 +438,63 @@ func applyClientOp(ctx context.Context, db clientI, op *Operation, inTxn bool) {
 			return
 		}
 		o.Result.OptionalTimestamp = ts
+	case *BarrierOperation:
+		_, _, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			b.AddRawRequest(&kvpb.BarrierRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    o.Key,
+					EndKey: o.EndKey,
+				},
+				WithLeaseAppliedIndex: o.WithLeaseAppliedIndex,
+			})
+		})
+		o.Result = resultInit(ctx, err)
 	case *BatchOperation:
 		b := &kv.Batch{}
 		applyBatchOp(ctx, b, db.Run, o)
+	case *SavepointCreateOperation:
+		txn, ok := db.(*kv.Txn) // savepoints are only allowed with transactions
+		if !ok {
+			panic(errors.AssertionFailedf(`non-txn interface attempted to create a savepoint %v`, o))
+		}
+		spt, err := txn.CreateSavepoint(ctx)
+		o.Result = resultInit(ctx, err)
+		if err != nil {
+			return
+		}
+		// Map the savepoint id to the newly created savepoint token.
+		if _, ok := (*spIDToToken)[int(o.ID)]; ok {
+			panic(errors.AssertionFailedf("applying a savepoint create op: ID %d already exists", o.ID))
+		}
+		(*spIDToToken)[int(o.ID)] = spt
+	case *SavepointReleaseOperation:
+		txn, ok := db.(*kv.Txn) // savepoints are only allowed with transactions
+		if !ok {
+			panic(errors.AssertionFailedf(`non-txn interface attempted to release a savepoint %v`, o))
+		}
+		spt, ok := (*spIDToToken)[int(o.ID)]
+		if !ok {
+			panic(errors.AssertionFailedf("applying a savepoint release op: ID %d does not exist", o.ID))
+		}
+		err := txn.ReleaseSavepoint(ctx, spt)
+		o.Result = resultInit(ctx, err)
+		if err != nil {
+			return
+		}
+	case *SavepointRollbackOperation:
+		txn, ok := db.(*kv.Txn) // savepoints are only allowed with transactions
+		if !ok {
+			panic(errors.AssertionFailedf(`non-txn interface attempted to rollback a savepoint %v`, o))
+		}
+		spt, ok := (*spIDToToken)[int(o.ID)]
+		if !ok {
+			panic(errors.AssertionFailedf("applying a savepoint rollback op: ID %d does not exist", o.ID))
+		}
+		err := txn.RollbackToSavepoint(ctx, spt)
+		o.Result = resultInit(ctx, err)
+		if err != nil {
+			return
+		}
 	default:
 		panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, o, o))
 	}
@@ -415,8 +514,17 @@ func applyBatchOp(
 	for i := range o.Ops {
 		switch subO := o.Ops[i].GetValue().(type) {
 		case *GetOperation:
+			if subO.SkipLocked {
+				panic(errors.AssertionFailedf(`SkipLocked cannot be used in batches`))
+			}
+			dur := kvpb.BestEffort
+			if subO.GuaranteedDurability {
+				dur = kvpb.GuaranteedDurability
+			}
 			if subO.ForUpdate {
-				b.GetForUpdate(subO.Key)
+				b.GetForUpdate(subO.Key, dur)
+			} else if subO.ForShare {
+				b.GetForShare(subO.Key, dur)
 			} else {
 				b.Get(subO.Key)
 			}
@@ -424,14 +532,29 @@ func applyBatchOp(
 			b.Put(subO.Key, subO.Value())
 			setLastReqSeq(b, subO.Seq)
 		case *ScanOperation:
-			if subO.Reverse && subO.ForUpdate {
-				b.ReverseScanForUpdate(subO.Key, subO.EndKey)
-			} else if subO.Reverse {
-				b.ReverseScan(subO.Key, subO.EndKey)
-			} else if subO.ForUpdate {
-				b.ScanForUpdate(subO.Key, subO.EndKey)
+			if subO.SkipLocked {
+				panic(errors.AssertionFailedf(`SkipLocked cannot be used in batches`))
+			}
+			dur := kvpb.BestEffort
+			if subO.GuaranteedDurability {
+				dur = kvpb.GuaranteedDurability
+			}
+			if subO.Reverse {
+				if subO.ForUpdate {
+					b.ReverseScanForUpdate(subO.Key, subO.EndKey, dur)
+				} else if subO.ForShare {
+					b.ReverseScanForShare(subO.Key, subO.EndKey, dur)
+				} else {
+					b.ReverseScan(subO.Key, subO.EndKey)
+				}
 			} else {
-				b.Scan(subO.Key, subO.EndKey)
+				if subO.ForUpdate {
+					b.ScanForUpdate(subO.Key, subO.EndKey, dur)
+				} else if subO.ForShare {
+					b.ScanForShare(subO.Key, subO.EndKey, dur)
+				} else {
+					b.Scan(subO.Key, subO.EndKey)
+				}
 			}
 		case *DeleteOperation:
 			b.Del(subO.Key)
@@ -444,6 +567,8 @@ func applyBatchOp(
 			setLastReqSeq(b, subO.Seq)
 		case *AddSSTableOperation:
 			panic(errors.AssertionFailedf(`AddSSTable cannot be used in batches`))
+		case *BarrierOperation:
+			panic(errors.AssertionFailedf(`Barrier cannot be used in batches`))
 		default:
 			panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, subO, subO))
 		}
@@ -541,18 +666,57 @@ func getRangeDesc(ctx context.Context, key roachpb.Key, dbs ...*kv.DB) roachpb.R
 
 func newGetReplicasFn(dbs ...*kv.DB) GetReplicasFn {
 	ctx := context.Background()
-	return func(key roachpb.Key) []roachpb.ReplicationTarget {
+	return func(key roachpb.Key) ([]roachpb.ReplicationTarget, []roachpb.ReplicationTarget) {
 		desc := getRangeDesc(ctx, key, dbs...)
 		replicas := desc.Replicas().Descriptors()
-		targets := make([]roachpb.ReplicationTarget, len(replicas))
-		for i, replica := range replicas {
-			targets[i] = roachpb.ReplicationTarget{
+		var voters []roachpb.ReplicationTarget
+		var nonVoters []roachpb.ReplicationTarget
+		for _, replica := range replicas {
+			target := roachpb.ReplicationTarget{
 				NodeID:  replica.NodeID,
 				StoreID: replica.StoreID,
 			}
+			if replica.Type == roachpb.NON_VOTER {
+				nonVoters = append(nonVoters, target)
+			} else {
+				voters = append(voters, target)
+			}
 		}
-		return targets
+		return voters, nonVoters
 	}
+}
+
+func changeClusterSettingInEnv(ctx context.Context, env *Env, op *ChangeSettingOperation) error {
+	var settings map[string]string
+	switch op.Type {
+	case ChangeSettingType_SetLeaseType:
+		switch op.LeaseType {
+		case roachpb.LeaseExpiration:
+			settings = map[string]string{
+				"kv.lease.expiration_leases_only.enabled": "true",
+			}
+		case roachpb.LeaseEpoch:
+			settings = map[string]string{
+				"kv.lease.expiration_leases_only.enabled":       "false",
+				"kv.raft.leader_fortification.fraction_enabled": "0.0",
+			}
+		case roachpb.LeaseLeader:
+			settings = map[string]string{
+				"kv.lease.expiration_leases_only.enabled":       "false",
+				"kv.raft.leader_fortification.fraction_enabled": "1.0",
+			}
+		default:
+			panic(errors.AssertionFailedf(`unknown LeaseType: %v`, op.LeaseType))
+		}
+	default:
+		panic(errors.AssertionFailedf(`unknown ChangeSettingType: %v`, op.Type))
+	}
+	for name, val := range settings {
+		if err := env.SetClusterSetting(ctx, name, val); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func updateZoneConfig(zone *zonepb.ZoneConfig, change ChangeZoneType) {

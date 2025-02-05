@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -62,7 +57,6 @@ func TestApplier(t *testing.T) {
 	sstFile := &storage.MemObject{}
 	{
 		st := cluster.MakeTestingClusterSettings()
-		storage.ValueBlocksEnabled.Override(ctx, &st.SV, true)
 		w := storage.MakeIngestionSSTWriter(ctx, st, sstFile)
 		defer w.Close()
 
@@ -76,7 +70,7 @@ func TestApplier(t *testing.T) {
 		require.NoError(t, w.Finish())
 	}
 
-	a := MakeApplier(env, db, db)
+	a := MakeApplier(env, db)
 
 	tests := []testCase{
 		{
@@ -92,7 +86,59 @@ func TestApplier(t *testing.T) {
 			"get-for-update", step(getForUpdate(k1)),
 		},
 		{
+			"get-for-update-guaranteed-durability", step(getForUpdateGuaranteedDurability(k1)),
+		},
+		{
+			"get-for-share", step(getForShare(k1)),
+		},
+		{
+			"get-for-share-guaranteed-durability", step(getForShareGuaranteedDurability(k1)),
+		},
+		{
+			"get-skip-locked", step(getSkipLocked(k1)),
+		},
+		{
+			"get-for-update-skip-locked", step(getForUpdateSkipLocked(k1)),
+		},
+		{
+			"get-for-update-skip-locked-guaranteed-durability",
+			step(getForUpdateSkipLockedGuaranteedDurability(k1)),
+		},
+		{
+			"get-for-share-skip-locked", step(getForShareSkipLocked(k1)),
+		},
+		{
+			"get-for-share-skip-locked-guaranteed-durability",
+			step(getForShareSkipLockedGuaranteedDurability(k1)),
+		},
+		{
 			"scan-for-update", step(scanForUpdate(k1, k3)),
+		},
+		{
+			"scan-for-update-guaranteed-durability", step(scanForUpdateGuaranteedDurability(k1, k3)),
+		},
+		{
+			"scan-for-share", step(scanForShare(k1, k3)),
+		},
+		{
+			"scan-for-share-guaranteed-durability", step(scanForShareGuaranteedDurability(k1, k3)),
+		},
+		{
+			"scan-skip-locked", step(scanSkipLocked(k1, k3)),
+		},
+		{
+			"scan-for-update-skip-locked", step(scanForUpdateSkipLocked(k1, k3)),
+		},
+		{
+			"scan-for-update-skip-locked-guaranteed-durability",
+			step(scanForUpdateSkipLockedGuaranteedDurability(k1, k3)),
+		},
+		{
+			"scan-for-share-skip-locked", step(scanForShareSkipLocked(k1, k3)),
+		},
+		{
+			"scan-for-share-skip-locked-guaranteed-durability",
+			step(scanForShareSkipLockedGuaranteedDurability(k1, k3)),
 		},
 		{
 			"batch", step(batch(put(k1, 21), delRange(k2, k3, 22))),
@@ -102,6 +148,34 @@ func TestApplier(t *testing.T) {
 		},
 		{
 			"rscan-for-update", step(reverseScanForUpdate(k1, k2)),
+		},
+		{
+			"rscan-for-update-guaranteed-durability",
+			step(reverseScanForUpdateGuaranteedDurability(k1, k2)),
+		},
+		{
+			"rscan-for-share", step(reverseScanForShare(k1, k2)),
+		},
+		{
+			"rscan-for-share-guaranteed-durability",
+			step(reverseScanForShareGuaranteedDurability(k1, k2)),
+		},
+		{
+			"rscan-skip-locked", step(reverseScanSkipLocked(k1, k2)),
+		},
+		{
+			"rscan-for-update-skip-locked", step(reverseScanForUpdateSkipLocked(k1, k2)),
+		},
+		{
+			"rscan-for-update-skip-locked-guaranteed-durability",
+			step(reverseScanForUpdateSkipLockedGuaranteedDurability(k1, k2)),
+		},
+		{
+			"rscan-for-share-skip-locked", step(reverseScanForShareSkipLocked(k1, k2)),
+		},
+		{
+			"rscan-for-share-skip-locked-guaranteed-durability",
+			step(reverseScanForShareSkipLockedGuaranteedDurability(k1, k2)),
 		},
 		{
 			"del", step(del(k2, 1)),
@@ -119,16 +193,51 @@ func TestApplier(t *testing.T) {
 			"get-err", step(get(k1)),
 		},
 		{
+			"get-for-update-err", step(getForUpdate(k1)),
+		},
+		{
+			"get-for-share-err", step(getForShare(k1)),
+		},
+		{
+			"get-skip-locked-err", step(getSkipLocked(k1)),
+		},
+		{
 			"put-err", step(put(k1, 1)),
 		},
 		{
 			"scan-for-update-err", step(scanForUpdate(k1, k3)),
 		},
 		{
+			"scan-for-update-guaranteed-durability-err", step(scanForUpdateGuaranteedDurability(k1, k3)),
+		},
+		{
+			"scan-for-share-err", step(scanForShare(k1, k3)),
+		},
+		{
+			"scan-for-share-guaranteed-durability-err", step(scanForShareGuaranteedDurability(k1, k3)),
+		},
+		{
+			"scan-skip-locked-err", step(scanSkipLocked(k1, k3)),
+		},
+		{
 			"rscan-err", step(reverseScan(k1, k3)),
 		},
 		{
 			"rscan-for-update-err", step(reverseScanForUpdate(k1, k3)),
+		},
+		{
+			"rscan-for-update-guaranteed-durability-err",
+			step(reverseScanForUpdateGuaranteedDurability(k1, k3)),
+		},
+		{
+			"rscan-for-share-err", step(reverseScanForShare(k1, k3)),
+		},
+		{
+			"rscan-for-share-guaranteed-durability-err",
+			step(reverseScanForShareGuaranteedDurability(k1, k3)),
+		},
+		{
+			"rscan-skip-locked-err", step(reverseScanSkipLocked(k1, k3)),
 		},
 		{
 			"del-err", step(del(k2, 1)),
@@ -195,6 +304,24 @@ func TestApplier(t *testing.T) {
 		},
 		{
 			"change-replicas", step(changeReplicas(k1, kvpb.ReplicationChange{ChangeType: roachpb.ADD_VOTER, Target: roachpb.ReplicationTarget{NodeID: 1, StoreID: 1}})),
+		},
+		{
+			"txn-ssi-savepoint", step(closureTxn(ClosureTxnType_Commit, isolation.Serializable, put(k5, 0), createSavepoint(1), put(k5, 2), createSavepoint(3), get(k5))),
+		},
+		{
+			"txn-si-savepoint", step(closureTxn(ClosureTxnType_Commit, isolation.Snapshot, put(k5, 0), createSavepoint(1), put(k5, 2), createSavepoint(3), get(k5))),
+		},
+		{
+			"txn-ssi-release-savepoint", step(closureTxn(ClosureTxnType_Commit, isolation.Serializable, put(k5, 0), createSavepoint(1), put(k5, 2), createSavepoint(3), get(k5), releaseSavepoint(1), get(k5))),
+		},
+		{
+			"txn-si-release-savepoint", step(closureTxn(ClosureTxnType_Commit, isolation.Snapshot, put(k5, 0), createSavepoint(1), put(k5, 2), createSavepoint(3), get(k5), releaseSavepoint(1), get(k5))),
+		},
+		{
+			"txn-ssi-rollback-savepoint", step(closureTxn(ClosureTxnType_Commit, isolation.Serializable, put(k5, 0), createSavepoint(1), put(k5, 2), createSavepoint(3), get(k5), rollbackSavepoint(1), get(k5))),
+		},
+		{
+			"txn-si-rollback-savepoint", step(closureTxn(ClosureTxnType_Commit, isolation.Snapshot, put(k5, 0), createSavepoint(1), put(k5, 2), createSavepoint(3), get(k5), rollbackSavepoint(1), get(k5))),
 		},
 	}
 

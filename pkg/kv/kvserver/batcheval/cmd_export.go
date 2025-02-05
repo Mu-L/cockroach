@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -25,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -38,7 +32,7 @@ const SSTTargetSizeSetting = "kv.bulk_sst.target_size"
 // ExportRequestTargetFileSize controls the target file size for SSTs created
 // during backups.
 var ExportRequestTargetFileSize = settings.RegisterByteSizeSetting(
-	settings.SystemOnly,
+	settings.SystemVisible, // used by BACKUP
 	SSTTargetSizeSetting,
 	fmt.Sprintf("target size for SSTs emitted from export requests; "+
 		"export requests (i.e. BACKUP) may buffer up to the sum of %s and %s in memory",
@@ -76,14 +70,18 @@ func declareKeysExport(
 	latchSpans *spanset.SpanSet,
 	lockSpans *lockspanset.LockSpanSet,
 	maxOffset time.Duration,
-) {
-	DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+) error {
+	err := DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
+	if err != nil {
+		return err
+	}
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeGCThresholdKey(header.RangeID)})
 	// Export requests will usually not hold latches during their evaluation.
 	//
 	// See call to `AssertAllowed()` in GetGCThreshold() to understand why we need
 	// to disable these assertions for export requests.
 	latchSpans.DisableUndeclaredAccessAssertions()
+	return nil
 }
 
 // evalExport dumps the requested keys into files of non-overlapping key ranges
@@ -104,7 +102,12 @@ func evalExport(
 	// ExportRequest is likely to find its target data has been GC'ed at this
 	// point, and so if the range being exported is part of such a table, we do
 	// not want to send back any row data to be backed up.
-	if cArgs.EvalCtx.ExcludeDataFromBackup() {
+	excludeFromBackup, err := cArgs.EvalCtx.ExcludeDataFromBackup(ctx,
+		roachpb.Span{Key: args.Key, EndKey: args.EndKey})
+	if err != nil {
+		return result.Result{}, err
+	}
+	if excludeFromBackup {
 		log.Infof(ctx, "[%s, %s) is part of a table excluded from backup, returning empty ExportResponse", args.Key, args.EndKey)
 		return result.Result{}, nil
 	}
@@ -154,16 +157,18 @@ func evalExport(
 		maxSize = targetSize + uint64(allowedOverage)
 	}
 
-	var maxIntents uint64
-	if m := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV); m > 0 {
-		maxIntents = uint64(m)
+	var maxLockConflicts uint64
+	if m := storage.MaxConflictsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV); m > 0 {
+		maxLockConflicts = uint64(m)
+	}
+
+	var targetLockConflictBytes uint64
+	if m := storage.TargetBytesPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV); m > 0 {
+		targetLockConflictBytes = uint64(m)
 	}
 
 	// Only use resume timestamp if splitting mid key is enabled.
-	resumeKeyTS := hlc.Timestamp{}
-	if args.SplitMidKey {
-		resumeKeyTS = args.ResumeKeyTS
-	}
+	resumeKeyTS := args.ResumeKeyTS
 
 	maybeAnnotateExceedMaxSizeError := func(err error) error {
 		if errors.HasType(err, (*storage.ExceedMaxSizeError)(nil)) {
@@ -177,15 +182,18 @@ func evalExport(
 	for start := args.Key; start != nil; {
 		var destFile bytes.Buffer
 		opts := storage.MVCCExportOptions{
-			StartKey:           storage.MVCCKey{Key: start, Timestamp: resumeKeyTS},
-			EndKey:             args.EndKey,
-			StartTS:            args.StartTime,
-			EndTS:              h.Timestamp,
-			ExportAllRevisions: exportAllRevisions,
-			TargetSize:         targetSize,
-			MaxSize:            maxSize,
-			MaxIntents:         maxIntents,
-			StopMidKey:         args.SplitMidKey,
+			StartKey:                storage.MVCCKey{Key: start, Timestamp: resumeKeyTS},
+			EndKey:                  args.EndKey,
+			StartTS:                 args.StartTime,
+			EndTS:                   h.Timestamp,
+			ExportAllRevisions:      exportAllRevisions,
+			TargetSize:              targetSize,
+			MaxSize:                 maxSize,
+			MaxLockConflicts:        maxLockConflicts,
+			TargetLockConflictBytes: targetLockConflictBytes,
+			StopMidKey:              args.SplitMidKey,
+			ScanStats:               cArgs.ScanStats,
+			IncludeMVCCValueHeader:  args.IncludeMVCCValueHeader,
 		}
 		var summary kvpb.BulkOpSummary
 		var resumeInfo storage.ExportRequestResumeInfo

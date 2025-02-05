@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient_test
 
@@ -38,7 +33,7 @@ func TestConnRecover(t *testing.T) {
 	defer c.Cleanup()
 	ctx := context.Background()
 
-	url, cleanup := sqlutils.PGUrl(t, c.Server.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.Server.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -108,7 +103,7 @@ func simulateServerRestart(
 	t *testing.T, c *cli.TestCLI, p cli.TestCLIParams, conn clisqlclient.Conn,
 ) func() {
 	c.RestartServer(p)
-	url2, cleanup2 := sqlutils.PGUrl(t, c.Server.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+	url2, cleanup2 := sqlutils.PGUrl(t, c.Server.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	conn.SetURL(url2.String())
 	return cleanup2
 }
@@ -121,7 +116,7 @@ func TestTransactionRetry(t *testing.T) {
 	defer c.Cleanup()
 	ctx := context.Background()
 
-	url, cleanup := sqlutils.PGUrl(t, c.Server.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.Server.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())

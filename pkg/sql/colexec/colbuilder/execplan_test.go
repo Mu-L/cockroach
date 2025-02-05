@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colbuilder
 
@@ -17,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -48,8 +42,9 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	// We will set up the following chain:
 	//
@@ -75,7 +70,7 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
-	txn := kv.NewTxn(ctx, s.DB(), s.NodeID())
+	txn := kv.NewTxn(ctx, s.DB(), s.DistSQLPlanningNodeID())
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
 		Mon:     evalCtx.TestingMon,
@@ -86,13 +81,10 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 		NodeID: evalCtx.NodeID,
 	}
 
-	streamingMemAcc := evalCtx.TestingMon.MakeBoundAccount()
-	defer streamingMemAcc.Close(ctx)
-
-	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "t")
 	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
-		&spec, keys.SystemSQLCodec,
+		&spec, s.Codec(),
 		desc, desc.GetPrimaryIndex(),
 		[]descpb.ColumnID{desc.PublicColumns()[0].GetID()},
 	); err != nil {
@@ -103,27 +95,28 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 		Spans:     make([]roachpb.Span, 1),
 	}
 	var err error
-	tr.Spans[0].Key, err = randgen.TestingMakePrimaryIndexKey(desc, 0)
+	tr.Spans[0].Key, err = randgen.TestingMakePrimaryIndexKeyForTenant(desc, s.Codec(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr.Spans[0].EndKey, err = randgen.TestingMakePrimaryIndexKey(desc, numRows+1)
+	tr.Spans[0].EndKey, err = randgen.TestingMakePrimaryIndexKeyForTenant(desc, s.Codec(), numRows+1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	defer closerRegistry.Close(ctx)
 	args := &colexecargs.NewColOperatorArgs{
 		Spec: &execinfrapb.ProcessorSpec{
 			Core:        execinfrapb.ProcessorCoreUnion{TableReader: &tr},
 			ResultTypes: []*types.T{types.Int4},
 		},
-		StreamingMemAccount: &streamingMemAcc,
-		MonitorRegistry:     &monitorRegistry,
+		MonitorRegistry: &monitorRegistry,
+		CloserRegistry:  &closerRegistry,
 	}
 	r1, err := NewColOperator(ctx, flowCtx, args)
 	require.NoError(t, err)
-	defer r1.TestCleanupNoError(t)
 
 	args = &colexecargs.NewColOperatorArgs{
 		Spec: &execinfrapb.ProcessorSpec{
@@ -132,16 +125,15 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 			Post:        execinfrapb.PostProcessSpec{RenderExprs: []execinfrapb.Expression{{Expr: "@1 - 1"}}},
 			ResultTypes: []*types.T{types.Int},
 		},
-		Inputs:              []colexecargs.OpWithMetaInfo{{Root: r1.Root}},
-		StreamingMemAccount: &streamingMemAcc,
-		MonitorRegistry:     &monitorRegistry,
+		Inputs:          []colexecargs.OpWithMetaInfo{{Root: r1.Root}},
+		MonitorRegistry: &monitorRegistry,
+		CloserRegistry:  &closerRegistry,
 	}
 	r, err := NewColOperator(ctx, flowCtx, args)
 	require.NoError(t, err)
-	defer r.TestCleanupNoError(t)
 
 	m := colexec.NewMaterializer(
-		nil, /* allocator */
+		nil, /* streamingMemAcc */
 		flowCtx,
 		0, /* processorID */
 		r.OpWithMetaInfo,
@@ -158,7 +150,9 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 		}
 		require.Equal(t, 1, len(row))
 		expected := tree.DInt(rowIdx)
-		require.True(t, row[0].Datum.Compare(&evalCtx, &expected) == 0)
+		cmp, err := row[0].Datum.Compare(ctx, &evalCtx, &expected)
+		require.NoError(t, err)
+		require.True(t, cmp == 0)
 		rowIdx++
 	}
 	require.Equal(t, numRows, rowIdx)

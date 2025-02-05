@@ -1,14 +1,10 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import moment from "moment-timezone";
+
 import { defaultTimeScaleOptions } from "./utils";
 
 /**
@@ -49,9 +45,9 @@ export class TimeScaleState {
   scale: TimeScale;
   constructor() {
     this.scale = {
-      ...defaultTimeScaleOptions["Past 10 Minutes"],
+      ...defaultTimeScaleOptions["Past Hour"],
       fixedWindowEnd: false,
-      key: "Past 10 Minutes",
+      key: "Past Hour",
     };
   }
 }

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -22,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -33,11 +27,11 @@ import (
 
 // KeyVisualizerServer is a concrete implementation of the keyvispb.KeyVisualizerServer interface.
 type KeyVisualizerServer struct {
-	ie         *sql.InternalExecutor
-	settings   *cluster.Settings
-	nodeDialer *nodedialer.Dialer
-	status     *systemStatusServer
-	node       *Node
+	ie           *sql.InternalExecutor
+	settings     *cluster.Settings
+	kvNodeDialer *nodedialer.Dialer
+	status       *systemStatusServer
+	node         *Node
 }
 
 var _ keyvispb.KeyVisualizerServer = &KeyVisualizerServer{}
@@ -55,7 +49,7 @@ func (s *KeyVisualizerServer) saveBoundaries(
 		ctx,
 		"upsert tenant boundaries",
 		nil,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		`UPSERT INTO system.span_stats_tenant_boundaries(
 			tenant_id,
 			boundaries
@@ -75,7 +69,7 @@ func (s *KeyVisualizerServer) getSamplesFromFanOut(
 	samplePeriod := keyvissettings.SampleInterval.Get(&s.settings.SV)
 
 	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
-		conn, err := s.nodeDialer.Dial(ctx, nodeID, rpc.DefaultClass)
+		conn, err := s.kvNodeDialer.Dial(ctx, nodeID, rpc.DefaultClass)
 		return keyvispb.NewKeyVisualizerClient(conn), err
 	}
 
@@ -109,7 +103,9 @@ func (s *KeyVisualizerServer) getSamplesFromFanOut(
 			nodeID, err)
 	}
 
-	err := s.status.iterateNodes(ctx,
+	err := iterateNodes(ctx,
+		s.status.serverIterator,
+		s.status.stopper,
 		"iterating nodes for key visualizer samples",
 		noTimeout,
 		dialFn,

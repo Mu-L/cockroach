@@ -1,17 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package localcluster
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	gosql "database/sql"
 	"fmt"
@@ -23,7 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"text/tabwriter"
@@ -237,8 +233,8 @@ func (c *Cluster) joins() []string {
 			})
 		}
 	}
-	sort.Slice(joins, func(i, j int) bool {
-		return joins[i].seq < joins[j].seq
+	slices.SortFunc(joins, func(a, b addrAndSeq) int {
+		return cmp.Compare(a.seq, b.seq)
 	})
 
 	if len(joins) == 0 {
@@ -481,7 +477,7 @@ func (n *Node) StatusClient(ctx context.Context) serverpb.StatusClient {
 		return existingClient
 	}
 
-	conn, err := n.rpcCtx.GRPCUnvalidatedDial(n.RPCAddr()).Connect(ctx)
+	conn, err := n.rpcCtx.GRPCUnvalidatedDial(n.RPCAddr(), roachpb.Locality{}).Connect(ctx)
 	if err != nil {
 		log.Fatalf(context.Background(), "failed to initialize status client: %s", err)
 	}
@@ -715,15 +711,19 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 		}
 
 		if n.Cfg.RPCPort == 0 {
-			n.Lock()
-			n.rpcPort = pgURL.Port()
-			n.Unlock()
+			func() {
+				n.Lock()
+				defer n.Unlock()
+				n.rpcPort = pgURL.Port()
+			}()
 		}
 
 		pgURL.Path = n.Cfg.DB
-		n.Lock()
-		n.pgURL = pgURL.String()
-		n.Unlock()
+		func() {
+			n.Lock()
+			defer n.Unlock()
+			n.pgURL = pgURL.String()
+		}()
 
 		var uiURL *url.URL
 
@@ -737,9 +737,11 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 		//
 		// This can be improved by making the below code run opportunistically whenever the
 		// http port is required but isn't initialized yet.
-		n.Lock()
-		n.db = makeDB(n.pgURL, n.Cfg.NumWorkers, n.Cfg.DB)
-		n.Unlock()
+		func() {
+			n.Lock()
+			defer n.Unlock()
+			n.db = makeDB(n.pgURL, n.Cfg.NumWorkers, n.Cfg.DB)
+		}()
 
 		{
 			var uiStr string

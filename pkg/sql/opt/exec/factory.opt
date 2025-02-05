@@ -100,6 +100,8 @@ define HashJoin {
     LeftEqColsAreKey bool
     RightEqColsAreKey bool
     ExtraOnCond tree.TypedExpr
+    EstimatedLeftRowCount uint64
+    EstimatedRightRowCount uint64
 }
 
 # MergeJoin runs a merge join.
@@ -118,6 +120,8 @@ define MergeJoin {
     ReqOrdering exec.OutputOrdering
     LeftEqColsAreKey bool
     RightEqColsAreKey bool
+    EstimatedLeftRowCount uint64
+    EstimatedRightRowCount uint64
 }
 
 # GroupBy runs an aggregation. A set of aggregations is performed for each group
@@ -142,6 +146,14 @@ define GroupBy {
     # The grouping column order type (Streaming, PartialStreaming, or
     # NoStreaming).
     groupingOrderType exec.GroupingOrderType
+
+    # If set, the estimated number of rows that this GroupBy will output
+    # (rounded up).
+    estimatedRowCount uint64
+
+    # If set, the estimated number of rows that this GroupBy will read from its
+    # input (rounded up).
+    estimatedInputRowCount uint64
 }
 
 # ScalarGroupBy runs a scalar aggregation, i.e.  one which performs a set of
@@ -151,6 +163,10 @@ define GroupBy {
 define ScalarGroupBy {
     Input exec.Node
     Aggregations []exec.AggInfo
+
+    # If set, the estimated number of rows that this GroupBy will read from its
+    # input (rounded up).
+    estimatedInputRowCount uint64
 }
 
 # Distinct filters out rows such that only the first row is kept for each set of
@@ -237,6 +253,10 @@ define Sort {
     Input exec.Node
     Ordering exec.OutputOrdering
     AlreadyOrderedPrefix int
+
+    # If set, the estimated number of rows that this sorter will read from its
+    # input (rounded up).
+    estimatedInputRowCount uint64
 }
 
 # Ordinality appends an ordinality column to each row in the input node.
@@ -386,6 +406,10 @@ define TopK {
     K int64
     Ordering exec.OutputOrdering
     AlreadyOrderedPrefix int
+
+    # If set, the estimated number of rows that this TopK sorter will read from
+    # its input (rounded up).
+    estimatedInputRowCount uint64
 }
 
 # Max1Row permits at most one row from the given input node, causing an error
@@ -448,6 +472,7 @@ define Insert {
     InsertCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     CheckCols exec.CheckOrdinalSet
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction, or there are
@@ -464,17 +489,22 @@ define Insert {
 #    insert is not processed through side-effecting expressions.
 #  - there are no self-referencing foreign keys;
 #  - all FK checks can be performed using direct lookups into unique indexes.
+#  - all uniqueness checks can be performed using direct lookups
+#    into an index (could be a key prefix and not the entire key).
 #
-# In this case, the foreign-key checks can run before (or even concurrently
-# with) the insert. If they are run before, the insert is allowed to
-# auto-commit.
+# In this case, the foreign-key and uniqueness checks can run before the insert.
+# Foreign-key checks could potentially be run concurrently with the insert since
+# they are scanning from a different index than is being mutated. If the checks
+# are run before, the insert is allowed to auto-commit.
 define InsertFastPath {
     Rows [][]tree.TypedExpr
     Table cat.Table
     InsertCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     CheckCols exec.CheckOrdinalSet
-    FkChecks []exec.InsertFastPathFKCheck
+    FkChecks []exec.InsertFastPathCheck
+    UniqChecks []exec.InsertFastPathCheck
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction.
@@ -510,6 +540,7 @@ define Update {
     ReturnCols exec.TableColumnOrdinalSet
     Checks exec.CheckOrdinalSet
     Passthrough colinfo.ResultColumns
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     AutoCommit bool
@@ -550,6 +581,7 @@ define Upsert {
     UpdateCols exec.TableColumnOrdinalSet
     ReturnCols exec.TableColumnOrdinalSet
     Checks exec.CheckOrdinalSet
+    UniqueWithTombstonesIndexes cat.IndexOrdinals
 
     # If set, the operator will commit the transaction as part of its execution.
     # This is false when executing inside an explicit transaction, or there are
@@ -767,6 +799,7 @@ define CreateFunction {
     Cr *tree.CreateRoutine
     Deps opt.SchemaDeps
     TypeDeps opt.SchemaTypeDeps
+    FunctionDeps opt.SchemaFunctionDeps
 }
 
 # LiteralValues allows datums to be planned directly that are type checked
@@ -779,4 +812,14 @@ define LiteralValues {
 # ShowCompletions implements SHOW COMPLETIONS.
 define ShowCompletions {
     Command *tree.ShowCompletions
+}
+
+# Call implements CALL for invoking a procedure.
+define Call {
+    Proc *tree.RoutineExpr
+}
+
+# CreateTrigger implements CREATE TRIGGER.
+define CreateTrigger {
+    Ct *tree.CreateTrigger
 }

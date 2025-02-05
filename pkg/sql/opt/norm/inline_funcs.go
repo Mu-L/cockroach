@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
@@ -250,7 +245,7 @@ func (c *CustomFuncs) InlineProjectProject(
 	}
 
 	// Add any outer passthrough columns that refer to inner synthesized columns.
-	newPassthrough := passthrough
+	newPassthrough := passthrough.Copy()
 	if !newPassthrough.Empty() {
 		for i := range innerProjections {
 			item := &innerProjections[i]
@@ -413,7 +408,6 @@ func (c *CustomFuncs) InlineConstVar(f memo.FiltersExpr) memo.FiltersExpr {
 //  4. Its arguments are only Variable or Const expressions.
 //  5. It is not a record-returning function.
 //  6. It does not recursively call itself.
-//  7. It does not have an exception-handling block.
 //
 // UDFs with mutations (INSERT, UPDATE, UPSERT, DELETE) cannot be inlined, but
 // we do not need an explicit check for this because immutable UDFs cannot
@@ -442,13 +436,15 @@ func (c *CustomFuncs) InlineConstVar(f memo.FiltersExpr) memo.FiltersExpr {
 // UDFs used as data sources return multiple columns. Other UDFs returning a
 // single column can be inlined since subqueries can only return a single
 // column.
+//
+// Note: Routines with an exception block or cursor declaration are volatile, so
+// there is no need to check those cases.
 func (c *CustomFuncs) IsInlinableUDF(args memo.ScalarListExpr, udfp *memo.UDFCallPrivate) bool {
 	if udfp.Def == nil {
 		panic(errors.AssertionFailedf("expected non-nil UDF definition"))
 	}
 	if udfp.Def.IsRecursive || udfp.Def.Volatility == volatility.Volatile ||
-		len(udfp.Def.Body) != 1 || udfp.Def.SetReturning || udfp.Def.MultiColDataSource ||
-		udfp.Def.ExceptionBlock != nil {
+		len(udfp.Def.Body) != 1 || udfp.Def.SetReturning || udfp.Def.MultiColDataSource {
 		return false
 	}
 	if !args.IsConstantsAndPlaceholdersAndVariables() {

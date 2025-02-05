@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package acl
 
@@ -214,10 +211,13 @@ func NewWatcher(ctx context.Context, opts ...Option) (*Watcher, error) {
 func (w *Watcher) addAccessController(
 	ctx context.Context, controller AccessController, next chan AccessController,
 ) {
-	w.mu.Lock()
-	index := len(w.controllers)
-	w.controllers = append(w.controllers, controller)
-	w.mu.Unlock()
+	var index int
+	func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		index = len(w.controllers)
+		w.controllers = append(w.controllers, controller)
+	}()
 
 	if next != nil {
 		go func() {
@@ -235,11 +235,15 @@ func (w *Watcher) addAccessController(
 func (w *Watcher) updateAccessController(
 	ctx context.Context, index int, controller AccessController,
 ) {
-	w.mu.Lock()
-	copy := w.listeners.Clone()
-	w.controllers[index] = controller
-	controllers := append([]AccessController(nil), w.controllers...)
-	w.mu.Unlock()
+	var copy *btree.BTree
+	var controllers []AccessController
+	func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		copy = w.listeners.Clone()
+		w.controllers[index] = controller
+		controllers = append([]AccessController(nil), w.controllers...)
+	}()
 
 	checkListeners(ctx, copy, controllers)
 }

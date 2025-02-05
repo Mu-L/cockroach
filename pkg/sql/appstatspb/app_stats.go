@@ -1,17 +1,13 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package appstatspb
 
 import (
 	"math"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
@@ -19,12 +15,16 @@ import (
 // StmtFingerprintID is the type of a Statement's fingerprint ID.
 type StmtFingerprintID uint64
 
+func (s StmtFingerprintID) String() string {
+	return strconv.FormatUint(uint64(s), 10)
+}
+
 // ConstructStatementFingerprintID constructs an ID by hashing query with
-// constants redacted, its database and failure status, and if it was part of an
+// constants redacted, its database, and if it was part of an
 // implicit txn. At the time of writing, these are the axis' we use to bucket
 // queries for stats collection (see stmtKey).
-func ConstructStatementFingerprintID(
-	stmtNoConstants string, failed bool, implicitTxn bool, database string,
+var ConstructStatementFingerprintID = func(
+	stmtNoConstants string, implicitTxn bool, database string,
 ) StmtFingerprintID {
 	fnv := util.MakeFNV64()
 	for _, c := range stmtNoConstants {
@@ -32,11 +32,6 @@ func ConstructStatementFingerprintID(
 	}
 	for _, c := range database {
 		fnv.Add(uint64(c))
-	}
-	if failed {
-		fnv.Add('F')
-	} else {
-		fnv.Add('S')
 	}
 	if implicitTxn {
 		fnv.Add('I')
@@ -49,6 +44,10 @@ func ConstructStatementFingerprintID(
 // TransactionFingerprintID is the hashed string constructed using the
 // individual statement fingerprint IDs that comprise the transaction.
 type TransactionFingerprintID uint64
+
+func (t TransactionFingerprintID) String() string {
+	return strconv.FormatUint(uint64(t), 10)
+}
 
 // InvalidTransactionFingerprintID denotes an invalid transaction fingerprint ID.
 const InvalidTransactionFingerprintID = TransactionFingerprintID(0)
@@ -138,6 +137,33 @@ func (t *TransactionStatistics) Add(other *TransactionStatistics) {
 	t.Count += other.Count
 }
 
+// Add combines CollectedStatementStatistics into a single AggregatedStatementMetadata.
+func (s *AggregatedStatementMetadata) Add(other *CollectedStatementStatistics) {
+	// Only set the value if it hasn't already been set.
+	if s.Query == "" || s.QuerySummary == "" {
+		s.ImplicitTxn = other.Key.ImplicitTxn
+		s.Query = other.Key.Query
+		s.QuerySummary = other.Key.QuerySummary
+		s.StmtType = other.Stats.SQLType
+	}
+
+	// Avoid creating the array if the db names match.
+	if len(s.Databases) != 1 || s.Databases[0] != other.Key.Database {
+		s.Databases = util.CombineUnique(s.Databases, []string{other.Key.Database})
+	}
+
+	if other.Key.DistSQL {
+		s.DistSQLCount++
+	}
+	if other.Key.FullScan {
+		s.FullScanCount++
+	}
+	if other.Key.Vec {
+		s.VecCount++
+	}
+	s.TotalCount++
+}
+
 // Add combines other into this StatementStatistics.
 func (s *StatementStatistics) Add(other *StatementStatistics) {
 	s.FirstAttemptCount += other.FirstAttemptCount
@@ -156,31 +182,37 @@ func (s *StatementStatistics) Add(other *StatementStatistics) {
 	s.RowsRead.Add(other.RowsRead, s.Count, other.Count)
 	s.RowsWritten.Add(other.RowsWritten, s.Count, other.Count)
 	s.Nodes = util.CombineUnique(s.Nodes, other.Nodes)
+	s.KVNodeIDs = util.CombineUnique(s.KVNodeIDs, other.KVNodeIDs)
 	s.Regions = util.CombineUnique(s.Regions, other.Regions)
+	s.UsedFollowerRead = s.UsedFollowerRead || other.UsedFollowerRead
 	s.PlanGists = util.CombineUnique(s.PlanGists, other.PlanGists)
-	s.IndexRecommendations = other.IndexRecommendations
 	s.Indexes = util.CombineUnique(s.Indexes, other.Indexes)
-
 	s.ExecStats.Add(other.ExecStats)
-	s.LatencyInfo.Add(other.LatencyInfo)
-
-	if other.SensitiveInfo.LastErr != "" {
-		s.SensitiveInfo.LastErr = other.SensitiveInfo.LastErr
-	}
-
-	if other.LastErrorCode != "" {
-		s.LastErrorCode = other.LastErrorCode
-	}
+	s.LatencyInfo.MergeMaxMin(other.LatencyInfo)
 
 	if s.SensitiveInfo.MostRecentPlanTimestamp.Before(other.SensitiveInfo.MostRecentPlanTimestamp) {
 		s.SensitiveInfo = other.SensitiveInfo
 	}
 
+	// Use the LastExecTimestamp to decide which object has the last error.
 	if s.LastExecTimestamp.Before(other.LastExecTimestamp) {
 		s.LastExecTimestamp = other.LastExecTimestamp
+
+		if other.SensitiveInfo.LastErr != "" {
+			s.SensitiveInfo.LastErr = other.SensitiveInfo.LastErr
+		}
+
+		if other.LastErrorCode != "" {
+			s.LastErrorCode = other.LastErrorCode
+		}
+	}
+
+	if len(other.IndexRecommendations) > 0 {
+		s.IndexRecommendations = other.IndexRecommendations
 	}
 
 	s.Count += other.Count
+	s.FailureCount += other.FailureCount
 }
 
 // AlmostEqual compares two StatementStatistics and their contained NumericStats
@@ -238,39 +270,12 @@ func (s *ExecStats) Add(other ExecStats) {
 	s.Count += other.Count
 }
 
-// Add combines other into this LatencyInfo.
-func (s *LatencyInfo) Add(other LatencyInfo) {
-	// Use the latest non-zero value.
-	if other.P50 != 0 {
-		s.P50 = other.P50
-		s.P90 = other.P90
-		s.P99 = other.P99
-	}
-
+// MergeMaxMin combines the max and min only into this LatencyInfo.
+func (s *LatencyInfo) MergeMaxMin(other LatencyInfo) {
 	if s.Min == 0 || other.Min < s.Min {
 		s.Min = other.Min
 	}
 	if other.Max > s.Max {
 		s.Max = other.Max
-	}
-	s.checkPercentiles()
-}
-
-// checkPercentiles is a patchy solution and not ideal.
-// When the execution count for a period is smaller than 500,
-// the percentiles sample is including previous aggregation periods,
-// making the p99 possible be greater than the max.
-// For now, we just do a check and update the percentiles to the max
-// possible size.
-// TODO(maryliag): use a proper sample size (#99070)
-func (s *LatencyInfo) checkPercentiles() {
-	if s.P99 > s.Max {
-		s.P99 = s.Max
-	}
-	if s.P90 > s.Max {
-		s.P90 = s.Max
-	}
-	if s.P50 > s.Max {
-		s.P50 = s.Max
 	}
 }

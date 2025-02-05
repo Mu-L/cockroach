@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -16,7 +11,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -25,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -42,10 +37,11 @@ func declareKeysPushTransaction(
 	latchSpans *spanset.SpanSet,
 	_ *lockspanset.LockSpanSet,
 	_ time.Duration,
-) {
+) error {
 	pr := req.(*kvpb.PushTxnRequest)
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.TransactionKey(pr.PusheeTxn.Key, pr.PusheeTxn.ID)})
 	latchSpans.AddNonMVCC(spanset.SpanReadWrite, roachpb.Span{Key: keys.AbortSpanKey(rs.GetRangeID(), pr.PusheeTxn.ID)})
+	return nil
 }
 
 // PushTxn resolves conflicts between concurrent txns (or between
@@ -146,7 +142,8 @@ func PushTxn(
 
 	// Fetch existing transaction; if missing, we're allowed to abort.
 	var existTxn roachpb.Transaction
-	ok, err := storage.MVCCGetProto(ctx, readWriter, key, hlc.Timestamp{}, &existTxn, storage.MVCCGetOptions{})
+	ok, err := storage.MVCCGetProto(ctx, readWriter, key, hlc.Timestamp{}, &existTxn,
+		storage.MVCCGetOptions{ReadCategory: fs.BatchEvalReadCategory})
 	if err != nil {
 		return result.Result{}, err
 	} else if !ok {
@@ -174,6 +171,10 @@ func PushTxn(
 		// then we know we're in either the second or the third case.
 		reply.PusheeTxn = SynthesizeTxnFromMeta(ctx, cArgs.EvalCtx, args.PusheeTxn)
 		if reply.PusheeTxn.Status == roachpb.ABORTED {
+			// The transaction may actually have committed and already removed its
+			// intents and txn record, or it may have aborted and done the same. We
+			// can't know, so mark the abort as ambiguous.
+			reply.AmbiguousAbort = true
 			// If the transaction is uncommittable, we don't even need to
 			// persist an ABORTED transaction record, we can just consider it
 			// aborted. This is good because it allows us to obey the invariant
@@ -304,6 +305,10 @@ func PushTxn(
 	// Determine what to do with the pushee, based on the push type.
 	switch pushType {
 	case kvpb.PUSH_ABORT:
+		if existTxn.Status == roachpb.PREPARED {
+			return result.Result{}, errors.AssertionFailedf(
+				"PUSH_ABORT succeeded against a PREPARED txn: %+v", existTxn)
+		}
 		// If aborting the transaction, set the new status.
 		reply.PusheeTxn.Status = roachpb.ABORTED
 		// Forward the timestamp to accommodate AbortSpan GC. See method comment for
@@ -320,7 +325,8 @@ func PushTxn(
 		// in the timestamp cache.
 		if ok {
 			txnRecord := reply.PusheeTxn.AsRecord()
-			if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord, storage.MVCCWriteOptions{Stats: cArgs.Stats}); err != nil {
+			if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord,
+				storage.MVCCWriteOptions{Stats: cArgs.Stats, Category: fs.BatchEvalReadCategory}); err != nil {
 				return result.Result{}, err
 			}
 		}
@@ -334,17 +340,6 @@ func PushTxn(
 		// cache. We rely on the timestamp cache to prevent the record from ever
 		// being committed with a timestamp beneath this timestamp.
 		reply.PusheeTxn.WriteTimestamp.Forward(args.PushTo)
-		// If the transaction record was already present, continue to update the
-		// transaction record until all nodes are running v23.1. v22.2 nodes won't
-		// know to check the timestamp cache again on commit to learn about any
-		// successful timestamp pushes.
-		// TODO(nvanbenschoten): remove this logic in v23.2.
-		if ok && !cArgs.EvalCtx.ClusterSettings().Version.IsActive(ctx, clusterversion.V23_1) {
-			txnRecord := reply.PusheeTxn.AsRecord()
-			if err := storage.MVCCPutProto(ctx, readWriter, key, hlc.Timestamp{}, &txnRecord, storage.MVCCWriteOptions{Stats: cArgs.Stats}); err != nil {
-				return result.Result{}, err
-			}
-		}
 	default:
 		return result.Result{}, errors.AssertionFailedf("unexpected push type: %v", pushType)
 	}

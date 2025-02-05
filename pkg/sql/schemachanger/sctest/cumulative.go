@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sctest
 
@@ -121,7 +116,6 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 	var testDMLInjectionCase func(
 		t *testing.T, ts CumulativeTestSpec, key stageKey, injectPreCommit bool,
 	)
-	var injectionFunc execInjectionCallback
 	testFunc := func(t *testing.T, ts CumulativeTestSpec) {
 		// Count number of stages in PostCommit and PostCommitNonRevertible phase
 		// for running `stmts` after properly running `setup`.
@@ -136,7 +130,6 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 				}
 			}
 		})
-		injectionFunc = ts.stageExecMap.GetInjectionCallback(t, ts.Rewrite)
 		injectionRanges := ts.stageExecMap.GetInjectionRuns(postCommit, nonRevertible)
 		defer ts.stageExecMap.AssertMapIsUsed(t)
 		injectPreCommits := []bool{false}
@@ -149,7 +142,7 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 		for _, injectPreCommit := range injectPreCommits {
 			for _, injection := range injectionRanges {
 				if !t.Run(
-					fmt.Sprintf("injection stage %v", injection),
+					fmt.Sprintf("injection stage %+v", injection),
 					func(t *testing.T) { testDMLInjectionCase(t, ts, injection, injectPreCommit) },
 				) {
 					return
@@ -167,6 +160,8 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 		var clusterCreated atomic.Bool
 		var tdb *sqlutils.SQLRunner
 		ctx := context.Background()
+		injectionFunc := ts.stageExecMap.GetInjectionCallback(t, ts.Rewrite)
+
 		knobs := &scexec.TestingKnobs{
 			BeforeStage: func(p scplan.Plan, stageIdx int) error {
 				if !clusterCreated.Load() {
@@ -175,6 +170,19 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 					// defaultdb`) and we don't want those to hijack this knob.
 					return nil
 				}
+
+				// if t.Fail/Fatal has been called, try to end the job as quickly as
+				// possible and avoid running any more test code.
+				if t.Failed() && p.InRollback {
+					t.Log("short-circuiting BeforeStage hook due to test failure")
+					return nil
+				}
+
+				if t.Failed() {
+					t.Log("forcing job failure from BeforeStage due to test failure")
+					return jobs.MarkAsPermanentJobError(errors.New("t.Failed() is true"))
+				}
+
 				s := p.Stages[stageIdx]
 				if (injection.phase == p.Stages[stageIdx].Phase &&
 					p.Stages[stageIdx].Ordinal >= injection.minOrdinal &&
@@ -185,6 +193,7 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 					defer jobErrorMutex.Unlock()
 					key := makeStageKey(s.Phase, s.Ordinal, p.InRollback || p.CurrentState.InRollback)
 					if _, ok := usedStages[key.AsInt()]; !ok {
+						t.Logf("Injecting into stage: %s", &key)
 						// Rollbacks don't count towards the successful count
 						if !p.InRollback && !p.CurrentState.InRollback &&
 							p.Stages[stageIdx].Phase != scop.PreCommitPhase {
@@ -203,15 +212,15 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 							}
 						}
 						usedStages[key.AsInt()] = struct{}{}
-						t.Logf("Completed stage: %v", key)
+						t.Logf("Completed stage: %s", &key)
 					} else {
-						t.Logf("Retrying stage: %v", key)
+						t.Logf("Retrying stage: %s", &key)
 					}
-
 				}
 				return nil
 			},
 		}
+
 		runfn := func(s serverutils.TestServerInterface, db *gosql.DB) {
 			clusterCreated.Store(true)
 			tdb = sqlutils.MakeSQLRunner(db)
@@ -235,6 +244,7 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, factory TestServerFac
 			// commits, this enforces any sanity checks one last time in
 			// the final descriptor state.
 			if lastRollbackStageKey != nil {
+				t.Logf("Job transaction committed. Re-inject statements from rollback: %s", lastRollbackStageKey.String())
 				injectionFunc(*lastRollbackStageKey, tdb, successfulStages)
 			}
 			require.Equal(t, errorDetected, schemaChangeErrorRegex != nil)
@@ -362,7 +372,7 @@ func pause(t *testing.T, factory TestServerFactory, cs CumulativeTestCaseSpec) {
 			t.Logf("job %d is paused", jobID)
 
 			// Upgrade the cluster, if applicable.
-			tdb.Exec(t, "SET CLUSTER SETTING VERSION=$1", clusterversion.TestingBinaryVersion.String())
+			tdb.Exec(t, "SET CLUSTER SETTING VERSION=$1", clusterversion.Latest.String())
 
 			// Resume the job and check that it succeeds.
 			tdb.Exec(t, "RESUME JOB $1", jobID)

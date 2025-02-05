@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -107,7 +104,15 @@ func init() {
 	jobspb.ChangefeedDetailsMarshaler = func(m *jobspb.ChangefeedDetails, marshaller *jsonpb.Marshaler) ([]byte, error) {
 		if protoreflect.ShouldRedact(marshaller) {
 			var err error
-			m.SinkURI, err = cloud.SanitizeExternalStorageURI(m.SinkURI, nil)
+			// Redacts user sensitive information from sinkURI.
+			m.SinkURI, err = cloud.SanitizeExternalStorageURI(m.SinkURI, []string{
+				changefeedbase.SinkParamSASLPassword,
+				changefeedbase.SinkParamCACert,
+				changefeedbase.SinkParamClientKey,
+				changefeedbase.SinkParamClientCert,
+				changefeedbase.SinkParamConfluentAPISecret,
+				changefeedbase.SinkParamAzureAccessKey,
+			})
 			if err != nil {
 				return nil, err
 			}

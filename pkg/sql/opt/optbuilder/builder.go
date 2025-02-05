@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -14,6 +9,8 @@ import (
 	"context"
 	"strconv"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/delegate"
@@ -71,6 +68,11 @@ type Builder struct {
 	// This is used when re-preparing invalidated queries.
 	KeepPlaceholders bool
 
+	// SkipAOST is a control knob: if set, optbuilder will not attempt to
+	// validate AS OF SYSTEM TIME clauses. This is used when re-preparing
+	// a statement during session migration.
+	SkipAOST bool
+
 	// -- Results --
 	//
 	// These fields are set during the building process and can be used after
@@ -88,11 +90,14 @@ type Builder struct {
 	factory *norm.Factory
 	stmt    tree.Statement
 
-	ctx        context.Context
-	semaCtx    *tree.SemaContext
-	evalCtx    *eval.Context
-	catalog    cat.Catalog
-	scopeAlloc []scope
+	ctx context.Context
+	// verboseTracing is set if expensive logging is enabled on ctx. If false,
+	// then some work can be omitted.
+	verboseTracing bool
+	semaCtx        *tree.SemaContext
+	evalCtx        *eval.Context
+	catalog        cat.Catalog
+	scopeAlloc     []scope
 
 	// stmtTree tracks the hierarchy of statements to ensure that multiple
 	// modifications to the same table cannot corrupt indexes (see #70731).
@@ -133,16 +138,24 @@ type Builder struct {
 	// are disabled and only statements whitelisted are allowed.
 	insideFuncDef bool
 
+	// If set, we are processing a trigger definition; in this case catalog caches
+	// are disabled.
+	insideTriggerDef bool
+
 	// insideUDF is true when the current expressions are being built within a
 	// UDF.
-	// TODO(mgartner): Once other UDFs can be referenced from within a UDF, a
-	// boolean will not be sufficient to track whether or not we are in a UDF.
-	// We'll need to track the depth of the UDFs we are building expressions
-	// within.
 	insideUDF bool
+
+	// insideSQLRoutine is true when the current expressions are being built
+	// within a SQL UDF or a SQL procedure.
+	insideSQLRoutine bool
 
 	// insideDataSource is true when we are processing a data source.
 	insideDataSource bool
+
+	// insideNestedPLpgSQLCall is true when we are processing a nested PLpgSQL
+	// CALL statement.
+	insideNestedPLpgSQLCall bool
 
 	// If set, we are collecting view dependencies in schemaDeps. This can only
 	// happen inside view/function definitions.
@@ -153,8 +166,9 @@ type Builder struct {
 	// inner view/function).
 	trackSchemaDeps bool
 
-	schemaDeps     opt.SchemaDeps
-	schemaTypeDeps opt.SchemaTypeDeps
+	schemaDeps         opt.SchemaDeps
+	schemaTypeDeps     opt.SchemaTypeDeps
+	schemaFunctionDeps opt.SchemaFunctionDeps
 
 	// If set, the data source names in the AST are rewritten to the fully
 	// qualified version (after resolution). Used to construct the strings for
@@ -170,6 +184,23 @@ type Builder struct {
 	// subqueryNameIdx helps generate unique subquery names during star
 	// expansion.
 	subqueryNameIdx int
+
+	// checkPrivilegeUser helps identify the username.SQLUsername for privilege
+	// checks performed. For routines that are specified with SECURITY
+	// DEFINER, the owner of the routine is checked. Otherwise, the check is
+	// against the user of the current session.
+	checkPrivilegeUser username.SQLUsername
+
+	// builtTriggerFuncs caches already-built trigger functions for a table. It is
+	// necessary to cache these functions since triggers can recursively reference
+	// one another.
+	//
+	// NOTE: Since we map from StableID, multiple mutations to the same table may
+	// reuse the same cached UDFDefinition to invoke a trigger function. This is
+	// ok because UDFDefinitions are independent of the context in which they are
+	// built, and can be safely reused across different call-sites within the same
+	// memo.
+	builtTriggerFuncs map[cat.StableID][]cachedTriggerFunc
 }
 
 // New creates a new Builder structure initialized with the given
@@ -182,13 +213,19 @@ func New(
 	factory *norm.Factory,
 	stmt tree.Statement,
 ) *Builder {
+	// NOTE: This is a hack to get a session setting plumbed into the
+	// type-checker without plumbing evalCtx. This pattern should probably not
+	// be repeated.
+	semaCtx.Properties.IgnoreUnpreferredOverloads = evalCtx.SessionData().LegacyVarcharTyping
 	return &Builder{
-		factory: factory,
-		stmt:    stmt,
-		ctx:     ctx,
-		semaCtx: semaCtx,
-		evalCtx: evalCtx,
-		catalog: catalog,
+		factory:            factory,
+		stmt:               stmt,
+		ctx:                ctx,
+		verboseTracing:     log.ExpensiveLogEnabled(ctx, 2),
+		semaCtx:            semaCtx,
+		evalCtx:            evalCtx,
+		catalog:            catalog,
+		checkPrivilegeUser: catalog.GetCurrentUser(),
 	}
 }
 
@@ -298,15 +335,13 @@ func (b *Builder) buildStmtAtRootWithScope(
 //	rather than a return value so its scopeColumns can be built up
 //	incrementally across several function calls.
 //
-// inScope   This parameter contains the name bindings that are visible for this
+// inScope - This parameter contains the name bindings that are visible for this
+// statement/expression (e.g., passed in from an enclosing statement).
 //
-//	statement/expression (e.g., passed in from an enclosing statement).
-//
-// outScope  This return value contains the newly bound variables that will be
-//
-//	visible to enclosing statements, as well as a pointer to any
-//	"parent" scope that is still visible. The top-level memo expression
-//	for the built statement/expression is returned in outScope.expr.
+// outScope - This return value contains the newly bound variables that will be
+// visible to enclosing statements, as well as a pointer to any
+// "parent" scope that is still visible. The top-level memo expression
+// for the built statement/expression is returned in outScope.expr.
 func (b *Builder) buildStmt(
 	stmt tree.Statement, desiredTypes []*types.T, inScope *scope,
 ) (outScope *scope) {
@@ -326,18 +361,29 @@ func (b *Builder) buildStmt(
 	// An allowlist of statements supported for user defined function.
 	if b.insideFuncDef {
 		switch stmt := stmt.(type) {
-		case *tree.Select, tree.SelectStatement, *tree.Insert, *tree.Update, *tree.Delete:
+		case *tree.Select, tree.SelectStatement:
+		case *tree.Insert, *tree.Update, *tree.Delete:
+		case *tree.Call:
+		case *tree.DoBlock:
+			if !b.evalCtx.Settings.Version.ActiveVersion(b.ctx).IsActive(clusterversion.V25_1) {
+				panic(doBlockVersionErr)
+			}
 		default:
+			if tree.CanModifySchema(stmt) {
+				panic(unimplemented.NewWithIssuef(110080,
+					"%s usage inside a function definition is not supported", stmt.StatementTag(),
+				))
+			}
 			panic(unimplemented.Newf("user-defined functions", "%s usage inside a function definition", stmt.StatementTag()))
 		}
 	}
 
 	switch stmt := stmt.(type) {
 	case *tree.Select:
-		return b.buildSelect(stmt, noRowLocking, desiredTypes, inScope)
+		return b.buildSelect(stmt, noLocking, desiredTypes, inScope)
 
 	case *tree.ParenSelect:
-		return b.buildSelect(stmt.Select, noRowLocking, desiredTypes, inScope)
+		return b.buildSelect(stmt.Select, noLocking, desiredTypes, inScope)
 
 	case *tree.Delete:
 		return b.processWiths(stmt.With, inScope, func(inScope *scope) *scope {
@@ -362,6 +408,15 @@ func (b *Builder) buildStmt(
 
 	case *tree.CreateRoutine:
 		return b.buildCreateFunction(stmt, inScope)
+
+	case *tree.CreateTrigger:
+		return b.buildCreateTrigger(stmt, inScope)
+
+	case *tree.Call:
+		return b.buildProcedure(stmt, inScope)
+
+	case *tree.DoBlock:
+		return b.buildDo(stmt, inScope)
 
 	case *tree.Explain:
 		return b.buildExplain(stmt, inScope)
@@ -481,7 +536,7 @@ func (b *Builder) trackReferencedColumnForViews(col *scopeColumn) {
 
 func (b *Builder) maybeTrackRegclassDependenciesForViews(texpr tree.TypedExpr) {
 	if b.trackSchemaDeps {
-		if texpr.ResolvedType() == types.RegClass {
+		if texpr != nil && texpr.ResolvedType().Identical(types.RegClass) {
 			// We do not add a dependency if the RegClass Expr contains variables,
 			// we cannot resolve the variables in this context. This matches Postgres
 			// behavior.
@@ -515,7 +570,7 @@ func (b *Builder) maybeTrackRegclassDependenciesForViews(texpr tree.TypedExpr) {
 
 func (b *Builder) maybeTrackUserDefinedTypeDepsForViews(texpr tree.TypedExpr) {
 	if b.trackSchemaDeps {
-		if texpr.ResolvedType().UserDefined() {
+		if texpr != nil && texpr.ResolvedType().UserDefined() {
 			typedesc.GetTypeDescriptorClosure(texpr.ResolvedType()).ForEach(func(id descpb.ID) {
 				b.schemaTypeDeps.Add(int(id))
 			})

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gcjob
 
@@ -17,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -46,7 +42,7 @@ func refreshTables(
 	tableIDs []descpb.ID,
 	tableDropTimes map[descpb.ID]int64,
 	indexDropTimes map[descpb.IndexID]int64,
-	jobID jobspb.JobID,
+	job *jobs.Job,
 	progress *jobspb.SchemaChangeGCProgress,
 ) (expired bool, earliestDeadline time.Time) {
 	earliestDeadline = maxDeadline
@@ -55,7 +51,7 @@ func refreshTables(
 		tableHasExpiredElem, tableIsMissing, deadline := updateStatusForGCElements(
 			ctx,
 			execCfg,
-			jobID,
+			job.ID(),
 			tableID,
 			tableDropTimes, indexDropTimes,
 			progress,
@@ -68,7 +64,7 @@ func refreshTables(
 	}
 
 	if expired || haveAnyMissing {
-		persistProgress(ctx, execCfg, jobID, progress, sql.RunningStatusWaitingGC)
+		persistProgress(ctx, execCfg, job, progress, sql.RunningStatusWaitingGC)
 	}
 
 	return expired, earliestDeadline
@@ -104,7 +100,7 @@ func updateStatusForGCElements(
 	earliestDeadline := timeutil.Unix(0, int64(math.MaxInt64))
 
 	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
-		table, err := col.ByID(txn.KV()).Get().Table(ctx, tableID)
+		table, err := col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, tableID)
 		if err != nil {
 			return err
 		}

@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package kvevent defines kvfeed events and buffers to communicate them
 // locally.
@@ -77,13 +74,10 @@ type MemAllocator interface {
 type Type uint8
 
 const (
-	// TypeUnknown indicates the event could not be parsed. Will fail the feed.
-	TypeUnknown Type = iota
-
 	// TypeFlush indicates a request to flush buffered data.
 	// This request type is emitted by blocking buffer when it's blocked, waiting
 	// for more memory.
-	TypeFlush
+	TypeFlush Type = iota
 
 	// TypeKV indicates that the KV, PrevKeyValue, and BackfillTimestamp methods
 	// on the Event meaningful.
@@ -98,6 +92,9 @@ const (
 	// TypeResolved indicates that the Resolved method on the Event will be
 	// meaningful.
 	TypeResolved = resolvedNone
+
+	// number of event types.
+	numEventTypes = TypeResolved + 1
 )
 
 // Event represents an event emitted by a kvfeed. It is either a KV or a
@@ -118,6 +115,27 @@ func (e *Event) Type() Type {
 	default:
 		return e.et
 	}
+}
+
+// Index returns numerical/ordinal type index suitable for indexing into arrays.
+func (t Type) Index() int {
+	switch t {
+	case TypeFlush:
+		return int(TypeFlush)
+	case TypeKV:
+		return int(TypeKV)
+	case TypeResolved, resolvedBackfill, resolvedRestart, resolvedExit:
+		return int(TypeResolved)
+	default:
+		log.Warningf(context.TODO(),
+			"returning TypeFlush boundary type for unknown event type %d", t)
+		return int(TypeFlush)
+	}
+}
+
+// Raw returns the underlying RangeFeedEvent.
+func (e *Event) Raw() *kvpb.RangeFeedEvent {
+	return e.ev
 }
 
 // ApproximateSize returns events approximate size in bytes.

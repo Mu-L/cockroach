@@ -1,25 +1,23 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catkv_test
 
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -30,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -37,7 +36,7 @@ import (
 	"github.com/cockroachdb/datadriven"
 	"github.com/kylelemons/godebug/diff"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 // TestDataDriven exercises the methods of a catkv.CatalogReader in a
@@ -49,151 +48,187 @@ func TestDataDriven(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
-		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
-			DefaultTestTenant: base.TODOTestTenantDisabled,
-			Knobs: base.TestingKnobs{
-				SQLExecutor: &sql.ExecutorTestingKnobs{
-					UseTransactionalDescIDGenerator: true,
-				},
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantAlwaysEnabled,
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				UseTransactionalDescIDGenerator: true,
 			},
-		})
-		defer s.Stopper().Stop(ctx)
-		tdb := sqlutils.MakeSQLRunner(sqlDB)
-		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
-		v := execCfg.Settings.Version.ActiveVersion(ctx)
-		sdc := catkv.NewSystemDatabaseCache(execCfg.Codec, execCfg.Settings)
-		ccr := catkv.NewCatalogReader(execCfg.Codec, v, sdc, nil /* maybeMonitor */)
-		ucr := catkv.NewUncachedCatalogReader(execCfg.Codec)
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
 
-		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) (ret string) {
-			h := testHelper{
-				t:       t,
-				d:       d,
-				execCfg: &execCfg,
-				ucr:     ucr,
-				ccr:     ccr,
-			}
+	for _, tc := range []struct {
+		name  string
+		layer serverutils.ApplicationLayerInterface
+	}{
+		{"system", srv.SystemLayer()},
+		{"app", srv.ApplicationLayer()},
+	} {
+		path := filepath.Join(datapathutils.TestDataPath(t), "testdata_"+tc.name)
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.layer
 
-			switch d.Cmd {
-			case "setup":
-				sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
-				stmts, err := parser.Parse(d.Input)
-				require.NoError(t, err)
-				for _, stmt := range stmts {
-					tdb.Exec(t, stmt.SQL)
+			sqlDB := s.SQLConn(t)
+			tdb := sqlutils.MakeSQLRunner(sqlDB)
+			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+			v := execCfg.Settings.Version.ActiveVersion(ctx)
+			sdc := catkv.NewSystemDatabaseCache(execCfg.Codec, execCfg.Settings)
+			ccr := catkv.NewCatalogReader(execCfg.Codec, v, sdc, nil /* maybeMonitor */)
+			ucr := catkv.NewUncachedCatalogReader(execCfg.Codec)
+
+			datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) (ret string) {
+				h := testHelper{
+					t:       t,
+					d:       d,
+					execCfg: &execCfg,
+					ucr:     ucr,
+					ccr:     ccr,
 				}
-				return ""
 
-			case "reset":
-				ucr.Reset(ctx)
-				ccr.Reset(ctx)
-				return ""
-
-			case "is_id_in_cache":
-				var id int
-				d.ScanArgs(t, "id", &id)
-				return fmt.Sprintf("%v", ccr.IsIDInCache(descpb.ID(id)))
-
-			case "is_name_in_cache":
-				var name string
-				var dbID, scID int
-				d.ScanArgs(t, "name_key", &dbID, &scID, &name)
-				ni := descpb.NameInfo{
-					ParentID:       descpb.ID(dbID),
-					ParentSchemaID: descpb.ID(scID),
-					Name:           name,
-				}
-				return fmt.Sprintf("%v", ccr.IsNameInCache(&ni))
-
-			case "is_desc_id_known_to_not_exist":
-				var id, maybeParentID int
-				d.ScanArgs(t, "id", &id)
-				if d.HasArg("maybe_parent_id") {
-					d.ScanArgs(t, "maybe_parent_id", &maybeParentID)
-				}
-				return fmt.Sprintf("%v", ccr.IsDescIDKnownToNotExist(descpb.ID(id), descpb.ID(maybeParentID)))
-
-			case "scan_all":
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					return cr.ScanAll(ctx, txn)
-				}
-				return h.doCatalogQuery(ctx, q)
-
-			case "scan_all_comments":
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					return cr.ScanAllComments(ctx, txn)
-				}
-				return h.doCatalogQuery(ctx, q)
-
-			case "scan_namespace_for_databases":
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					return cr.ScanNamespaceForDatabases(ctx, txn)
-				}
-				return h.doCatalogQuery(ctx, q)
-
-			case "scan_namespace_for_database_schemas":
-				db := h.argDesc(ctx, "db_id", catalog.Database).(catalog.DatabaseDescriptor)
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					return cr.ScanNamespaceForDatabaseSchemas(ctx, txn, db)
-				}
-				return h.doCatalogQuery(ctx, q)
-
-			case "scan_namespace_for_database_schemas_and_objects":
-				db := h.argDesc(ctx, "db_id", catalog.Database).(catalog.DatabaseDescriptor)
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					return cr.ScanNamespaceForDatabaseSchemasAndObjects(ctx, txn, db)
-				}
-				return h.doCatalogQuery(ctx, q)
-
-			case "scan_namespace_for_schema_objects":
-				db := h.argDesc(ctx, "db_id", catalog.Database).(catalog.DatabaseDescriptor)
-				sc := h.argDesc(ctx, "sc_id", catalog.Schema).(catalog.SchemaDescriptor)
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					return cr.ScanNamespaceForSchemaObjects(ctx, txn, db, sc)
-				}
-				return h.doCatalogQuery(ctx, q)
-
-			case "get_by_ids":
-				var ids []descpb.ID
-				for _, pair := range d.CmdArgs {
-					if len(pair.Vals) != 1 || pair.Key != "id" {
-						t.Fatalf("%s: bad id arguments", d.Pos)
+				switch d.Cmd {
+				case "setup":
+					sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
+					stmts, err := parser.Parse(d.Input)
+					require.NoError(t, err)
+					for _, stmt := range stmts {
+						tdb.Exec(t, stmt.SQL)
 					}
-					idInt, err := strconv.ParseInt(pair.Vals[0], 10, 64)
-					require.NoErrorf(t, err, "%s: bad id arguments", d.Pos)
-					ids = append(ids, descpb.ID(idInt))
-				}
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					const isDescriptorRequired = false
-					return cr.GetByIDs(ctx, txn, ids, isDescriptorRequired, catalog.Any)
-				}
-				return h.doCatalogQuery(ctx, q)
+					return ""
 
-			case "get_by_names":
-				var nis []descpb.NameInfo
-				for _, pair := range d.CmdArgs {
-					if len(pair.Vals) != 3 || pair.Key != "name_key" {
-						t.Fatalf("%s: bad name_key arguments", d.Pos)
-					}
-					dbID, err := strconv.ParseInt(pair.Vals[0], 10, 64)
-					require.NoErrorf(t, err, "%s: bad name_key arguments", d.Pos)
-					scID, err := strconv.ParseInt(pair.Vals[1], 10, 64)
-					require.NoErrorf(t, err, "%s: bad name_key arguments", d.Pos)
-					nis = append(nis, descpb.NameInfo{
+				case "reset":
+					ucr.Reset(ctx)
+					ccr.Reset(ctx)
+					return ""
+
+				case "is_id_in_cache":
+					var id int
+					d.ScanArgs(t, "id", &id)
+					return fmt.Sprintf("%v", ccr.IsIDInCache(descpb.ID(id)))
+
+				case "is_name_in_cache":
+					var name string
+					var dbID, scID int
+					d.ScanArgs(t, "name_key", &dbID, &scID, &name)
+					ni := descpb.NameInfo{
 						ParentID:       descpb.ID(dbID),
 						ParentSchemaID: descpb.ID(scID),
-						Name:           pair.Vals[2],
-					})
+						Name:           name,
+					}
+					return fmt.Sprintf("%v", ccr.IsNameInCache(ni))
+
+				case "is_desc_id_known_to_not_exist":
+					var id, maybeParentID int
+					d.ScanArgs(t, "id", &id)
+					if d.HasArg("maybe_parent_id") {
+						d.ScanArgs(t, "maybe_parent_id", &maybeParentID)
+					}
+					return fmt.Sprintf("%v", ccr.IsDescIDKnownToNotExist(descpb.ID(id), descpb.ID(maybeParentID)))
+
+				case "scan_all":
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.ScanAll(ctx, txn)
+					}
+					return h.doCatalogQuery(ctx, q)
+
+				case "scan_all_comments":
+					db := h.argDesc(ctx, "db_id", catalog.Database).(catalog.DatabaseDescriptor)
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.ScanAllComments(ctx, txn, db)
+					}
+					return h.doCatalogQuery(ctx, q)
+				case "scan_all_comments_nil_db":
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.ScanAllComments(ctx, txn, nil)
+					}
+					return h.doCatalogQuery(ctx, q)
+				case "scan_namespace_for_databases":
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.ScanNamespaceForDatabases(ctx, txn)
+					}
+					return h.doCatalogQuery(ctx, q)
+
+				case "scan_namespace_for_database_schemas":
+					db := h.argDesc(ctx, "db_id", catalog.Database).(catalog.DatabaseDescriptor)
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.ScanNamespaceForDatabaseSchemas(ctx, txn, db)
+					}
+					return h.doCatalogQuery(ctx, q)
+
+				case "scan_namespace_for_database_schemas_and_objects":
+					db := h.argDesc(ctx, "db_id", catalog.Database).(catalog.DatabaseDescriptor)
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.ScanNamespaceForDatabaseSchemasAndObjects(ctx, txn, db)
+					}
+					return h.doCatalogQuery(ctx, q)
+
+				case "scan_namespace_for_schema_objects":
+					db := h.argDesc(ctx, "db_id", catalog.Database).(catalog.DatabaseDescriptor)
+					sc := h.argDesc(ctx, "sc_id", catalog.Schema).(catalog.SchemaDescriptor)
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.ScanNamespaceForSchemaObjects(ctx, txn, db, sc)
+					}
+					return h.doCatalogQuery(ctx, q)
+
+				case "get_by_ids":
+					var ids []descpb.ID
+					for _, pair := range d.CmdArgs {
+						if len(pair.Vals) != 1 || pair.Key != "id" {
+							t.Fatalf("%s: bad id arguments", d.Pos)
+						}
+						idInt, err := strconv.ParseInt(pair.Vals[0], 10, 64)
+						require.NoErrorf(t, err, "%s: bad id arguments", d.Pos)
+						ids = append(ids, descpb.ID(idInt))
+					}
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						const isDescriptorRequired = false
+						return cr.GetByIDs(ctx, txn, ids, isDescriptorRequired, catalog.Any)
+					}
+					return h.doCatalogQuery(ctx, q)
+
+				case "get_by_names":
+					var nis []descpb.NameInfo
+					for _, pair := range d.CmdArgs {
+						if len(pair.Vals) != 3 || pair.Key != "name_key" {
+							t.Fatalf("%s: bad name_key arguments", d.Pos)
+						}
+						dbID, err := strconv.ParseInt(pair.Vals[0], 10, 64)
+						require.NoErrorf(t, err, "%s: bad name_key arguments", d.Pos)
+						scID, err := strconv.ParseInt(pair.Vals[1], 10, 64)
+						require.NoErrorf(t, err, "%s: bad name_key arguments", d.Pos)
+						nis = append(nis, descpb.NameInfo{
+							ParentID:       descpb.ID(dbID),
+							ParentSchemaID: descpb.ID(scID),
+							Name:           pair.Vals[2],
+						})
+					}
+					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+						return cr.GetByNames(ctx, txn, nis)
+					}
+					return h.doCatalogQuery(ctx, q)
+				case "scan_descriptors_in_span":
+					{
+						start := h.parseKeyFromArgKey("start")
+						end := h.parseKeyFromArgKey("end")
+						q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+							return cr.ScanDescriptorsInSpans(ctx, txn, []roachpb.Span{{Key: start, EndKey: end}})
+						}
+						return h.doCatalogQuery(ctx, q)
+					}
+				case "scan_descriptors_in_multiple_spans":
+					{
+						first := h.parseSpanFromArgKey("first")
+						second := h.parseSpanFromArgKey("second")
+						q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
+							return cr.ScanDescriptorsInSpans(ctx, txn, []roachpb.Span{first, second})
+						}
+						return h.doCatalogQuery(ctx, q)
+					}
 				}
-				q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
-					return cr.GetByNames(ctx, txn, nis)
-				}
-				return h.doCatalogQuery(ctx, q)
-			}
-			return fmt.Sprintf("%s: unknown command: %s", d.Pos, d.Cmd)
+				return fmt.Sprintf("%s: unknown command: %s", d.Pos, d.Cmd)
+			})
 		})
-	})
+	}
 }
 
 type testHelper struct {
@@ -201,6 +236,58 @@ type testHelper struct {
 	d        *datadriven.TestData
 	execCfg  *sql.ExecutorConfig
 	ucr, ccr catkv.CatalogReader
+}
+
+func (h testHelper) parseSpanFromArgKey(argkey string) roachpb.Span {
+	arg, exists := h.d.Arg(argkey)
+	if !exists {
+		h.t.Fatalf("scan_descriptors_in_span requires '%s' arg", argkey)
+	}
+	start, end := arg.TwoVals(h.t)
+	return roachpb.Span{
+		Key:    h.parseKeyFromArgStr(start),
+		EndKey: h.parseKeyFromArgStr(end),
+	}
+}
+
+func (h testHelper) parseKeyFromArgKey(argkey string) roachpb.Key {
+	arg, exists := h.d.Arg(argkey)
+	if !exists {
+		h.t.Fatalf("scan_descriptors_in_span requires '%s' arg", argkey)
+	}
+	return h.parseKeyFromArgStr(arg.SingleVal(h.t))
+}
+
+func (h testHelper) parseKeyFromArgStr(argstr string) roachpb.Key {
+	parts := strings.Split(argstr, "/")
+	if len(parts) == 0 {
+		h.t.Fatal("cannot parse key without at least one key part")
+	} else if len(parts) > 4 {
+		h.t.Fatal("key argument has too many parts")
+	}
+
+	tableId, err := strconv.Atoi(parts[0])
+	require.NoError(h.t, err)
+	if len(parts) == 1 {
+		return h.execCfg.Codec.TablePrefix(uint32(tableId))
+	}
+
+	indexId, err := strconv.Atoi(parts[1])
+	require.NoError(h.t, err)
+
+	key := h.execCfg.Codec.IndexPrefix(uint32(tableId), uint32(indexId))
+	if len(parts) == 3 && parts[2] != "" {
+		// only supports integer and string key values
+		if encoding.PeekType([]byte(parts[2])) == encoding.Int {
+			pkey, err := strconv.Atoi(parts[1])
+			require.NoError(h.t, err)
+			return encoding.EncodeVarintAscending(key, int64(pkey))
+		} else {
+			return encoding.EncodeStringAscending(key, parts[2])
+		}
+	}
+
+	return key
 }
 
 func (h testHelper) argDesc(
@@ -231,8 +318,8 @@ type queryFunc func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (n
 
 func (h testHelper) wrappedQuery(
 	ctx context.Context, label string, cr catkv.CatalogReader, unwrapped queryFunc,
-) (c nstree.Catalog, rs tracingpb.RecordedSpan) {
-	err := h.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+) (c nstree.Catalog, rs tracingpb.RecordedSpan, err error) {
+	err = h.execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
 		tracer := h.execCfg.AmbientCtx.Tracer
 		vCtx, vSpan := tracer.StartSpanCtx(
 			ctx, catkv.TestingSpanOperationName, tracing.WithRecording(tracingpb.RecordingVerbose),
@@ -244,8 +331,7 @@ func (h testHelper) wrappedQuery(
 		require.True(h.t, found)
 		return err
 	})
-	require.NoErrorf(h.t, err, "%s: error running query with %s CatalogReader", h.d.Pos, label)
-	return c, rs
+	return c, rs, err
 }
 
 func (h testHelper) doCatalogQuery(ctx context.Context, fn queryFunc) string {
@@ -280,10 +366,15 @@ func (h testHelper) doCatalogQuery(ctx context.Context, fn queryFunc) string {
 	return fmt.Sprintf("%scached:\n%s", u, d)
 }
 
-func (h testHelper) marshalResult(c nstree.Catalog, rs tracingpb.RecordedSpan) string {
+func (h testHelper) marshalResult(
+	c nstree.Catalog, rs tracingpb.RecordedSpan, queryErr error,
+) string {
 	m := map[string]interface{}{
 		"catalog": h.catalogToYaml(c),
 		"trace":   h.traceToYaml(rs),
+	}
+	if queryErr != nil {
+		m["error"] = queryErr.Error()
 	}
 	bytes, err := yaml.Marshal(m)
 	require.NoError(h.t, err)
@@ -340,13 +431,26 @@ func (h testHelper) catalogToYaml(c nstree.Catalog) interface{} {
 		ids.Add(id)
 	}
 	y := make(map[string]interface{})
+
+	var systemDatabaseEntry map[string]interface{}
+	var numSystemObjects int
 	for _, id := range ids.Ordered() {
 		j := m[id]
 		jm := make(map[string]interface{})
+		if id == keys.SystemDatabaseID {
+			systemDatabaseEntry = jm
+		}
 		if j.d != nil {
 			jm["descriptor"] = j.d.DescriptorType()
 		}
 		if j.ns != nil {
+			if j.ns.ParentID == keys.SystemDatabaseID {
+				if systemDatabaseEntry != nil {
+					// Skip this entry, it will be aggregated into the systemEntry.
+					numSystemObjects++
+					continue
+				}
+			}
 			jm["namespace"] = fmt.Sprintf("(%d, %d, %q)",
 				j.ns.ParentID, j.ns.ParentSchemaID, j.ns.Name)
 		}
@@ -370,6 +474,9 @@ func (h testHelper) catalogToYaml(c nstree.Catalog) interface{} {
 		}
 		y[fmt.Sprintf("%03d", id)] = jm
 	}
+	if systemDatabaseEntry != nil {
+		systemDatabaseEntry["num_objects"] = numSystemObjects
+	}
 	return y
 }
 
@@ -381,6 +488,8 @@ func (h testHelper) traceToYaml(rs tracingpb.RecordedSpan) interface{} {
 	for i := range rs.Logs {
 		msgWithFilePrefix := rs.Logs[i].Message.StripMarkers()
 		stripped := re.ReplaceAllString(msgWithFilePrefix, "")
+		// Make the test agnostic of cluster virtualization.
+		stripped = strings.ReplaceAll(stripped, "/Tenant/10", "")
 		l = append(l, stripped)
 	}
 	return l

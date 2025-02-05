@@ -16,7 +16,7 @@ go_library(
     visibility = ["//visibility:public"],
     # Pin the dependencies used in auto-generated code.
     deps = [
-        "//pkg/geo/geoindex",
+        "//pkg/geo/geopb",
         "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/roachpb",
         "//pkg/sql/appstatspb",
@@ -31,10 +31,13 @@ go_library(
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sem/catid",
+        "//pkg/sql/sem/eval",
+        "//pkg/sql/sem/idxtype",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",
         "//pkg/util",
+        "//pkg/util/base64",
         "//pkg/util/errorutil",
         "//pkg/util/humanizeutil",
         "//pkg/util/intsets",
@@ -55,23 +58,23 @@ go_test(
         "output_test.go",
         "plan_gist_test.go",
     ],
-    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]) + [
         "//pkg/sql/opt/testutils/opttester:testfixtures",
     ],
     embed = [":explain"],
     deps = [
         "//pkg/base",
+        "//pkg/multitenant/tenantcapabilities",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/catalog/colinfo",
-        "//pkg/sql/execinfra",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/exec",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/testutils/opttester",
         "//pkg/sql/opt/testutils/testcat",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/testutils",
@@ -103,7 +106,7 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ execexplain $(locations //pkg/sql/opt/exec:defs)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
     visibility = [
         ":__pkg__",
         "//pkg/gen:__pkg__",
@@ -121,7 +124,7 @@ genrule(
     cmd = """
       $(location //pkg/sql/opt/optgen/cmd/optgen) -out $@ execplangist $(locations //pkg/sql/opt/exec:defs)
     """,
-    exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
+    tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
     visibility = [
         ":__pkg__",
         "//pkg/gen:__pkg__",

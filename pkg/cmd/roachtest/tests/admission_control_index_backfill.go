@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
@@ -32,27 +28,27 @@ func registerIndexBackfill(r registry.Registry) {
 	clusterSpec := r.MakeClusterSpec(
 		10, /* nodeCount */
 		spec.CPU(8),
-		spec.Zones("us-east1-b"),
+		spec.WorkloadNode(),
+		spec.WorkloadNodeCPU(8),
 		spec.VolumeSize(500),
-		spec.Cloud(spec.GCE),
+		spec.GCEVolumeType("pd-ssd"),
+		spec.GCEMachineType("n2-standard-8"),
+		spec.GCEZones("us-east1-b"),
 	)
-	clusterSpec.InstanceType = "n2-standard-8"
-	clusterSpec.GCEMinCPUPlatform = "Intel Ice Lake"
-	clusterSpec.GCEVolumeType = "pd-ssd"
 
 	r.Add(registry.TestSpec{
-		Name:            "admission-control/index-backfill",
-		Timeout:         6 * time.Hour,
-		Owner:           registry.OwnerAdmissionControl,
-		Benchmark:       true,
-		Tags:            registry.Tags(`weekly`),
-		Cluster:         clusterSpec,
-		RequiresLicense: true,
-		SnapshotPrefix:  "index-backfill-tpce-100k",
+		Name:             "admission-control/index-backfill",
+		Timeout:          6 * time.Hour,
+		Owner:            registry.OwnerAdmissionControl,
+		Benchmark:        true,
+		CompatibleClouds: registry.OnlyGCE,
+		Suites:           registry.ManualOnly,
+		// TODO(aaditya): Revisit this as part of #111614.
+		//Suites:           registry.Suites(registry.Weekly),
+		//Tags:             registry.Tags(`weekly`),
+		Cluster:        clusterSpec,
+		SnapshotPrefix: "index-backfill-tpce-100k",
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			crdbNodes := c.Spec().NodeCount - 1
-			workloadNode := c.Spec().NodeCount
-
 			snapshots, err := c.ListSnapshots(ctx, vm.VolumeSnapshotListOpts{
 				// TODO(irfansharif): Search by taking in the other parts of the
 				// snapshot fingerprint, i.e. the node count, the version, etc.
@@ -75,7 +71,9 @@ func registerIndexBackfill(r registry.Registry) {
 							t.Fatal(err)
 						}
 
-						path, err := clusterupgrade.UploadVersion(ctx, t, t.L(), c, c.All(), pred)
+						path, err := clusterupgrade.UploadCockroach(
+							ctx, t, t.L(), c, c.All(), clusterupgrade.MustParseVersion(pred),
+						)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -86,9 +84,11 @@ func registerIndexBackfill(r registry.Registry) {
 						// path. The reason it can't just poke at the running
 						// CRDB process is because when grabbing snapshots, CRDB
 						// is not running.
-						c.Run(ctx, c.All(), fmt.Sprintf("cp %s ./cockroach", path))
-						settings := install.MakeClusterSettings(install.NumRacksOption(crdbNodes))
-						if err := c.StartE(ctx, t.L(), option.DefaultStartOptsNoBackups(), settings, c.Range(1, crdbNodes)); err != nil {
+						c.Run(ctx, option.WithNodes(c.All()), fmt.Sprintf("cp %s ./cockroach", path))
+						settings := install.MakeClusterSettings(install.NumRacksOption(len(c.CRDBNodes())))
+						startOpts := option.NewStartOpts(option.NoBackupSchedule)
+						roachtestutil.SetDefaultSQLPort(c, &startOpts.RoachprodOpts)
+						if err := c.StartE(ctx, t.L(), startOpts, settings, c.CRDBNodes()); err != nil {
 							t.Fatal(err)
 						}
 					},
@@ -96,7 +96,7 @@ func registerIndexBackfill(r registry.Registry) {
 					disablePrometheus:  true,
 					setupType:          usingTPCEInit,
 					estimatedSetupTime: 4 * time.Hour,
-					nodes:              crdbNodes,
+					nodes:              len(c.CRDBNodes()),
 					cpus:               clusterSpec.CPUs,
 					ssds:               1,
 					onlySetup:          true,
@@ -127,15 +127,15 @@ func registerIndexBackfill(r registry.Registry) {
 			}
 
 			promCfg := &prometheus.Config{}
-			promCfg.WithPrometheusNode(c.Node(workloadNode).InstallNodes()[0]).
-				WithNodeExporter(c.Range(1, crdbNodes).InstallNodes()).
-				WithCluster(c.Range(1, crdbNodes).InstallNodes()).
+			promCfg.WithPrometheusNode(c.WorkloadNode().InstallNodes()[0]).
+				WithNodeExporter(c.CRDBNodes().InstallNodes()).
+				WithCluster(c.CRDBNodes().InstallNodes()).
 				WithGrafanaDashboard("https://go.crdb.dev/p/index-admission-control-grafana").
 				WithScrapeConfigs(
 					prometheus.MakeWorkloadScrapeConfig("workload", "/",
 						makeWorkloadScrapeNodes(
-							c.Node(workloadNode).InstallNodes()[0],
-							[]workloadInstance{{nodes: c.Node(workloadNode)}},
+							c.WorkloadNode().InstallNodes()[0],
+							[]workloadInstance{{nodes: c.WorkloadNode()}},
 						),
 					),
 				)
@@ -144,11 +144,11 @@ func registerIndexBackfill(r registry.Registry) {
 			// large index backfills while it's running.
 			runTPCE(ctx, t, c, tpceOptions{
 				start: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-					startOpts := option.DefaultStartOptsNoBackups()
-					startOpts.RoachprodOpts.Sequential = false // the cluster's already bootstrapped
-					settings := install.MakeClusterSettings(install.NumRacksOption(crdbNodes))
-					if err := c.StartE(ctx, t.L(), startOpts, settings, c.Range(1, crdbNodes)); err != nil {
+					startOpts := option.NewStartOpts(option.NoBackupSchedule)
+					roachtestutil.SetDefaultSQLPort(c, &startOpts.RoachprodOpts)
+					roachtestutil.SetDefaultAdminUIPort(c, &startOpts.RoachprodOpts)
+					settings := install.MakeClusterSettings(install.NumRacksOption(len(c.CRDBNodes())))
+					if err := c.StartE(ctx, t.L(), startOpts, settings, c.CRDBNodes()); err != nil {
 						t.Fatal(err)
 					}
 				},
@@ -161,7 +161,7 @@ func registerIndexBackfill(r registry.Registry) {
 				nodes:            clusterSpec.NodeCount - 1,
 				cpus:             clusterSpec.CPUs,
 				prometheusConfig: promCfg,
-				workloadDuration: time.Hour,
+				workloadDuration: time.Hour + 30*time.Minute,
 				during: func(ctx context.Context) error {
 					db := c.Conn(ctx, t.L(), 1)
 					defer db.Close()
@@ -176,33 +176,40 @@ func registerIndexBackfill(r registry.Registry) {
 					t.Status(fmt.Sprintf("recording baseline performance (<%s)", 5*time.Minute))
 					time.Sleep(5 * time.Minute)
 
-					// Choose index creations that would take ~30 minutes each.
-					// Offset them by 5 minutes.
-					m := c.NewMonitor(ctx, c.Range(1, crdbNodes))
+					// Choose index creations and primary key changes that would
+					// take ~30 minutes each. Offset them by 5 minutes.
+					//
+					// TODO(irfansharif): These now take closer to an hour after
+					// https://github.com/cockroachdb/cockroach/pull/109085. Do
+					// something about it if customers complain.
+					m := c.NewMonitor(ctx, c.CRDBNodes())
 					m.Go(func(ctx context.Context) error {
-						t.Status(fmt.Sprintf("starting first index creation (<%s)", 30*time.Minute))
+						t.Status(fmt.Sprintf("starting index creation (<%s)", 30*time.Minute))
 						_, err := db.ExecContext(ctx,
 							fmt.Sprintf("CREATE INDEX index_%s ON tpce.cash_transaction (ct_dts)",
 								timeutil.Now().Format("20060102_T150405"),
 							),
 						)
-						t.Status("finished first index creation")
+						t.Status("finished index creation")
 						return err
 					})
 					m.Go(func(ctx context.Context) error {
+						// TODO(irfansharif): Is the re-entrant? As in,
+						// effective when re-running the roachtest against the
+						// same cluster that's already run the test once? Useful
+						// to make it so if possible, to run things more
+						// iteratively.
 						time.Sleep(5 * time.Minute)
-						t.Status(fmt.Sprintf("starting second index creation (<%s)", 30*time.Minute))
+						t.Status(fmt.Sprintf("starting primary key change (<%s)", 30*time.Minute))
 						_, err := db.ExecContext(ctx,
-							fmt.Sprintf("CREATE INDEX index_%s ON tpce.holding_history (hh_before_qty)",
-								timeutil.Now().Format("20060102_T150405"),
-							),
+							"ALTER TABLE tpce.holding_history ALTER PRIMARY KEY USING COLUMNS (hh_h_t_id ASC, hh_t_id ASC, hh_before_qty ASC)",
 						)
-						t.Status("finished second index creation")
+						t.Status("finished primary key change")
 						return err
 					})
 					m.Wait()
 
-					t.Status(fmt.Sprintf("waiting for workload to finish (<%s)", 20*time.Minute))
+					t.Status(fmt.Sprintf("waiting for workload to finish (<%s)", 50*time.Minute))
 					return nil
 				},
 			})

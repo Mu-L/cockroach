@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 syntax = "proto3";
 package cockroach.kv.kvnemesis;
@@ -43,15 +38,21 @@ message ClosureTxnOperation {
 message GetOperation {
   bytes key = 1;
   bool for_update = 2;
-  Result result = 3 [(gogoproto.nullable) = false];
+  bool for_share = 3;
+  bool guaranteed_durability = 4;
+  bool skip_locked = 5;
+  Result result = 6 [(gogoproto.nullable) = false];
 }
 
 message ScanOperation {
   bytes key = 1;
   bytes end_key = 2;
   bool for_update = 3;
-  bool reverse = 4;
-  Result result = 5 [(gogoproto.nullable) = false];
+  bool for_share = 4;
+  bool guaranteed_durability = 5;
+  bool skip_locked = 6;
+  bool reverse = 7;
+  Result result = 8 [(gogoproto.nullable) = false];
 }
 
 message PutOperation {
@@ -89,6 +90,13 @@ message AddSSTableOperation {
   Result result = 6 [(gogoproto.nullable) = false];
 }
 
+message BarrierOperation {
+  bytes key = 1;
+  bytes end_key = 2;
+  bool with_lease_applied_index = 3;
+  Result result = 4 [(gogoproto.nullable) = false];
+}
+
 message SplitOperation {
   bytes key = 1;
   Result result = 2 [(gogoproto.nullable) = false];
@@ -111,12 +119,37 @@ message TransferLeaseOperation {
   Result result = 3 [(gogoproto.nullable) = false];
 }
 
+enum ChangeSettingType {
+  SetLeaseType = 0;
+}
+
+message ChangeSettingOperation {
+  ChangeSettingType type = 1;
+  int32 lease_type = 2 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.LeaseType"];
+  Result result = 3 [(gogoproto.nullable) = false];
+}
+
 enum ChangeZoneType {
   ToggleGlobalReads = 0;
 }
 
 message ChangeZoneOperation {
   ChangeZoneType type = 1;
+  Result result = 2 [(gogoproto.nullable) = false];
+}
+
+message SavepointCreateOperation {
+  int32 id = 1 [(gogoproto.customname) = "ID"];
+  Result result = 2 [(gogoproto.nullable) = false];
+}
+
+message SavepointReleaseOperation {
+  int32 id = 1 [(gogoproto.customname) = "ID"];
+  Result result = 2 [(gogoproto.nullable) = false];
+}
+
+message SavepointRollbackOperation {
+  int32 id = 1 [(gogoproto.customname) = "ID"];
   Result result = 2 [(gogoproto.nullable) = false];
 }
 
@@ -142,8 +175,13 @@ message Operation {
   MergeOperation merge = 14;
   ChangeReplicasOperation change_replicas = 15;
   TransferLeaseOperation transfer_lease = 16;
-  ChangeZoneOperation change_zone = 17;
-  AddSSTableOperation add_sstable = 18 [(gogoproto.customname) = "AddSSTable"];
+  ChangeSettingOperation change_setting = 17;
+  ChangeZoneOperation change_zone = 18;
+  AddSSTableOperation add_sstable = 19 [(gogoproto.customname) = "AddSSTable"];
+  SavepointCreateOperation savepoint_create = 20;
+  SavepointReleaseOperation savepoint_release = 21;
+  SavepointRollbackOperation savepoint_rollback = 22;
+  BarrierOperation barrier = 23;
 }
 
 enum ResultType {

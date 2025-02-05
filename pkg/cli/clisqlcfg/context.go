@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package clisqlcfg defines configuration settings and mechanisms for
 // instances of the SQL shell.
@@ -184,7 +179,7 @@ func (c *Context) MakeConn(url string) (clisqlclient.Conn, error) {
 	// By default, all connections will use the underlying driver to infer
 	// result types. This should be set back to false for any use case where the
 	// results are only shown for textual display.
-	conn.SetAlwaysInferResultTypes(true)
+	_ = conn.SetAlwaysInferResultTypes(true)
 
 	return conn, nil
 }
@@ -198,7 +193,7 @@ func (c *Context) Run(ctx context.Context, conn clisqlclient.Conn) error {
 	// Anything using a SQL shell (e.g. `cockroach sql` or `demo`), only needs
 	// to show results in text format, so the underlying driver doesn't need to
 	// infer types.
-	conn.SetAlwaysInferResultTypes(false)
+	_ = conn.SetAlwaysInferResultTypes(false)
 
 	// Open the connection to make sure everything is OK before running any
 	// statements. Performs authentication.

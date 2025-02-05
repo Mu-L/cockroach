@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecdisk
 
@@ -66,6 +61,19 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	}
 	rng, _ := randutil.NewTestRand()
 
+	// Ensure that coldata-batch-size is in [MinBatchSize, 1024] range. If the
+	// batch size becomes too large, then the test will use multiple GBs of RAM
+	// which might lead to OOMs in some environments.
+	const maxBatchSize = 1024
+	if oldBatchSize := coldata.BatchSize(); oldBatchSize > maxBatchSize {
+		defer func() {
+			require.NoError(t, coldata.SetBatchSizeForTests(oldBatchSize))
+		}()
+		newBatchSize := colexectestutils.MinBatchSize + rng.Intn(maxBatchSize-colexectestutils.MinBatchSize+1)
+		require.NoError(t, coldata.SetBatchSizeForTests(newBatchSize))
+		t.Logf("coldata-batch-size overridden to %d", newBatchSize)
+	}
+
 	// Use the Bytes type because we can control the size of values with it
 	// easily.
 	typs := []*types.T{types.Bytes}
@@ -75,6 +83,8 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	defer closerRegistry.Close(ctx)
 
 	numInMemoryBufferedBatches := 8 + rng.Intn(4)
 	// numNewPartitions determines the expected number of partitions created as
@@ -105,28 +115,22 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	var spilled bool
 	// We multiply by 16 because the external sorter divides by this number.
 	sem := colexecop.NewTestingSemaphore(numFDs * 16)
-	sorter, closers, err := createDiskBackedSorter(
+	sorter, err := createDiskBackedSorter(
 		ctx, flowCtx, []colexecop.Operator{input}, typs, ordCols,
 		0 /* matchLen */, 0 /* k */, func() { spilled = true },
 		0 /* numForcedRepartitions */, false, /* delegateFDAcquisition */
-		queueCfg, sem, &monitorRegistry,
+		queueCfg, sem, &monitorRegistry, &closerRegistry,
 	)
 	require.NoError(t, err)
-	// We expect the disk spiller as well as the external sorter to be included
-	// into the set of closers.
-	require.Equal(t, 2, len(closers))
 
 	sorter.Init(ctx)
 	for b := sorter.Next(); b.Length() > 0; b = sorter.Next() {
-	}
-	for _, c := range closers {
-		require.NoError(t, c.Close(ctx))
 	}
 
 	require.True(t, spilled)
 	require.Zero(t, sem.GetCount(), "sem still reports open FDs")
 
-	externalSorter := colexec.MaybeUnwrapInvariantsChecker(sorter).(*diskSpillerBase).diskBackedOp.(*externalSorter)
+	externalSorter := colexec.MaybeUnwrapInvariantsChecker(sorter).(*oneInputDiskSpiller).diskBackedOp.(*externalSorter)
 	numPartitionsCreated := externalSorter.currentPartitionIdx
 	// This maximum can be achieved when we have minimum required number of FDs
 	// as follows: we expect that each newly created partition contains about
@@ -181,8 +185,9 @@ func TestExternalSortMemoryAccounting(t *testing.T) {
 	// keeping the remaining 0.2 for the output batch (which is never utilized).
 	// This logic lives in createDiskBackedSorter in execplan.go.
 	//
-	// To allow some drift we add another 0.2.
-	expMax := int64(float64(memoryLimit) * 2.8)
+	// To allow some drift (for things like memory used by the disk queue) we
+	// add another 0.7.
+	expMax := int64(float64(memoryLimit) * 3.3)
 	require.GreaterOrEqualf(t, totalMaxMemUsage, expMin, "minimum memory bound not satisfied: "+
 		"actual %d, expected min %d", totalMaxMemUsage, expMin)
 	require.GreaterOrEqualf(t, expMax, totalMaxMemUsage, "maximum memory bound not satisfied: "+
@@ -206,7 +211,8 @@ func createDiskBackedSorter(
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	testingSemaphore semaphore.Semaphore,
 	monitorRegistry *colexecargs.MonitorRegistry,
-) (colexecop.Operator, []colexecop.Closer, error) {
+	closerRegistry *colexecargs.CloserRegistry,
+) (colexecop.Operator, error) {
 	sorterSpec := &execinfrapb.SorterSpec{
 		OutputOrdering:   execinfrapb.Ordering{Columns: ordCols},
 		OrderingMatchLen: uint32(matchLen),
@@ -220,16 +226,16 @@ func createDiskBackedSorter(
 		ResultTypes: typs,
 	}
 	args := &colexecargs.NewColOperatorArgs{
-		Spec:                spec,
-		Inputs:              colexectestutils.MakeInputs(sources),
-		StreamingMemAccount: testMemAcc,
-		DiskQueueCfg:        diskQueueCfg,
-		FDSemaphore:         testingSemaphore,
-		MonitorRegistry:     monitorRegistry,
+		Spec:            spec,
+		Inputs:          colexectestutils.MakeInputs(sources),
+		DiskQueueCfg:    diskQueueCfg,
+		FDSemaphore:     testingSemaphore,
+		MonitorRegistry: monitorRegistry,
+		CloserRegistry:  closerRegistry,
 	}
 	args.TestingKnobs.SpillingCallbackFn = spillingCallbackFn
 	args.TestingKnobs.NumForcedRepartitions = numForcedRepartitions
 	args.TestingKnobs.DelegateFDAcquisitions = delegateFDAcquisitions
 	result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
-	return result.Root, result.ToClose, err
+	return result.Root, err
 }

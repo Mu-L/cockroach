@@ -1,19 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package concurrency
 
 import (
 	"context"
 	"fmt"
-	"runtime/debug"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -27,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -142,8 +137,9 @@ type Config struct {
 	Stopper        *stop.Stopper
 	IntentResolver IntentResolver
 	// Metrics.
-	TxnWaitMetrics *txnwait.Metrics
-	SlowLatchGauge *metric.Gauge
+	TxnWaitMetrics     *txnwait.Metrics
+	SlowLatchGauge     *metric.Gauge
+	LatchWaitDurations metric.IHistogram
 	// Configs + Knobs.
 	MaxLockTableSize  int64
 	DisableTxnPushing bool
@@ -160,7 +156,9 @@ func (c *Config) initDefaults() {
 func NewManager(cfg Config) Manager {
 	cfg.initDefaults()
 	m := new(managerImpl)
-	lt := newLockTable(cfg.MaxLockTableSize, cfg.RangeDesc.RangeID, cfg.Clock, cfg.Settings)
+	lt := maybeWrapInVerifyingLockTable(
+		newLockTable(cfg.MaxLockTableSize, cfg.RangeDesc.RangeID, cfg.Clock, cfg.Settings),
+	)
 	*m = managerImpl{
 		st: cfg.Settings,
 		// TODO(nvanbenschoten): move pkg/storage/spanlatch to a new
@@ -170,6 +168,8 @@ func NewManager(cfg Config) Manager {
 			m: spanlatch.Make(
 				cfg.Stopper,
 				cfg.SlowLatchGauge,
+				cfg.Settings,
+				cfg.LatchWaitDurations,
 			),
 		},
 		lt: lt,
@@ -239,7 +239,7 @@ func (m *managerImpl) SequenceReq(
 	resp, err := m.sequenceReqWithGuard(ctx, g, branch)
 	if resp != nil || err != nil {
 		// Ensure that we release the guard if we return a response or an error.
-		m.FinishReq(g)
+		m.FinishReq(ctx, g)
 		return nil, resp, err
 	}
 	return g, nil, nil
@@ -258,7 +258,7 @@ func (m *managerImpl) sequenceReqWithGuard(
 	// them.
 	if shouldWaitOnLatchesWithoutAcquiring(g.Req) {
 		log.Event(ctx, "waiting on latches without acquiring")
-		return nil, m.lm.WaitFor(ctx, g.Req.LatchSpans, g.Req.PoisonPolicy)
+		return nil, m.lm.WaitFor(ctx, g.Req.LatchSpans, g.Req.PoisonPolicy, g.Req.BaFmt)
 	}
 
 	// Provide the manager with an opportunity to intercept the request. It
@@ -302,7 +302,7 @@ func (m *managerImpl) sequenceReqWithGuard(
 				panic(redact.Safe(fmt.Sprintf("must not be holding latches\n"+
 					"this is tracked in github.com/cockroachdb/cockroach/issues/77663; please comment if seen\n"+
 					"eval_kind=%d, holding_latches=%t, branch=%d, first_iteration=%t, stack=\n%s",
-					g.EvalKind, g.HoldingLatches(), branch, firstIteration, string(debug.Stack()))))
+					g.EvalKind, g.HoldingLatches(), branch, firstIteration, debugutil.Stack())))
 			}
 			log.Event(ctx, "optimistic failed, so waiting for latches")
 			g.lg, err = m.lm.WaitUntilAcquired(ctx, g.lg)
@@ -332,14 +332,17 @@ func (m *managerImpl) sequenceReqWithGuard(
 		} else {
 			// Scan for conflicting locks.
 			log.Event(ctx, "scanning lock table for conflicting locks")
-			g.ltg = m.lt.ScanAndEnqueue(g.Req, g.ltg)
+			g.ltg, err = m.lt.ScanAndEnqueue(g.Req, g.ltg)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// Wait on conflicting locks, if necessary. Note that this will never be
 		// true if ScanOptimistic was called above. Therefore it will also never
 		// be true if latchManager.AcquireOptimistic was called.
 		if g.ltg.ShouldWait() {
-			m.lm.Release(g.moveLatchGuard())
+			m.lm.Release(ctx, g.moveLatchGuard())
 
 			log.Event(ctx, "waiting in lock wait-queues")
 			if err := m.ltw.WaitOn(ctx, g.Req, g.ltg); err != nil {
@@ -361,7 +364,7 @@ func (m *managerImpl) maybeInterceptReq(ctx context.Context, req Request) (Respo
 		// If necessary, wait in the txnWaitQueue for the pushee transaction to
 		// expire or to move to a finalized state.
 		t := req.Requests[0].GetPushTxn()
-		resp, err := m.twq.MaybeWaitForPush(ctx, t)
+		resp, err := m.twq.MaybeWaitForPush(ctx, t, req.WaitPolicy)
 		if err != nil {
 			return nil, err
 		} else if resp != nil {
@@ -423,7 +426,7 @@ func (m *managerImpl) PoisonReq(g *Guard) {
 }
 
 // FinishReq implements the RequestSequencer interface.
-func (m *managerImpl) FinishReq(g *Guard) {
+func (m *managerImpl) FinishReq(ctx context.Context, g *Guard) {
 	// NOTE: we release latches _before_ exiting lock wait-queues deliberately.
 	// Either order would be correct, but the order here avoids non-determinism in
 	// cases where a request A holds both latches and has claimed some keys by
@@ -442,7 +445,7 @@ func (m *managerImpl) FinishReq(g *Guard) {
 	// signaler wakes up (if anyone) will never bump into its mutex immediately
 	// upon resumption.
 	if lg := g.moveLatchGuard(); lg != nil {
-		m.lm.Release(lg)
+		m.lm.Release(ctx, lg)
 	}
 	if ltg := g.moveLockTableGuard(); ltg != nil {
 		m.lt.Dequeue(ltg)
@@ -498,13 +501,13 @@ func (m *managerImpl) HandleLockConflictError(
 	// not releasing lockWaitQueueGuards. We expect the caller of this method to
 	// then re-sequence the Request by calling SequenceReq with the un-latched
 	// Guard. This is analogous to iterating through the loop in SequenceReq.
-	m.lm.Release(g.moveLatchGuard())
+	m.lm.Release(ctx, g.moveLatchGuard())
 
 	// If the discovery process collected a set of intents to resolve before the
 	// next evaluation attempt, do so.
 	if toResolve := g.ltg.ResolveBeforeScanning(); len(toResolve) > 0 {
-		if err := m.ltw.ResolveDeferredIntents(ctx, toResolve); err != nil {
-			m.FinishReq(g)
+		if err := m.ltw.ResolveDeferredIntents(ctx, g.Req.AdmissionHeader, toResolve); err != nil {
+			m.FinishReq(ctx, g)
 			return nil, err
 		}
 	}
@@ -523,7 +526,7 @@ func (m *managerImpl) HandleTransactionPushError(
 	// caller of this method to then re-sequence the Request by calling
 	// SequenceReq with the un-latched Guard. This is analogous to iterating
 	// through the loop in SequenceReq.
-	m.lm.Release(g.moveLatchGuard())
+	m.lm.Release(ctx, g.moveLatchGuard())
 	return g
 }
 
@@ -645,7 +648,7 @@ func (m *managerImpl) TestingTxnWaitQueue() *txnwait.Queue {
 
 // TestingSetMaxLocks implements the TestingAccessor interface.
 func (m *managerImpl) TestingSetMaxLocks(maxLocks int64) {
-	m.lt.(*lockTableImpl).setMaxKeysLocked(maxLocks)
+	m.lt.TestingSetMaxLocks(maxLocks)
 }
 
 func (r *Request) isSingle(m kvpb.Method) bool {
@@ -720,16 +723,33 @@ func (g *Guard) AssertNoLatches() {
 // before the request can evaluate at that later timestamp.
 func (g *Guard) IsolatedAtLaterTimestamps() bool {
 	// If the request acquired any read latches with bounded (MVCC) timestamps
-	// then it can not trivially bump its timestamp without dropping and
-	// re-acquiring those latches. Doing so could allow the request to read at an
-	// unprotected timestamp. We only look at global latch spans because local
+	// then it cannot trivially bump its timestamp without dropping and
+	// re-acquiring those latches. Doing so could allow the request to read at
+	// an unprotected timestamp. We only look at global latch spans because local
 	// latch spans always use unbounded (NonMVCC) timestamps.
-	return len(g.Req.LatchSpans.GetSpans(spanset.SpanReadOnly, spanset.SpanGlobal)) == 0 &&
-		// Similarly, if the request intends to perform any non-locking reads, it
-		// cannot trivially bump its timestamp and expect to be isolated at the
-		// higher timestamp. Bumping its timestamp could cause the request to
-		// conflict with locks that it previously did not conflict with. It must
-		// drop its lockTableGuard and re-scan the lockTable.
+	//
+	// Even still, the existence of read only global latch spans is not enough for
+	// us to determine that the request is not isolated at higher timestamps -- we
+	// must check the timestamps at which the latches are declared as well. That's
+	// because if a read latch is declared at hlc.MaxTimestamp, it is isolated at
+	// higher timestamps; shared locking requests do exactly this.
+	readLatchesIsolatedAtHigherTimestamp := true
+	for _, l := range g.Req.LatchSpans.GetSpans(spanset.SpanReadOnly, spanset.SpanGlobal) {
+		if !l.Timestamp.Equal(hlc.MaxTimestamp) {
+			readLatchesIsolatedAtHigherTimestamp = false
+			break
+		}
+	}
+	// If read latches are isolated at higher timestamps then the request can
+	// trivially bump its timestamp without dropping and re-acquiring those
+	// latches. There's no need to check write latches, as they're always isolated
+	// at higher timestamps.
+	return readLatchesIsolatedAtHigherTimestamp &&
+		// If the request intends to perform any non-locking reads, it cannot
+		// trivially bump its timestamp and expect to be isolated at the higher
+		// timestamp. Bumping its timestamp could cause the request to conflict with
+		// locks that it previously did not conflict with. It must drop its
+		// lockTableGuard and re-scan the lockTable.
 		len(g.Req.LockSpans.GetSpans(lock.None)) == 0
 }
 
@@ -782,9 +802,9 @@ func (g *Guard) CheckOptimisticNoLatchConflicts() (ok bool) {
 // from starving out regular locking requests. In such cases, true is
 // returned, but so is nil.
 func (g *Guard) IsKeyLockedByConflictingTxn(
-	key roachpb.Key, strength lock.Strength,
+	ctx context.Context, key roachpb.Key, strength lock.Strength,
 ) (bool, *enginepb.TxnMeta, error) {
-	return g.ltg.IsKeyLockedByConflictingTxn(key, strength)
+	return g.ltg.IsKeyLockedByConflictingTxn(ctx, key, strength)
 }
 
 func (g *Guard) moveLatchGuard() latchGuard {

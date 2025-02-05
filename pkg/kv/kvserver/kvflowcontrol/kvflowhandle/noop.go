@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvflowhandle
 
@@ -26,8 +21,10 @@ type Noop struct{}
 var _ kvflowcontrol.Handle = Noop{}
 
 // Admit is part of the kvflowcontrol.Handle interface.
-func (n Noop) Admit(ctx context.Context, priority admissionpb.WorkPriority, time time.Time) error {
-	return nil
+func (n Noop) Admit(
+	ctx context.Context, priority admissionpb.WorkPriority, time time.Time,
+) (bool, error) {
+	return false, nil
 }
 
 // DeductTokensFor is part of the kvflowcontrol.Handle interface.

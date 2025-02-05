@@ -1,18 +1,15 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ttljob
 
 import (
 	"bytes"
 	"context"
+	"math"
+	"math/rand"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -34,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -43,10 +41,17 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// ttlProcessor manages the work managed by a single node for a job run by
+// rowLevelTTLResumer. SpanToQueryBounds converts a DistSQL span into
+// QueryBounds. The QueryBounds are passed to SelectQueryBuilder and
+// DeleteQueryBuilder which manage the state for the SELECT/DELETE loop
+// that is run by runTTLOnQueryBounds.
 type ttlProcessor struct {
 	execinfra.ProcessorBase
 	ttlSpec execinfrapb.TTLSpec
 }
+
+var _ execinfra.RowSource = (*ttlProcessor)(nil)
 
 func (t *ttlProcessor) Start(ctx context.Context) {
 	ctx = t.StartInternal(ctx, "ttl")
@@ -54,39 +59,25 @@ func (t *ttlProcessor) Start(ctx context.Context) {
 	t.MoveToDraining(err)
 }
 
-func (t *ttlProcessor) work(ctx context.Context) error {
-
-	ttlSpec := t.ttlSpec
-	flowCtx := t.FlowCtx
-	serverCfg := flowCtx.Cfg
-	db := serverCfg.DB
-	descsCol := flowCtx.Descriptors
-	codec := serverCfg.Codec
-	details := ttlSpec.RowLevelTTLDetails
-	tableID := details.TableID
-
-	deleteRateLimit := ttlSpec.DeleteRateLimit
-	deleteRateLimiter := quotapool.NewRateLimiter(
-		"ttl-delete",
-		quotapool.Limit(deleteRateLimit),
-		deleteRateLimit,
-	)
-
-	processorRowCount := int64(0)
-
-	var (
-		relationName string
-		pkColNames   []string
-		pkColTypes   []*types.T
-		pkColDirs    []catenumpb.IndexColumn_Direction
-		labelMetrics bool
-	)
-	if err := db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+func getTableInfo(
+	ctx context.Context, db descs.DB, descsCol *descs.Collection, tableID descpb.ID,
+) (
+	relationName string,
+	pkColIDs catalog.TableColMap,
+	pkColNames []string,
+	pkColTypes []*types.T,
+	pkColDirs []catenumpb.IndexColumn_Direction,
+	numFamilies int,
+	labelMetrics bool,
+	err error,
+) {
+	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		desc, err := descsCol.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, tableID)
 		if err != nil {
 			return err
 		}
 
+		numFamilies = desc.NumFamilies()
 		var buf bytes.Buffer
 		primaryIndexDesc := desc.GetPrimaryIndex().IndexDesc()
 		pkColNames = make([]string, 0, len(primaryIndexDesc.KeyColumnNames))
@@ -100,6 +91,10 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 			return err
 		}
 		pkColDirs = primaryIndexDesc.KeyColumnDirections
+		pkColIDs = catalog.TableColMap{}
+		for i, id := range primaryIndexDesc.KeyColumnIDs {
+			pkColIDs.Set(id, i)
+		}
 
 		if !desc.HasRowLevelTTL() {
 			return errors.Newf("unable to find TTL on table %s", desc.GetName())
@@ -113,9 +108,49 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 			return errors.Wrapf(err, "error fetching table relation name for TTL")
 		}
 
-		relationName = tn.FQString()
+		relationName = tn.FQString() + "@" + lexbase.EscapeSQLIdent(primaryIndexDesc.Name)
 		return nil
-	}); err != nil {
+	})
+	return relationName, pkColIDs, pkColNames, pkColTypes, pkColDirs, numFamilies, labelMetrics, err
+}
+
+func (t *ttlProcessor) work(ctx context.Context) error {
+
+	ttlSpec := t.ttlSpec
+	flowCtx := t.FlowCtx
+	serverCfg := flowCtx.Cfg
+	db := serverCfg.DB
+	descsCol := flowCtx.Descriptors
+	codec := serverCfg.Codec
+	details := ttlSpec.RowLevelTTLDetails
+	tableID := details.TableID
+	cutoff := details.Cutoff
+	ttlExpr := ttlSpec.TTLExpr
+
+	selectRateLimit := ttlSpec.SelectRateLimit
+	// Default 0 value to "unlimited" in case job started on node <= v23.2.
+	// todo(sql-foundations): Remove this in 25.1 for consistency with
+	//  deleteRateLimit.
+	if selectRateLimit == 0 {
+		selectRateLimit = math.MaxInt64
+	}
+	selectRateLimiter := quotapool.NewRateLimiter(
+		"ttl-select",
+		quotapool.Limit(selectRateLimit),
+		selectRateLimit,
+	)
+
+	deleteRateLimit := ttlSpec.DeleteRateLimit
+	deleteRateLimiter := quotapool.NewRateLimiter(
+		"ttl-delete",
+		quotapool.Limit(deleteRateLimit),
+		deleteRateLimit,
+	)
+
+	relationName, pkColIDs, pkColNames, pkColTypes, pkColDirs, numFamilies, labelMetrics, err := getTableInfo(
+		ctx, db, descsCol, tableID,
+	)
+	if err != nil {
 		return err
 	}
 
@@ -131,25 +166,100 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 	if processorSpanCount < processorConcurrency {
 		processorConcurrency = processorSpanCount
 	}
-	err := func() error {
+	var processorRowCount atomic.Int64
+	var spansProccessedSinceLastUpdate atomic.Int64
+	var rowsProccessedSinceLastUpdate atomic.Int64
+
+	// Update progress for approximately every 1% of spans processed, at least
+	// 60 seconds apart with jitter.
+	updateEvery := max(1, processorSpanCount/100)
+	updateEveryDuration := 60*time.Second + time.Duration(rand.Int63n(10*1000))*time.Millisecond
+	lastUpdated := timeutil.Now()
+	updateFractionCompleted := func() error {
+		jobID := ttlSpec.JobID
+		lastUpdated = timeutil.Now()
+		spansToAdd := spansProccessedSinceLastUpdate.Swap(0)
+		rowsToAdd := rowsProccessedSinceLastUpdate.Swap(0)
+
+		var deletedRowCount, processedSpanCount, totalSpanCount int64
+		var fractionCompleted float32
+
+		err := jobRegistry.UpdateJobWithTxn(
+			ctx,
+			jobID,
+			nil, /* txn */
+			func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+				progress := md.Progress
+				rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
+				rowLevelTTL.JobProcessedSpanCount += spansToAdd
+				rowLevelTTL.JobDeletedRowCount += rowsToAdd
+				deletedRowCount = rowLevelTTL.JobDeletedRowCount
+				processedSpanCount = rowLevelTTL.JobProcessedSpanCount
+				totalSpanCount = rowLevelTTL.JobTotalSpanCount
+
+				fractionCompleted = float32(rowLevelTTL.JobProcessedSpanCount) / float32(rowLevelTTL.JobTotalSpanCount)
+				progress.Progress = &jobspb.Progress_FractionCompleted{
+					FractionCompleted: fractionCompleted,
+				}
+
+				ju.UpdateProgress(progress)
+				return nil
+			},
+		)
+		if err != nil {
+			return err
+		}
+		processorID := t.ProcessorID
+		log.Infof(
+			ctx,
+			"TTL fractionCompleted updated processorID=%d tableID=%d deletedRowCount=%d processedSpanCount=%d totalSpanCount=%d fractionCompleted=%.3f",
+			processorID, tableID, deletedRowCount, processedSpanCount, totalSpanCount, fractionCompleted,
+		)
+		return nil
+	}
+
+	err = func() error {
 		boundsChan := make(chan QueryBounds, processorConcurrency)
 		defer close(boundsChan)
 		for i := int64(0); i < processorConcurrency; i++ {
 			group.GoCtx(func(ctx context.Context) error {
 				for bounds := range boundsChan {
 					start := timeutil.Now()
+					selectBuilder := MakeSelectQueryBuilder(
+						SelectQueryParams{
+							RelationName:      relationName,
+							PKColNames:        pkColNames,
+							PKColDirs:         pkColDirs,
+							Bounds:            bounds,
+							AOSTDuration:      ttlSpec.AOSTDuration,
+							SelectBatchSize:   ttlSpec.SelectBatchSize,
+							TTLExpr:           ttlExpr,
+							SelectDuration:    metrics.SelectDuration,
+							SelectRateLimiter: selectRateLimiter,
+						},
+						cutoff,
+					)
+					deleteBuilder := MakeDeleteQueryBuilder(
+						DeleteQueryParams{
+							RelationName:      relationName,
+							PKColNames:        pkColNames,
+							DeleteBatchSize:   ttlSpec.DeleteBatchSize,
+							TTLExpr:           ttlExpr,
+							DeleteDuration:    metrics.DeleteDuration,
+							DeleteRateLimiter: deleteRateLimiter,
+						},
+						cutoff,
+					)
 					spanRowCount, err := t.runTTLOnQueryBounds(
 						ctx,
 						metrics,
-						bounds,
-						pkColNames,
-						pkColDirs,
-						relationName,
-						deleteRateLimiter,
+						selectBuilder,
+						deleteBuilder,
 					)
 					// add before returning err in case of partial success
-					atomic.AddInt64(&processorRowCount, spanRowCount)
-					metrics.SpanTotalDuration.RecordValue(int64(timeutil.Since(start)))
+					processorRowCount.Add(spanRowCount)
+					rowsProccessedSinceLastUpdate.Add(spanRowCount)
+					spansProccessedSinceLastUpdate.Add(1)
 					if err != nil {
 						// Continue until channel is fully read.
 						// Otherwise, the keys input will be blocked.
@@ -157,6 +267,7 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 						}
 						return err
 					}
+					metrics.SpanTotalDuration.RecordValue(int64(timeutil.Since(start)))
 				}
 				return nil
 			})
@@ -170,8 +281,10 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 				ctx,
 				kvDB,
 				codec,
+				pkColIDs,
 				pkColTypes,
 				pkColDirs,
+				numFamilies,
 				span,
 				&alloc,
 			); err != nil {
@@ -179,6 +292,17 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 			} else if hasRows {
 				// Only process bounds from spans with rows inside them.
 				boundsChan <- bounds
+			} else {
+				// If the span has no rows, we still need to increment the processed
+				// count.
+				spansProccessedSinceLastUpdate.Add(1)
+			}
+
+			if spansProccessedSinceLastUpdate.Load() >= updateEvery &&
+				timeutil.Since(lastUpdated) >= updateEveryDuration {
+				if err := updateFractionCompleted(); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -190,47 +314,51 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 	if err := group.Wait(); err != nil {
 		return err
 	}
+	if err := updateFractionCompleted(); err != nil {
+		return err
+	}
 
 	sqlInstanceID := flowCtx.NodeID.SQLInstanceID()
 	jobID := ttlSpec.JobID
 	return jobRegistry.UpdateJobWithTxn(
 		ctx,
 		jobID,
-		nil,  /* txn */
-		true, /* useReadLock */
+		nil, /* txn */
 		func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 			progress := md.Progress
 			rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
-			rowLevelTTL.JobRowCount += processorRowCount
 			processorID := t.ProcessorID
 			rowLevelTTL.ProcessorProgresses = append(rowLevelTTL.ProcessorProgresses, jobspb.RowLevelTTLProcessorProgress{
 				ProcessorID:          processorID,
 				SQLInstanceID:        sqlInstanceID,
-				ProcessorRowCount:    processorRowCount,
+				ProcessorRowCount:    processorRowCount.Load(),
 				ProcessorSpanCount:   processorSpanCount,
 				ProcessorConcurrency: processorConcurrency,
 			})
+			var fractionCompleted float32
+			if f, ok := progress.Progress.(*jobspb.Progress_FractionCompleted); ok {
+				fractionCompleted = f.FractionCompleted
+			}
 			ju.UpdateProgress(progress)
 			log.VInfof(
 				ctx,
 				2, /* level */
-				"TTL processorRowCount updated jobID=%d processorID=%d sqlInstanceID=%d tableID=%d jobRowCount=%d processorRowCount=%d",
-				jobID, processorID, sqlInstanceID, tableID, rowLevelTTL.JobRowCount, processorRowCount,
+				"TTL processorRowCount updated processorID=%d sqlInstanceID=%d tableID=%d jobRowCount=%d processorRowCount=%d fractionCompleted=%.3f",
+				processorID, sqlInstanceID, tableID, rowLevelTTL.JobDeletedRowCount, processorRowCount.Load(), fractionCompleted,
 			)
 			return nil
 		},
 	)
 }
 
-// spanRowCount should be checked even if the function returns an error because it may have partially succeeded
+// runTTLOnQueryBounds runs the SELECT/DELETE loop for a single DistSQL span.
+// spanRowCount should be checked even if the function returns an error
+// because it may have partially succeeded.
 func (t *ttlProcessor) runTTLOnQueryBounds(
 	ctx context.Context,
 	metrics rowLevelTTLMetrics,
-	bounds QueryBounds,
-	pkColNames []string,
-	pkColDirs []catenumpb.IndexColumn_Direction,
-	relationName string,
-	deleteRateLimiter *quotapool.RateLimiter,
+	selectBuilder SelectQueryBuilder,
+	deleteBuilder DeleteQueryBuilder,
 ) (spanRowCount int64, err error) {
 	metrics.NumActiveSpans.Inc(1)
 	defer metrics.NumActiveSpans.Dec(1)
@@ -239,42 +367,9 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 
 	ttlSpec := t.ttlSpec
 	details := ttlSpec.RowLevelTTLDetails
-	cutoff := details.Cutoff
-	ttlExpr := ttlSpec.TTLExpr
 	flowCtx := t.FlowCtx
 	serverCfg := flowCtx.Cfg
 	ie := serverCfg.DB.Executor()
-
-	selectBatchSize := ttlSpec.SelectBatchSize
-
-	aostDuration := ttlSpec.AOSTDuration
-	if aostDuration == 0 {
-		// Read AOST in case of mixed 22.2.0/22.2.1+ cluster where the job started on a 22.2.0 node.
-		//lint:ignore SA1019 execinfrapb.TTLSpec.AOST is deprecated
-		aost := ttlSpec.AOST
-		if !aost.IsZero() {
-			aostDuration = aost.Sub(details.Cutoff)
-		}
-	}
-
-	selectBuilder := MakeSelectQueryBuilder(
-		cutoff,
-		pkColNames,
-		pkColDirs,
-		relationName,
-		bounds,
-		aostDuration,
-		selectBatchSize,
-		ttlExpr,
-	)
-	deleteBatchSize := ttlSpec.DeleteBatchSize
-	deleteBuilder := MakeDeleteQueryBuilder(
-		cutoff,
-		pkColNames,
-		relationName,
-		deleteBatchSize,
-		ttlExpr,
-	)
 
 	preSelectStatement := ttlSpec.PreSelectStatement
 	if preSelectStatement != "" {
@@ -282,7 +377,9 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 			ctx,
 			"pre-select-delete-statement",
 			nil, /* txn */
-			sessiondata.RootUserSessionDataOverride,
+			// This is a test-only knob, so we're ok not specifying custom
+			// InternalExecutorOverride.
+			sessiondata.NodeUserSessionDataOverride,
 			preSelectStatement,
 		); err != nil {
 			return spanRowCount, err
@@ -292,22 +389,22 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 	settingsValues := &serverCfg.Settings.SV
 	for {
 		// Check the job is enabled on every iteration.
-		if err := checkEnabled(settingsValues); err != nil {
+		if err := ttlbase.CheckJobEnabled(settingsValues); err != nil {
 			return spanRowCount, err
 		}
 
 		// Step 1. Fetch some rows we want to delete using a historical
 		// SELECT query.
-		start := timeutil.Now()
 		expiredRowsPKs, hasNext, err := selectBuilder.Run(ctx, ie)
-		metrics.SelectDuration.RecordValue(int64(timeutil.Since(start)))
 		if err != nil {
 			return spanRowCount, errors.Wrapf(err, "error selecting rows to delete")
 		}
+
 		numExpiredRows := int64(len(expiredRowsPKs))
 		metrics.RowSelections.Inc(numExpiredRows)
 
 		// Step 2. Delete the rows which have expired.
+		deleteBatchSize := deleteBuilder.DeleteBatchSize
 		for startRowIdx := int64(0); startRowIdx < numExpiredRows; startRowIdx += deleteBatchSize {
 			until := startRowIdx + deleteBatchSize
 			if until > numExpiredRows {
@@ -317,6 +414,9 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 			var batchRowCount int64
 			do := func(ctx context.Context, txn isql.Txn) error {
 				txn.KV().SetDebugName("ttljob-delete-batch")
+				if ttlSpec.DisableChangefeedReplication {
+					txn.KV().SetOmitInRangefeeds()
+				}
 				// If we detected a schema change here, the DELETE will not succeed
 				// (the SELECT still will because of the AOST). Early exit here.
 				desc, err := flowCtx.Descriptors.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, details.TableID)
@@ -329,22 +429,14 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 						desc.GetModificationTime().GoTime().Format(time.RFC3339),
 					)
 				}
-				tokens, err := deleteRateLimiter.Acquire(ctx, int64(len(deleteBatch)))
-				if err != nil {
-					return err
-				}
-				defer tokens.Consume()
-
-				start := timeutil.Now()
 				batchRowCount, err = deleteBuilder.Run(ctx, txn, deleteBatch)
 				if err != nil {
 					return err
 				}
-				metrics.DeleteDuration.RecordValue(int64(timeutil.Since(start)))
 				return nil
 			}
 			if err := serverCfg.DB.Txn(
-				ctx, do, isql.SteppingEnabled(), isql.WithPriority(admissionpb.TTLLowPri),
+				ctx, do, isql.SteppingEnabled(), isql.WithPriority(admissionpb.BulkLowPri),
 			); err != nil {
 				return spanRowCount, errors.Wrapf(err, "error during row deletion")
 			}
@@ -395,15 +487,16 @@ func SpanToQueryBounds(
 	ctx context.Context,
 	kvDB *kv.DB,
 	codec keys.SQLCodec,
+	pkColIDs catalog.TableColMap,
 	pkColTypes []*types.T,
 	pkColDirs []catenumpb.IndexColumn_Direction,
+	numFamilies int,
 	span roachpb.Span,
 	alloc *tree.DatumAlloc,
 ) (bounds QueryBounds, hasRows bool, _ error) {
-	const maxRows = 1
 	partialStartKey := span.Key
 	partialEndKey := span.EndKey
-	startKeyValues, err := kvDB.Scan(ctx, partialStartKey, partialEndKey, maxRows)
+	startKeyValues, err := kvDB.Scan(ctx, partialStartKey, partialEndKey, int64(numFamilies))
 	if err != nil {
 		return bounds, false, errors.Wrapf(err, "scan error startKey=%x endKey=%x", []byte(partialStartKey), []byte(partialEndKey))
 	}
@@ -411,7 +504,7 @@ func SpanToQueryBounds(
 	if len(startKeyValues) == 0 {
 		return bounds, false, nil
 	}
-	endKeyValues, err := kvDB.ReverseScan(ctx, partialStartKey, partialEndKey, maxRows)
+	endKeyValues, err := kvDB.ReverseScan(ctx, partialStartKey, partialEndKey, int64(numFamilies))
 	if err != nil {
 		return bounds, false, errors.Wrapf(err, "reverse scan error startKey=%x endKey=%x", []byte(partialStartKey), []byte(partialEndKey))
 	}
@@ -421,15 +514,13 @@ func SpanToQueryBounds(
 	if len(endKeyValues) == 0 {
 		return bounds, false, nil
 	}
-	startKey := startKeyValues[0].Key
-	bounds.Start, err = rowenc.DecodeIndexKeyToDatums(codec, pkColTypes, pkColDirs, startKey, alloc)
+	bounds.Start, err = rowenc.DecodeIndexKeyToDatums(codec, pkColIDs, pkColTypes, pkColDirs, startKeyValues, alloc)
 	if err != nil {
-		return bounds, false, errors.Wrapf(err, "decode startKey error key=%x", []byte(startKey))
+		return bounds, false, errors.Wrapf(err, "decode startKeyValues error on %+v", startKeyValues)
 	}
-	endKey := endKeyValues[0].Key
-	bounds.End, err = rowenc.DecodeIndexKeyToDatums(codec, pkColTypes, pkColDirs, endKey, alloc)
+	bounds.End, err = rowenc.DecodeIndexKeyToDatums(codec, pkColIDs, pkColTypes, pkColDirs, endKeyValues, alloc)
 	if err != nil {
-		return bounds, false, errors.Wrapf(err, "decode endKey error key=%x", []byte(endKey))
+		return bounds, false, errors.Wrapf(err, "decode endKeyValues error on %+v", endKeyValues)
 	}
 	return bounds, true, nil
 }

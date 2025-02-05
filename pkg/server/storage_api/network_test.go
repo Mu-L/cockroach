@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
@@ -16,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -35,7 +31,22 @@ func TestNetworkConnectivity(t *testing.T) {
 	})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
-	ts := testCluster.Server(0)
+
+	s0 := testCluster.Server(0)
+
+	if s0.TenantController().StartedDefaultTestTenant() {
+		_, err := s0.SystemLayer().SQLConn(t).Exec(
+			`ALTER TENANT [$1] GRANT CAPABILITY can_debug_process=true`,
+			serverutils.TestTenantID().ToUint64(),
+		)
+		require.NoError(t, err)
+
+		serverutils.WaitForTenantCapabilities(t, s0, serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
+			tenantcapabilities.CanDebugProcess: "true",
+		}, "")
+	}
+
+	ts := s0.ApplicationLayer()
 
 	var resp serverpb.NetworkConnectivityResponse
 	// Should wait because endpoint relies on Gossip.
@@ -60,13 +71,35 @@ func TestNetworkConnectivity(t *testing.T) {
 			return err
 		}
 		require.Equal(t, len(resp.Connections), numNodes-1)
-		fmt.Printf("got status: %s", resp.Connections[ts.NodeID()].Peers[stoppedNodeID].Status.String())
-		if resp.Connections[ts.NodeID()].Peers[stoppedNodeID].Status != serverpb.NetworkConnectivityResponse_ERROR {
+		fmt.Printf("got status: %s", resp.Connections[s0.StorageLayer().NodeID()].Peers[stoppedNodeID].Status.String())
+		if resp.Connections[s0.StorageLayer().NodeID()].Peers[stoppedNodeID].Status != serverpb.NetworkConnectivityResponse_ERROR {
 			return errors.New("waiting for connection state to be changed.")
 		}
-		if latency := resp.Connections[ts.NodeID()].Peers[stoppedNodeID].Latency; latency > 0 {
+		if latency := resp.Connections[s0.StorageLayer().NodeID()].Peers[stoppedNodeID].Latency; latency > 0 {
 			return errors.Errorf("expected latency to be 0 but got %s", latency.String())
 		}
 		return nil
 	})
+}
+
+func TestNetworkConnectivityTenantCapability(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	numNodes := 3
+	testCluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// Note: We're only testing external-process mode because shared service
+			// mode tenants have all capabilities. See PR #119211 for more info.
+			DefaultTestTenant: base.ExternalTestTenantAlwaysEnabled,
+		},
+		ReplicationMode: base.ReplicationManual,
+	})
+	ctx := context.Background()
+	defer testCluster.Stopper().Stop(ctx)
+
+	var resp serverpb.NetworkConnectivityResponse
+	err := srvtestutils.GetStatusJSONProto(
+		testCluster.Server(0).ApplicationLayer(), "connectivity", &resp)
+	require.ErrorContains(t, err,
+		"client tenant does not have capability to debug the process")
 }

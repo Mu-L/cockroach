@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package regionlatency has testing utilities for injecting artificial latency
 // into test clusters.
@@ -58,7 +53,9 @@ type OneWayLatency = time.Duration
 // error will be returned.
 func (m LatencyMap) Apply(tc TestCluster) error {
 	for i, n := 0, tc.NumServers(); i < n; i++ {
-		serv := tc.Server(i)
+		// TODO(#109869): This seems incorrect; what of the latency between
+		// SQL servers which use their own, separate RPC service?
+		serv := tc.Server(i).SystemLayer()
 		serverKnobs, ok := serv.TestingKnobs().Server.(*server.TestingKnobs)
 		if !ok {
 			return errors.AssertionFailedf(

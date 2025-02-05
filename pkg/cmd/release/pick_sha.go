@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -15,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -104,6 +100,16 @@ func pickSHA(_ *cobra.Command, _ []string) error {
 	fmt.Println("Next version:", nextRelease.nextReleaseVersion)
 	fmt.Println("Release SHA:", nextRelease.buildInfo.SHA)
 
+	// Verify that the guessed version matches the contents of the version.txt file.
+	curVersion, err := fileContent(nextRelease.buildInfo.SHA, versionFile)
+	if err != nil {
+		return fmt.Errorf("reading version file: %w", err)
+	}
+	curVersion = strings.TrimSpace(curVersion)
+	if curVersion != nextRelease.nextReleaseVersion {
+		return fmt.Errorf("guessed version %s does not match version.txt %s", nextRelease.nextReleaseVersion, curVersion)
+	}
+
 	// TODO: before copying check if it's already there and bail if exists, can be forced by -f
 	releaseInfoPath := fmt.Sprintf("%s/%s.json", pickSHAFlags.releaseObjectPrefix, nextRelease.nextReleaseVersion)
 	fmt.Println("Publishing release candidate metadata")
@@ -111,18 +117,13 @@ func pickSHA(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("cannot publish release metadata: %w", err)
 	}
 
-	fmt.Println("Creating SRE issue")
 	jiraClient, err := newJiraClient(jiraBaseURL, jiraUsername, jiraToken)
 	if err != nil {
 		return fmt.Errorf("cannot create Jira client: %w", err)
 	}
-	sreIssue, err := createSREIssue(jiraClient, nextRelease, pickSHAFlags.dryRun)
-	if err != nil {
-		return err
-	}
 
 	fmt.Println("Creating tracking issue")
-	trackingIssue, err := createTrackingIssue(jiraClient, nextRelease, sreIssue, pickSHAFlags.dryRun)
+	trackingIssue, err := createTrackingIssue(jiraClient, nextRelease, pickSHAFlags.dryRun)
 	if err != nil {
 		return fmt.Errorf("cannot create tracking issue: %w", err)
 	}
@@ -149,10 +150,6 @@ func pickSHA(_ *cobra.Command, _ []string) error {
 	fmt.Println("Sending email")
 	if err := sendMailPickSHA(args, opts); err != nil {
 		return fmt.Errorf("cannot send email: %w", err)
-	}
-	fmt.Println("Generating panic")
-	if err := generatePanic(nextRelease.buildInfo.Tag); err != nil {
-		return fmt.Errorf("cannot generate panic: %w", err)
 	}
 	return nil
 }

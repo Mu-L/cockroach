@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package logconfig
 
@@ -29,8 +24,7 @@ import (
 // specified in a configuration.
 const DefaultFileFormat = `crdb-v2`
 
-// DefaultStderrFormat is the entry format for stderr sinks
-// when not specified in a configuration.
+// DefaultStderrFormat is the entry format for stderr sinks.
 const DefaultStderrFormat = `crdb-v2-tty`
 
 // DefaultFluentFormat is the entry format for fluent sinks
@@ -40,6 +34,10 @@ const DefaultFluentFormat = `json-fluent-compact`
 // DefaultHTTPFormat is the entry format for HTTP sinks
 // when not specified in a configuration.
 const DefaultHTTPFormat = `json-compact`
+
+// DefaultFilePerms is the default permissions used in file-defaults. It
+// is applied literally via os.Chmod, without considering the umask.
+const DefaultFilePerms = FilePermissions(0o640)
 
 // DefaultConfig returns a suitable default configuration when logging
 // is meant to primarily go to files.
@@ -69,6 +67,7 @@ http-defaults:
     format: ` + DefaultHTTPFormat + `
     redactable: true
     exit-on-error: false
+    timeout: 2s
     buffering:
       max-staleness: 5s	
       flush-trigger-size: 1mib
@@ -511,6 +510,10 @@ type HTTPDefaults struct {
 
 	// Headers is a list of headers to attach to each HTTP request
 	Headers map[string]string `yaml:",omitempty,flow"`
+
+	// FileBasedHeaders is a list of headers with filepaths whose contents are
+	// attached to each HTTP request
+	FileBasedHeaders map[string]string `yaml:"file-based-headers,omitempty,flow"`
 
 	// Compression can be "none" or "gzip" to enable gzip compression.
 	// Set to "gzip" by default.
@@ -1042,6 +1045,15 @@ func (x *FilePermissions) UnmarshalYAML(fn func(interface{}) error) (err error) 
 	return nil
 }
 
+func init() {
+	// Use FutureLineWrap to avoid wrapping long lines. This is required for cases
+	// where one of the logging or zone config fields is longer than 80
+	// characters. In that case, without FutureLineWrap, the output will have `\n`
+	// characters interspersed every 80 characters. FutureLineWrap ensures that
+	// the whole field shows up as a single line.
+	yaml.FutureLineWrap()
+}
+
 // String implements the fmt.Stringer interface.
 func (c *Config) String() string {
 	b, err := yaml.Marshal(c)
@@ -1156,6 +1168,7 @@ type constrainedString interface {
 const (
 	BufferFmtJsonArray BufferFormat = "json-array"
 	BufferFmtNewline   BufferFormat = "newline"
+	BufferFmtNone      BufferFormat = "none"
 )
 
 // BufferFormat is a string restricted to "json-array" and "newline".

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package security_test
 
@@ -24,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/rand"
@@ -98,7 +94,7 @@ func testTenantCertificatesInner(t *testing.T, embedded bool) {
 		certsDir = makeTenantCerts(t, tenant)
 	} else {
 		certsDir = certnames.EmbeddedCertsDir
-		tenant = security.EmbeddedTenantIDs()[0]
+		tenant = securitytest.EmbeddedTenantIDs()[0]
 	}
 
 	// Now set up the config a server would use. The client will trust it based on

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
@@ -17,11 +12,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -30,6 +23,7 @@ import (
 //
 // See TableStatistic for a description of the fields.
 type JSONStatistic struct {
+	ID            uint64   `json:"id,omitempty"`
 	Name          string   `json:"name,omitempty"`
 	CreatedAt     string   `json:"created_at"`
 	Columns       []string `json:"columns"`
@@ -66,30 +60,33 @@ func (js *JSONStatistic) SetHistogram(h *HistogramData) error {
 	if typ == nil {
 		return fmt.Errorf("histogram type is unset")
 	}
-	js.HistogramColumnType = typ.SQLString()
-	js.HistogramBuckets = make([]JSONHistoBucket, len(h.Buckets))
+	// Use the fully qualified type name in case this is part of injected stats
+	// done across databases. If it is a user-defined type, we need the type name
+	// resolution to be for the correct database.
+	js.HistogramColumnType = typ.SQLStringFullyQualified()
+	js.HistogramBuckets = make([]JSONHistoBucket, 0, len(h.Buckets))
 	js.HistogramVersion = h.Version
 	var a tree.DatumAlloc
 	for i := range h.Buckets {
 		b := &h.Buckets[i]
-		js.HistogramBuckets[i].NumEq = b.NumEq
-		js.HistogramBuckets[i].NumRange = b.NumRange
-		js.HistogramBuckets[i].DistinctRange = b.DistinctRange
-
 		if b.UpperBound == nil {
 			return fmt.Errorf("histogram bucket upper bound is unset")
 		}
-		datum, _, err := keyside.Decode(&a, typ, b.UpperBound, encoding.Ascending)
+		datum, err := DecodeUpperBound(h.Version, typ, &a, b.UpperBound)
 		if err != nil {
+			if h.ColumnType.Family() == types.EnumFamily && errors.Is(err, types.EnumValueNotFound) {
+				// Skip over buckets for enum values that were dropped.
+				continue
+			}
 			return err
 		}
 
-		js.HistogramBuckets[i] = JSONHistoBucket{
+		js.HistogramBuckets = append(js.HistogramBuckets, JSONHistoBucket{
 			NumEq:         b.NumEq,
 			NumRange:      b.NumRange,
 			DistinctRange: b.DistinctRange,
-			UpperBound:    tree.AsStringWithFlags(datum, tree.FmtExport),
-		}
+			UpperBound:    tree.AsStringWithFlags(datum, tree.FmtExport|tree.FmtAlwaysQualifyUserDefinedTypeNames),
+		})
 	}
 	return nil
 }
@@ -150,14 +147,14 @@ func (js *JSONStatistic) GetHistogram(
 	h.Buckets = make([]HistogramData_Bucket, len(js.HistogramBuckets))
 	for i := range h.Buckets {
 		hb := &js.HistogramBuckets[i]
-		upperVal, err := rowenc.ParseDatumStringAs(ctx, colType, hb.UpperBound, evalCtx)
+		upperVal, err := rowenc.ParseDatumStringAs(ctx, colType, hb.UpperBound, evalCtx, semaCtx)
 		if err != nil {
 			return nil, err
 		}
 		h.Buckets[i].NumEq = hb.NumEq
 		h.Buckets[i].NumRange = hb.NumRange
 		h.Buckets[i].DistinctRange = hb.DistinctRange
-		h.Buckets[i].UpperBound, err = keyside.Encode(nil, upperVal, encoding.Ascending)
+		h.Buckets[i].UpperBound, err = EncodeUpperBound(h.Version, upperVal)
 		if err != nil {
 			return nil, err
 		}

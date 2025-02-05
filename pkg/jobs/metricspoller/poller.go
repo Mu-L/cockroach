@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metricspoller
 
@@ -46,6 +41,11 @@ func (mp *metricsPoller) OnFailOrCancel(
 	return nil
 }
 
+// CollectProfile is a part of the Resumer interface.
+func (mp *metricsPoller) CollectProfile(_ context.Context, _ interface{}) error {
+	return nil
+}
+
 // Resume is part of the Resumer interface.
 func (mp *metricsPoller) Resume(ctx context.Context, execCtx interface{}) error {
 	// The metrics polling job is a forever running background job. It's always
@@ -56,7 +56,7 @@ func (mp *metricsPoller) Resume(ctx context.Context, execCtx interface{}) error 
 	exec := execCtx.(sql.JobExecContext)
 	metrics := exec.ExecCfg().JobRegistry.MetricsStruct().JobSpecificMetrics[jobspb.TypePollJobsStats].(pollerMetrics)
 
-	t := timeutil.NewTimer()
+	var t timeutil.Timer
 	defer t.Stop()
 
 	runTask := func(name string, task func(ctx context.Context, execCtx sql.JobExecContext) error) error {
@@ -89,6 +89,7 @@ type pollerMetrics struct {
 var metricPollerTasks = map[string]func(ctx context.Context, execCtx sql.JobExecContext) error{
 	"paused-jobs": updatePausedMetrics,
 	"manage-pts":  manageProtectedTimestamps,
+	"resolved-ts": updateTSMetrics,
 }
 
 func (m pollerMetrics) MetricStruct() {}

@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metrics_test
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/metrics"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/scheduled"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/state"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
 	"github.com/stretchr/testify/require"
@@ -45,7 +41,7 @@ func TestTracker(t *testing.T) {
 	l2 := &mockListener{history: [][]metrics.StoreMetrics{}}
 	tracker := metrics.NewTracker(testingMetricsInterval, l1, l2)
 
-	sim := asim.NewSimulator(duration, rwg, s, settings, tracker)
+	sim := asim.NewSimulator(duration, rwg, s, settings, tracker, scheduled.NewExecutorWithNoEvents())
 	sim.RunSim(ctx)
 
 	require.Equal(t, l1.history, l2.history)

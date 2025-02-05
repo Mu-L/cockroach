@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -102,12 +97,15 @@ func (c *vmoduleConfig) vDepth(l Level, depth int) bool {
 			c.pcsPool.Put(poolObj)
 			return false
 		}
-		c.mu.Lock()
-		v, ok := c.mu.vmap[pcs[0]]
-		if !ok {
-			v = c.setV(pcs)
-		}
-		c.mu.Unlock()
+		v := func() Level {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			lvl, ok := c.mu.vmap[pcs[0]]
+			if !ok {
+				lvl = c.setV(pcs)
+			}
+			return lvl
+		}()
 		c.pcsPool.Put(poolObj)
 		return v >= l
 	}

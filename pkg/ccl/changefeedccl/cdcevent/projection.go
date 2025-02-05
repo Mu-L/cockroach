@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdcevent
 
@@ -30,7 +27,9 @@ type Projection Row
 // MakeProjection returns Projection builder given underlying descriptor.
 func MakeProjection(d *EventDescriptor) Projection {
 	p := Projection{
-		EventDescriptor: &EventDescriptor{Metadata: d.Metadata},
+		EventDescriptor: &EventDescriptor{
+			Metadata: d.Metadata,
+		},
 	}
 
 	// Add all primary key columns.
@@ -54,6 +53,10 @@ func (p *Projection) addColumn(name string, typ *types.T, sqlString string, colI
 
 	p.datums = append(p.datums, rowenc.EncDatum{})
 	p.allCols = append(p.allCols, ord)
+	if p.colsByName == nil {
+		p.colsByName = make(map[string]int)
+	}
+	p.colsByName[name] = ord
 	*colIdxSlice = append(*colIdxSlice, ord)
 	if typ.UserDefined() {
 		p.udtCols = append(p.udtCols, ord)

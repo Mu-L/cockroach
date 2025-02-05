@@ -1,21 +1,13 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -26,6 +18,7 @@ import (
 const dropExternalConnectionOp = "DROP EXTERNAL CONNECTION"
 
 type dropExternalConnectionNode struct {
+	zeroInputPlanNode
 	n *tree.DropExternalConnection
 }
 
@@ -41,12 +34,6 @@ func (c *dropExternalConnectionNode) startExec(params runParams) error {
 }
 
 func (p *planner) dropExternalConnection(params runParams, n *tree.DropExternalConnection) error {
-	if !p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.TODODelete_V22_2SystemExternalConnectionsTable) {
-		return pgerror.Newf(pgcode.FeatureNotSupported,
-			"External Connections are not supported until upgrade to version %v is finalized",
-			clusterversion.ByKey(clusterversion.TODODelete_V22_2SystemExternalConnectionsTable))
-	}
-
 	// TODO(adityamaru): Add some metrics to track DROP EXTERNAL CONNECTION
 	// usage.
 

@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package queue
 
@@ -20,11 +15,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/state"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/raft/v3"
 )
 
 // SimulatorReplica is a replica that is being tracked as a potential candidate
@@ -59,7 +55,7 @@ func (sr *SimulatorReplica) HasCorrectLeaseType(lease roachpb.Lease) bool {
 	return true
 }
 
-// CurrentLeaseStatus returns the status of the current lease for the
+// LeaseStatusAt returns the status of the current lease for the
 // timestamp given.
 //
 // Common operations to perform on the resulting status are to check if
@@ -85,7 +81,7 @@ func (sr *SimulatorReplica) LeaseStatusAt(
 // error or no preferences defined then it will return false and consider that
 // to be in-conformance.
 func (sr *SimulatorReplica) LeaseViolatesPreferences(
-	_ context.Context, conf roachpb.SpanConfig,
+	_ context.Context, conf *roachpb.SpanConfig,
 ) bool {
 	descs := sr.state.StoreDescriptors(true /* useCached */, sr.repl.StoreID())
 	if len(descs) != 1 {
@@ -147,7 +143,7 @@ func (sr *SimulatorReplica) GetFirstIndex() kvpb.RaftIndex {
 	return 2
 }
 
-func (sr *SimulatorReplica) SpanConfig() (roachpb.SpanConfig, error) {
+func (sr *SimulatorReplica) SpanConfig() (*roachpb.SpanConfig, error) {
 	return sr.rng.SpanConfig(), nil
 }
 
@@ -161,4 +157,7 @@ func (sr *SimulatorReplica) Desc() *roachpb.RangeDescriptor {
 // the allocator to make rebalancing decisions for a given range.
 func (sr *SimulatorReplica) RangeUsageInfo() allocator.RangeUsageInfo {
 	return sr.usage
+}
+
+func (sr *SimulatorReplica) SendStreamStats(stats *rac2.RangeSendStreamStats) {
 }

@@ -1,10 +1,28 @@
-parse
+error
 DECLARE
 BEGIN
   RAISE;
 END
 ----
+----
 at or near ";": syntax error: unimplemented: this syntax
+DETAIL: source SQL:
+DECLARE
+BEGIN
+  RAISE;
+       ^
+HINT: You have attempted to use a feature that is not yet implemented.
+
+Please check the public issue tracker to check whether this problem is
+already tracked. If you cannot find it there, please report the error
+with details by creating a new issue.
+
+If you would rather not post publicly, please contact us directly
+using the support form.
+
+We appreciate your feedback.
+----
+----
 
 parse
 DECLARE
@@ -14,9 +32,28 @@ END
 ----
 DECLARE
 BEGIN
-RAISE exception
+RAISE EXCEPTION
 USING MESSAGE = "why is this so involved?";
-END
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE EXCEPTION
+USING MESSAGE = ("why is this so involved?");
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE EXCEPTION
+USING MESSAGE = "why is this so involved?";
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE EXCEPTION
+USING MESSAGE = _;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -26,9 +63,28 @@ END
 ----
 DECLARE
 BEGIN
-RAISE log
+RAISE LOG
 USING HINT = "Insert HINT";
-END
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE LOG
+USING HINT = ("Insert HINT");
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE LOG
+USING HINT = "Insert HINT";
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE LOG
+USING HINT = _;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -38,8 +94,24 @@ END
 ----
 DECLARE
 BEGIN
-RAISE log 'Nonexistent ID --> %', user_id;
-END
+RAISE LOG 'Nonexistent ID --> %', user_id;
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE LOG 'Nonexistent ID --> %', (user_id);
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE LOG '_', user_id;
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE LOG 'Nonexistent ID --> %', _;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -50,9 +122,28 @@ END
 ----
 DECLARE
 BEGIN
-RAISE log 'Nonexistent ID --> %', user_id
+RAISE LOG 'Nonexistent ID --> %', user_id
 USING HINT = "check...userid?";
-END
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE LOG 'Nonexistent ID --> %', (user_id)
+USING HINT = ("check...userid?");
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE LOG '_', user_id
+USING HINT = "check...userid?";
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE LOG 'Nonexistent ID --> %', _
+USING HINT = _;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -63,7 +154,23 @@ END
 DECLARE
 BEGIN
 RAISE 'foo %', 'bar';
-END
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE 'foo %', ('bar');
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE '_', '_';
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE 'foo %', 'bar';
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -76,7 +183,26 @@ DECLARE
 i INT8 := 0;
 BEGIN
 RAISE 'foo %', i;
-END
+END;
+ -- normalized!
+DECLARE
+i INT8 := (0);
+BEGIN
+RAISE 'foo %', (i);
+END;
+ -- fully parenthesized
+DECLARE
+i INT8 := _;
+BEGIN
+RAISE '_', i;
+END;
+ -- literals removed
+DECLARE
+_ INT8 := 0;
+BEGIN
+RAISE 'foo %', _;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -89,7 +215,26 @@ DECLARE
 i INT8 := 0;
 BEGIN
 RAISE 'foo %, %, %.', i, i * 2, i * 100;
-END
+END;
+ -- normalized!
+DECLARE
+i INT8 := (0);
+BEGIN
+RAISE 'foo %, %, %.', (i), ((i) * (2)), ((i) * (100));
+END;
+ -- fully parenthesized
+DECLARE
+i INT8 := _;
+BEGIN
+RAISE '_', i, i * _, i * _;
+END;
+ -- literals removed
+DECLARE
+_ INT8 := 0;
+BEGIN
+RAISE 'foo %, %, %.', _, _ * 2, _ * 100;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -102,7 +247,26 @@ DECLARE
 i INT8 := 0;
 BEGIN
 RAISE 'foo %', (SELECT count(*) FROM xy WHERE x = i);
-END
+END;
+ -- normalized!
+DECLARE
+i INT8 := (0);
+BEGIN
+RAISE 'foo %', ((SELECT (count((*))) FROM xy WHERE ((x) = (i))));
+END;
+ -- fully parenthesized
+DECLARE
+i INT8 := _;
+BEGIN
+RAISE '_', (SELECT count(*) FROM xy WHERE x = i);
+END;
+ -- literals removed
+DECLARE
+_ INT8 := 0;
+BEGIN
+RAISE 'foo %', (SELECT _(*) FROM _ WHERE _ = _);
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -114,7 +278,26 @@ DECLARE
 BEGIN
 RAISE SQLSTATE '222222'
 USING HINT = hm;
-END
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE SQLSTATE '222222'
+USING HINT = (hm);
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE SQLSTATE '_'
+USING HINT = hm;
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE SQLSTATE '222222'
+USING HINT = _;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -125,7 +308,23 @@ END
 DECLARE
 BEGIN
 RAISE internal_screaming;
-END
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE internal_screaming;
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE _;
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE internal_screaming;
+END;
+ -- identifiers removed
 
 parse
 DECLARE
@@ -140,4 +339,26 @@ BEGIN
 RAISE internal_screaming
 USING MESSAGE = 'blah blah blah',
 COLUMN = 'foo';
-END
+END;
+ -- normalized!
+DECLARE
+BEGIN
+RAISE internal_screaming
+USING MESSAGE = ('blah blah blah'),
+COLUMN = ('foo');
+END;
+ -- fully parenthesized
+DECLARE
+BEGIN
+RAISE _
+USING MESSAGE = '_',
+COLUMN = '_';
+END;
+ -- literals removed
+DECLARE
+BEGIN
+RAISE internal_screaming
+USING MESSAGE = 'blah blah blah',
+COLUMN = 'foo';
+END;
+ -- identifiers removed

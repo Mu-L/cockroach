@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -19,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -50,8 +46,13 @@ func TestUpsertFastPath(t *testing.T) {
 	var gets uint64
 	var scans uint64
 	var endTxn uint64
+	var codecValue atomic.Value
 	filter := func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
-		if bytes.Compare(filterArgs.Req.Header().Key, bootstrap.TestingUserTableDataMin()) >= 0 {
+		codec := codecValue.Load()
+		if codec == nil {
+			return nil
+		}
+		if bytes.Compare(filterArgs.Req.Header().Key, bootstrap.TestingUserTableDataMin(codec.(keys.SQLCodec))) >= 0 {
 			switch filterArgs.Req.Method() {
 			case kvpb.Scan:
 				atomic.AddUint64(&scans, 1)
@@ -68,14 +69,15 @@ func TestUpsertFastPath(t *testing.T) {
 		return nil
 	}
 
-	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
+	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
 			EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 				TestingEvalFilter: filter,
 			},
 		}},
 	})
-	defer s.Stopper().Stop(context.Background())
+	defer srv.Stopper().Stop(context.Background())
+	codecValue.Store(srv.ApplicationLayer().Codec())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 	sqlDB.Exec(t, `CREATE DATABASE d`)
 	sqlDB.Exec(t, `CREATE TABLE d.kv (k INT PRIMARY KEY, v INT)`)

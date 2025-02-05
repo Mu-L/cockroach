@@ -4,8 +4,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      root     ALL             true
 root  false          sequences    root     ALL             true
 root  false          tables       root     ALL             true
@@ -22,8 +22,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      root     ALL             true
 root  false          sequences    root     ALL             true
 root  false          types        root     ALL             true
@@ -38,8 +38,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      public   USAGE           false
 root  false          schemas      root     ALL             true
 root  false          sequences    public   SELECT          false
@@ -58,8 +58,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      public   USAGE           false
 root  false          schemas      root     ALL             true
 root  false          sequences    public   SELECT          false
@@ -78,22 +78,22 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES FOR ROLE foo, bar, root
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-bar   false          functions    bar      ALL             true
-bar   false          functions    public   EXECUTE         false
+bar   false          routines     bar      ALL             true
+bar   false          routines     public   EXECUTE         false
 bar   false          schemas      bar      ALL             true
 bar   false          sequences    bar      ALL             true
 bar   false          tables       bar      ALL             true
 bar   false          types        bar      ALL             true
 bar   false          types        public   USAGE           false
-foo   false          functions    foo      ALL             true
-foo   false          functions    public   EXECUTE         false
+foo   false          routines     foo      ALL             true
+foo   false          routines     public   EXECUTE         false
 foo   false          schemas      foo      ALL             true
 foo   false          sequences    foo      ALL             true
 foo   false          tables       foo      ALL             true
 foo   false          types        foo      ALL             true
 foo   false          types        public   USAGE           false
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      bar      ALL             false
 root  false          schemas      foo      ALL             false
 root  false          schemas      public   USAGE           false
@@ -123,8 +123,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      bar      ALL             false
 root  false          schemas      foo      ALL             false
 root  false          schemas      public   USAGE           false
@@ -151,8 +151,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      bar      ALL             false
 root  false          schemas      foo      ALL             false
 root  false          schemas      public   USAGE           false
@@ -179,8 +179,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      root     ALL             true
 root  false          sequences    root     ALL             true
 root  false          tables       bar      BACKUP          false
@@ -189,6 +189,7 @@ root  false          tables       bar      CREATE          false
 root  false          tables       bar      DELETE          false
 root  false          tables       bar      DROP            false
 root  false          tables       bar      INSERT          false
+root  false          tables       bar      TRIGGER         false
 root  false          tables       bar      UPDATE          false
 root  false          tables       bar      ZONECONFIG      false
 root  false          tables       foo      BACKUP          false
@@ -197,6 +198,7 @@ root  false          tables       foo      CREATE          false
 root  false          tables       foo      DELETE          false
 root  false          tables       foo      DROP            false
 root  false          tables       foo      INSERT          false
+root  false          tables       foo      TRIGGER         false
 root  false          tables       foo      UPDATE          false
 root  false          tables       foo      ZONECONFIG      false
 root  false          types        root     ALL             true
@@ -209,8 +211,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      root     ALL             true
 root  false          sequences    root     ALL             true
 root  false          tables       foo      DROP            true
@@ -224,15 +226,14 @@ use test2;
 CREATE USER testuser2;
 
 statement ok
-GRANT testuser TO root;
 ALTER DEFAULT PRIVILEGES FOR ROLE testuser GRANT DROP, ZONECONFIG ON TABLES TO foo WITH GRANT OPTION;
 
 query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES FOR ROLE testuser
 ----
 role      for_all_roles  object_type  grantee   privilege_type  is_grantable
-testuser  false          functions    public    EXECUTE         false
-testuser  false          functions    testuser  ALL             true
+testuser  false          routines     public    EXECUTE         false
+testuser  false          routines     testuser  ALL             true
 testuser  false          schemas      testuser  ALL             true
 testuser  false          sequences    testuser  ALL             true
 testuser  false          tables       foo       DROP            true
@@ -247,8 +248,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role      for_all_roles  object_type  grantee   privilege_type  is_grantable
-testuser  false          functions    public    EXECUTE         false
-testuser  false          functions    testuser  ALL             true
+testuser  false          routines     public    EXECUTE         false
+testuser  false          routines     testuser  ALL             true
 testuser  false          schemas      testuser  ALL             true
 testuser  false          sequences    testuser  ALL             true
 testuser  false          tables       testuser  ALL             true
@@ -261,8 +262,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES FOR ROLE testuser
 ----
 role      for_all_roles  object_type  grantee   privilege_type  is_grantable
-testuser  false          functions    public    EXECUTE         false
-testuser  false          functions    testuser  ALL             true
+testuser  false          routines     public    EXECUTE         false
+testuser  false          routines     testuser  ALL             true
 testuser  false          schemas      testuser  ALL             true
 testuser  false          sequences    testuser  ALL             true
 testuser  false          tables       foo       DROP            true
@@ -278,8 +279,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES FOR ROLE root, testuser
 ----
 role      for_all_roles  object_type  grantee   privilege_type  is_grantable
-root      false          functions    public    EXECUTE         false
-root      false          functions    root      ALL             true
+root      false          routines     public    EXECUTE         false
+root      false          routines     root      ALL             true
 root      false          schemas      root      ALL             true
 root      false          sequences    root      ALL             true
 root      false          tables       foo       DROP            true
@@ -287,8 +288,8 @@ root      false          tables       foo       ZONECONFIG      true
 root      false          tables       root      ALL             true
 root      false          types        public    USAGE           false
 root      false          types        root      ALL             true
-testuser  false          functions    public    EXECUTE         false
-testuser  false          functions    testuser  ALL             true
+testuser  false          routines     public    EXECUTE         false
+testuser  false          routines     testuser  ALL             true
 testuser  false          schemas      testuser  ALL             true
 testuser  false          sequences    testuser  ALL             true
 testuser  false          tables       foo       DROP            true
@@ -305,7 +306,7 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES FOR ALL ROLES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-NULL  true           functions    public   EXECUTE         false
+NULL  true           routines     public   EXECUTE         false
 NULL  true           tables       foo      DROP            true
 NULL  true           tables       foo      ZONECONFIG      true
 NULL  true           types        public   USAGE           false
@@ -327,8 +328,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-root  false          functions    public   EXECUTE         false
-root  false          functions    root     ALL             true
+root  false          routines     public   EXECUTE         false
+root  false          routines     root     ALL             true
 root  false          schemas      root     ALL             true
 root  false          sequences    root     ALL             true
 root  false          tables       root     ALL             true
@@ -349,8 +350,8 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES
 ----
 role  for_all_roles  object_type  grantee   privilege_type  is_grantable
-root  false          functions    public    EXECUTE         false
-root  false          functions    root      ALL             true
+root  false          routines     public    EXECUTE         false
+root  false          routines     root      ALL             true
 root  false          schemas      root      ALL             true
 root  false          sequences    root      ALL             true
 root  false          tables       root      ALL             true
@@ -362,7 +363,7 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES FOR GRANTEE testuser
 ----
 role      for_all_roles  object_type  grantee   privilege_type  is_grantable
-testuser  false          functions    testuser  ALL             true
+testuser  false          routines     testuser  ALL             true
 testuser  false          schemas      testuser  ALL             true
 testuser  false          sequences    testuser  ALL             true
 testuser  false          tables       testuser  ALL             true
@@ -376,14 +377,14 @@ query TBTTTB colnames,rowsort
 SHOW DEFAULT PRIVILEGES FOR GRANTEE foo, bar
 ----
 role  for_all_roles  object_type  grantee  privilege_type  is_grantable
-foo   false          functions    foo      ALL             true
+foo   false          routines     foo      ALL             true
 foo   false          schemas      foo      ALL             true
 foo   false          sequences    foo      ALL             true
 foo   false          tables       foo      ALL             true
 foo   false          types        foo      ALL             true
 NULL  true           tables       foo      DROP            true
 NULL  true           tables       foo      ZONECONFIG      true
-bar   false          functions    bar      ALL             true
+bar   false          routines     bar      ALL             true
 bar   false          schemas      bar      ALL             true
 bar   false          sequences    bar      ALL             true
 bar   false          tables       bar      ALL             true

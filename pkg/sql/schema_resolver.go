@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -32,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -110,7 +106,7 @@ func (sr *schemaResolver) CurrentSearchPath() sessiondata.SearchPath {
 
 func (sr *schemaResolver) byIDGetterBuilder() descs.ByIDGetterBuilder {
 	if sr.skipDescriptorCache {
-		return sr.descCollection.ByID(sr.txn)
+		return sr.descCollection.ByIDWithoutLeased(sr.txn)
 	}
 	return sr.descCollection.ByIDWithLeased(sr.txn)
 }
@@ -126,7 +122,6 @@ func (sr *schemaResolver) byNameGetterBuilder() descs.ByNameGetterBuilder {
 func (sr *schemaResolver) LookupObject(
 	ctx context.Context, flags tree.ObjectLookupFlags, dbName, scName, obName string,
 ) (found bool, prefix catalog.ResolvedObjectPrefix, desc catalog.Descriptor, err error) {
-
 	// Check if we are looking up a type which matches a built-in type in
 	// CockroachDB but is an extension type on the public schema in PostgreSQL.
 	if flags.DesiredObjectKind == tree.TypeObject && scName == catconstants.PublicSchemaName {
@@ -167,12 +162,22 @@ func (sr *schemaResolver) LookupObject(
 		b = b.WithOffline()
 	}
 	g := b.MaybeGet()
-	tn := tree.MakeQualifiedTypeName(dbName, scName, obName)
 	switch flags.DesiredObjectKind {
 	case tree.TableObject:
-		prefix, desc, err = descs.PrefixAndTable(ctx, g, &tn)
+		tn := tree.NewTableNameWithSchema(tree.Name(dbName), tree.Name(scName), tree.Name(obName))
+		prefix, desc, err = descs.PrefixAndTable(ctx, g, tn)
 	case tree.TypeObject:
-		prefix, desc, err = descs.PrefixAndType(ctx, g, &tn)
+		tn := tree.NewQualifiedTypeName(dbName, scName, obName)
+		prefix, desc, err = descs.PrefixAndType(ctx, g, tn)
+	case tree.AnyObject:
+		tn := tree.NewTableNameWithSchema(tree.Name(dbName), tree.Name(scName), tree.Name(obName))
+		prefix, desc, err = descs.PrefixAndTable(ctx, g, tn)
+		if err != nil {
+			if sqlerrors.IsUndefinedRelationError(err) || errors.Is(err, catalog.ErrDescriptorWrongType) {
+				tn := tree.NewQualifiedTypeName(dbName, scName, obName)
+				prefix, desc, err = descs.PrefixAndType(ctx, g, tn)
+			}
+		}
 	default:
 		return false, prefix, nil, errors.AssertionFailedf(
 			"unknown desired object kind %v", flags.DesiredObjectKind,
@@ -187,6 +192,8 @@ func (sr *schemaResolver) LookupObject(
 			desc, err = sr.descCollection.MutableByID(sr.txn).Table(ctx, desc.GetID())
 		case tree.TypeObject:
 			desc, err = sr.descCollection.MutableByID(sr.txn).Type(ctx, desc.GetID())
+		case tree.AnyObject:
+			desc, err = sr.descCollection.MutableByID(sr.txn).Desc(ctx, desc.GetID())
 		}
 	}
 	return desc != nil, prefix, desc, err
@@ -435,13 +442,14 @@ func (sr *schemaResolver) runWithOptions(flags resolveFlags, fn func()) {
 }
 
 func (sr *schemaResolver) ResolveFunction(
-	ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
+	ctx context.Context, name tree.UnresolvedRoutineName, path tree.SearchPath,
 ) (*tree.ResolvedFunctionDefinition, error) {
-	if name.NumParts > 3 || len(name.Parts[0]) == 0 || name.Star {
+	uname := name.UnresolvedName()
+	if uname.NumParts > 3 || len(uname.Parts[0]) == 0 || uname.Star {
 		return nil, pgerror.Newf(pgcode.InvalidName, "invalid function name: %s", name)
 	}
 
-	fn, err := name.ToFunctionName()
+	fn, err := uname.ToRoutineName()
 	if err != nil {
 		return nil, err
 	}
@@ -455,14 +463,14 @@ func (sr *schemaResolver) ResolveFunction(
 	if err != nil {
 		return nil, err
 	}
-	udfDef, err := maybeLookUpUDF(ctx, sr, path, fn)
+	routine, err := maybeLookupRoutine(ctx, sr, path, fn)
 	if err != nil {
 		return nil, err
 	}
 
 	switch {
-	case builtinDef != nil && udfDef != nil:
-		return builtinDef.MergeWith(udfDef)
+	case builtinDef != nil && routine != nil:
+		return builtinDef.MergeWith(routine, path)
 	case builtinDef != nil:
 		props, _ := builtinsregistry.GetBuiltinProperties(builtinDef.Name)
 		if props.UnsupportedWithIssue != 0 {
@@ -478,8 +486,8 @@ func (sr *schemaResolver) ResolveFunction(
 			return nil, pgerror.Wrapf(unImplErr, pgcode.InvalidParameterValue, "%s()", builtinDef.Name)
 		}
 		return builtinDef, nil
-	case udfDef != nil:
-		return udfDef, nil
+	case routine != nil:
+		return routine, nil
 	default:
 		return nil, makeFunctionUndefinedError(ctx, name, path, fn, sr)
 	}
@@ -490,20 +498,35 @@ func (sr *schemaResolver) ResolveFunction(
 // function name and find a suggested function name if possible.
 func makeFunctionUndefinedError(
 	ctx context.Context,
-	name *tree.UnresolvedName,
+	name tree.UnresolvedRoutineName,
 	path tree.SearchPath,
 	fn tree.RoutineName,
 	sr *schemaResolver,
 ) error {
+	uname := name.UnresolvedName()
+	makeRoutineName := func(n *tree.UnresolvedName) (tree.UnresolvedRoutineName, error) {
+		switch name.(type) {
+		case tree.UnresolvedFunctionName:
+			return tree.MakeUnresolvedFunctionName(n), nil
+		case tree.UnresolvedProcedureName:
+			return tree.MakeUnresolvedProcedureName(n), nil
+		default:
+			return nil, errors.AssertionFailedf("unexpected routine name type")
+		}
+	}
 	var lowerName tree.UnresolvedName
 	if fn.ExplicitSchema {
-		lowerName = tree.MakeUnresolvedName(strings.ToLower(name.Parts[1]), strings.ToLower(name.Parts[0]))
+		lowerName = tree.MakeUnresolvedName(strings.ToLower(uname.Parts[1]), strings.ToLower(uname.Parts[0]))
 	} else {
-		lowerName = tree.MakeUnresolvedName(strings.ToLower(name.Parts[0]))
+		lowerName = tree.MakeUnresolvedName(strings.ToLower(uname.Parts[0]))
+	}
+	lowerRoutineName, err := makeRoutineName(&lowerName)
+	if err != nil {
+		return err
 	}
 	wrap := func(err error) error { return err }
-	if lowerName != *name {
-		alternative, err := sr.ResolveFunction(ctx, &lowerName, path)
+	if lowerName != *uname {
+		alternative, err := sr.ResolveFunction(ctx, lowerRoutineName, path)
 		if err != nil {
 			switch pgerror.GetPGCode(err) {
 			case pgcode.UndefinedFunction, pgcode.UndefinedSchema:
@@ -521,20 +544,36 @@ func makeFunctionUndefinedError(
 			}
 		}
 	}
-	return wrap(errors.Wrapf(
-		tree.ErrFunctionUndefined, "unknown function: %s()", tree.ErrString(name),
-	))
+	if _, ok := name.(tree.UnresolvedProcedureName); ok {
+		err = errors.Mark(
+			pgerror.Newf(pgcode.UndefinedFunction, "unknown procedure: %s()", tree.ErrString(uname)),
+			tree.ErrRoutineUndefined,
+		)
+	} else {
+		err = errors.Mark(
+			pgerror.Newf(pgcode.UndefinedFunction, "unknown function: %s()", tree.ErrString(uname)),
+			tree.ErrRoutineUndefined,
+		)
+	}
+	return wrap(err)
 }
 
-func maybeLookUpUDF(
+func maybeLookupRoutine(
 	ctx context.Context, sr *schemaResolver, path tree.SearchPath, fn tree.RoutineName,
 ) (*tree.ResolvedFunctionDefinition, error) {
 	if sr.txn == nil {
 		return nil, nil
 	}
 
+	db := sr.CurrentDatabase()
+	if db == "" {
+		// The database is empty for queries run in the internal executor. None
+		// of the lookups below will succeed, so we can return early.
+		return nil, nil
+	}
+
 	if fn.ExplicitSchema && fn.Schema() != catconstants.CRDBInternalSchemaName {
-		found, prefix, err := sr.LookupSchema(ctx, sr.CurrentDatabase(), fn.Schema())
+		found, prefix, err := sr.LookupSchema(ctx, db, fn.Schema())
 		if err != nil {
 			return nil, err
 		}
@@ -543,25 +582,25 @@ func maybeLookUpUDF(
 			return nil, pgerror.Newf(pgcode.UndefinedSchema, "schema %q does not exist", fn.Schema())
 		}
 
-		udfDef, _ := prefix.Schema.GetResolvedFuncDefinition(fn.Object())
+		udfDef, _ := prefix.Schema.GetResolvedFuncDefinition(ctx, fn.Object())
 		return udfDef, nil
 	}
 
 	var udfDef *tree.ResolvedFunctionDefinition
 	for i, n := 0, path.NumElements(); i < n; i++ {
 		schema := path.GetSchema(i)
-		found, prefix, err := sr.LookupSchema(ctx, sr.CurrentDatabase(), schema)
+		found, prefix, err := sr.LookupSchema(ctx, db, schema)
 		if err != nil {
 			return nil, err
 		}
 		if !found {
 			continue
 		}
-		curUdfDef, found := prefix.Schema.GetResolvedFuncDefinition(fn.Object())
+		curUdfDef, found := prefix.Schema.GetResolvedFuncDefinition(ctx, fn.Object())
 		if !found {
 			continue
 		}
-		udfDef, err = udfDef.MergeWith(curUdfDef)
+		udfDef, err = udfDef.MergeWith(curUdfDef, path)
 		if err != nil {
 			return nil, err
 		}
@@ -575,7 +614,10 @@ func (sr *schemaResolver) ResolveFunctionByOID(
 	if !funcdesc.IsOIDUserDefinedFunc(oid) {
 		qol, ok := tree.OidToQualifiedBuiltinOverload[oid]
 		if !ok {
-			return nil, nil, errors.Wrapf(tree.ErrFunctionUndefined, "function %d not found", oid)
+			return nil, nil, errors.Mark(
+				pgerror.Newf(pgcode.UndefinedFunction, "function %d not found", oid),
+				tree.ErrRoutineUndefined,
+			)
 		}
 		fnName := tree.MakeQualifiedRoutineName(sr.CurrentDatabase(), qol.Schema, tree.OidToBuiltinName[oid])
 		return &fnName, qol.Overload, nil
@@ -596,6 +638,21 @@ func (sr *schemaResolver) ResolveFunctionByOID(
 		return nil, nil, err
 	}
 	return fnName, ret, nil
+}
+
+// FunctionDesc returns the descriptor for the function with the given OID.
+func (sr *schemaResolver) FunctionDesc(
+	ctx context.Context, oid oid.Oid,
+) (catalog.FunctionDescriptor, error) {
+	if !funcdesc.IsOIDUserDefinedFunc(oid) {
+		return nil, errors.Mark(
+			pgerror.Newf(pgcode.UndefinedFunction, "function %d  not user-defined", oid),
+			tree.ErrRoutineUndefined,
+		)
+	}
+	g := sr.byIDGetterBuilder().WithoutNonPublic().WithoutOtherParent(sr.typeResolutionDbID).Get()
+	descID := funcdesc.UserDefinedFunctionOIDToID(oid)
+	return g.Function(ctx, descID)
 }
 
 // NewSkippingCacheSchemaResolver constructs a schemaResolver which always skip

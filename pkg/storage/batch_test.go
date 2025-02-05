@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -23,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -112,7 +108,7 @@ func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Write
 		{Key: mvccKey("d"), Value: []byte("before")},
 		{Key: keyF, Value: encodedValueF},
 	}
-	kvs, err := Scan(e, localMax, roachpb.KeyMax, 0)
+	kvs, err := Scan(context.Background(), e, localMax, roachpb.KeyMax, 0)
 	require.NoError(t, err)
 	require.Equal(t, expValues, kvs)
 
@@ -124,14 +120,14 @@ func testBatchBasics(t *testing.T, writeOnly bool, commit func(e Engine, b Write
 	}
 	if r, ok := b.(Reader); !writeOnly && ok {
 		// Scan values from batch directly.
-		kvs, err = Scan(r, localMax, roachpb.KeyMax, 0)
+		kvs, err = Scan(context.Background(), r, localMax, roachpb.KeyMax, 0)
 		require.NoError(t, err)
 		require.Equal(t, expValues, kvs)
 	}
 
 	// Commit batch and verify direct engine scan yields correct values.
 	require.NoError(t, commit(e, b))
-	kvs, err = Scan(e, localMax, roachpb.KeyMax, 0)
+	kvs, err = Scan(context.Background(), e, localMax, roachpb.KeyMax, 0)
 	require.NoError(t, err)
 	require.Equal(t, expValues, kvs)
 }
@@ -183,18 +179,19 @@ func TestReadOnlyBasics(t *testing.T) {
 	a := mvccKey("a")
 	successTestCases := []func(){
 		func() {
-			_ = ro.MVCCIterate(a.Key, a.Key, MVCCKeyIterKind, IterKeyTypePointsOnly,
+			_ = ro.MVCCIterate(context.Background(), a.Key, a.Key, MVCCKeyIterKind, IterKeyTypePointsOnly,
+				fs.UnknownReadCategory,
 				func(MVCCKeyValue, MVCCRangeKeyStack) error { return iterutil.StopIteration() })
 		},
 		func() {
-			iter, _ := ro.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax})
+			iter, _ := ro.NewMVCCIterator(context.Background(), MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax})
 			iter.Close()
 		},
 		func() {
-			iter, _ := ro.NewMVCCIterator(MVCCKeyIterKind, IterOptions{
-				MinTimestampHint: hlc.MinTimestamp,
-				MaxTimestampHint: hlc.MaxTimestamp,
-				UpperBound:       roachpb.KeyMax,
+			iter, _ := ro.NewMVCCIterator(context.Background(), MVCCKeyIterKind, IterOptions{
+				MinTimestamp: hlc.MinTimestamp,
+				MaxTimestamp: hlc.MaxTimestamp,
+				UpperBound:   roachpb.KeyMax,
 			})
 			iter.Close()
 		},
@@ -255,7 +252,7 @@ func TestReadOnlyBasics(t *testing.T) {
 		{Key: mvccKey("c"), Value: appender("foobar")},
 	}
 
-	kvs, err := Scan(e, localMax, roachpb.KeyMax, 0)
+	kvs, err := Scan(context.Background(), e, localMax, roachpb.KeyMax, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +563,7 @@ func TestBatchScan(t *testing.T) {
 	// Scan each case using the batch and store the results.
 	results := map[int][]MVCCKeyValue{}
 	for i, scan := range scans {
-		kvs, err := Scan(b, scan.start, scan.end, scan.max)
+		kvs, err := Scan(context.Background(), b, scan.start, scan.end, scan.max)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -578,7 +575,7 @@ func TestBatchScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, scan := range scans {
-		kvs, err := Scan(e, scan.start, scan.end, scan.max)
+		kvs, err := Scan(context.Background(), e, scan.start, scan.end, scan.max)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -610,7 +607,7 @@ func TestBatchScanWithDelete(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	kvs, err := Scan(b, localMax, roachpb.KeyMax, 0)
+	kvs, err := Scan(context.Background(), b, localMax, roachpb.KeyMax, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +644,7 @@ func TestBatchScanMaxWithDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A scan with max=1 should scan "b".
-	kvs, err := Scan(b, localMax, roachpb.KeyMax, 1)
+	kvs, err := Scan(context.Background(), b, localMax, roachpb.KeyMax, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +699,7 @@ func TestUnindexedBatchThatSupportsReader(t *testing.T) {
 
 	// Verify that reads on the distinct batch go to the underlying engine, not
 	// to the unindexed batch.
-	iter, err := b.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax})
+	iter, err := b.NewMVCCIterator(context.Background(), MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -720,7 +717,7 @@ func TestUnindexedBatchThatSupportsReader(t *testing.T) {
 	require.Equal(t, []byte("c"), mvccGetRaw(t, e, mvccKey("b")))
 }
 
-func TestWriteBatchPanicsAsReader(t *testing.T) {
+func TestWriteBatchCoerceAsReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -730,29 +727,9 @@ func TestWriteBatchPanicsAsReader(t *testing.T) {
 	batch := e.NewWriteBatch()
 	defer batch.Close()
 
-	// The underlying type returned by NewWriteBatch does implement Reader.
-	// Ensure that if a user coerces the WriteBatch into a Reader, it panics.
-	r := batch.(Reader)
-
-	// The various Reader methods on the batch should panic.
-	a := mvccKey("a")
-	b := mvccKey("b")
-	testCases := []func(){
-		func() { _ = r.MVCCIterate(a.Key, b.Key, MVCCKeyIterKind, IterKeyTypePointsOnly, nil) },
-		func() { _, _ = r.NewMVCCIterator(MVCCKeyIterKind, IterOptions{UpperBound: roachpb.KeyMax}) },
-	}
-	for i, f := range testCases {
-		func() {
-			defer func(i int) {
-				if r := recover(); r == nil {
-					t.Fatalf("%d: test did not panic", i)
-				} else if r != "write-only batch" {
-					t.Fatalf("%d: unexpected panic: %v", i, r)
-				}
-			}(i)
-			f()
-		}()
-	}
+	// The underlying type returned by NewWriteBatch does NOT implement Reader.
+	_, ok := batch.(Reader)
+	require.False(t, ok)
 }
 
 func TestBatchIteration(t *testing.T) {
@@ -782,7 +759,7 @@ func TestBatchIteration(t *testing.T) {
 	}
 
 	iterOpts := IterOptions{UpperBound: k3.Key}
-	iter, err := b.NewMVCCIterator(MVCCKeyIterKind, iterOpts)
+	iter, err := b.NewMVCCIterator(context.Background(), MVCCKeyIterKind, iterOpts)
 	if err != nil {
 		t.Fatal(err)
 	}

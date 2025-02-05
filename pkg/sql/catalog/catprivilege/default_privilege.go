@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catprivilege
 
@@ -263,7 +258,7 @@ func CreatePrivilegesFromDefaultPrivileges(
 		}
 	}
 
-	newPrivs.Version = catpb.Version21_2
+	newPrivs.Version = catpb.Version23_2
 	return newPrivs, nil
 }
 
@@ -335,13 +330,13 @@ func foldPrivileges(
 			return err
 		}
 	}
-	if targetObject == privilege.Functions &&
+	if targetObject == privilege.Routines &&
 		privileges.CheckPrivilege(username.PublicRoleName(), privilege.EXECUTE) {
 		setPublicHasExecuteOnFunctions(defaultPrivilegesForRole, true)
 		if err := privileges.Revoke(
 			username.PublicRoleName(),
 			privilege.List{privilege.EXECUTE},
-			privilege.Function,
+			privilege.Routine,
 			false, /* grantOptionFor */
 		); err != nil {
 			return err
@@ -382,7 +377,7 @@ func expandPrivileges(
 		privileges.Grant(username.PublicRoleName(), privilege.List{privilege.USAGE}, false /* withGrantOption */)
 		setPublicHasUsageOnTypes(defaultPrivilegesForRole, false)
 	}
-	if targetObject == privilege.Functions && GetPublicHasExecuteOnFunctions(defaultPrivilegesForRole) {
+	if targetObject == privilege.Routines && GetPublicHasExecuteOnFunctions(defaultPrivilegesForRole) {
 		privileges.Grant(username.PublicRoleName(), privilege.List{privilege.EXECUTE}, false /* withGrantOption */)
 		setPublicHasExecuteOnFunctions(defaultPrivilegesForRole, false)
 	}
@@ -414,7 +409,7 @@ func GetUserPrivilegesForObject(
 			Privileges: privilege.USAGE.Mask(),
 		})
 	}
-	if GetPublicHasExecuteOnFunctions(&p) && targetObject == privilege.Functions {
+	if GetPublicHasExecuteOnFunctions(&p) && targetObject == privilege.Routines {
 		userPrivileges = append(userPrivileges, catpb.UserPrivileges{
 			UserProto:  username.PublicRoleName().EncodeProto(),
 			Privileges: privilege.EXECUTE.Mask(),
@@ -457,7 +452,7 @@ func GetRoleHasAllPrivilegesOnTargetObject(
 		return defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnTypes
 	case privilege.Schemas:
 		return defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnSchemas
-	case privilege.Functions:
+	case privilege.Routines:
 		return defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnFunctions
 	default:
 		panic(fmt.Sprintf("unknown target object %s", targetObject))
@@ -565,7 +560,7 @@ func setRoleHasAllOnTargetObject(
 		defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnTypes = roleHasAll
 	case privilege.Schemas:
 		defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnSchemas = roleHasAll
-	case privilege.Functions:
+	case privilege.Routines:
 		defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnFunctions = roleHasAll
 	default:
 		panic(fmt.Sprintf("unknown target object %s", targetObject))

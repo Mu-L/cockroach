@@ -1,25 +1,22 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { Button } from "@cockroachlabs/ui-components";
 import { assert } from "chai";
 import { mount, ReactWrapper } from "enzyme";
+import moment from "moment-timezone";
+import React from "react";
 import { MemoryRouter } from "react-router-dom";
-import { Button } from "@cockroachlabs/ui-components";
+
+import { SortedTable } from "src/sortedtable";
+import { TestStoreProvider } from "src/test-utils";
+import { TimeScale } from "src/timeScaleDropdown";
+
+import { StatementDiagnosticsReport } from "../../api";
 
 import { DiagnosticsView } from "./diagnosticsView";
-import { TestStoreProvider } from "src/test-utils";
-import { StatementDiagnosticsReport } from "../../api";
-import moment from "moment-timezone";
-import { SortedTable } from "src/sortedtable";
-import { TimeScale } from "src/timeScaleDropdown";
 
 const activateDiagnosticsRef = { current: { showModalFor: jest.fn() } };
 const ts: TimeScale = {
@@ -63,6 +60,7 @@ describe("DiagnosticsView", () => {
             requestTime={undefined}
             currentScale={ts}
             onChangeTimeScale={mockSetTimeScale}
+            planGists={["gist"]}
           />
         </MemoryRouter>,
       );
@@ -73,6 +71,7 @@ describe("DiagnosticsView", () => {
       activateButtonComponent.simulate("click");
       expect(activateDiagnosticsRef.current.showModalFor).toBeCalledWith(
         statementFingerprint,
+        ["gist"],
       );
     });
   });
@@ -94,6 +93,7 @@ describe("DiagnosticsView", () => {
             dismissAlertMessage={() => {}}
             currentScale={ts}
             onChangeTimeScale={mockSetTimeScale}
+            planGists={["gist"]}
           />
         </TestStoreProvider>,
       );
@@ -110,6 +110,7 @@ describe("DiagnosticsView", () => {
       activateButtonComponent.simulate("click");
       expect(activateDiagnosticsRef.current.showModalFor).toBeCalledWith(
         statementFingerprint,
+        ["gist"],
       );
     });
 
@@ -128,6 +129,7 @@ describe("DiagnosticsView", () => {
             currentScale={ts}
             requestTime={requestTime}
             onChangeTimeScale={mockSetTimeScale}
+            planGists={["gist"]}
           />
         </TestStoreProvider>,
       );
@@ -152,6 +154,7 @@ describe("DiagnosticsView", () => {
             currentScale={ts}
             requestTime={requestTime}
             onChangeTimeScale={mockSetTimeScale}
+            planGists={["gist"]}
           />
         </TestStoreProvider>,
       );

@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -17,12 +12,15 @@ import (
 )
 
 func TestStatementTree(t *testing.T) {
-	type cmd uint8
+	type cmd uint16
 	const (
 		push cmd = 1 << iota
 		pop
 		mut
 		simple
+		post
+		getInit
+		init
 		t1
 		t2
 		fail
@@ -374,10 +372,226 @@ func TestStatementTree(t *testing.T) {
 				mut | t1 | fail,
 			},
 		},
+		// 21.
+		// Push
+		//     CanMutateTable(t1, simpleInsert)
+		//     Push
+		//         CanMutateTable(t2, default)
+		//         CanMutateTable(t1, default, post) FAIL
+		{
+			cmds: []cmd{
+				push,
+				mut | t1 | simple,
+				push,
+				mut | t2,
+				mut | t1 | post | fail,
+			},
+		},
+		// 22.
+		// Push
+		//     Push
+		//         CanMutateTable(t1, default)
+		//         CanMutateTable(t2, default, post)
+		//     Pop
+		//     CanMutateTable(t2, simpleInsert) FAIL
+		{
+			cmds: []cmd{
+				push,
+				push,
+				mut | t1,
+				mut | t2 | post,
+				pop,
+				mut | t1 | simple | fail,
+			},
+		},
+		// 23.
+		// Push
+		//     Push
+		//         CanMutateTable(t1, default)
+		//         CanMutateTable(t2, default, post)
+		//     Pop
+		// Pop
+		{
+			cmds: []cmd{
+				push,
+				push,
+				mut | t1,
+				mut | t2 | post,
+				pop,
+				pop,
+			},
+		},
+		// 24.
+		// Original:
+		// Push
+		//     CanMutateTable(t1, default)
+		//     GetInitFnForPostQuery()
+		// Pop
+		//
+		// Post-Query:
+		// initFn()
+		// Push
+		//     CanMutateTable(t1, default)
+		// Pop
+		{
+			cmds: []cmd{
+				push,
+				mut | t1,
+				getInit,
+				pop,
+				init,
+				push,
+				mut | t1,
+				pop,
+			},
+		},
+		// 25.
+		// Original:
+		// Push
+		//     Push
+		//         CanMutateTable(t1, default)
+		//     Pop
+		//     GetInitFnForPostQuery()
+		// Pop
+		//
+		// Post-Query:
+		// initFn()
+		// Push
+		//     CanMutateTable(t1, default)
+		// Pop
+		{
+			cmds: []cmd{
+				push,
+				push,
+				mut | t1,
+				pop,
+				getInit,
+				pop,
+				init,
+				push,
+				mut | t1,
+				pop,
+			},
+		},
+		// 25.
+		// Original:
+		// Push
+		//     Push
+		//         CanMutateTable(t1, default)
+		//     Pop
+		//     Push
+		//         GetInitFnForPostQuery()
+		//     Pop
+		// Pop
+		//
+		// Post-Query:
+		// initFn()
+		// Push
+		//     CanMutateTable(t1, default)
+		// Pop
+		{
+			cmds: []cmd{
+				push,
+				push,
+				mut | t1,
+				pop,
+				push,
+				getInit,
+				pop,
+				pop,
+				init,
+				push,
+				mut | t1,
+				pop,
+			},
+		},
+		// 26.
+		// Original:
+		// Push
+		//     CanMutateTable(t1, default)
+		//     Push
+		//         GetInitFnForPostQuery()
+		//     Pop
+		// Pop
+		//
+		// Post-Query:
+		// initFn()
+		// Push
+		//     CanMutateTable(t1, default) FAIL
+		{
+			cmds: []cmd{
+				push,
+				mut | t1,
+				push,
+				getInit,
+				pop,
+				pop,
+				init,
+				push,
+				mut | t1 | fail,
+			},
+		},
+		// 27.
+		// Original:
+		// Push
+		//     Push
+		//         GetInitFnForPostQuery()
+		//     Pop
+		//     CanMutateTable(t1, default)
+		// Pop
+		//
+		// Post-Query:
+		// initFn()
+		// Push
+		//     CanMutateTable(t1, default) FAIL
+		{
+			cmds: []cmd{
+				push,
+				push,
+				getInit,
+				pop,
+				mut | t1,
+				pop,
+				init,
+				push,
+				mut | t1 | fail,
+			},
+		},
+		// 28.
+		// Original:
+		// Push
+		//     CanMutateTable(t1, default)
+		//     Push
+		//         Push
+		//             GetInitFnForPostQuery()
+		//         Pop
+		//     Pop
+		// Pop
+		//
+		// Post-Query:
+		// initFn()
+		// Push
+		//     CanMutateTable(t1, default) FAIL
+		{
+			cmds: []cmd{
+				push,
+				mut | t1,
+				push,
+				push,
+				getInit,
+				pop,
+				pop,
+				pop,
+				init,
+				push,
+				mut | t1 | fail,
+			},
+		},
 	}
 
 	for i, tc := range testCases {
 		var mt statementTree
+		var pqTreeFn func() statementTree
 		for j, c := range tc.cmds {
 			switch {
 			case c&push == push:
@@ -385,6 +599,19 @@ func TestStatementTree(t *testing.T) {
 
 			case c&pop == pop:
 				mt.Pop()
+
+			case c&getInit == getInit:
+				if pqTreeFn != nil {
+					t.Fatalf("test case %d: GetInitFnForPostQuery called twice", i)
+				}
+				pqTreeFn = mt.GetInitFnForPostQuery()
+
+			case c&init == init:
+				if pqTreeFn == nil {
+					mt = statementTree{}
+				} else {
+					mt = pqTreeFn()
+				}
 
 			case c&mut == mut:
 				var tabID cat.StableID
@@ -400,7 +627,12 @@ func TestStatementTree(t *testing.T) {
 					typ = simpleInsert
 				}
 
-				res := mt.CanMutateTable(tabID, typ)
+				isPost := false
+				if c&post == post {
+					isPost = true
+				}
+
+				res := mt.CanMutateTable(tabID, typ, isPost)
 
 				expected := c&fail != fail
 				if res != expected {

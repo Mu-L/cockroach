@@ -1,27 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import { isNil, merge } from "lodash";
-
-import { syncHistory } from "src/util/query";
-import {
-  getStatusString,
-  makeSessionsColumns,
-  SessionInfo,
-  SessionsSortedTable,
-} from "./sessionsTable";
-import { RouteComponentProps } from "react-router-dom";
 import classNames from "classnames/bind";
+import isNil from "lodash/isNil";
+import merge from "lodash/merge";
+import moment from "moment-timezone";
+import React from "react";
+import { RouteComponentProps } from "react-router-dom";
 
-import LoadingError, { mergeErrors } from "../sqlActivity/errorComponent";
+import { Loading } from "src/loading";
 import { Pagination } from "src/pagination";
 import {
   SortSetting,
@@ -29,7 +18,17 @@ import {
   updateSortSettingQueryParamsOnTab,
   ColumnDescriptor,
 } from "src/sortedtable";
-import { Loading } from "src/loading";
+import statementsPageStyles from "src/statementsPage/statementsPage.module.scss";
+import {
+  ICancelSessionRequest,
+  ICancelQueryRequest,
+} from "src/store/terminateQuery";
+import { TimestampToMoment, unset } from "src/util";
+import { syncHistory } from "src/util/query";
+
+import ColumnsSelector, {
+  SelectOption,
+} from "../columnsSelector/columnsSelector";
 import {
   calculateActiveFilters,
   defaultFilters,
@@ -39,32 +38,27 @@ import {
   handleFiltersFromQueryString,
   SelectedFilters,
 } from "../queryFilter";
+import LoadingError, { mergeErrors } from "../sqlActivity/errorComponent";
+import {
+  getLabel,
+  StatisticTableColumnKeys,
+} from "../statsTableUtil/statsTableUtil";
+import { TableStatistics } from "../tableStatistics";
 
+import { EmptySessionsTablePlaceholder } from "./emptySessionsTablePlaceholder";
+import sessionPageStyles from "./sessionPage.module.scss";
+import {
+  getStatusString,
+  makeSessionsColumns,
+  SessionInfo,
+  SessionsSortedTable,
+} from "./sessionsTable";
 import TerminateQueryModal, {
   TerminateQueryModalRef,
 } from "./terminateQueryModal";
 import TerminateSessionModal, {
   TerminateSessionModalRef,
 } from "./terminateSessionModal";
-
-import {
-  ICancelSessionRequest,
-  ICancelQueryRequest,
-} from "src/store/terminateQuery";
-
-import statementsPageStyles from "src/statementsPage/statementsPage.module.scss";
-import sessionPageStyles from "./sessionPage.module.scss";
-import ColumnsSelector, {
-  SelectOption,
-} from "../columnsSelector/columnsSelector";
-import { TimestampToMoment, unset } from "src/util";
-import moment from "moment-timezone";
-import {
-  getLabel,
-  StatisticTableColumnKeys,
-} from "../statsTableUtil/statsTableUtil";
-import { TableStatistics } from "../tableStatistics";
-import { EmptySessionsTablePlaceholder } from "./emptySessionsTablePlaceholder";
 
 const statementsPageCx = classNames.bind(statementsPageStyles);
 const sessionsPageCx = classNames.bind(sessionPageStyles);
@@ -155,8 +149,8 @@ export class SessionsPage extends React.Component<
     if (
       this.props.onSortingChange &&
       columnTitle &&
-      (sortSetting.columnTitle != columnTitle ||
-        sortSetting.ascending != ascending)
+      (sortSetting.columnTitle !== columnTitle ||
+        sortSetting.ascending !== ascending)
     ) {
       this.props.onSortingChange("Sessions", columnTitle, ascending);
     }
@@ -298,7 +292,7 @@ export class SessionsPage extends React.Component<
       .filter((s: SessionInfo) => {
         const isInternal = (s: SessionInfo) =>
           s.session.application_name.startsWith(internalAppNamePrefix);
-        if (filters.app && filters.app != "All") {
+        if (filters.app && filters.app !== "All") {
           const apps = filters.app.split(",");
           let showInternal = false;
           if (apps.includes(internalAppNamePrefix)) {
@@ -324,14 +318,14 @@ export class SessionsPage extends React.Component<
         return timeValue === "empty" || sessionTime >= Number(timeValue);
       })
       .filter((s: SessionInfo) => {
-        if (filters.username && filters.username != "All") {
+        if (filters.username && filters.username !== "All") {
           const usernames = filters.username.split(",");
           return usernames.includes(s.session.username);
         }
         return true;
       })
       .filter((s: SessionInfo) => {
-        if (filters.sessionStatus && filters.sessionStatus != "All") {
+        if (filters.sessionStatus && filters.sessionStatus !== "All") {
           const statuses = filters.sessionStatus.split(",");
           return statuses.includes(getStatusString(s.session.status));
         }

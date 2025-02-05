@@ -1,15 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import moment from "moment-timezone";
+
 import { CoordinatedUniversalTime } from "src/contexts";
+
 import { longToInt } from "./fixLong";
 
 export const kibi = 1024;
@@ -168,7 +165,7 @@ export function PercentageCustom(
   let found = false;
   for (let index = 2; index < pctString.length && !found; index++) {
     finalPct = `${finalPct}${pctString[index]}`;
-    if (pctString[index] != "0") {
+    if (pctString[index] !== "0") {
       found = true;
     }
   }
@@ -184,7 +181,7 @@ export function PercentageCustom(
  */
 export function ComputeDurationScale(ns: number): UnitValue {
   return durationUnitsDescending.find(
-    ({ value }) => ns / value >= 1 || value == 1,
+    ({ value }) => ns / value >= 1 || value === 1,
   );
 }
 
@@ -206,15 +203,16 @@ export function Duration(nanoseconds: number): string {
  * If the value is 0, return "no samples".
  */
 export function DurationCheckSample(nanoseconds: number): string {
-  if (nanoseconds == 0) {
+  if (nanoseconds === 0) {
     return "no samples";
   }
   return Duration(nanoseconds);
 }
 
 export const DATE_FORMAT = "MMM DD, YYYY [at] H:mm";
+export const DATE_WITH_SECONDS_FORMAT = "MMM DD, YYYY [at] H:mm:ss";
 export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT =
-  "MMM DD, YYYY [at] H:mm:ss:ms";
+  "MMM DD, YYYY [at] H:mm:ss.ms";
 
 /**
  * Alternate 24 hour formats
@@ -222,7 +220,7 @@ export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT =
 export const DATE_FORMAT_24_TZ = "MMM DD, YYYY [at] H:mm z";
 export const DATE_WITH_SECONDS_FORMAT_24_TZ = "MMM DD, YYYY [at] H:mm:ss z";
 export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_TZ =
-  "MMM DD, YYYY [at] H:mm:ss:ms z";
+  "MMM DD, YYYY [at] H:mm:ss.ms z";
 
 export function FormatWithTimezone(
   m: moment.Moment,
@@ -233,10 +231,10 @@ export function FormatWithTimezone(
 }
 
 export function RenderCount(yesCount: Long, totalCount: Long): string {
-  if (longToInt(yesCount) == 0) {
+  if (longToInt(yesCount) === 0) {
     return "No";
   }
-  if (longToInt(yesCount) == longToInt(totalCount)) {
+  if (longToInt(yesCount) === longToInt(totalCount)) {
     return "Yes";
   }
   const noCount = longToInt(totalCount) - longToInt(yesCount);
@@ -275,17 +273,17 @@ export const limitText = (text: string, limit: number): string => {
 
 // limitStringArray returns a shortened form of text that surpasses a given limit
 export const limitStringArray = (arr: string[], limit: number): string => {
-  if (!arr || arr.length == 0) {
+  if (!arr || arr.length === 0) {
     return "";
   }
 
   // Remove null and undefined entries in the array.
   arr = arr.filter(n => n);
-  if (arr.length == 0) {
+  if (arr.length === 0) {
     return "";
   }
 
-  if (arr.length == 1 || arr[0]?.length > limit) {
+  if (arr.length === 1 || arr[0]?.length > limit) {
     return limitText(arr[0], limit);
   }
 
@@ -358,7 +356,7 @@ export function EncodeUriName(name: string): string {
   return encodeURIComponent(name).replace(/%25/g, "%252525");
 }
 
-export function EncodeDatabasesUri(db: string): string {
+function encodeDatabasesUri(db: string): string {
   return `/databases/${EncodeUriName(db)}`;
 }
 
@@ -368,13 +366,13 @@ export function EncodeDatabasesToIndexUri(
   table: string,
   indexName: string,
 ): string {
-  return `${EncodeDatabasesUri(db)}/${EncodeUriName(schema)}/${EncodeUriName(
+  return `${encodeDatabasesUri(db)}/${EncodeUriName(schema)}/${EncodeUriName(
     table,
   )}/${EncodeUriName(indexName)}`;
 }
 
-export function EncodeDatabaseTableUri(db: string, table: string): string {
-  return `${EncodeDatabaseUri(db)}/table/${EncodeUriName(table)}`;
+function encodeDatabaseTableUri(db: string, table: string): string {
+  return `${encodeDatabaseUri(db)}/table/${EncodeUriName(table)}`;
 }
 
 export function EncodeDatabaseTableIndexUri(
@@ -382,12 +380,12 @@ export function EncodeDatabaseTableIndexUri(
   table: string,
   indexName: string,
 ): string {
-  return `${EncodeDatabaseTableUri(db, table)}/index/${EncodeUriName(
+  return `${encodeDatabaseTableUri(db, table)}/index/${EncodeUriName(
     indexName,
   )}`;
 }
 
-export function EncodeDatabaseUri(db: string): string {
+function encodeDatabaseUri(db: string): string {
   return `/database/${EncodeUriName(db)}`;
 }
 
@@ -429,7 +427,7 @@ function breakLongLine(line: string, limit: number): string {
     return line;
   }
   const idxComma = line.indexOf(",", limit);
-  if (idxComma == -1) {
+  if (idxComma === -1) {
     return line;
   }
 

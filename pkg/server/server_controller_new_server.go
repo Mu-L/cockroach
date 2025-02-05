@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -16,10 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
@@ -56,7 +49,7 @@ type tenantServerCreator interface {
 	newTenantServer(ctx context.Context,
 		tenantNameContainer *roachpb.TenantNameContainer,
 		tenantStopper *stop.Stopper,
-		index int,
+		portStartHint int,
 		testArgs base.TestSharedProcessTenantArgs,
 	) (onDemandServer, error)
 }
@@ -68,14 +61,15 @@ func (s *topLevelServer) newTenantServer(
 	ctx context.Context,
 	tenantNameContainer *roachpb.TenantNameContainer,
 	tenantStopper *stop.Stopper,
-	index int,
+	portStartHint int,
 	testArgs base.TestSharedProcessTenantArgs,
 ) (onDemandServer, error) {
 	tenantID, err := s.getTenantID(ctx, tenantNameContainer.Get())
 	if err != nil {
 		return nil, err
 	}
-	baseCfg, sqlCfg, err := s.makeSharedProcessTenantConfig(ctx, tenantID, index, tenantStopper)
+
+	baseCfg, sqlCfg, err := s.makeSharedProcessTenantConfig(ctx, tenantID, portStartHint, tenantStopper, testArgs.Settings)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +144,11 @@ func newTenantServerInternal(
 }
 
 func (s *topLevelServer) makeSharedProcessTenantConfig(
-	ctx context.Context, tenantID roachpb.TenantID, index int, stopper *stop.Stopper,
+	ctx context.Context,
+	tenantID roachpb.TenantID,
+	portStartHint int,
+	stopper *stop.Stopper,
+	testSettings *cluster.Settings,
 ) (BaseConfig, SQLConfig, error) {
 	// Create a configuration for the new tenant.
 	parentCfg := s.cfg
@@ -159,7 +157,14 @@ func (s *topLevelServer) makeSharedProcessTenantConfig(
 		ServerInterceptors:              s.grpc.serverInterceptorsInfo,
 		SameProcessCapabilityAuthorizer: s.rpcContext.TenantRPCAuthorizer,
 	}
-	baseCfg, sqlCfg, err := makeSharedProcessTenantServerConfig(ctx, tenantID, index, parentCfg, localServerInfo, stopper, s.recorder)
+	st := cluster.MakeClusterSettings()
+	if testSettings != nil {
+		// If there are testing default overrides in the base config, copy them to the
+		// shared process server too.
+		st.SV.TestingCopyForVirtualCluster(&testSettings.SV)
+	}
+
+	baseCfg, sqlCfg, err := makeSharedProcessTenantServerConfig(ctx, tenantID, portStartHint, parentCfg, localServerInfo, st, stopper, s.recorder)
 	if err != nil {
 		return BaseConfig{}, SQLConfig{}, err
 	}
@@ -171,29 +176,13 @@ func (s *topLevelServer) makeSharedProcessTenantConfig(
 func makeSharedProcessTenantServerConfig(
 	ctx context.Context,
 	tenantID roachpb.TenantID,
-	index int,
+	portStartHint int,
 	kvServerCfg Config,
 	kvServerInfo LocalKVServerInfo,
+	st *cluster.Settings,
 	stopper *stop.Stopper,
 	nodeMetricsRecorder *status.MetricsRecorder,
 ) (baseCfg BaseConfig, sqlCfg SQLConfig, err error) {
-	st := cluster.MakeClusterSettings()
-
-	// We need a value in the version setting prior to the update
-	// coming from the system.settings table. This value must be valid
-	// and compatible with the state of the tenant's keyspace.
-	//
-	// Since we don't know at which binary version the tenant
-	// keyspace was initialized, we must be conservative and
-	// assume it was created a long time ago; and that we may
-	// have to run all known migrations since then. So initialize
-	// the version setting to the minimum supported version.
-	if err := clusterversion.Initialize(
-		ctx, st.Version.BinaryMinSupportedVersion(), &st.SV,
-	); err != nil {
-		return BaseConfig{}, SQLConfig{}, err
-	}
-
 	tr := tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV))
 
 	// Define a tenant store. This will be used to write the
@@ -240,19 +229,30 @@ func makeSharedProcessTenantServerConfig(
 	baseCfg.Config.DisableClusterNameVerification = kvServerCfg.Config.DisableClusterNameVerification
 
 	baseCfg.MaxOffset = kvServerCfg.BaseConfig.MaxOffset
-	baseCfg.StorageEngine = kvServerCfg.BaseConfig.StorageEngine
 	baseCfg.TestingInsecureWebAccess = kvServerCfg.BaseConfig.TestingInsecureWebAccess
 	baseCfg.Locality = kvServerCfg.BaseConfig.Locality
-	baseCfg.SpanConfigsDisabled = kvServerCfg.BaseConfig.SpanConfigsDisabled
 	baseCfg.EnableDemoLoginEndpoint = kvServerCfg.BaseConfig.EnableDemoLoginEndpoint
+	baseCfg.DefaultZoneConfig = kvServerCfg.BaseConfig.DefaultZoneConfig
+	baseCfg.HeapProfileDirName = kvServerCfg.BaseConfig.HeapProfileDirName
+	baseCfg.CPUProfileDirName = kvServerCfg.BaseConfig.CPUProfileDirName
+	baseCfg.GoroutineDumpDirName = kvServerCfg.BaseConfig.GoroutineDumpDirName
 
+	// The ListenerFactory allows us to dynamically choose a
+	// listen port based on the user's configuration.
+	//
 	// TODO(knz): use a single network interface for all tenant servers.
 	// See: https://github.com/cockroachdb/cockroach/issues/92524
-	portOffset := kvServerCfg.Config.SecondaryTenantPortOffset
-	var err1, err2 error
-	baseCfg.Addr, err1 = rederivePort(index, kvServerCfg.Config.Addr, "", portOffset)
-	baseCfg.AdvertiseAddr, err2 = rederivePort(index, kvServerCfg.Config.AdvertiseAddr, baseCfg.Addr, portOffset)
-	if err := errors.CombineErrors(err1, err2); err != nil {
+	baseCfg.RPCListenerFactory = ListenerFactoryForConfig(&kvServerCfg.BaseConfig, portStartHint)
+
+	// We reset the port of the KV Addr configuration to 0. If we
+	// don't have a customized listener factory, this will force
+	// the operating system to choose a port by default.
+	baseCfg.Config.Addr, err = resetPort(kvServerCfg.Config.Addr)
+	if err != nil {
+		return BaseConfig{}, SQLConfig{}, err
+	}
+	baseCfg.Config.AdvertiseAddr, err = resetPort(kvServerCfg.Config.AdvertiseAddr)
+	if err != nil {
 		return BaseConfig{}, SQLConfig{}, err
 	}
 
@@ -308,25 +308,26 @@ func makeSharedProcessTenantServerConfig(
 		baseCfg.InflightTraceDirName = traceDir
 	}
 
-	useStore := kvServerCfg.SQLConfig.TempStorageConfig.Spec
-	tempStorageCfg := base.TempStorageConfigFromEnv(
-		ctx, st, useStore, "" /* parentDir */, kvServerCfg.SQLConfig.TempStorageConfig.Mon.Limit())
-	// TODO(knz): Make tempDir configurable.
-	tempDir := useStore.Path
-	if tempStorageCfg.Path, err = fs.CreateTempDir(tempDir, TempDirPrefix, stopper); err != nil {
-		return BaseConfig{}, SQLConfig{}, errors.Wrap(err, "could not create temporary directory for temp storage")
-	}
-	if useStore.Path != "" {
-		recordPath := filepath.Join(useStore.Path, TempDirsRecordFilename)
-		if err := fs.RecordTempDir(recordPath, tempStorageCfg.Path); err != nil {
-			return BaseConfig{}, SQLConfig{}, errors.Wrap(err, "could not record temp dir")
+	tempStorageCfg := base.InheritTempStorageConfig(ctx, st, kvServerCfg.SQLConfig.TempStorageConfig)
+	if !tempStorageCfg.InMemory {
+		useStore := tempStorageCfg.Spec
+		// TODO(knz): Make tempDir configurable.
+		tempDir := useStore.Path
+		if tempStorageCfg.Path, err = fs.CreateTempDir(tempDir, TempDirPrefix, stopper); err != nil {
+			return BaseConfig{}, SQLConfig{}, errors.Wrap(err, "could not create temporary directory for temp storage")
+		}
+		if useStore.Path != "" {
+			recordPath := filepath.Join(useStore.Path, TempDirsRecordFilename)
+			if err := fs.RecordTempDir(recordPath, tempStorageCfg.Path); err != nil {
+				return BaseConfig{}, SQLConfig{}, errors.Wrap(err, "could not record temp dir")
+			}
 		}
 	}
 
 	sqlCfg = MakeSQLConfig(tenantID, tempStorageCfg)
+	baseCfg.ExternalIODirConfig = kvServerCfg.BaseConfig.ExternalIODirConfig
 
-	baseCfg.Settings.ExternalIODir = kvServerCfg.BaseConfig.Settings.ExternalIODir
-	sqlCfg.ExternalIODirConfig = kvServerCfg.SQLConfig.ExternalIODirConfig
+	baseCfg.ExternalIODir = kvServerCfg.BaseConfig.ExternalIODir
 
 	// Use the internal connector instead of the network.
 	// See: https://github.com/cockroachdb/cockroach/issues/84591
@@ -346,53 +347,18 @@ func makeSharedProcessTenantServerConfig(
 	sqlCfg.LocalKVServerInfo = &kvServerInfo
 
 	sqlCfg.NodeMetricsRecorder = nodeMetricsRecorder
+	sqlCfg.LicenseEnforcer = kvServerCfg.SQLConfig.LicenseEnforcer
 
 	return baseCfg, sqlCfg, nil
 }
 
-// rederivePort computes a host:port pair for a secondary tenant.
-// TODO(knz): All this can be removed once we implement a single
-// network listener.
-// See https://github.com/cockroachdb/cockroach/issues/84604.
-func rederivePort(index int, addrToChange string, prevAddr string, portOffset int) (string, error) {
-	h, port, err := addr.SplitHostPort(addrToChange, "0")
+func resetPort(addrToChange string) (string, error) {
+	h, _, err := addr.SplitHostPort(addrToChange, "0")
 	if err != nil {
-		return "", errors.Wrapf(err, "%d: %q", index, addrToChange)
+		return "", err
 	}
 
-	if portOffset == 0 {
-		// Shortcut: random selection for base address.
-		return net.JoinHostPort(h, "0"), nil
-	}
-
-	var pnum int
-	if port != "" {
-		pnum, err = strconv.Atoi(port)
-		if err != nil {
-			return "", errors.Wrapf(err, "%d: %q", index, addrToChange)
-		}
-	}
-
-	if prevAddr != "" && pnum == 0 {
-		// Try harder to find a port number, by taking one from
-		// the previously computed addr.
-		_, port2, err := addr.SplitHostPort(prevAddr, "0")
-		if err != nil {
-			return "", errors.Wrapf(err, "%d: %q", index, prevAddr)
-		}
-		pnum, err = strconv.Atoi(port2)
-		if err != nil {
-			return "", errors.Wrapf(err, "%d: %q", index, prevAddr)
-		}
-	}
-
-	// Do we have a base port to go with now?
-	if pnum == 0 {
-		// No, bail.
-		return "", errors.Newf("%d: no base port available for computation in %q / %q", index, addrToChange, prevAddr)
-	}
-	port = strconv.Itoa(pnum + portOffset + index)
-	return net.JoinHostPort(h, port), nil
+	return net.JoinHostPort(h, "0"), nil
 }
 
 func (s *SQLServerWrapper) reportTenantInfo(ctx context.Context) error {

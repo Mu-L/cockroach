@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -20,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedpb"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -29,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs/schedulebase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -58,7 +57,7 @@ type testHelper struct {
 	sqlDB            *sqlutils.SQLRunner
 	server           serverutils.TestServerInterface
 	executeSchedules func() error
-	createdSchedules []int64
+	createdSchedules []jobspb.ScheduleID
 }
 
 func newTestHelper(t *testing.T) (*testHelper, func()) {
@@ -94,6 +93,15 @@ func withSchedulerHelper(sh *testHelper) func(opts *feedTestOptions) {
 	}
 }
 
+func (h *testHelper) loadSchedule(t *testing.T, scheduleID jobspb.ScheduleID) *jobs.ScheduledJob {
+	t.Helper()
+
+	loaded, err := jobs.ScheduledJobDB(h.internalDB()).
+		Load(context.Background(), h.env, scheduleID)
+	require.NoError(t, err)
+	return loaded
+}
+
 func (h *testHelper) clearSchedules(t *testing.T) {
 	t.Helper()
 
@@ -101,14 +109,16 @@ func (h *testHelper) clearSchedules(t *testing.T) {
 	sep := ""
 	for _, id := range h.createdSchedules {
 		sb.WriteString(sep)
-		sb.WriteString(strconv.FormatInt(id, 10))
+		sb.WriteString(strconv.FormatInt(int64(id), 10))
 		sep = ", "
 	}
 	h.sqlDB.Exec(t, fmt.Sprintf("DELETE FROM %s WHERE schedule_id IN (%s)",
 		h.env.ScheduledJobsTableName(), sb.String()))
 }
 
-func (h *testHelper) waitForSuccessfulScheduledJob(t *testing.T, scheduleID int64) int64 {
+func (h *testHelper) waitForSuccessfulScheduledJob(
+	t *testing.T, scheduleID jobspb.ScheduleID,
+) int64 {
 	query := "SELECT id FROM " + h.env.SystemJobsTableName() +
 		" WHERE status=$1 AND created_by_type=$2 AND created_by_id=$3"
 	var jobID int64
@@ -140,7 +150,7 @@ func (h *testHelper) createChangefeedSchedule(
 	// Query system.scheduled_job table and load those schedules.
 	datums, cols, err := h.cfg.DB.Executor().QueryRowExWithCols(
 		context.Background(), "sched-load", nil,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		"SELECT * FROM system.scheduled_jobs WHERE schedule_id = $1",
 		id,
 	)
@@ -158,6 +168,10 @@ func getScheduledChangefeedStatement(t *testing.T, arg *jobspb.ExecutionArgument
 	var scheduledChangefeed changefeedpb.ScheduledChangefeedExecutionArgs
 	require.NoError(t, pbtypes.UnmarshalAny(arg.Args, &scheduledChangefeed))
 	return scheduledChangefeed.ChangefeedStatement
+}
+
+func (h *testHelper) internalDB() descs.DB {
+	return h.server.InternalDB().(descs.DB)
 }
 
 // This test examines serialized representation of changefeed schedule arguments
@@ -236,8 +250,8 @@ func TestSerializesScheduledChangefeedExecutionArgs(t *testing.T) {
 			queryArgs: []interface{}{th.env.Now()},
 			es: expectedSchedule{
 				nameRe:         "foo-changefeed",
-				changefeedStmt: "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop' AS SELECT * FROM d.public.foo",
-				shownStmt:      "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop' AS SELECT * FROM d.public.foo",
+				changefeedStmt: "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=nevershown' WITH OPTIONS (format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop') AS SELECT * FROM d.public.foo",
+				shownStmt:      "CREATE CHANGEFEED INTO 'webhook-https://0/changefeed?AWS_SECRET_ACCESS_KEY=redacted' WITH OPTIONS (format = 'JSON', initial_scan = 'only', schema_change_policy = 'stop') AS SELECT * FROM d.public.foo",
 				period:         time.Hour,
 				runsNow:        true,
 			},
@@ -245,7 +259,7 @@ func TestSerializesScheduledChangefeedExecutionArgs(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		t.Run(fmt.Sprintf(tc.name), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			defer th.clearSchedules(t)
 
 			sj, err := th.createChangefeedSchedule(t, tc.query, tc.queryArgs...)
@@ -354,7 +368,7 @@ func TestCreateChangefeedScheduleIfNotExists(t *testing.T) {
 
 	rows, err := th.cfg.DB.Executor().QueryBufferedEx(
 		context.Background(), "check-sched", nil,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		selectQuery)
 
 	require.NoError(t, err)
@@ -367,7 +381,7 @@ func TestCreateChangefeedScheduleIfNotExists(t *testing.T) {
 
 	rows, err = th.cfg.DB.Executor().QueryBufferedEx(
 		context.Background(), "check-sched2", nil,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		selectQuery)
 
 	require.NoError(t, err)
@@ -412,7 +426,7 @@ CREATE TABLE t2(b INT PRIMARY KEY, c STRING);
 INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
 `)
 
-	getFeed := func(isBare bool, db *gosql.DB) (string, *webhookFeed, func()) {
+	getFeed := func(envelopeType changefeedbase.EnvelopeType, db *gosql.DB) (string, *webhookFeed, func()) {
 		cert, _, err := cdctest.NewCACertBase64Encoded()
 		require.NoError(t, err)
 		sinkDest, err := cdctest.StartMockWebhookSink(cert)
@@ -428,7 +442,7 @@ INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
 		feed := &webhookFeed{
 			seenTrackerMap: make(map[string]struct{}),
 			mockSink:       sinkDest,
-			isBare:         isBare,
+			envelopeType:   envelopeType,
 			jobFeed:        newJobFeed(db, dummyWrapper),
 		}
 
@@ -440,7 +454,7 @@ INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
 		name            string
 		scheduleStmt    string
 		expectedPayload []string
-		isBare          bool
+		envelopeType    changefeedbase.EnvelopeType
 	}{
 		{
 			name:         "one-table",
@@ -450,7 +464,7 @@ INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
 				`t1: [10]->{"after": {"a": 10, "b": "ten"}}`,
 				`t1: [100]->{"after": {"a": 100, "b": "hundred"}}`,
 			},
-			isBare: false,
+			envelopeType: changefeedbase.OptEnvelopeWrapped,
 		},
 		{
 			name:         "two-table",
@@ -463,7 +477,7 @@ INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
 				`t2: [2]->{"after": {"b": 2, "c": "two"}}`,
 				`t2: [1]->{"after": {"b": 1, "c": "one"}}`,
 			},
-			isBare: false,
+			envelopeType: changefeedbase.OptEnvelopeWrapped,
 		},
 		{
 			name: "changefeed-expressions",
@@ -474,13 +488,13 @@ INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
 				`t1: [10]->{"b": "ten"}`,
 				`t1: [100]->{"b": "hundred"}`,
 			},
-			isBare: true,
+			envelopeType: changefeedbase.OptEnvelopeBare,
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
-			sinkURI, feed, cleanup := getFeed(test.isBare, th.db)
+			sinkURI, feed, cleanup := getFeed(test.envelopeType, th.db)
 			defer cleanup()
 
 			sj, err := th.createChangefeedSchedule(
@@ -500,6 +514,111 @@ INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
 			assertPayloads(t, feed, test.expectedPayload)
 		})
 	}
+}
+
+// TestPauseScheduledChangefeedOnNewClusterID schedules a changefeed and verifies the changefeed pauses
+// if it is running on a cluster with a different ID than is stored in the schedule details
+func TestPauseScheduledChangefeedOnNewClusterID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	th, cleanup := newTestHelper(t)
+	defer cleanup()
+
+	th.sqlDB.Exec(t, `
+CREATE TABLE t1(a INT PRIMARY KEY, b STRING);
+INSERT INTO t1 values (1, 'one'), (10, 'ten'), (100, 'hundred');
+
+CREATE TABLE t2(b INT PRIMARY KEY, c STRING);
+INSERT INTO t2 VALUES (3, 'three'), (2, 'two'), (1, 'one');
+`)
+
+	getFeed := func(envelopeType changefeedbase.EnvelopeType, db *gosql.DB) (string, *webhookFeed, func()) {
+		cert, _, err := cdctest.NewCACertBase64Encoded()
+		require.NoError(t, err)
+		sinkDest, err := cdctest.StartMockWebhookSink(cert)
+		require.NoError(t, err)
+
+		dummyWrapper := func(s Sink) Sink {
+			return s
+		}
+		// NB: This is a partially initialized webhookFeed.
+		// You must call th.waitForSuccessfulScheduledJob prior to reading
+		// feed messages. If messages are tried to access before they are present,
+		// this feed will panic because sink synchronizer is not initialized.
+		feed := &webhookFeed{
+			seenTrackerMap: make(map[string]struct{}),
+			mockSink:       sinkDest,
+			envelopeType:   envelopeType,
+			jobFeed:        newJobFeed(db, dummyWrapper),
+		}
+
+		sinkURI := fmt.Sprintf("webhook-%s?insecure_tls_skip_verify=true", sinkDest.URL())
+		return sinkURI, feed, sinkDest.Close
+	}
+
+	testCase := struct {
+		name            string
+		scheduleStmt    string
+		expectedPayload []string
+		envelopeType    changefeedbase.EnvelopeType
+	}{
+		name:         "one-table",
+		scheduleStmt: "CREATE SCHEDULE FOR changefeed TABLE t1 INTO $1 RECURRING '@hourly'",
+		expectedPayload: []string{
+			`t1: [1]->{"after": {"a": 1, "b": "one"}}`,
+			`t1: [10]->{"after": {"a": 10, "b": "ten"}}`,
+			`t1: [100]->{"after": {"a": 100, "b": "hundred"}}`,
+		},
+		envelopeType: changefeedbase.OptEnvelopeWrapped,
+	}
+
+	t.Run(testCase.name, func(t *testing.T) {
+		sinkURI, feed, cleanup := getFeed(testCase.envelopeType, th.db)
+		defer cleanup()
+
+		sj, err := th.createChangefeedSchedule(
+			t, testCase.scheduleStmt, sinkURI)
+		require.NoError(t, err)
+		defer th.clearSchedules(t)
+
+		// Get schedule DB to update the schedule with new clusterID
+		scheduleStorage := jobs.ScheduledJobDB(th.internalDB())
+
+		details := sj.ScheduleDetails()
+		currentClusterID := details.ClusterID
+		require.NotZero(t, currentClusterID)
+
+		// Modify the scheduled clusterID and update the job
+		details.ClusterID = jobstest.DummyClusterID
+		sj.SetScheduleDetails(*details)
+		th.env.SetTime(sj.NextRun().Add(time.Second))
+		require.NoError(t, scheduleStorage.Update(context.Background(), sj))
+		require.NoError(t, th.executeSchedules())
+
+		// Schedule is expected to be paused
+		testutils.SucceedsSoon(t, func() error {
+			expectPausedSchedule := th.loadSchedule(t, sj.ScheduleID())
+			if !expectPausedSchedule.IsPaused() {
+				return errors.New("schedule has not paused yet")
+			}
+			// The cluster ID should have been reset.
+			require.Equal(t, currentClusterID, expectPausedSchedule.ScheduleDetails().ClusterID)
+			return nil
+		})
+
+		th.sqlDB.Exec(t, "RESUME SCHEDULE $1", sj.ScheduleID())
+		resumedSchedule := th.loadSchedule(t, sj.ScheduleID())
+		require.False(t, resumedSchedule.IsPaused())
+		th.env.SetTime(resumedSchedule.NextRun().Add(time.Second))
+		require.NoError(t, th.executeSchedules())
+		jobID := th.waitForSuccessfulScheduledJob(t, sj.ScheduleID())
+		// We need to set the job ID here explicitly because the webhookFeed.Next
+		// function calls jobFeed.Details, which uses the job ID to get the
+		// changefeed details from the system.jobs table.
+		feed.jobFeed.jobID = jobspb.JobID(jobID)
+		assertPayloads(t, feed, testCase.expectedPayload)
+	})
 }
 
 // TestScheduledChangefeedErrors tests cases where a schedule changefeed statement will return an error.
@@ -709,7 +828,7 @@ func TestCheckScheduleAlreadyExists(t *testing.T) {
 	sd.Database = "d"
 	p, cleanup := sql.NewInternalPlanner("test",
 		execCfg.DB.NewTxn(ctx, "test-planner"),
-		username.RootUserName(), &sql.MemoryMetrics{}, &execCfg,
+		username.NodeUserName(), &sql.MemoryMetrics{}, &execCfg,
 		sd,
 	)
 	defer cleanup()
@@ -744,7 +863,7 @@ func TestFullyQualifyTables(t *testing.T) {
 	sd.Database = "ocean"
 	p, cleanupPlanHook := sql.NewInternalPlanner("test",
 		execCfg.DB.NewTxn(ctx, "test-planner"),
-		username.RootUserName(), &sql.MemoryMetrics{}, &execCfg,
+		username.NodeUserName(), &sql.MemoryMetrics{}, &execCfg,
 		sd,
 	)
 	defer cleanupPlanHook()

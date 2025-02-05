@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
@@ -174,9 +169,7 @@ func (m *Outbox) flush(ctx context.Context) error {
 	}
 	msg := m.encoder.FormMessage(ctx)
 
-	if log.V(3) {
-		log.Infof(ctx, "flushing outbox")
-	}
+	log.VEvent(ctx, 2, "Outbox flushing")
 	sendErr := m.stream.Send(msg)
 	if m.statsCollectionEnabled {
 		m.streamStats.NetTx.BytesSent.Add(int64(msg.Size()))
@@ -191,11 +184,9 @@ func (m *Outbox) flush(ctx context.Context) error {
 		HandleStreamErr(ctx, "flushing", sendErr, m.flowCtxCancel, m.outboxCtxCancel)
 		// Make sure the stream is not used any more.
 		m.stream = nil
-		if log.V(1) {
-			log.Errorf(ctx, "outbox flush error: %s", sendErr)
-		}
-	} else if log.V(3) {
-		log.Infof(ctx, "outbox flushed")
+		log.VWarningf(ctx, 1, "Outbox flush error: %s", sendErr)
+	} else {
+		log.VEvent(ctx, 2, "Outbox flushed")
 	}
 	if sendErr != nil {
 		return sendErr
@@ -241,13 +232,10 @@ func (m *Outbox) mainLoop(ctx context.Context, wg *sync.WaitGroup) (retErr error
 
 	if err := func() error {
 		conn, err := execinfra.GetConnForOutbox(
-			ctx, m.flowCtx.Cfg.PodNodeDialer, m.sqlInstanceID, SettingFlowStreamTimeout.Get(&m.flowCtx.Cfg.Settings.SV),
+			ctx, m.flowCtx.Cfg.SQLInstanceDialer, m.sqlInstanceID, SettingFlowStreamTimeout.Get(&m.flowCtx.Cfg.Settings.SV),
 		)
 		if err != nil {
-			// Log any Dial errors. This does not have a verbosity check due to being
-			// a critical part of query execution: if this step doesn't work, the
-			// receiving side might end up hanging or timing out.
-			log.Infof(ctx, "outbox: connection dial error: %+v", err)
+			log.VWarningf(ctx, 1, "Outbox Dial connection error, distributed query will fail: %+v", err)
 			return err
 		}
 		client := execinfrapb.NewDistSQLClient(conn)
@@ -256,9 +244,7 @@ func (m *Outbox) mainLoop(ctx context.Context, wg *sync.WaitGroup) (retErr error
 		}
 		m.stream, err = client.FlowStream(ctx)
 		if err != nil {
-			if log.V(1) {
-				log.Infof(ctx, "FlowStream error: %s", err)
-			}
+			log.VWarningf(ctx, 1, "Outbox FlowStream connection error, distributed query will fail: %+v", err)
 			return err
 		}
 		return nil

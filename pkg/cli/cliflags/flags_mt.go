@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cliflags
 
@@ -16,6 +11,14 @@ var (
 		Name:        "tenant-id",
 		EnvVar:      "COCKROACH_TENANT_ID",
 		Description: `The tenant ID under which to start the SQL server.`,
+	}
+
+	TenantIDFile = FlagInfo{
+		Name: "tenant-id-file",
+		Description: `Allows sourcing the tenant id from a file. The tenant id
+will be expected to be by itself on the first line of the file. If the file does
+not exist, or if the tenant id is incomplete, the tenant server will block, and
+wait for the tenant id to be fully written to the file (with a newline character).`,
 	}
 
 	KVAddrs = FlagInfo{
@@ -37,6 +40,11 @@ var (
 	ProxyListenAddr = FlagInfo{
 		Name:        "listen-addr",
 		Description: "Listen address for incoming connections.",
+	}
+
+	ProxyProtocolListenAddr = FlagInfo{
+		Name:        "proxy-protocol-listen-addr",
+		Description: "Listen address for incoming connections which require proxy protocol headers.",
 	}
 
 	ThrottleBaseDelay = FlagInfo{
@@ -86,6 +94,9 @@ var (
 		Description: "If true, proxy will not attempt to rebalance connections.",
 	}
 
+	// TODO(joel): Remove this flag, and use --listen-addr for a non-proxy
+	// protocol listener, and use --proxy-protocol-listen-addr for a proxy
+	// protocol listener.
 	RequireProxyProtocol = FlagInfo{
 		Name: "require-proxy-protocol",
 		Description: `Requires PROXY protocol on the SQL listener. The HTTP
@@ -122,5 +133,14 @@ listeners, if the headers are allowed.`,
 	TestDirectoryTenantBaseDir = FlagInfo{
 		Name:        "base-dir",
 		Description: "If set, the tenant processes will use it as a store location.",
+	}
+
+	Virtualized = FlagInfo{
+		Name:        "virtualized",
+		Description: "If set, the cluster will be initialized as a virtualized cluster.",
+	}
+	VirtualizedEmpty = FlagInfo{
+		Name:        "virtualized-empty",
+		Description: "If set, the cluster will be initialized as a virtualized cluster without main virtual cluster.",
 	}
 )

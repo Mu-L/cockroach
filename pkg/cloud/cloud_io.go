@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cloud
 
@@ -35,14 +30,14 @@ import (
 
 // Timeout is a cluster setting used for cloud storage interactions.
 var Timeout = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"cloudstorage.timeout",
 	"the timeout for import/export storage operations",
 	10*time.Minute,
 	settings.WithPublic)
 
 var httpCustomCA = settings.RegisterStringSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"cloudstorage.http.custom_ca",
 	"custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage",
 	"",
@@ -51,14 +46,14 @@ var httpCustomCA = settings.RegisterStringSetting(
 // WriteChunkSize is used to control the size of each chunk that is buffered and
 // uploaded by the cloud storage client.
 var WriteChunkSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"cloudstorage.write_chunk.size",
 	"controls the size of each file chunk uploaded by the cloud storage client",
-	8<<20,
+	5<<20,
 )
 
 var retryConnectionTimedOut = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"cloudstorage.connection_timed_out_retries.enabled",
 	"retry generic connection timed out errors; use with extreme caution",
 	false,
@@ -73,9 +68,39 @@ var HTTPRetryOptions = retry.Options{
 	Multiplier:     4,
 }
 
+var httpMetrics = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"cloudstorage.http.detailed_metrics.enabled",
+	"enabled collection of detailed metrics on cloud http requests",
+	true)
+
 // MakeHTTPClient makes an http client configured with the common settings used
 // for interacting with cloud storage (timeouts, retries, CA certs, etc).
-func MakeHTTPClient(settings *cluster.Settings) (*http.Client, error) {
+func MakeHTTPClient(
+	settings *cluster.Settings, metrics *Metrics, cloud, bucket, client string,
+) (*http.Client, error) {
+	t, err := MakeTransport(settings, metrics, cloud, bucket, client)
+	if err != nil {
+		return nil, err
+	}
+	return MakeHTTPClientForTransport(t)
+}
+
+// MakeHTTPClientForTransport creates a new http.Client with the given
+// transport.
+//
+// NB: This indirection is a little silly. But the goal is to prevent
+// us from modifying the defaults on some clients and not others.
+func MakeHTTPClientForTransport(t http.RoundTripper) (*http.Client, error) {
+	return &http.Client{Transport: t}, nil
+}
+
+// MakeTransport makes an http transport configured with the common settings
+// used for interacting with cloud storage (timeouts, retries, CA certs, etc).
+// Prefer MakeHTTPClient where possible.
+func MakeTransport(
+	settings *cluster.Settings, metrics *Metrics, cloud, bucket, client string,
+) (*http.Transport, error) {
 	var tlsConf *tls.Config
 	if pem := httpCustomCA.Get(&settings.SV); pem != "" {
 		roots, err := x509.SystemCertPool()
@@ -87,10 +112,18 @@ func MakeHTTPClient(settings *cluster.Settings) (*http.Client, error) {
 		}
 		tlsConf = &tls.Config{RootCAs: roots}
 	}
+
 	t := http.DefaultTransport.(*http.Transport).Clone()
+
 	// Add our custom CA.
 	t.TLSClientConfig = tlsConf
-	return &http.Client{Transport: t}, nil
+	// Bump up the default idle conn pool size as we have many parallel workers in
+	// most bulk jobs.
+	t.MaxIdleConnsPerHost = 64
+	if metrics != nil {
+		t.DialContext = metrics.NetMetrics.Wrap(t.DialContext, cloud, bucket, client)
+	}
+	return t, nil
 }
 
 // MaxDelayedRetryAttempts is the number of times the delayedRetry method will
@@ -250,6 +283,8 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 	ctx, sp := tracing.ChildSpan(ctx, "cloud.ResumingReader.Read")
 	defer sp.Finish()
 
+	var read int
+
 	var lastErr error
 	for retries := 0; lastErr == nil; retries++ {
 		if r.Reader == nil {
@@ -257,10 +292,15 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 		}
 
 		if lastErr == nil {
-			n, readErr := r.Reader.Read(p)
+			n, readErr := r.Reader.Read(p[read:])
+			read += n
+			r.Pos += int64(n)
 			if readErr == nil || readErr == io.EOF {
-				r.Pos += int64(n)
-				return n, readErr
+				return read, readErr
+			}
+			if r.Size > 0 && r.Pos == r.Size {
+				log.Warningf(ctx, "read %s ignoring read error received after completed read (%d): %v", r.Filename, r.Pos, readErr)
+				return read, io.EOF
 			}
 			lastErr = errors.Wrapf(readErr, "read %s", r.Filename)
 		}
@@ -272,7 +312,7 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 		// Use the configured retry-on-error decider to check for a resumable error.
 		if r.RetryOnErrFn(lastErr) {
 			if retries >= maxNoProgressReads {
-				return 0, errors.Wrapf(lastErr, "multiple Read calls (%d) return no data", retries)
+				return read, errors.Wrapf(lastErr, "multiple Read calls (%d) return no data", retries)
 			}
 			log.Errorf(ctx, "Retry IO error: %s", lastErr)
 			lastErr = nil
@@ -287,7 +327,7 @@ func (r *ResumingReader) Read(ctx context.Context, p []byte) (int, error) {
 	// something with what was read before the error, but this mostly applies to
 	// err = EOF case which we handle above, so likely OK that we're discarding n
 	// here and pretending it was zero.
-	return 0, lastErr
+	return read, lastErr
 }
 
 // Close implements io.Closer.

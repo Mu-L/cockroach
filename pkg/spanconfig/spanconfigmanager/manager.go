@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfigmanager
 
@@ -30,10 +25,9 @@ import (
 // checkReconciliationJobInterval is a cluster setting to control how often we
 // check if the span config reconciliation job exists. If it's not found, it
 // will be started. It has no effect unless
-// spanconfig.reconciliation_job.enabled is configured. For host
-// tenants, COCKROACH_DISABLE_SPAN_CONFIGS must not be set.
+// spanconfig.reconciliation_job.enabled is configured.
 var checkReconciliationJobInterval = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"spanconfig.reconciliation_job.check_interval",
 	"the frequency at which to check if the span config reconciliation job exists (and to start it if not)",
 	10*time.Minute,
@@ -41,13 +35,11 @@ var checkReconciliationJobInterval = settings.RegisterDurationSetting(
 )
 
 // jobEnabledSetting gates the activation of the span config reconciliation job.
-// For the host tenant it has no effect if COCKROACH_DISABLE_SPAN_CONFIGS is
-// set.
 //
 // TODO(irfansharif): This should be a tenant read-only setting once the work
 // for #73349 is completed.
 var jobEnabledSetting = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"spanconfig.reconciliation_job.enabled",
 	"enable the use of the kv accessor", true)
 
@@ -147,7 +139,7 @@ func (m *Manager) run(ctx context.Context) {
 
 	// Periodically check if the span config reconciliation job exists and start
 	// it if it doesn't.
-	timer := timeutil.NewTimer()
+	var timer timeutil.Timer
 	defer timer.Stop()
 
 	triggerJobCheck()
@@ -185,7 +177,7 @@ func (m *Manager) createAndStartJobIfNoneExists(ctx context.Context) (bool, erro
 
 	var job *jobs.Job
 	if err := m.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		exists, err := jobs.RunningJobExists(ctx, jobspb.InvalidJobID, txn, m.settings.Version,
+		exists, err := jobs.RunningJobExists(ctx, jobspb.InvalidJobID, txn,
 			jobspb.TypeAutoSpanConfigReconciliation)
 		if err != nil {
 			return err

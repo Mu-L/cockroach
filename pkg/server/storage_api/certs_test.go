@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
@@ -25,16 +20,19 @@ import (
 func TestCertificatesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
 
 	var response serverpb.CertificatesResponse
 	if err := srvtestutils.GetStatusJSONProto(ts, "certificates/local", &response); err != nil {
 		t.Fatal(err)
 	}
 
-	// We expect 5 certificates: CA, node, and client certs for root, testuser, testuser2.
-	if a, e := len(response.Certificates), 5; a != e {
+	// We expect 6 certificates: CA, node, and client certs for root, testuser,
+	// testuser2, testuser3, testuser_cn_only, testuser_san_only,
+	// testuser_cn_and_san.
+	if a, e := len(response.Certificates), 9; a != e {
 		t.Errorf("expected %d certificates, found %d", e, a)
 	}
 

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantsettingswatcher_test
 
@@ -27,14 +22,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
 func TestWatcher(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	defer srv.Stopper().Stop(ctx)
 	ts := srv.ApplicationLayer()
 
@@ -48,7 +47,7 @@ func TestWatcher(t *testing.T) {
 	w := tenantsettingswatcher.New(
 		ts.Clock(),
 		ts.ExecutorConfig().(sql.ExecutorConfig).RangeFeedFactory,
-		ts.Stopper(),
+		ts.AppStopper(),
 		ts.ClusterSettings(),
 	)
 	err := w.Start(ctx, ts.SystemTableIDResolver().(catalog.SystemTableIDResolver))
@@ -73,16 +72,16 @@ func TestWatcher(t *testing.T) {
 	t1 := roachpb.MustMakeTenantID(1)
 	t2 := roachpb.MustMakeTenantID(2)
 	t3 := roachpb.MustMakeTenantID(3)
-	all, allCh := w.GetAllTenantOverrides()
+	all, allCh := w.GetAllTenantOverrides(ctx)
 	expect(all, "foo=foo-all")
 
-	t1Overrides, t1Ch := w.GetTenantOverrides(t1)
+	t1Overrides, t1Ch := w.GetTenantOverrides(ctx, t1)
 	expect(t1Overrides, "bar=bar-t1 foo=foo-t1")
 
-	t2Overrides, _ := w.GetTenantOverrides(t2)
+	t2Overrides, _ := w.GetTenantOverrides(ctx, t2)
 	expect(t2Overrides, "baz=baz-t2")
 
-	t3Overrides, t3Ch := w.GetTenantOverrides(t3)
+	t3Overrides, t3Ch := w.GetTenantOverrides(ctx, t3)
 	expect(t3Overrides, "")
 
 	expectClose := func(ch <-chan struct{}) {
@@ -96,24 +95,24 @@ func TestWatcher(t *testing.T) {
 	// Add an all-tenant override.
 	r.Exec(t, "INSERT INTO system.tenant_settings (tenant_id, name, value, value_type) VALUES (0, 'bar', 'bar-all', 's')")
 	expectClose(allCh)
-	all, allCh = w.GetAllTenantOverrides()
+	all, allCh = w.GetAllTenantOverrides(ctx)
 	expect(all, "bar=bar-all foo=foo-all")
 
 	// Modify a tenant override.
 	r.Exec(t, "UPSERT INTO system.tenant_settings (tenant_id, name, value, value_type) VALUES (1, 'bar', 'bar-t1-updated', 's')")
 	expectClose(t1Ch)
-	t1Overrides, _ = w.GetTenantOverrides(t1)
+	t1Overrides, _ = w.GetTenantOverrides(ctx, t1)
 	expect(t1Overrides, "bar=bar-t1-updated foo=foo-t1")
 
 	// Remove an all-tenant override.
 	r.Exec(t, "DELETE FROM system.tenant_settings WHERE tenant_id = 0 AND name = 'foo'")
 	expectClose(allCh)
-	all, _ = w.GetAllTenantOverrides()
+	all, _ = w.GetAllTenantOverrides(ctx)
 	expect(all, "bar=bar-all")
 
 	// Add an override for a tenant that has no overrides.
 	r.Exec(t, "INSERT INTO system.tenant_settings (tenant_id, name, value, value_type) VALUES (3, 'qux', 'qux-t3', 's')")
 	expectClose(t3Ch)
-	t3Overrides, _ = w.GetTenantOverrides(t3)
+	t3Overrides, _ = w.GetTenantOverrides(ctx, t3)
 	expect(t3Overrides, "qux=qux-t3")
 }

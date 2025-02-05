@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package grunning is a library that's able to retrieve on-CPU running time for
 // individual goroutines. It relies on using a patched Go and provides a
@@ -50,10 +45,7 @@ func Elapsed(start, end time.Duration) time.Duration {
 
 // Supported returns true iff per-goroutine running time is available in this
 // build. We use a patched Go runtime for all platforms officially supported for
-// CRDB when built using Bazel. Some engineers commonly building CRDB also
-// happen to use FreeBSD, which we don't use a patched Go for (we don't have
-// cross-compilers setup, yet). We use 'freebsd || !bazel' as the build tag to
-// exclude unsupported platforms.
+// CRDB when built using Bazel.
 func Supported() bool {
 	return supported()
 }

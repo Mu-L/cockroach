@@ -1,4 +1,3 @@
-# tenant-cluster-setting-override-opt: sql.virtual_cluster.feature_access.multiregion.enabled=true
 # LogicTest: multiregion-9node-3region-3azs !metamorphic-batch-sizes
 
 # Set the closed timestamp interval to be short to shorten the amount of time
@@ -53,7 +52,7 @@ vectorized: true
 ·
 • lookup join
 │ table: parent@parent_pkey
-│ equality: (cr, c_p_id) = (cr,p_id)
+│ equality: (cr, c_p_id) = (cr, p_id)
 │ equality cols are key
 │
 └── • scan
@@ -131,7 +130,7 @@ vectorized: true
 ·
 • lookup join
 │ table: parent_rbr@parent_rbr_pkey
-│ equality: (crdb_region, c_p_id) = (crdb_region,p_id)
+│ equality: (crdb_region, c_p_id) = (crdb_region, p_id)
 │ equality cols are key
 │
 └── • scan
@@ -159,7 +158,7 @@ vectorized: true
 ·
 • lookup join
 │ table: parent_rbr@parent_rbr_pkey
-│ equality: (crdb_region, c_p_id) = (crdb_region,p_id)
+│ equality: (crdb_region, c_p_id) = (crdb_region, p_id)
 │ equality cols are key
 │
 └── • filter
@@ -168,7 +167,7 @@ vectorized: true
     └── • scan
           missing stats
           table: child_rbr@child_rbr_pkey
-          spans: [/'ap-southeast-2' - /'ap-southeast-2'] [/'ca-central-1' - /'us-east-1']
+          spans: FULL SCAN
 
 query IIIIITI
 SELECT *
@@ -189,9 +188,9 @@ vectorized: true
 ·
 • lookup join
 │ table: parent_rbr@parent_rbr_pkey
-│ equality: (crdb_region, c_p_id) = (crdb_region,p_id)
+│ equality: (crdb_region, c_p_id) = (crdb_region, p_id)
 │ equality cols are key
-│ pred: column14 = p_int
+│ pred: column18 = p_int
 │
 └── • render
     │
@@ -201,7 +200,7 @@ vectorized: true
         └── • scan
               missing stats
               table: child_rbr@child_rbr_pkey
-              spans: [/'ap-southeast-2' - /'ap-southeast-2'] [/'ca-central-1' - /'us-east-1']
+              spans: FULL SCAN
 
 query IIIIITI rowsort
 SELECT *
@@ -224,7 +223,7 @@ vectorized: true
 ·
 • lookup join
 │ table: parent_rbr@parent_rbr_pkey
-│ equality: (crdb_region, c_p_id) = (crdb_region,p_id)
+│ equality: (crdb_region, c_p_id) = (crdb_region, p_id)
 │ equality cols are key
 │
 └── • scan

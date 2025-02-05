@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package state
 
@@ -20,9 +15,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/raft/v3"
 )
 
 type (
@@ -36,18 +31,6 @@ type (
 	RangeID int32
 )
 
-type RangeIDSlice []RangeID
-
-func (r RangeIDSlice) Len() int           { return len(r) }
-func (r RangeIDSlice) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
-func (r RangeIDSlice) Less(i, j int) bool { return r[i] < r[j] }
-
-type StoreIDSlice []StoreID
-
-func (r StoreIDSlice) Len() int           { return len(r) }
-func (r StoreIDSlice) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
-func (r StoreIDSlice) Less(i, j int) bool { return r[i] < r[j] }
-
 // State encapsulates the current configuration and load of a simulation run.
 // It provides methods for accessing and mutation simulation state of nodes,
 // stores, ranges and replicas.
@@ -55,6 +38,9 @@ type State interface {
 	// TODO(kvoli): Unit test this fn.
 	// String returns string containing a compact representation of the state.
 	String() string
+	// PrettyPrint returns a pretty formatted string representation of the
+	// state (more concise than String()).
+	PrettyPrint() string
 	// ClusterInfo returns the info of the cluster represented in state.
 	ClusterInfo() ClusterInfo
 	// Store returns the Store with ID StoreID. This fails if no Store exists
@@ -132,10 +118,10 @@ type State interface {
 	// if it exists, otherwise it returns false.
 	RangeSpan(RangeID) (Key, Key, bool)
 	// SetSpanConfigForRange set the span config for the Range with ID RangeID.
-	SetSpanConfigForRange(RangeID, roachpb.SpanConfig) bool
+	SetSpanConfigForRange(RangeID, *roachpb.SpanConfig) bool
 	// SetSpanConfig sets the span config for all ranges represented by the span,
 	// splitting if necessary.
-	SetSpanConfig(roachpb.Span, roachpb.SpanConfig)
+	SetSpanConfig(roachpb.Span, *roachpb.SpanConfig)
 	// SetRangeBytes sets the size of the range with ID RangeID to be equal to
 	// the bytes given.
 	SetRangeBytes(RangeID, int64)
@@ -164,6 +150,8 @@ type State interface {
 	ClusterUsageInfo() *ClusterUsageInfo
 	// TickClock modifies the state Clock time to Tick.
 	TickClock(time.Time)
+	// Clock returns the state Clock.
+	Clock() timeutil.TimeSource
 	// UpdateStorePool modifies the state of the StorePool for the Store with
 	// ID StoreID.
 	UpdateStorePool(StoreID, map[roachpb.StoreID]*storepool.StoreDetail)
@@ -246,7 +234,7 @@ type Range interface {
 	// String returns a string representing the state of the range.
 	String() string
 	// SpanConfig returns the span config for this range.
-	SpanConfig() roachpb.SpanConfig
+	SpanConfig() *roachpb.SpanConfig
 	// Replicas returns all replicas which exist for this range.
 	Replicas() []Replica
 	// Replica returns the replica that is on the store with ID StoreID if it
@@ -287,6 +275,8 @@ type ManualSimClock struct {
 	nanos int64
 }
 
+var _ timeutil.TimeSource = &ManualSimClock{}
+
 // Now returns the current time.
 func (m *ManualSimClock) Now() time.Time {
 	return timeutil.Unix(0, m.nanos)
@@ -295,6 +285,18 @@ func (m *ManualSimClock) Now() time.Time {
 // Set sets the wall time to the supplied timestamp.
 func (m *ManualSimClock) Set(tsNanos int64) {
 	m.nanos = tsNanos
+}
+
+func (m *ManualSimClock) Since(t time.Time) time.Duration {
+	return m.Now().Sub(t)
+}
+
+func (m *ManualSimClock) NewTimer() timeutil.TimerI {
+	panic("unimplemented")
+}
+
+func (m *ManualSimClock) NewTicker(duration time.Duration) timeutil.TickerI {
+	panic("unimplemented")
 }
 
 // Keys in the simulator are 64 bit integers. They are mapped to Keys in

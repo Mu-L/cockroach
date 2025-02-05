@@ -1,27 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+import { util } from "@cockroachlabs/cluster-ui";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { createMemoryHistory } from "history";
+import merge from "lodash/merge";
+import moment from "moment-timezone";
+import { RouteComponentProps } from "react-router";
+
+import { AdminUIState, createAdminUIStore } from "src/redux/state";
+import { queryByName } from "src/util/query";
 
 import {
-  databaseRequestPayloadToID,
-  tableRequestToID,
   createSelectorForCachedDataField,
   createSelectorForKeyedCachedDataField,
 } from "./apiReducers";
-import { api as clusterUiApi, util } from "@cockroachlabs/cluster-ui";
-import { AdminUIState, createAdminUIStore } from "src/redux/state";
-import { createMemoryHistory } from "history";
-import { merge } from "lodash";
-import moment from "moment-timezone";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { RouteComponentProps } from "react-router";
-import { queryByName } from "src/util/query";
 
 describe("table id generator", function () {
   it("generates encoded db/table id", function () {
@@ -36,29 +31,6 @@ describe("table id generator", function () {
     expect(
       decodeURIComponent(util.generateTableID(db, table).split("/")[1]),
     ).toEqual(table);
-  });
-});
-
-describe("request to string functions", function () {
-  it("correctly generates a string from a database details request", function () {
-    const database = "testDatabase";
-    const csIndexUnusedDuration = "168h";
-    expect(
-      databaseRequestPayloadToID({ database, csIndexUnusedDuration }),
-    ).toEqual(database);
-  });
-  it("correctly generates a string from a table details request", function () {
-    const database = "testDatabase";
-    const table = "testTable";
-    const csIndexUnusedDuration = "168h";
-    const tableRequest: clusterUiApi.TableDetailsReqParams = {
-      database,
-      table,
-      csIndexUnusedDuration,
-    };
-    expect(tableRequestToID(tableRequest)).toEqual(
-      util.generateTableID(database, table),
-    );
   });
 });
 

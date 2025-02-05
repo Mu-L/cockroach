@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
@@ -31,27 +27,24 @@ func registerDatabaseDrop(r registry.Registry) {
 	clusterSpec := r.MakeClusterSpec(
 		10, /* nodeCount */
 		spec.CPU(8),
-		spec.Zones("us-east1-b"),
+		spec.WorkloadNode(),
+		spec.WorkloadNodeCPU(8),
 		spec.VolumeSize(500),
-		spec.Cloud(spec.GCE),
+		spec.GCEVolumeType("pd-ssd"),
+		spec.GCEMachineType("n2-standard-8"),
+		spec.GCEZones("us-east1-b"),
 	)
-	clusterSpec.InstanceType = "n2-standard-8"
-	clusterSpec.GCEMinCPUPlatform = "Intel Ice Lake"
-	clusterSpec.GCEVolumeType = "pd-ssd"
 
 	r.Add(registry.TestSpec{
-		Name:            "admission-control/database-drop",
-		Timeout:         10 * time.Hour,
-		Owner:           registry.OwnerAdmissionControl,
-		Benchmark:       true,
-		Tags:            registry.Tags(`weekly`),
-		Cluster:         clusterSpec,
-		RequiresLicense: true,
-		SnapshotPrefix:  "droppable-database-tpce-100k",
+		Name:             "admission-control/database-drop",
+		Timeout:          15 * time.Hour,
+		Owner:            registry.OwnerAdmissionControl,
+		Benchmark:        true,
+		CompatibleClouds: registry.OnlyGCE,
+		Suites:           registry.Suites(registry.Weekly),
+		Cluster:          clusterSpec,
+		SnapshotPrefix:   "droppable-database-tpce-100k",
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			crdbNodes := c.Spec().NodeCount - 1
-			workloadNode := c.Spec().NodeCount
-
 			snapshots, err := c.ListSnapshots(ctx, vm.VolumeSnapshotListOpts{
 				NamePrefix: t.SnapshotPrefix(),
 			})
@@ -66,7 +59,9 @@ func registerDatabaseDrop(r registry.Registry) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				path, err := clusterupgrade.UploadVersion(ctx, t, t.L(), c, c.All(), pred)
+				path, err := clusterupgrade.UploadCockroach(
+					ctx, t, t.L(), c, c.All(), clusterupgrade.MustParseVersion(pred),
+				)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -78,7 +73,7 @@ func registerDatabaseDrop(r registry.Registry) {
 				//
 				// TODO(irfansharif): Make this versioning business a bit more
 				// explicit throughout. It works, but too tacitly.
-				c.Run(ctx, c.All(), fmt.Sprintf("cp %s ./cockroach", path))
+				c.Run(ctx, option.WithNodes(c.All()), fmt.Sprintf("cp %s ./cockroach", path))
 
 				// Set up TPC-E with 100k customers.
 				//
@@ -91,8 +86,10 @@ func registerDatabaseDrop(r registry.Registry) {
 
 				runTPCE(ctx, t, c, tpceOptions{
 					start: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-						settings := install.MakeClusterSettings(install.NumRacksOption(crdbNodes))
-						if err := c.StartE(ctx, t.L(), option.DefaultStartOptsNoBackups(), settings, c.Range(1, crdbNodes)); err != nil {
+						settings := install.MakeClusterSettings(install.NumRacksOption(len(c.CRDBNodes())))
+						startOpts := option.NewStartOpts(option.NoBackupSchedule)
+						roachtestutil.SetDefaultSQLPort(c, &startOpts.RoachprodOpts)
+						if err := c.StartE(ctx, t.L(), startOpts, settings, c.CRDBNodes()); err != nil {
 							t.Fatal(err)
 						}
 					},
@@ -100,7 +97,7 @@ func registerDatabaseDrop(r registry.Registry) {
 					disablePrometheus:  true,
 					setupType:          usingTPCEInit,
 					estimatedSetupTime: 4 * time.Hour,
-					nodes:              crdbNodes,
+					nodes:              len(c.CRDBNodes()),
 					cpus:               clusterSpec.CPUs,
 					ssds:               1,
 					onlySetup:          true,
@@ -135,7 +132,7 @@ func registerDatabaseDrop(r registry.Registry) {
 					disablePrometheus:  true,
 					setupType:          usingTPCEInit,
 					estimatedSetupTime: 4 * time.Hour,
-					nodes:              crdbNodes,
+					nodes:              len(c.CRDBNodes()),
 					cpus:               clusterSpec.CPUs,
 					ssds:               1,
 					onlySetup:          true,
@@ -166,15 +163,15 @@ func registerDatabaseDrop(r registry.Registry) {
 			}
 
 			promCfg := &prometheus.Config{}
-			promCfg.WithPrometheusNode(c.Node(workloadNode).InstallNodes()[0]).
-				WithNodeExporter(c.Range(1, crdbNodes).InstallNodes()).
-				WithCluster(c.Range(1, crdbNodes).InstallNodes()).
+			promCfg.WithPrometheusNode(c.WorkloadNode().InstallNodes()[0]).
+				WithNodeExporter(c.CRDBNodes().InstallNodes()).
+				WithCluster(c.CRDBNodes().InstallNodes()).
 				WithGrafanaDashboard("https://go.crdb.dev/p/index-admission-control-grafana").
 				WithScrapeConfigs(
 					prometheus.MakeWorkloadScrapeConfig("workload", "/",
 						makeWorkloadScrapeNodes(
-							c.Node(workloadNode).InstallNodes()[0],
-							[]workloadInstance{{nodes: c.Node(workloadNode)}},
+							c.WorkloadNode().InstallNodes()[0],
+							[]workloadInstance{{nodes: c.WorkloadNode()}},
 						),
 					),
 				)
@@ -193,11 +190,11 @@ func registerDatabaseDrop(r registry.Registry) {
 			// test and use disk snapshots?
 			runTPCE(ctx, t, c, tpceOptions{
 				start: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-					startOpts := option.DefaultStartOptsNoBackups()
-					startOpts.RoachprodOpts.Sequential = false // the cluster's already bootstrapped
-					settings := install.MakeClusterSettings(install.NumRacksOption(crdbNodes))
-					if err := c.StartE(ctx, t.L(), startOpts, settings, c.Range(1, crdbNodes)); err != nil {
+					startOpts := option.NewStartOpts(option.NoBackupSchedule)
+					roachtestutil.SetDefaultSQLPort(c, &startOpts.RoachprodOpts)
+					roachtestutil.SetDefaultAdminUIPort(c, &startOpts.RoachprodOpts)
+					settings := install.MakeClusterSettings(install.NumRacksOption(len(c.CRDBNodes())))
+					if err := c.StartE(ctx, t.L(), startOpts, settings, c.CRDBNodes()); err != nil {
 						t.Fatal(err)
 					}
 				},

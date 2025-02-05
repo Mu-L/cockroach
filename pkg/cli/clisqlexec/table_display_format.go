@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlexec
 
@@ -51,6 +46,9 @@ const (
 	// TableDisplayRawHTML is a variant of the HTML output format
 	// supported specifically to generate CockroachDB's documentation.
 	TableDisplayRawHTML
+	// TableDisplayUnumberedHTML is a variant of the HTML output
+	// format which does not include a row number prefix on each line.
+	TableDisplayUnnumberedHTML
 	// TableDisplayRaw is a special format optimized to ensure that the
 	// values can be parsed accurately from the text output.
 	TableDisplayRaw
@@ -103,6 +101,8 @@ func (f *TableDisplayFormat) String() string {
 		return "html"
 	case TableDisplayRawHTML:
 		return "rawhtml"
+	case TableDisplayUnnumberedHTML:
+		return "unnumbered-html"
 	case TableDisplayRaw:
 		return "raw"
 	}
@@ -130,6 +130,8 @@ func (f *TableDisplayFormat) Set(s string) error {
 		*f = TableDisplayHTML
 	case "rawhtml":
 		*f = TableDisplayRawHTML
+	case "unnumbered-html":
+		*f = TableDisplayUnnumberedHTML
 	case "raw":
 		*f = TableDisplayRaw
 	default:

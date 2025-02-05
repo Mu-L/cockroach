@@ -1,19 +1,16 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -30,9 +27,40 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type logSpy struct {
+	Timestamp, TimestampE, TimestampEW, TimestampEWI int64
+	MsgErr, MsgWarn, MsgInf                          string
+}
+
+// Intercept intercepts all log entries and checks if entry's message is one
+// that we're interested in and then it updates exact time when this entry
+// has been logged.
+// It allows to have exact timestamps of logs to test filtering and have
+// predictable results.
+func (s *logSpy) Intercept(data []byte) {
+	var e struct {
+		Message string `json:"message"`
+		Time    int64  `json:"time"`
+	}
+	err := json.Unmarshal(data, &e)
+	if err != nil {
+		return
+	}
+	if e.Message == s.MsgErr {
+		s.TimestampE = e.Time
+	}
+	if e.Message == s.MsgWarn {
+		s.TimestampEW = e.Time
+	}
+	if e.Message == s.MsgInf {
+		s.TimestampEWI = e.Time
+	}
+}
 
 // TestStatusLocalLogs checks to ensure that local/logfiles,
 // local/logfiles/{filename} and local/log function
@@ -50,32 +78,42 @@ func TestStatusLocalLogs(t *testing.T) {
 	// there's just one.
 	defer s.SetupSingleFileLogging()()
 
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
 
-	// Log an error of each main type which we expect to be able to retrieve.
-	// The resolution of our log timestamps is such that it's possible to get
-	// two subsequent log messages with the same timestamp. This test will fail
-	// when that occurs. By adding a small sleep in here after each timestamp to
-	// ensures this isn't the case and that the log filtering doesn't filter out
-	// the log entires we're looking for. The value of 20 μs was chosen because
-	// the log timestamps have a fidelity of 10 μs and thus doubling that should
-	// be a sufficient buffer.
-	// See util/log/clog.go formatHeader() for more details.
-	const sleepBuffer = time.Microsecond * 20
-	timestamp := timeutil.Now().UnixNano()
+	logCtx := ts.AnnotateCtx(context.Background())
+
+	spy := logSpy{
+		Timestamp: timeutil.Now().UnixNano(),
+		MsgWarn:   "TestStatusLocalLogFile test message-Warning",
+		MsgErr:    "TestStatusLocalLogFile test message-Error",
+		MsgInf:    "TestStatusLocalLogFile test message-Info",
+	}
+
+	defer log.InterceptWith(logCtx, &spy)()
+
+	const sleepBuffer = time.Millisecond * 10
 	time.Sleep(sleepBuffer)
-	log.Errorf(context.Background(), "TestStatusLocalLogFile test message-Error")
+	// Ignoring fmtsafe lintrule is essential in this test to make filtering
+	// log events easier and compare entry messages later on.
+	// Changing formatting to log.Error(logCtx, "%s", spy.MsgErr) will wrap
+	// message with < > brackets and would require to strip them of later.
+	log.Errorf(logCtx, "%s", redact.Safe(spy.MsgErr))
 	time.Sleep(sleepBuffer)
-	timestampE := timeutil.Now().UnixNano()
+	log.Warningf(logCtx, "%s", redact.Safe(spy.MsgWarn))
 	time.Sleep(sleepBuffer)
-	log.Warningf(context.Background(), "TestStatusLocalLogFile test message-Warning")
+	log.Infof(logCtx, "%s", redact.Safe(spy.MsgInf))
 	time.Sleep(sleepBuffer)
-	timestampEW := timeutil.Now().UnixNano()
-	time.Sleep(sleepBuffer)
-	log.Infof(context.Background(), "TestStatusLocalLogFile test message-Info")
-	time.Sleep(sleepBuffer)
-	timestampEWI := timeutil.Now().UnixNano()
+
+	// Ensure all log lines above are written to disk.
+	log.FlushAllSync()
+
+	require.True(t, spy.TimestampE > 0)
+	require.True(t, spy.TimestampEW > 0)
+	require.True(t, spy.TimestampEWI > 0)
 
 	var wrapper serverpb.LogFilesListResponse
 	if err := srvtestutils.GetStatusJSONProto(ts, "logfiles/local", &wrapper); err != nil {
@@ -94,11 +132,11 @@ func TestStatusLocalLogs(t *testing.T) {
 		}
 		for _, entry := range wrapper.Entries {
 			switch strings.TrimSpace(entry.Message) {
-			case "TestStatusLocalLogFile test message-Error":
+			case spy.MsgErr:
 				foundError = true
-			case "TestStatusLocalLogFile test message-Warning":
+			case spy.MsgWarn:
 				foundWarning = true
-			case "TestStatusLocalLogFile test message-Info":
+			case spy.MsgInf:
 				foundInfo = true
 			}
 		}
@@ -121,17 +159,18 @@ func TestStatusLocalLogs(t *testing.T) {
 	}{
 		// Test filtering by log severity.
 		// // Test entry limit. Ignore Info/Warning/Error filters.
-		{1, timestamp, timestampEWI, "", levelPresence{false, false, false}},
-		{2, timestamp, timestampEWI, "", levelPresence{false, false, false}},
-		{3, timestamp, timestampEWI, "", levelPresence{false, false, false}},
+		{1, spy.Timestamp, spy.TimestampEWI, "", levelPresence{false, false, false}},
+		{2, spy.Timestamp, spy.TimestampEWI, "", levelPresence{false, false, false}},
+		{3, spy.Timestamp, spy.TimestampEWI, "", levelPresence{false, false, false}},
 		// Test filtering in different timestamp windows.
-		{0, timestamp, timestamp, "", levelPresence{false, false, false}},
-		{0, timestamp, timestampE, "", levelPresence{true, false, false}},
-		{0, timestampE, timestampEW, "", levelPresence{false, true, false}},
-		{0, timestampEW, timestampEWI, "", levelPresence{false, false, true}},
-		{0, timestamp, timestampEW, "", levelPresence{true, true, false}},
-		{0, timestampE, timestampEWI, "", levelPresence{false, true, true}},
-		{0, timestamp, timestampEWI, "", levelPresence{true, true, true}},
+		{0, spy.Timestamp, spy.Timestamp, "", levelPresence{false, false, false}},
+		{0, spy.Timestamp, spy.TimestampE, "", levelPresence{true, false, false}},
+		// spy.TimestampE is the exact timestamp when entry has been logged but we want to specify time after this event, that's why it is incremented by 1.
+		{0, spy.TimestampE + 1, spy.TimestampEW, "", levelPresence{false, true, false}},
+		{0, spy.TimestampEW + 1, spy.TimestampEWI, "", levelPresence{false, false, true}},
+		{0, spy.Timestamp, spy.TimestampEW, "", levelPresence{true, true, false}},
+		{0, spy.TimestampE + 1, spy.TimestampEWI, "", levelPresence{false, true, true}},
+		{0, spy.Timestamp, spy.TimestampEWI, "", levelPresence{true, true, true}},
 		// Test filtering by regexp pattern.
 		{0, 0, 0, "Info", levelPresence{false, false, true}},
 		{0, 0, 0, "Warning", levelPresence{false, true, false}},
@@ -149,7 +188,7 @@ func TestStatusLocalLogs(t *testing.T) {
 		if testCase.StartTimestamp > 0 {
 			fmt.Fprintf(&url, "&start_time=%d", testCase.StartTimestamp)
 		}
-		if testCase.StartTimestamp > 0 {
+		if testCase.EndTimestamp > 0 {
 			fmt.Fprintf(&url, "&end_time=%d", testCase.EndTimestamp)
 		}
 		if len(testCase.Pattern) > 0 {
@@ -173,17 +212,17 @@ func TestStatusLocalLogs(t *testing.T) {
 				fmt.Fprintln(&logsBuf, entry.Message)
 
 				switch strings.TrimSpace(entry.Message) {
-				case "TestStatusLocalLogFile test message-Error":
+				case spy.MsgErr:
 					actual.Error = true
-				case "TestStatusLocalLogFile test message-Warning":
+				case spy.MsgWarn:
 					actual.Warning = true
-				case "TestStatusLocalLogFile test message-Info":
+				case spy.MsgInf:
 					actual.Info = true
 				}
 			}
 
 			if testCase.levelPresence != actual {
-				t.Errorf("%d: expected %+v at %s, got:\n%s", i, testCase, path, logsBuf.String())
+				t.Errorf("%d: expected %+v at %s, got:\n%s \n\n spy = %+v\n", i, testCase, path, logsBuf.String(), spy)
 			}
 		}
 	}
@@ -205,8 +244,11 @@ func TestStatusLocalLogsTenantFilter(t *testing.T) {
 	// there's just one.
 	defer sc.SetupSingleFileLogging()()
 
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
 
 	appTenantID := roachpb.MustMakeTenantID(uint64(2))
 	ctxSysTenant, ctxAppTenant := server.TestingMakeLoggingContexts(appTenantID)
@@ -336,11 +378,13 @@ func TestStatusLogRedaction(t *testing.T) {
 			// Apply the redactable log boolean for this test.
 			defer log.TestingSetRedactable(redactableLogs)()
 
-			ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-			defer ts.Stopper().Stop(context.Background())
+			srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+			defer srv.Stopper().Stop(context.Background())
+			ts := srv.ApplicationLayer()
 
 			// Log something.
-			log.Infof(context.Background(), "THISISSAFE %s", "THISISUNSAFE")
+			logCtx := ts.AnnotateCtx(context.Background())
+			log.Infof(logCtx, "THISISSAFE %s", "THISISUNSAFE")
 
 			// Determine the log file name.
 			var wrapper serverpb.LogFilesListResponse
@@ -418,4 +462,51 @@ func TestStatusLogRedaction(t *testing.T) {
 					})
 			}
 		})
+}
+
+// TestStatusLogCorruptedEntry checks that RPC returns partial result with log
+// entries if log file is corrupted and includes occurred errors.
+func TestStatusLogCorruptedEntry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	if log.V(3) {
+		skip.IgnoreLint(t, "Test only works with low verbosity levels")
+	}
+
+	s := log.ScopeWithoutShowLogs(t)
+	defer s.Close(t)
+
+	// This test cares about the number of output files. Ensure
+	// there's just one.
+	defer s.SetupSingleFileLogging()()
+
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
+
+	logCtx := ts.AnnotateCtx(context.Background())
+
+	log.Errorf(logCtx, "TestStatusLogCorruptedEntry test message")
+	log.FlushFiles()
+
+	files, err := log.ListLogFiles()
+	require.NoError(t, err)
+	require.Equal(t, len(files), 1)
+	file := files[0]
+	f, err := os.OpenFile(fmt.Sprintf("%s%s%s", s.GetDirectory(), string(os.PathSeparator), file.Name), os.O_APPEND|os.O_WRONLY, 0600)
+	require.NoError(t, err)
+	// Insert empty lines into log file to simulate corrupted rows that cannot be
+	// parsed. And then append random log.
+	_, err = f.WriteString("\n\n")
+	require.NoError(t, err)
+	err = f.Close()
+	require.NoError(t, err)
+	log.Errorf(logCtx, "TestStatusLogCorruptedEntry test message 2")
+	log.FlushFiles()
+
+	var wrapper serverpb.LogEntriesResponse
+	err = srvtestutils.GetStatusJSONProto(ts, "logfiles/local/"+file.Name, &wrapper)
+	require.NoError(t, err)
+	require.NotEmpty(t, wrapper.Entries)
+	require.NotEmpty(t, wrapper.ParseErrors)
+	require.Equal(t, 2, len(wrapper.ParseErrors))
 }

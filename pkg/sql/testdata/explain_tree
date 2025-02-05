@@ -11,6 +11,7 @@ planning time: 0µs
 execution time: 0µs
 distribution: local
 vectorized: false
+plan type: custom
 maximum memory usage: 0 B
 network usage: 0 B (0 messages)
 isolation level: serializable
@@ -25,19 +26,6 @@ quality of service: regular
 ----
 ----
 
-plan-tree
-SELECT oid FROM t.orders WHERE oid = 123
-----
-name: scan
-attrs:
-- key: missing stats
-  value: ""
-- key: table
-  value: orders@orders_pkey
-- key: spans
-  value: 1 span
-children: []
-
 plan-string
 SELECT cid, date, value FROM t.orders
 ----
@@ -46,6 +34,7 @@ planning time: 0µs
 execution time: 0µs
 distribution: local
 vectorized: false
+plan type: custom
 maximum memory usage: 0 B
 network usage: 0 B (0 messages)
 isolation level: serializable
@@ -60,19 +49,6 @@ quality of service: regular
 ----
 ----
 
-plan-tree
-SELECT cid, date, value FROM t.orders
-----
-name: scan
-attrs:
-- key: missing stats
-  value: ""
-- key: table
-  value: orders@orders_pkey
-- key: spans
-  value: FULL SCAN
-children: []
-
 plan-string
 SELECT cid, sum(value) FROM t.orders WHERE date > '2015-01-01' GROUP BY cid ORDER BY 1 - sum(value)
 ----
@@ -81,6 +57,7 @@ planning time: 0µs
 execution time: 0µs
 distribution: local
 vectorized: false
+plan type: custom
 maximum memory usage: 0 B
 network usage: 0 B (0 messages)
 isolation level: serializable
@@ -91,14 +68,13 @@ quality of service: regular
 │ columns: (cid int, sum decimal)
 │
 └── • sort
-    │ columns: (column8 decimal, cid int, sum decimal)
-    │ ordering: +column8
+    │ columns: (column10 decimal, cid int, sum decimal)
     │ estimated row count: 98 (missing stats)
-    │ order: +column8
+    │ order: +column10
     │
     └── • render
-        │ columns: (column8 decimal, cid int, sum decimal)
-        │ render column8: ((1)[decimal] - (sum)[decimal])[decimal]
+        │ columns: (column10 decimal, cid int, sum decimal)
+        │ render column10: ((1)[decimal] - (sum)[decimal])[decimal]
         │ render cid: (cid)[int]
         │ render sum: (sum)[decimal]
         │
@@ -124,37 +100,6 @@ quality of service: regular
 ----
 ----
 
-plan-tree
-SELECT cid, sum(value) FROM t.orders WHERE date > '2015-01-01' GROUP BY cid ORDER BY 1 - sum(value)
-----
-name: sort
-attrs:
-- key: order
-  value: +column8
-children:
-- name: render
-  attrs: []
-  children:
-  - name: group (hash)
-    attrs:
-    - key: group by
-      value: cid
-    children:
-    - name: filter
-      attrs:
-      - key: filter
-        value: date > _
-      children:
-      - name: scan
-        attrs:
-        - key: missing stats
-          value: ""
-        - key: table
-          value: orders@orders_pkey
-        - key: spans
-          value: FULL SCAN
-        children: []
-
 plan-string
 SELECT value FROM (SELECT cid, date, value FROM t.orders)
 ----
@@ -163,6 +108,7 @@ planning time: 0µs
 execution time: 0µs
 distribution: local
 vectorized: false
+plan type: custom
 maximum memory usage: 0 B
 network usage: 0 B (0 messages)
 isolation level: serializable
@@ -177,19 +123,6 @@ quality of service: regular
 ----
 ----
 
-plan-tree
-SELECT value FROM (SELECT cid, date, value FROM t.orders)
-----
-name: scan
-attrs:
-- key: missing stats
-  value: ""
-- key: table
-  value: orders@orders_pkey
-- key: spans
-  value: FULL SCAN
-children: []
-
 plan-string
 SELECT cid, date, value FROM t.orders WHERE date IN (SELECT date FROM t.orders)
 ----
@@ -198,6 +131,7 @@ planning time: 0µs
 execution time: 0µs
 distribution: local
 vectorized: false
+plan type: custom
 maximum memory usage: 0 B
 network usage: 0 B (0 messages)
 isolation level: serializable
@@ -232,40 +166,6 @@ quality of service: regular
 ----
 ----
 
-plan-tree
-SELECT cid, date, value FROM t.orders WHERE date IN (SELECT date FROM t.orders)
-----
-name: hash join
-attrs:
-- key: equality
-  value: (date) = (date)
-- key: right cols are key
-  value: ""
-children:
-- name: scan
-  attrs:
-  - key: missing stats
-    value: ""
-  - key: table
-    value: orders@orders_pkey
-  - key: spans
-    value: FULL SCAN
-  children: []
-- name: distinct
-  attrs:
-  - key: distinct on
-    value: date
-  children:
-  - name: scan
-    attrs:
-    - key: missing stats
-      value: ""
-    - key: table
-      value: orders@orders_pkey
-    - key: spans
-      value: FULL SCAN
-    children: []
-
 exec
 CREATE TABLE t.movies (
   id SERIAL PRIMARY KEY,
@@ -290,6 +190,7 @@ planning time: 0µs
 execution time: 0µs
 distribution: local
 vectorized: false
+plan type: custom
 maximum memory usage: 0 B
 network usage: 0 B (0 messages)
 isolation level: serializable
@@ -333,49 +234,3 @@ quality of service: regular
 ----
 ----
 
-plan-tree
-SELECT id AS movie_id, title, (SELECT name FROM t.actors WHERE name = 'Foo') FROM t.movies
-----
-name: root
-attrs: []
-children:
-- name: render
-  attrs: []
-  children:
-  - name: scan
-    attrs:
-    - key: missing stats
-      value: ""
-    - key: table
-      value: movies@movies_pkey
-    - key: spans
-      value: FULL SCAN
-    children: []
-- name: subquery
-  attrs:
-  - key: id
-    value: '@S1'
-  - key: original sql
-    value: (SELECT name FROM t.actors WHERE name = '_')
-  - key: exec mode
-    value: one row
-  children:
-  - name: max1row
-    attrs:
-    - key: estimated row count
-      value: "1"
-    children:
-    - name: filter
-      attrs:
-      - key: filter
-        value: name = _
-      children:
-      - name: scan
-        attrs:
-        - key: missing stats
-          value: ""
-        - key: table
-          value: actors@actors_pkey
-        - key: spans
-          value: FULL SCAN
-        children: []

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval_test
 
@@ -30,7 +25,10 @@ func TestDeleteRangeTombstoneSetsGCHint(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		// Disable tenant testing here to simplify the creation of the scratch range
+		// below.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue: true,
@@ -38,18 +36,20 @@ func TestDeleteRangeTombstoneSetsGCHint(t *testing.T) {
 			},
 		},
 	})
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
 
-	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
+	s := srv.ApplicationLayer()
+	key, err := srv.ScratchRange()
+	require.NoError(t, err, "failed to create scratch range")
+
+	store, err := srv.StorageLayer().GetStores().(*kvserver.Stores).GetStore(srv.StorageLayer().GetFirstStoreID())
 	require.NoError(t, err)
-
-	key := roachpb.Key("b")
-	content := []byte("test")
-
 	repl := store.LookupReplica(roachpb.RKey(key))
+
 	gcHint := repl.GetGCHint()
 	require.True(t, gcHint.LatestRangeDeleteTimestamp.IsEmpty(), "gc hint should be empty by default")
 
+	content := []byte("test")
 	pArgs := &kvpb.PutRequest{
 		RequestHeader: kvpb.RequestHeader{
 			Key: key,
@@ -60,7 +60,7 @@ func TestDeleteRangeTombstoneSetsGCHint(t *testing.T) {
 		t.Fatal(pErr)
 	}
 
-	r, err := s.LookupRange(key)
+	r, err := srv.LookupRange(key)
 	require.NoError(t, err, "failed to lookup range")
 
 	drArgs := &kvpb.DeleteRangeRequest{

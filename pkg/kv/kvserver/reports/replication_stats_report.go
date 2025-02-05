@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reports
 
@@ -264,11 +259,12 @@ func makeReplicationStatsVisitor(
 	ctx context.Context, cfg *config.SystemConfig, nodeChecker nodeChecker,
 ) replicationStatsVisitor {
 	v := replicationStatsVisitor{
-		cfg:         cfg,
-		nodeChecker: nodeChecker,
-		report:      make(RangeReport),
+		cfg:           cfg,
+		nodeChecker:   nodeChecker,
+		report:        make(RangeReport),
+		prevNumVoters: -1,
 	}
-	v.reset(ctx)
+	v.init(ctx)
 	return v
 }
 
@@ -282,15 +278,7 @@ func (v *replicationStatsVisitor) Report() RangeReport {
 	return v.report
 }
 
-// reset is part of the rangeVisitor interface.
-func (v *replicationStatsVisitor) reset(ctx context.Context) {
-	*v = replicationStatsVisitor{
-		cfg:           v.cfg,
-		nodeChecker:   v.nodeChecker,
-		prevNumVoters: -1,
-		report:        make(RangeReport, len(v.report)),
-	}
-
+func (v *replicationStatsVisitor) init(ctx context.Context) {
 	// Iterate through all the zone configs to create report entries for all the
 	// zones that have constraints. Otherwise, just iterating through the ranges
 	// wouldn't create entries for zones that don't apply to any ranges.

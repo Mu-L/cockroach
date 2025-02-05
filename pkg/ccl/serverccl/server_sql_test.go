@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package serverccl
 
@@ -24,11 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher/systemconfigwatchertest"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance/instancestorage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -91,9 +88,9 @@ func TestTenantCannotSetClusterSetting(t *testing.T) {
 	}
 }
 
-// TestTenantCanUseEnterpriseFeatures verifies that tenants can get a license
-// from the env variable.
-func TestTenantCanUseEnterpriseFeatures(t *testing.T) {
+// TestTenantCanUseEnterpriseFeaturesWithEnvVar verifies that tenants
+// can get a license from the env variable.
+func TestTenantCanUseEnterpriseFeaturesWithEnvVar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -105,10 +102,6 @@ func TestTenantCanUseEnterpriseFeatures(t *testing.T) {
 	defer envutil.TestSetEnv(t, "COCKROACH_TENANT_LICENSE", license)()
 
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{
-		// Note: we can't use `TestTenantAlwaysEnabled` here because
-		// (currently) that requires the enterprise license to be set at
-		// the storage layer, which we just disabled above (because we
-		// want to check the effects of the env var instead).
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(context.Background())
@@ -117,6 +110,40 @@ func TestTenantCanUseEnterpriseFeatures(t *testing.T) {
 	defer db.Close()
 
 	_, err := db.Exec(`BACKUP INTO 'userfile:///backup'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`BACKUP INTO LATEST IN 'userfile:///backup'`)
+	require.NoError(t, err)
+}
+
+// TestTenantCanUseEnterpriseFeatures verifies that tenants can get a license
+// from the cluster setting.
+func TestTenantCanUseEnterpriseFeaturesWithSetting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	license, _ := (&licenseccl.License{
+		Type:             licenseccl.License_Enterprise,
+		OrganizationName: "mytest",
+	}).Encode()
+
+	defer ccl.TestingDisableEnterprise()()
+
+	ctx := context.Background()
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
+	defer s.Stopper().Stop(ctx)
+
+	ie := s.SystemLayer().InternalExecutor().(isql.Executor)
+	_, err := ie.Exec(ctx, "set-license", nil, "SET CLUSTER SETTING cluster.organization = 'mytest'")
+	require.NoError(t, err)
+	_, err = ie.Exec(ctx, "set-license", nil, "SET CLUSTER SETTING enterprise.license = $1", license)
+	require.NoError(t, err)
+
+	_, db := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: serverutils.TestTenantID()})
+	defer db.Close()
+
+	_, err = db.Exec(`BACKUP INTO 'userfile:///backup'`)
 	require.NoError(t, err)
 	_, err = db.Exec(`BACKUP INTO LATEST IN 'userfile:///backup'`)
 	require.NoError(t, err)
@@ -132,13 +159,13 @@ func TestTenantUnauthenticatedAccess(t *testing.T) {
 	})
 	defer s.Stopper().Stop(ctx)
 
-	_, err := s.StartTenant(ctx,
+	_, err := s.TenantController().StartTenant(ctx,
 		base.TestTenantArgs{
-			TenantID: roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[0]),
+			TenantID: roachpb.MustMakeTenantID(securitytest.EmbeddedTenantIDs()[0]),
 			TestingKnobs: base.TestingKnobs{
 				TenantTestingKnobs: &sql.TenantTestingKnobs{
 					// Configure the SQL server to access the wrong tenant keyspace.
-					TenantIDCodecOverride: roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[1]),
+					TenantIDCodecOverride: roachpb.MustMakeTenantID(securitytest.EmbeddedTenantIDs()[1]),
 				},
 			},
 		})
@@ -155,7 +182,9 @@ func TestTenantHTTP(t *testing.T) {
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		// This test is specific to secondary tenants; no need to run it
 		// using the system tenant.
-		DefaultTestTenant: base.TestTenantAlwaysEnabled,
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSharedProcessModeButDoesntYet(
+			base.TestTenantAlwaysEnabled, 113187,
+		),
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -196,26 +225,31 @@ func TestTenantProcessDebugging(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
+	// External service tenants are allowed to debug their own processes without
+	// capabilities and shared service tenants implicitly have all capabilities,
+	// so we currently never expect a tenant hitting their admin server -- whether
+	// that is their own process or the system one.
+	const expectDebugToRequireCap = false
+
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
-	tenant, _, err := s.StartSharedProcessTenant(ctx,
+	tenant, _, err := s.TenantController().StartSharedProcessTenant(ctx,
 		base.TestSharedProcessTenantArgs{
 			TenantID:   serverutils.TestTenantID(),
 			TenantName: "processdebug",
 		})
 	require.NoError(t, err)
-	defer tenant.Stopper().Stop(ctx)
+	defer tenant.AppStopper().Stop(ctx)
 
 	t.Run("system tenant pprof", func(t *testing.T) {
 		httpClient, err := s.GetAdminHTTPClient()
 		require.NoError(t, err)
 		defer httpClient.CloseIdleConnections()
 
-		url := s.AdminURL().URL
-		url.Path = url.Path + "/debug/pprof/goroutine"
+		url := s.AdminURL().WithPath("/debug/pprof/goroutine")
 		q := url.Query()
 		q.Add("debug", "2")
 		url.RawQuery = q.Encode()
@@ -235,31 +269,31 @@ func TestTenantProcessDebugging(t *testing.T) {
 		require.NoError(t, err)
 		defer httpClient.CloseIdleConnections()
 
-		url := tenant.AdminURL().URL
-		url.Path = url.Path + "/debug/pprof/"
+		url := tenant.AdminURL().WithPath("/debug/pprof/")
 		q := url.Query()
 		q.Add("debug", "2")
 		url.RawQuery = q.Encode()
 
+		if expectDebugToRequireCap {
+			resp, err := httpClient.Get(url.String())
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusForbidden, resp.StatusCode)
+			require.Contains(t, string(body), "tenant does not have capability to debug the running process")
+
+			_, err = db.Exec(`ALTER TENANT processdebug GRANT CAPABILITY can_debug_process=true`)
+			require.NoError(t, err)
+
+			serverutils.WaitForTenantCapabilities(t, s, serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
+				tenantcapabilities.CanDebugProcess: "true",
+			}, "")
+		}
 		resp, err := httpClient.Get(url.String())
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusForbidden, resp.StatusCode)
-		require.Contains(t, string(body), "tenant does not have capability to debug the running process")
-
-		_, err = db.Exec(`ALTER TENANT processdebug GRANT CAPABILITY can_debug_process=true`)
-		require.NoError(t, err)
-
-		serverutils.WaitForTenantCapabilities(t, s, serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
-			tenantcapabilities.CanDebugProcess: "true",
-		}, "")
-
-		resp, err = httpClient.Get(url.String())
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		body, err = io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		require.Contains(t, string(body), "goroutine")
@@ -277,32 +311,32 @@ func TestTenantProcessDebugging(t *testing.T) {
 		require.NoError(t, err)
 		defer httpClient.CloseIdleConnections()
 
-		url := tenant.AdminURL().URL
-		url.Path = url.Path + "/debug/vmodule"
+		url := tenant.AdminURL().WithPath("/debug/vmodule")
 		q := url.Query()
 		q.Add("duration", "-1s")
 		q.Add("vmodule", "exec_log=3")
 		url.RawQuery = q.Encode()
 
+		if expectDebugToRequireCap {
+			resp, err := httpClient.Get(url.String())
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusForbidden, resp.StatusCode)
+			require.Contains(t, string(body), "tenant does not have capability to debug the running process")
+
+			_, err = db.Exec(`ALTER TENANT processdebug GRANT CAPABILITY can_debug_process=true`)
+			require.NoError(t, err)
+
+			serverutils.WaitForTenantCapabilities(t, s, serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
+				tenantcapabilities.CanDebugProcess: "true",
+			}, "")
+		}
 		resp, err := httpClient.Get(url.String())
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusForbidden, resp.StatusCode)
-		require.Contains(t, string(body), "tenant does not have capability to debug the running process")
-
-		_, err = db.Exec(`ALTER TENANT processdebug GRANT CAPABILITY can_debug_process=true`)
-		require.NoError(t, err)
-
-		serverutils.WaitForTenantCapabilities(t, s, serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
-			tenantcapabilities.CanDebugProcess: "true",
-		}, "")
-
-		resp, err = httpClient.Get(url.String())
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		body, err = io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		require.Contains(t, string(body), "previous vmodule configuration: \nnew vmodule configuration: exec_log=3\n")
@@ -326,7 +360,7 @@ func TestNonExistentTenant(t *testing.T) {
 	})
 	defer s.Stopper().Stop(ctx)
 
-	_, err := s.StartTenant(ctx,
+	_, err := s.TenantController().StartTenant(ctx,
 		base.TestTenantArgs{
 			TenantID:            serverutils.TestTenantID(),
 			DisableCreateTenant: true,
@@ -383,18 +417,24 @@ func TestTenantInstanceIDReclaimLoop(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	clusterSettings := cluster.MakeTestingClusterSettings()
+	clusterSettings := func() *cluster.Settings {
+		cs := cluster.MakeTestingClusterSettings()
+		instancestorage.ReclaimLoopInterval.Override(ctx, &cs.SV, 250*time.Millisecond)
+		instancestorage.PreallocatedCount.Override(ctx, &cs.SV, 5)
+		return cs
+	}
+
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{
-		Settings:          clusterSettings,
+		Settings:          clusterSettings(),
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
-	instancestorage.ReclaimLoopInterval.Override(ctx, &clusterSettings.SV, 250*time.Millisecond)
-	instancestorage.PreallocatedCount.Override(ctx, &clusterSettings.SV, 5)
-
 	_, db := serverutils.StartTenant(
-		t, s, base.TestTenantArgs{TenantID: serverutils.TestTenantID(), Settings: clusterSettings},
+		t, s, base.TestTenantArgs{
+			TenantID: serverutils.TestTenantID(),
+			Settings: clusterSettings(),
+		},
 	)
 	defer db.Close()
 	sqlDB := sqlutils.MakeSQLRunner(db)
@@ -409,11 +449,6 @@ func TestTenantInstanceIDReclaimLoop(t *testing.T) {
 		}
 		return fmt.Errorf("waiting for preallocated rows")
 	})
-}
-
-func TestSystemConfigWatcherCache(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	systemconfigwatchertest.TestSystemConfigWatcher(t, false /* skipSecondary */)
 }
 
 // TestStartTenantWithStaleInstance covers the following scenario:

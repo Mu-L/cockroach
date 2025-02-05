@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package copy
 
@@ -14,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -31,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,13 +46,12 @@ func TestCopyOutTransaction(t *testing.T) {
 	`)
 	require.NoError(t, err)
 
-	pgURL, cleanupGoDB, err := sqlutils.PGUrlE(
-		s.AdvSQLAddr(),
-		"StartServer", /* prefix */
-		url.User(username.RootUser),
+	pgURL, cleanupGoDB, err := s.PGUrlE(
+		serverutils.CertsDirPrefix("StartServer"),
+		serverutils.User(username.RootUser),
 	)
 	require.NoError(t, err)
-	s.Stopper().AddCloser(stop.CloserFn(func() { cleanupGoDB() }))
+	s.AppStopper().AddCloser(stop.CloserFn(func() { cleanupGoDB() }))
 	config, err := pgx.ParseConfig(pgURL.String())
 	require.NoError(t, err)
 
@@ -120,13 +113,12 @@ func TestCopyOutRandom(t *testing.T) {
 
 	// Use pgx for this next bit as it allows selecting rows by raw values.
 	// Furthermore, it handles CopyTo!
-	pgURL, cleanupGoDB, err := sqlutils.PGUrlE(
-		s.AdvSQLAddr(),
-		"StartServer", /* prefix */
-		url.User(username.RootUser),
+	pgURL, cleanupGoDB, err := s.PGUrlE(
+		serverutils.CertsDirPrefix("StartServer"),
+		serverutils.User(username.RootUser),
 	)
 	require.NoError(t, err)
-	s.Stopper().AddCloser(stop.CloserFn(func() { cleanupGoDB() }))
+	s.AppStopper().AddCloser(stop.CloserFn(func() { cleanupGoDB() }))
 	config, err := pgx.ParseConfig(pgURL.String())
 	require.NoError(t, err)
 	config.Database = sqlutils.TestDB

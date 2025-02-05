@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
@@ -18,16 +13,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -39,9 +32,20 @@ import (
 // AutomaticStatisticsClusterMode controls the cluster setting for enabling
 // automatic table statistics collection.
 var AutomaticStatisticsClusterMode = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	catpb.AutoStatsEnabledSettingName,
 	"automatic statistics collection mode",
+	true,
+	settings.WithPublic)
+
+// AutomaticPartialStatisticsClusterMode controls the cluster setting for
+// enabling automatic table partial statistics collection. If automatic full
+// table statistics are disabled for a table, then automatic partial statistics
+// will also be disabled.
+var AutomaticPartialStatisticsClusterMode = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	catpb.AutoPartialStatsEnabledSettingName,
+	"automatic partial statistics collection mode",
 	true,
 	settings.WithPublic)
 
@@ -49,7 +53,7 @@ var AutomaticStatisticsClusterMode = settings.RegisterBoolSetting(
 // statistics usage by the optimizer for planning queries involving system
 // tables.
 var UseStatisticsOnSystemTables = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	catpb.UseStatsOnSystemTables,
 	"when true, enables use of statistics on system tables by the query optimizer",
 	true,
@@ -60,7 +64,7 @@ var UseStatisticsOnSystemTables = settings.RegisterBoolSetting(
 // via a true setting of sql.stats.automatic_collection.enabled for this flag to
 // have any effect.
 var AutomaticStatisticsOnSystemTables = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	catpb.AutoStatsOnSystemTables,
 	"when true, enables automatic collection of statistics on system tables",
 	true,
@@ -69,7 +73,7 @@ var AutomaticStatisticsOnSystemTables = settings.RegisterBoolSetting(
 // MultiColumnStatisticsClusterMode controls the cluster setting for enabling
 // automatic collection of multi-column statistics.
 var MultiColumnStatisticsClusterMode = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.stats.multi_column_collection.enabled",
 	"multi-column statistics collection mode",
 	true,
@@ -80,7 +84,7 @@ var MultiColumnStatisticsClusterMode = settings.RegisterBoolSetting(
 // statistics (in high load scenarios). This value can be tuned to trade off
 // the runtime vs performance impact of automatic stats.
 var AutomaticStatisticsMaxIdleTime = settings.RegisterFloatSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.stats.automatic_collection.max_fraction_idle",
 	"maximum fraction of time that automatic statistics sampler processors are idle",
 	0.9,
@@ -92,10 +96,23 @@ var AutomaticStatisticsMaxIdleTime = settings.RegisterFloatSetting(
 // statistics on that table are refreshed, in addition to the constant value
 // AutomaticStatisticsMinStaleRows.
 var AutomaticStatisticsFractionStaleRows = settings.RegisterFloatSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	catpb.AutoStatsFractionStaleSettingName,
 	"target fraction of stale rows per table that will trigger a statistics refresh",
 	0.2,
+	settings.NonNegativeFloat,
+	settings.WithPublic,
+)
+
+// AutomaticPartialStatisticsFractionStaleRows controls the cluster setting for
+// the target fraction of rows in a table that should be stale before partial
+// statistics on that table are refreshed, in addition to the constant value
+// AutomaticPartialStatisticsMinStaleRows.
+var AutomaticPartialStatisticsFractionStaleRows = settings.RegisterFloatSetting(
+	settings.ApplicationLevel,
+	catpb.AutoPartialStatsFractionStaleSettingName,
+	"target fraction of stale rows per table that will trigger a partial statistics refresh",
+	0.05,
 	settings.NonNegativeFloat,
 	settings.WithPublic,
 )
@@ -104,7 +121,7 @@ var AutomaticStatisticsFractionStaleRows = settings.RegisterFloatSetting(
 // number of rows that should be updated before a table is refreshed, in
 // addition to the fraction AutomaticStatisticsFractionStaleRows.
 var AutomaticStatisticsMinStaleRows = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	catpb.AutoStatsMinStaleSettingName,
 	"target minimum number of stale rows per table that will trigger a statistics refresh",
 	500,
@@ -112,10 +129,22 @@ var AutomaticStatisticsMinStaleRows = settings.RegisterIntSetting(
 	settings.WithPublic,
 )
 
+// AutomaticPartialStatisticsMinStaleRows controls the cluster setting for the
+// target number of rows that should be updated before a table is refreshed, in
+// addition to the fraction AutomaticStatisticsFractionStaleRows.
+var AutomaticPartialStatisticsMinStaleRows = settings.RegisterIntSetting(
+	settings.ApplicationLevel,
+	catpb.AutoPartialStatsMinStaleSettingName,
+	"target minimum number of stale rows per table that will trigger a partial statistics refresh",
+	100,
+	settings.NonNegativeInt,
+	settings.WithPublic,
+)
+
 // statsGarbageCollectionInterval controls the interval between running an
 // internal query to delete stats for dropped tables.
 var statsGarbageCollectionInterval = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.stats.garbage_collection_interval",
 	"interval between deleting stats for dropped tables, set to 0 to disable",
 	time.Hour,
@@ -127,7 +156,7 @@ var statsGarbageCollectionInterval = settings.RegisterDurationSetting(
 // beyond the limit will need to wait out statsGarbageCollectionInterval until
 // the next "sweep").
 var statsGarbageCollectionLimit = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.stats.garbage_collection_limit",
 	"limit on the number of dropped tables that stats are deleted for as part of a single statement",
 	1000,
@@ -173,7 +202,10 @@ const (
 //
 // The Refresher is designed to schedule a CREATE STATISTICS refresh job after
 // approximately X% of total rows have been updated/inserted/deleted in a given
-// table. Currently, X is hardcoded to be 20%.
+// table. It also schedules partial stats refresh jobs (CREATE STATISTICS ...
+// USING EXTREMES) jobs after approximately Y% of total rows have been affected,
+// where Y < X. X is 20% and Y is 5% by default. These values can be configured
+// with their respective cluster and table settings.
 //
 // The decision to refresh is based on a percentage rather than a fixed number
 // of rows because if a table is huge and rarely updated, we don't want to
@@ -181,14 +213,21 @@ const (
 // updated, we want to update stats more often.
 //
 // To avoid contention on row update counters, we use a statistical approach.
-// For example, suppose we want to refresh stats after 20% of rows are updated
-// and there are currently 1M rows in the table. If a user updates 10 rows,
-// we use random number generation to refresh stats with probability
+// For example, suppose we want to refresh full stats after 20% of rows are
+// updated, and we want to refresh partial stats after 5% of rows are updated.
+// If there are currently 1M rows in the table and a user updates 10 rows,
+// we use random number generation to refresh full stats with probability
 // 10/(1M * 0.2) = 0.00005. The general formula is:
 //
 //	                        # rows updated/inserted/deleted
 //	p =  --------------------------------------------------------------------
 //	     (# rows in table) * (target fraction of rows updated before refresh)
+//
+// If we decide not to refresh full stats based on the above probability, we
+// make a decision to refresh stats with a partial collection. This is done
+// using the same formula as above, but with a smaller target fraction of rows
+// changed before refresh. This ensures that we maintain stats on new values
+// that are added to the table between full stats refreshes.
 //
 // The existing statistics in the stats cache are used to get the number of
 // rows in the table.
@@ -218,10 +257,11 @@ const (
 // sent.
 type Refresher struct {
 	log.AmbientContext
-	st      *cluster.Settings
-	ex      isql.Executor
-	cache   *TableStatisticsCache
-	randGen autoStatsRand
+	st         *cluster.Settings
+	internalDB descs.DB
+	cache      *TableStatisticsCache
+	randGen    autoStatsRand
+	knobs      *TableStatsTestingKnobs
 
 	// mutations is the buffered channel used to pass messages containing
 	// metadata about SQL mutations to the background Refresher thread.
@@ -280,22 +320,39 @@ type settingOverride struct {
 	settings catpb.AutoStatsSettings
 }
 
+// TableStatsTestingKnobs contains testing knobs for table statistics.
+type TableStatsTestingKnobs struct {
+	// DisableInitialTableCollection, if set, indicates that the "initial table
+	// collection" performed by the Refresher should be skipped.
+	DisableInitialTableCollection bool
+	// DisableFullStatsRefresh, if set, indicates that the Refresher should not
+	// perform full statistics refreshes. Useful for testing the partial stats
+	// refresh logic.
+	DisableFullStatsRefresh bool
+}
+
+var _ base.ModuleTestingKnobs = &TableStatsTestingKnobs{}
+
+func (k *TableStatsTestingKnobs) ModuleTestingKnobs() {}
+
 // MakeRefresher creates a new Refresher.
 func MakeRefresher(
 	ambientCtx log.AmbientContext,
 	st *cluster.Settings,
-	ex isql.Executor,
+	internalDB descs.DB,
 	cache *TableStatisticsCache,
 	asOfTime time.Duration,
+	knobs *TableStatsTestingKnobs,
 ) *Refresher {
 	randSource := rand.NewSource(rand.Int63())
 
 	return &Refresher{
 		AmbientContext:   ambientCtx,
 		st:               st,
-		ex:               ex,
+		internalDB:       internalDB,
 		cache:            cache,
 		randGen:          makeAutoStatsRand(randSource),
+		knobs:            knobs,
 		mutations:        make(chan mutation, refreshChanBufferLen),
 		settings:         make(chan settingOverride, refreshChanBufferLen),
 		asOfTime:         asOfTime,
@@ -322,6 +379,25 @@ func (r *Refresher) autoStatsEnabled(desc catalog.TableDescriptor) bool {
 		return AutomaticStatisticsClusterMode.Get(&r.st.SV)
 	}
 	return enabledForTable == catpb.AutoStatsCollectionEnabled
+}
+
+// autoPartialStatsEnabled returns true if the
+// sql_stats_automatic_partial_collection_enabled setting of the table
+// descriptor set to true. If the table descriptor is nil or the table-level
+// setting is not set, the function returns true if the automatic partial stats
+// cluster setting is enabled.
+func (r *Refresher) autoPartialStatsEnabled(desc catalog.TableDescriptor) bool {
+	if desc == nil {
+		// If the descriptor could not be accessed, defer to the cluster setting.
+		return AutomaticPartialStatisticsClusterMode.Get(&r.st.SV)
+	}
+	enabledForTable := desc.AutoPartialStatsCollectionEnabled()
+	// The table-level setting of sql_stats_automatic_partial_collection_enabled
+	// takes precedence over the cluster setting.
+	if enabledForTable == catpb.AutoPartialStatsCollectionNotSet {
+		return AutomaticPartialStatisticsClusterMode.Get(&r.st.SV)
+	}
+	return enabledForTable == catpb.AutoPartialStatsCollectionEnabled
 }
 
 func (r *Refresher) autoStatsEnabledForTableID(
@@ -356,6 +432,16 @@ func (r *Refresher) autoStatsMinStaleRows(explicitSettings *catpb.AutoStatsSetti
 	return AutomaticStatisticsMinStaleRows.Get(&r.st.SV)
 }
 
+func (r *Refresher) autoPartialStatsMinStaleRows(explicitSettings *catpb.AutoStatsSettings) int64 {
+	if explicitSettings == nil {
+		return AutomaticPartialStatisticsMinStaleRows.Get(&r.st.SV)
+	}
+	if minStaleRows, ok := explicitSettings.AutoPartialStatsMinStaleRows(); ok {
+		return minStaleRows
+	}
+	return AutomaticPartialStatisticsMinStaleRows.Get(&r.st.SV)
+}
+
 func (r *Refresher) autoStatsFractionStaleRows(explicitSettings *catpb.AutoStatsSettings) float64 {
 	if explicitSettings == nil {
 		return AutomaticStatisticsFractionStaleRows.Get(&r.st.SV)
@@ -364,6 +450,18 @@ func (r *Refresher) autoStatsFractionStaleRows(explicitSettings *catpb.AutoStats
 		return fractionStaleRows
 	}
 	return AutomaticStatisticsFractionStaleRows.Get(&r.st.SV)
+}
+
+func (r *Refresher) autoPartialStatsFractionStaleRows(
+	explicitSettings *catpb.AutoStatsSettings,
+) float64 {
+	if explicitSettings == nil {
+		return AutomaticPartialStatisticsFractionStaleRows.Get(&r.st.SV)
+	}
+	if fractionStaleRows, ok := explicitSettings.AutoPartialStatsFractionStaleRows(); ok {
+		return fractionStaleRows
+	}
+	return AutomaticPartialStatisticsFractionStaleRows.Get(&r.st.SV)
 }
 
 func (r *Refresher) getTableDescriptor(
@@ -406,7 +504,8 @@ func (r *Refresher) SetDraining() {
 func (r *Refresher) Start(
 	ctx context.Context, stopper *stop.Stopper, refreshInterval time.Duration,
 ) error {
-	bgCtx := r.AnnotateCtx(context.Background())
+	stoppingCtx, _ := stopper.WithCancelOnQuiesce(context.Background())
+	bgCtx := r.AnnotateCtx(stoppingCtx)
 	r.startedTasksWG.Add(1)
 	if err := stopper.RunAsyncTask(bgCtx, "refresher", func(ctx context.Context) {
 		defer r.startedTasksWG.Done()
@@ -430,7 +529,10 @@ func (r *Refresher) Start(
 		for {
 			select {
 			case <-initialTableCollection:
-				r.ensureAllTables(ctx, &r.st.SV, initialTableCollectionDelay)
+				if r.knobs != nil && r.knobs.DisableInitialTableCollection {
+					continue
+				}
+				r.ensureAllTables(ctx, initialTableCollectionDelay)
 				if len(r.mutationCounts) > 0 {
 					ensuringAllTables = true
 				}
@@ -472,7 +574,7 @@ func (r *Refresher) Start(
 							break
 						case <-r.drainAutoStats:
 							return
-						case <-stopper.ShouldQuiesce():
+						case <-ctx.Done():
 							return
 						}
 
@@ -514,12 +616,18 @@ func (r *Refresher) Start(
 									explicitSettings = &settings
 								}
 							}
-							r.maybeRefreshStats(ctx, stopper, tableID, explicitSettings, rowsAffected, r.asOfTime)
+							r.maybeRefreshStats(
+								ctx,
+								stopper,
+								tableID,
+								explicitSettings,
+								rowsAffected,
+								r.asOfTime,
+								r.autoPartialStatsEnabled(desc),
+							)
 
 							select {
-							case <-stopper.ShouldQuiesce():
-								// Don't bother trying to refresh the remaining tables if we
-								// are shutting down.
+							case <-ctx.Done():
 								return
 							case <-r.drainAutoStats:
 								// Ditto.
@@ -554,8 +662,7 @@ func (r *Refresher) Start(
 			case <-r.drainAutoStats:
 				log.Infof(ctx, "draining auto stats refresher")
 				return
-			case <-stopper.ShouldQuiesce():
-				log.Info(ctx, "quiescing auto stats refresher")
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -610,7 +717,7 @@ func (r *Refresher) Start(
 				log.Infof(ctx, "quiescing stats garbage collector")
 				return
 			}
-			if err := deleteStatsForDroppedTables(ctx, r.ex, statsGarbageCollectionLimit.Get(&r.st.SV)); err != nil {
+			if err := deleteStatsForDroppedTables(ctx, r.internalDB, statsGarbageCollectionLimit.Get(&r.st.SV)); err != nil {
 				log.Warningf(ctx, "stats-garbage-collector encountered an error when deleting stats: %v", err)
 			}
 		}
@@ -621,68 +728,44 @@ func (r *Refresher) Start(
 	return nil
 }
 
-const (
-	getAllTablesTemplateSQL = `
-SELECT
-	tbl.table_id
-FROM
-	crdb_internal.tables AS tbl
-	INNER JOIN system.descriptor AS d ON d.id = tbl.table_id
-		AS OF SYSTEM TIME '-%s'
-WHERE
-	tbl.database_name IS NOT NULL
-	AND tbl.table_id NOT IN (%d, %d, %d)  -- excluded system tables
-	AND tbl.drop_time IS NULL
-	AND (
-			crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', d.descriptor, false)->'table'->>'viewQuery'
-		) IS NULL
-	%s
-	%s`
-
-	explicitlyEnabledTablesPredicate = `AND
-	(crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor',
-		d.descriptor, false)->'table'->'autoStatsSettings' ->> 'enabled' = 'true'
-	)`
-
-	autoStatsEnabledOrNotSpecifiedPredicate = `AND
-	(crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor',
-		d.descriptor, false)->'table'->'autoStatsSettings'->'enabled' IS NULL
-	 OR crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor',
-		d.descriptor, false)->'table'->'autoStatsSettings' ->> 'enabled' = 'true'
-	)`
-
-	autoStatsOnSystemTablesEnabledPredicate = `AND TRUE`
-
-	autoStatsOnSystemTablesDisabledPredicate = `AND tbl.database_name != 'system'`
-)
-
 func (r *Refresher) getApplicableTables(
-	ctx context.Context, stmt string, opname string, forTesting bool,
+	ctx context.Context, initialTableCollectionDelay time.Duration, forTesting bool,
 ) {
 	if forTesting {
 		r.numTablesEnsured = 0
 	}
-	it, err := r.ex.QueryIterator(
-		ctx,
-		opname,
-		nil, /* txn */
-		stmt,
-	)
-	if err == nil {
-		var ok bool
-		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
-			row := it.Cur()
-			tableID := descpb.ID(*row[0].(*tree.DInt))
-			// Don't create statistics for virtual tables.
-			// The query already excludes views and system tables.
-			if !descpb.IsVirtualTable(tableID) {
-				r.mutationCounts[tableID] += 0
-				if forTesting {
-					r.numTablesEnsured++
+	err := r.internalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
+		fixedTs := r.internalDB.KV().Clock().Now().AddDuration(-initialTableCollectionDelay)
+		if err := txn.KV().SetFixedTimestamp(ctx, fixedTs); err != nil {
+			return err
+		}
+		all, err := txn.Descriptors().GetAll(ctx, txn.KV())
+		if err != nil {
+			return err
+		}
+		return all.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			tableDesc, isTable := desc.(catalog.TableDescriptor)
+			if !isTable {
+				return nil
+			}
+			if !autostatsCollectionAllowed(tableDesc, r.st) {
+				return nil
+			}
+			switch tableDesc.AutoStatsCollectionEnabled() {
+			case catpb.AutoStatsCollectionDisabled:
+				return nil
+			case catpb.AutoStatsCollectionNotSet:
+				if !AutomaticStatisticsClusterMode.Get(&r.st.SV) {
+					return nil
 				}
 			}
-		}
-	}
+			r.mutationCounts[tableDesc.GetID()] += 0
+			if forTesting {
+				r.numTablesEnsured++
+			}
+			return nil
+		})
+	})
 	if err != nil {
 		// Note that it is ok if the iterator returned partial results before
 		// encountering an error - in that case we added entries to
@@ -697,29 +780,9 @@ func (r *Refresher) getApplicableTables(
 // table in the database which has auto stats enabled, either explicitly via
 // a table-level setting, or implicitly via the cluster setting.
 func (r *Refresher) ensureAllTables(
-	ctx context.Context, settings *settings.Values, initialTableCollectionDelay time.Duration,
+	ctx context.Context, initialTableCollectionDelay time.Duration,
 ) {
-	// A table-level setting of sql_stats_automatic_collection_enabled of null,
-	// meaning not set, or true qualifies rows we're interested in.
-	autoStatsPredicate := autoStatsEnabledOrNotSpecifiedPredicate
-	if !AutomaticStatisticsClusterMode.Get(settings) {
-		autoStatsPredicate = explicitlyEnabledTablesPredicate
-	}
-
-	systemTablesPredicate := autoStatsOnSystemTablesEnabledPredicate
-	if !AutomaticStatisticsOnSystemTables.Get(settings) {
-		systemTablesPredicate = autoStatsOnSystemTablesDisabledPredicate
-	}
-
-	// Use a historical read so as to disable txn contention resolution.
-	getAllTablesQuery := fmt.Sprintf(
-		getAllTablesTemplateSQL,
-		initialTableCollectionDelay,
-		keys.TableStatisticsTableID, keys.LeaseTableID, keys.ScheduledJobsTableID,
-		autoStatsPredicate, systemTablesPredicate,
-	)
-	r.getApplicableTables(ctx, getAllTablesQuery,
-		"get-tables", false)
+	r.getApplicableTables(ctx, initialTableCollectionDelay, false)
 }
 
 // NotifyMutation is called by SQL mutation operations to signal to the
@@ -790,8 +853,9 @@ func (r *Refresher) maybeRefreshStats(
 	explicitSettings *catpb.AutoStatsSettings,
 	rowsAffected int64,
 	asOf time.Duration,
+	partialStatsEnabled bool,
 ) {
-	tableStats, err := r.cache.getTableStatsFromCache(ctx, tableID, nil /* forecast */)
+	tableStats, err := r.cache.getTableStatsFromCache(ctx, tableID, nil /* forecast */, nil /* udtCols */, nil /* typeResolver */)
 	if err != nil {
 		log.Errorf(ctx, "failed to get table statistics: %v", err)
 		return
@@ -799,7 +863,9 @@ func (r *Refresher) maybeRefreshStats(
 
 	var rowCount float64
 	mustRefresh := false
-	if stat := mostRecentAutomaticStat(tableStats); stat != nil {
+	isPartial := false
+	stat := mostRecentAutomaticFullStat(tableStats)
+	if stat != nil {
 		// Check if too much time has passed since the last refresh.
 		// This check is in place to corral statistical outliers and avoid a
 		// case where a significant portion of the data in a table has changed but
@@ -822,8 +888,8 @@ func (r *Refresher) maybeRefreshStats(
 		}
 		rowCount = float64(stat.RowCount)
 	} else {
-		// If there are no statistics available on this table, we must perform a
-		// refresh.
+		// If there are no full statistics available on this table, we must perform
+		// a refresh.
 		mustRefresh = true
 	}
 
@@ -835,12 +901,32 @@ func (r *Refresher) maybeRefreshStats(
 	if targetRows > 0 {
 		randomTargetRows = r.randGen.randInt(targetRows)
 	}
-	if !mustRefresh && rowsAffected < math.MaxInt32 && randomTargetRows >= rowsAffected {
-		// No refresh is happening this time.
-		return
+	if (!mustRefresh && rowsAffected < math.MaxInt32 && randomTargetRows >= rowsAffected) ||
+		(r.knobs != nil && r.knobs.DisableFullStatsRefresh) {
+		// No full statistics refresh is happening this time. Let's try a partial
+		// stats refresh.
+		if !partialStatsEnabled {
+			// No refresh is happening this time, full or partial.
+			return
+		}
+
+		randomTargetRows = int64(0)
+		partialStatsMinStaleRows := r.autoPartialStatsMinStaleRows(explicitSettings)
+		partialStatsFractionStaleRows := r.autoPartialStatsFractionStaleRows(explicitSettings)
+		targetRows = int64(rowCount*partialStatsFractionStaleRows) + partialStatsMinStaleRows
+		// randInt will panic if we pass it a value of 0.
+		if targetRows > 0 {
+			randomTargetRows = r.randGen.randInt(targetRows)
+		}
+		if randomTargetRows >= rowsAffected {
+			// No refresh is happening this time, full or partial
+			return
+		}
+
+		isPartial = true
 	}
 
-	if err := r.refreshStats(ctx, tableID, asOf); err != nil {
+	if err := r.refreshStats(ctx, tableID, asOf, isPartial); err != nil {
 		if errors.Is(err, ConcurrentCreateStatsError) {
 			// Another stats job was already running. Attempt to reschedule this
 			// refresh.
@@ -884,17 +970,29 @@ func (r *Refresher) maybeRefreshStats(
 	}
 }
 
-func (r *Refresher) refreshStats(ctx context.Context, tableID descpb.ID, asOf time.Duration) error {
+func (r *Refresher) refreshStats(
+	ctx context.Context, tableID descpb.ID, asOf time.Duration, isPartial bool,
+) error {
+	var usingExtremes string
+	autoStatsJobName := jobspb.AutoStatsName
+	if isPartial {
+		usingExtremes = " USING EXTREMES"
+		autoStatsJobName = jobspb.AutoPartialStatsName
+	}
 	// Create statistics for all default column sets on the given table.
 	stmt := fmt.Sprintf(
-		"CREATE STATISTICS %s FROM [%d] WITH OPTIONS THROTTLING %g AS OF SYSTEM TIME '-%s'",
-		jobspb.AutoStatsName,
+		"CREATE STATISTICS %s FROM [%d] WITH OPTIONS THROTTLING %g AS OF SYSTEM TIME '-%s'%s",
+		autoStatsJobName,
 		tableID,
 		AutomaticStatisticsMaxIdleTime.Get(&r.st.SV),
 		asOf.String(),
+		usingExtremes,
 	)
-	log.Infof(ctx, "automatically executing %q", stmt)
-	_ /* rows */, err := r.ex.Exec(
+
+	if log.ExpensiveLogEnabled(ctx, 1) {
+		log.Infof(ctx, "automatically executing %q", stmt)
+	}
+	_ /* rows */, err := r.internalDB.Executor().Exec(
 		ctx,
 		"create-stats",
 		nil, /* txn */
@@ -903,9 +1001,9 @@ func (r *Refresher) refreshStats(ctx context.Context, tableID descpb.ID, asOf ti
 	return err
 }
 
-// mostRecentAutomaticStat finds the most recent automatic statistic
+// mostRecentAutomaticFullStat finds the most recent automatic statistic
 // (identified by the name AutoStatsName).
-func mostRecentAutomaticStat(tableStats []*TableStatistic) *TableStatistic {
+func mostRecentAutomaticFullStat(tableStats []*TableStatistic) *TableStatistic {
 	// Stats are sorted with the most recent first.
 	for _, stat := range tableStats {
 		if stat.Name == jobspb.AutoStatsName {

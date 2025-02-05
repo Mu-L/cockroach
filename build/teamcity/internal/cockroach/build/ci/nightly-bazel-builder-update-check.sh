@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
+
+# Copyright 2022 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 set -xeuo pipefail
 
-BASE_IMAGE="ubuntu:focal"
-BAZEL_IMAGE="cockroachdb/bazel:latest-do-not-use"
+# We use a docker image mirror to avoid pulling from 3rd party repos, which sometimes have reliability issues.
+# See https://cockroachlabs.atlassian.net/wiki/spaces/devinf/pages/3462594561/Docker+image+sync for the details.
+BASE_IMAGE="us-east1-docker.pkg.dev/crl-docker-sync/docker-io/library/ubuntu:focal"
+BAZEL_IMAGE="us-east1-docker.pkg.dev/crl-ci-images/cockroach/bazel:latest-do-not-use"
 
 docker pull $BASE_IMAGE && docker pull $BAZEL_IMAGE
 LATEST_BASE_IMAGE_CREATE_DT="$(docker inspect $BASE_IMAGE -f '{{.Created}}')"

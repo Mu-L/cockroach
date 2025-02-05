@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package sqlproxyccl implements a server to proxy SQL connections.
 package sqlproxyccl
@@ -70,5 +67,9 @@ var SendErrToClient = func(conn net.Conn, err error) {
 	if err == nil || conn == nil {
 		return
 	}
-	_, _ = conn.Write(toPgError(err).Encode(nil))
+	buf, err := toPgError(err).Encode(nil)
+	if err != nil {
+		return // void function - eat the error
+	}
+	_, _ = conn.Write(buf)
 }

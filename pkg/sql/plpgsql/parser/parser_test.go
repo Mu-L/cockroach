@@ -1,47 +1,64 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parser_test
 
 import (
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/plpgsql/parser"
+	plpgsql "github.com/cockroachdb/cockroach/pkg/sql/plpgsql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree/utils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/datadriven"
 )
 
-// TODO: Define(if possible) a data driven test framework so that sql and
-// plpgsql share a parse test
-func TestParseDataDriver(t *testing.T) {
+// TestParseDataDriven verifies that we can parse the supplied PL/pgSQL.
+//
+// The follow commands are allowed:
+//
+//   - parse
+//
+//     Parses PL/pgSQL and verifies that it round-trips. Various forms of the
+//     formatted AST are printed as test output.
+//
+//   - error
+//
+//     Parses PL/pgSQL and expects an error. The error is printed as test
+//     output.
+//
+//   - feature-count
+//
+//     Parses PL/pgSQL and prints PL/pgSQL-related telemetry counters.
+func TestParseDataDriven(t *testing.T) {
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "parse":
-				// Check parse.
-				fn, err := parser.Parse(d.Input)
-				if err != nil {
-					return err.Error()
+				const plpgsql = true
+				reParseWithoutLiterals := true
+				for _, arg := range d.CmdArgs {
+					if arg.Key == "no-parse-without-literals" {
+						reParseWithoutLiterals = false
+					}
 				}
-				// TODO(chengxiong): add pretty print round trip test.
-				return fn.String()
+				return sqlutils.VerifyParseFormat(t, d.Input, d.Pos, plpgsql, reParseWithoutLiterals)
+			case "error":
+				_, err := plpgsql.Parse(d.Input)
+				if err == nil {
+					d.Fatalf(t, "%s\nexpected error, found none", d.Pos)
+				}
+				return sqlutils.VerifyParseError(err)
 			case "feature-count":
 				fn, err := utils.CountPLpgSQLStmt(d.Input)
 				if err != nil {
-					d.Fatalf(t, "unexpected parse error: %v", err)
+					d.Fatalf(t, "%s\nunexpected parse error: %v", d.Pos, err)
 				}
-
 				return fn.String()
 			}
-			d.Fatalf(t, "unsupported command: %s", d.Cmd)
+			d.Fatalf(t, "%s\nunsupported command: %s", d.Pos, d.Cmd)
 			return ""
 		})
 	})

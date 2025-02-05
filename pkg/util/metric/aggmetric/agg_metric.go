@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package aggmetric provides functionality to create metrics which expose
 // aggregate metrics for internal collection and additionally per-child
@@ -36,6 +31,12 @@ func MakeBuilder(labels ...string) Builder {
 // Gauge constructs a new AggGauge with the Builder's labels.
 func (b Builder) Gauge(metadata metric.Metadata) *AggGauge {
 	return NewGauge(metadata, b.labels...)
+}
+
+// FunctionalGauge constructs a new AggGauge with the Builder's labels who's
+// value is determined when asked for.
+func (b Builder) FunctionalGauge(metadata metric.Metadata, f func(cvs []int64) int64) *AggGauge {
+	return NewFunctionalGauge(metadata, f, b.labels...)
 }
 
 // GaugeFloat64 constructs a new AggGaugeFloat64 with the Builder's labels.
@@ -90,6 +91,16 @@ func (cs *childSet) Each(
 		}
 		pm.Label = childLabels
 		f(pm)
+		return true
+	})
+}
+
+// apply applies the given applyFn to every item in the childSet
+func (cs *childSet) apply(applyFn func(item btree.Item)) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.mu.tree.Ascend(func(item btree.Item) bool {
+		applyFn(item)
 		return true
 	})
 }

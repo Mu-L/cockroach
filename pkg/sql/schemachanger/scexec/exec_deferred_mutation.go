@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scexec
 
@@ -23,14 +18,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 )
 
 type deferredState struct {
 	databaseRoleSettingsToDelete []databaseRoleSettingToDelete
 	schemaChangerJob             *jobs.Record
 	schemaChangerJobUpdates      map[jobspb.JobID]schemaChangerJobUpdate
-	scheduleIDsToDelete          []int64
+	scheduleIDsToDelete          []jobspb.ScheduleID
 	statsToRefresh               catalog.DescriptorIDSet
 	indexesToSplitAndScatter     []indexesToSplitAndScatter
 	gcJobs
@@ -71,7 +65,7 @@ func (s *deferredState) AddIndexForMaybeSplitAndScatter(
 		})
 }
 
-func (s *deferredState) DeleteSchedule(scheduleID int64) {
+func (s *deferredState) DeleteSchedule(scheduleID jobspb.ScheduleID) {
 	s.scheduleIDsToDelete = append(s.scheduleIDsToDelete, scheduleID)
 }
 
@@ -125,7 +119,7 @@ func MakeDeclarativeSchemaChangeJobRecord(
 		// but that's a possibly ambiguous value and not what the old
 		// schema changer used. It's probably that the right thing to use
 		// is the redactable string with the redaction markers.
-		stmtStrs[i] = redact.RedactableString(stmt.RedactedStatement).StripMarkers()
+		stmtStrs[i] = stmt.RedactedStatement.StripMarkers()
 	}
 	// The description being all the statements might seem a bit suspect, but
 	// it's what the old schema changer does, so it's what we'll do.
@@ -171,7 +165,7 @@ func (s *deferredState) exec(
 	q StatsRefreshQueue,
 	iss IndexSpanSplitter,
 ) error {
-	dbZoneConfigsToDelete, gcJobRecords := s.gcJobs.makeRecords(tjr.MakeJobID, !tjr.UseLegacyGCJob(ctx))
+	dbZoneConfigsToDelete, gcJobRecords := s.gcJobs.makeRecords(tjr.MakeJobID)
 	// Any databases being GCed should have an entry even if none of its tables
 	// are being dropped. This entry will be used to generate the GC jobs below.
 	for _, id := range dbZoneConfigsToDelete.Ordered() {

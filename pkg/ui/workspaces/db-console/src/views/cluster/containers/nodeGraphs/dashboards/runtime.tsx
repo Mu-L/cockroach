@@ -1,19 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
+import map from "lodash/map";
 import React from "react";
-import _ from "lodash";
 
 import LineGraph from "src/views/cluster/components/linegraph";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
-import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 import { GraphDashboardProps, nodeDisplayName } from "./dashboardUtils";
 
@@ -30,7 +25,8 @@ export default function (props: GraphDashboardProps) {
     <LineGraph
       title="Live Node Count"
       tenantSource={tenantSource}
-      tooltip="The number of live nodes in the cluster."
+      tooltip={`The number of live nodes in the cluster.`}
+      showMetricsInTooltip={true}
     >
       <Axis label="nodes">
         <Metric
@@ -62,6 +58,7 @@ export default function (props: GraphDashboardProps) {
           </dl>
         </div>
       }
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Bytes} label="memory usage">
         <Metric name="cr.node.sys.rss" title="Total memory (RSS)" />
@@ -76,8 +73,9 @@ export default function (props: GraphDashboardProps) {
       title="Goroutine Count"
       sources={nodeSources}
       tenantSource={tenantSource}
-      tooltip={`The number of Goroutines ${tooltipSelection}.
-           This count should rise and fall based on load.`}
+      tooltip={`The number of Goroutines ${tooltipSelection}. This count should rise
+          and fall based on load.`}
+      showMetricsInTooltip={true}
     >
       <Axis label="goroutines">
         <Metric name="cr.node.sys.goroutines" title="Goroutine Count" />
@@ -85,11 +83,34 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
+      title="Goroutine Scheduling Latency: 99th percentile"
+      sources={nodeSources}
+      tenantSource={tenantSource}
+      tooltip={`P99 scheduling latency for goroutines`}
+      showMetricsInTooltip={true}
+    >
+      <Axis units={AxisUnits.Duration} label="latency">
+        {nodeIDs.map(nid => (
+          <>
+            <Metric
+              key={nid}
+              name="cr.node.go.scheduler_latency-p99"
+              title={nodeDisplayName(nodeDisplayNameByID, nid)}
+              sources={[nid]}
+              downsampleMax
+            />
+          </>
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
       title="Runnable Goroutines per CPU"
       sources={nodeSources}
       tenantSource={tenantSource}
-      tooltip={`The number of Goroutines waiting for CPU ${tooltipSelection}.
-           This count should rise and fall based on load.`}
+      tooltip={`The number of Goroutines waiting for CPU ${tooltipSelection}. This
+          count should rise and fall based on load.`}
+      showMetricsInTooltip={true}
     >
       <Axis label="goroutines">
         {nodeIDs.map(nid => (
@@ -109,6 +130,7 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tenantSource={tenantSource}
       tooltip={`The number of times that Go’s garbage collector was invoked per second ${tooltipSelection}.`}
+      showMetricsInTooltip={true}
     >
       <Axis label="runs">
         <Metric name="cr.node.sys.gc.count" title="GC Runs" nonNegativeRate />
@@ -119,9 +141,10 @@ export default function (props: GraphDashboardProps) {
       title="GC Pause Time"
       sources={nodeSources}
       tenantSource={tenantSource}
-      tooltip={`The amount of processor time used by Go’s garbage collector
-           per second ${tooltipSelection}.
-           During garbage collection, application code execution is paused.`}
+      tooltip={`The amount of processor time used by Go’s garbage collector per second
+          ${tooltipSelection}. During garbage collection, application code
+          execution is paused.`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="pause time">
         <Metric
@@ -133,11 +156,82 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
+      title="GC Stopping Time"
+      sources={nodeSources}
+      tenantSource={tenantSource}
+      tooltip={`The time it takes from deciding to
+      stop-the-world (gc related) until all Ps are stopped
+        ${tooltipSelection}.`}
+      showMetricsInTooltip={true}
+    >
+      <Axis units={AxisUnits.Duration} label="pause time">
+        <Metric
+          name="cr.node.sys.gc.stop.ns"
+          title="GC Stopping Time"
+          nonNegativeRate
+        />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="GC Assist Time"
+      sources={nodeSources}
+      tenantSource={tenantSource}
+      tooltip={`Estimated total CPU time user goroutines spent performing GC tasks on processors
+        ${tooltipSelection}.`}
+      showMetricsInTooltip={true}
+    >
+      <Axis units={AxisUnits.Duration} label="gc assist time">
+        <Metric
+          name="cr.node.sys.gc.assist.ns"
+          title="GC Assist Time"
+          nonNegativeRate
+        />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Non-GC Pause Time"
+      sources={nodeSources}
+      tenantSource={tenantSource}
+      tooltip={`The stop-the-world pause time during
+      non-gc process ${tooltipSelection}.`}
+      showMetricsInTooltip={true}
+    >
+      <Axis units={AxisUnits.Duration} label="pause time">
+        <Metric
+          name="cr.node.sys.go.pause.other.ns"
+          title="Non-GC Pause Time"
+          nonNegativeRate
+        />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Non-GC Stopping Time"
+      sources={nodeSources}
+      tenantSource={tenantSource}
+      tooltip={`The time it takes from deciding to stop-the-world 
+      (non-gc-related) until all Ps are stopped
+      ${tooltipSelection}.`}
+      showMetricsInTooltip={true}
+    >
+      <Axis units={AxisUnits.Duration} label="pause time">
+        <Metric
+          name="cr.node.sys.go.stop.other.ns"
+          title="Non-GC Stopping Time"
+          nonNegativeRate
+        />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
       title="CPU Time"
       sources={nodeSources}
       tenantSource={tenantSource}
-      tooltip={`The amount of CPU time used by CockroachDB (User)
-           and system-level operations (Sys) ${tooltipSelection}.`}
+      tooltip={`The amount of CPU time used by CockroachDB (User) and system-level
+          operations (Sys) ${tooltipSelection}.`}
+      showMetricsInTooltip={true}
     >
       <Axis units={AxisUnits.Duration} label="cpu time">
         <Metric
@@ -158,9 +252,10 @@ export default function (props: GraphDashboardProps) {
       sources={nodeSources}
       tenantSource={tenantSource}
       tooltip={`Mean clock offset of each node against the rest of the cluster.`}
+      showMetricsInTooltip={true}
     >
       <Axis label="offset" units={AxisUnits.Duration}>
-        {_.map(nodeIDs, nid => (
+        {map(nodeIDs, nid => (
           <Metric
             key={nid}
             name="cr.node.clock-offset.meannanos"

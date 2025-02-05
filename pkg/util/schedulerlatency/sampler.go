@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schedulerlatency
 
@@ -34,7 +29,7 @@ import (
 // requests in work queues as part of this tick). Might be worth checking for
 // grantees more frequently independent of this sample period.
 var samplePeriod = settings.RegisterDurationSetting(
-	settings.SystemOnly,
+	settings.ApplicationLevel, // used in virtual clusters
 	"scheduler_latency.sample_period",
 	"controls the duration between consecutive scheduler latency samples",
 	100*time.Millisecond,
@@ -47,7 +42,7 @@ var samplePeriod = settings.RegisterDurationSetting(
 )
 
 var sampleDuration = settings.RegisterDurationSetting(
-	settings.SystemOnly,
+	settings.ApplicationLevel, // used in virtual clusters
 	"scheduler_latency.sample_duration",
 	"controls the duration over which each scheduler latency sample is a measurement over",
 	2500*time.Millisecond,
@@ -147,9 +142,11 @@ func StartSampler(
 			case <-stopper.ShouldQuiesce():
 				return
 			case <-ticker.C:
-				settingsValuesMu.Lock()
-				period := settingsValuesMu.period
-				settingsValuesMu.Unlock()
+				period := func() time.Duration {
+					settingsValuesMu.Lock()
+					defer settingsValuesMu.Unlock()
+					return settingsValuesMu.period
+				}()
 				s.sampleOnTickAndInvokeCallbacks(period)
 			}
 		}
@@ -175,6 +172,7 @@ func newSampler(period, duration time.Duration, listener LatencyObserver) *sampl
 
 func (s *sampler) setPeriodAndDuration(period, duration time.Duration) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.mu.ringBuffer.Discard()
 	numSamples := int(duration / period)
 	if numSamples < 1 {
@@ -182,7 +180,6 @@ func (s *sampler) setPeriodAndDuration(period, duration time.Duration) {
 	}
 	s.mu.ringBuffer.Resize(numSamples)
 	s.mu.lastIntervalHistogram = nil
-	s.mu.Unlock()
 }
 
 // sampleOnTickAndInvokeCallbacks samples scheduler latency stats as the ticker

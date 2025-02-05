@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rangefeed
 
@@ -19,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -77,31 +73,37 @@ type CatchUpIterator struct {
 // NB: startTime is exclusive, i.e. the first possible event will be emitted at
 // Timestamp.Next().
 func NewCatchUpIterator(
+	ctx context.Context,
 	reader storage.Reader,
 	span roachpb.Span,
 	startTime hlc.Timestamp,
 	closer func(),
 	pacer *admission.Pacer,
-) *CatchUpIterator {
-	return &CatchUpIterator{
-		simpleCatchupIter: storage.NewMVCCIncrementalIterator(reader.(storage.ReaderWithMustIterators),
-			storage.MVCCIncrementalIterOptions{
-				KeyTypes:  storage.IterKeyTypePointsAndRanges,
-				StartKey:  span.Key,
-				EndKey:    span.EndKey,
-				StartTime: startTime,
-				EndTime:   hlc.MaxTimestamp,
-				// We want to emit intents rather than error
-				// (the default behavior) so that we can skip
-				// over the provisional values during
-				// iteration.
-				IntentPolicy: storage.MVCCIncrementalIterIntentPolicyEmit,
-			}),
-		close:     closer,
-		span:      span,
-		startTime: startTime,
-		pacer:     pacer,
+) (*CatchUpIterator, error) {
+	iter, err := storage.NewMVCCIncrementalIterator(ctx, reader,
+		storage.MVCCIncrementalIterOptions{
+			KeyTypes:  storage.IterKeyTypePointsAndRanges,
+			StartKey:  span.Key,
+			EndKey:    span.EndKey,
+			StartTime: startTime,
+			EndTime:   hlc.MaxTimestamp,
+			// We want to emit intents rather than error
+			// (the default behavior) so that we can skip
+			// over the provisional values during
+			// iteration.
+			IntentPolicy: storage.MVCCIncrementalIterIntentPolicyEmit,
+			ReadCategory: fs.RangefeedReadCategory,
+		})
+	if err != nil {
+		return nil, err
 	}
+	return &CatchUpIterator{
+		simpleCatchupIter: iter,
+		close:             closer,
+		span:              span,
+		startTime:         startTime,
+		pacer:             pacer,
+	}, nil
 }
 
 // Close closes the iterator and calls the instantiator-supplied close
@@ -130,8 +132,15 @@ type outputEventFn func(e *kvpb.RangeFeedEvent) error
 // For example, with MVCC range tombstones [a-f)@5 and [a-f)@3 overlapping point
 // keys a@6, a@4, and b@2, the emitted order is [a-f)@3,[a-f)@5,a@4,a@6,b@2 because
 // the start key "a" is ordered before all of the timestamped point keys.
+//
+// TODO(sumeer): ctx is not used for SeekGE and Next. Fix by adding a method
+// to SimpleMVCCIterator to replace the context.
 func (i *CatchUpIterator) CatchUpScan(
-	ctx context.Context, outputFn outputEventFn, withDiff bool,
+	ctx context.Context,
+	outputFn outputEventFn,
+	withDiff bool,
+	withFiltering bool,
+	withOmitRemote bool,
 ) error {
 	var a bufalloc.ByteAllocator
 	// MVCCIterator will encounter historical values for each key in
@@ -252,7 +261,7 @@ func (i *CatchUpIterator) CatchUpScan(
 			} else if !ok {
 				return errors.Errorf("expected provisional value for intent")
 			}
-			if !meta.Timestamp.ToTimestamp().EqOrdering(i.UnsafeKey().Timestamp) {
+			if meta.Timestamp.ToTimestamp() != i.UnsafeKey().Timestamp {
 				return errors.Errorf("expected provisional value for intent with ts %s, found %s",
 					meta.Timestamp, i.UnsafeKey().Timestamp)
 			}
@@ -311,20 +320,33 @@ func (i *CatchUpIterator) CatchUpScan(
 			if withDiff {
 				// Update the last version with its previous value (this version).
 				if l := len(reorderBuf) - 1; l >= 0 {
-					if reorderBuf[l].Val.PrevValue.IsPresent() {
-						return errors.AssertionFailedf("unexpected previous value %s for key %s",
-							reorderBuf[l].Val.PrevValue, key)
-					}
-					// However, don't emit a value if an MVCC range tombstone existed
-					// between this value and the next one. The RangeKeysIgnoringTime()
-					// call is cheap, no need for caching.
-					rangeKeys := i.RangeKeysIgnoringTime()
-					if rangeKeys.IsEmpty() || !rangeKeys.HasBetween(ts, reorderBuf[l].Val.Value.Timestamp) {
-						// TODO(sumeer): find out if it is deliberate that we are not populating
-						// PrevValue.Timestamp.
-						reorderBuf[l].Val.PrevValue.RawBytes = val
+					// The previous value may have already been set by an event with
+					// either OmitInRangefeeds = true (and withFiltering = true) or
+					// OriginID !=0 (and withOmitRemote = true). That event is not in
+					// reorderBuf because we want to filter it out of the rangefeed, but
+					// we still want to keep it as a previous value.
+					if !reorderBuf[l].Val.PrevValue.IsPresent() {
+						// However, don't emit a value if an MVCC range tombstone existed
+						// between this value and the next one. The RangeKeysIgnoringTime()
+						// call is cheap, no need for caching.
+						rangeKeys := i.RangeKeysIgnoringTime()
+						if rangeKeys.IsEmpty() || !rangeKeys.HasBetween(ts, reorderBuf[l].Val.Value.Timestamp) {
+							// TODO(sumeer): find out if it is deliberate that we are not populating
+							// PrevValue.Timestamp.
+							reorderBuf[l].Val.PrevValue.RawBytes = val
+						}
 					}
 				}
+			}
+
+			// The iterator may move to the next version for this key if at least one
+			// of the conditions is met: 1) the value has the OmitInRangefeeds flag,
+			// and this iterator has opted into filtering; 2) the value is from a
+			// remote cluster (non zero originID), and the iterator has opted into
+			// omitting remote values.
+			if (mvccVal.OmitInRangefeeds && withFiltering) || (mvccVal.OriginID != 0 && withOmitRemote) {
+				i.Next()
+				continue
 			}
 
 			if !ignore {

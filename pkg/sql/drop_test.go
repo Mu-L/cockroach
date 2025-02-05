@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -14,7 +9,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -99,7 +92,7 @@ func descExists(sqlDB *gosql.DB, exists bool, id descpb.ID) error {
 	}
 	defer rows.Close()
 	if exists != rows.Next() {
-		return errors.Errorf("descriptor exists = %v", exists)
+		return errors.Errorf("descriptor exists expected=%v was=%v", exists, !exists)
 	}
 	return nil
 }
@@ -107,7 +100,7 @@ func descExists(sqlDB *gosql.DB, exists bool, id descpb.ID) error {
 func TestDropDatabase(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	ctx, cancel := context.WithCancel(context.Background())
 	params.Knobs.GCJob = &sql.GCJobTestingKnobs{
 		RunBeforeResume: func(jobID jobspb.JobID) error {
@@ -115,9 +108,10 @@ func TestDropDatabase(t *testing.T) {
 			return ctx.Err()
 		},
 	}
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
 	defer cancel()
+	s := srv.ApplicationLayer()
 
 	// Fix the column families so the key counts below don't change if the
 	// family heuristics are updated.
@@ -129,10 +123,10 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatal(err)
 	}
 
-	tbDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tbDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "t", "kv")
 	var dbDesc catalog.DatabaseDescriptor
 	require.NoError(t, sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
-		dbDesc, err = col.ByID(txn.KV()).Get().Database(ctx, tbDesc.GetParentID())
+		dbDesc, err = col.ByIDWithoutLeased(txn.KV()).Get().Database(ctx, tbDesc.GetParentID())
 		return err
 	}))
 
@@ -156,7 +150,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatal(err)
 	}
 
-	tableSpan := tbDesc.TableSpan(keys.SystemSQLCodec)
+	tableSpan := tbDesc.TableSpan(s.Codec())
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 
 	if _, err := sqlDB.Exec(`DROP DATABASE t RESTRICT`); !testutils.IsError(err,
@@ -174,7 +168,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	if err := descExists(sqlDB, true, tbDesc.GetID()); err != nil {
 		t.Fatal(err)
 	}
-	tbNameKey := catalogkeys.EncodeNameKey(keys.SystemSQLCodec, tbDesc)
+	tbNameKey := catalogkeys.EncodeNameKey(s.Codec(), tbDesc)
 	if gr, err := kvDB.Get(ctx, tbNameKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -189,7 +183,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 		t.Fatal(err)
 	}
 
-	dbNameKey := catalogkeys.EncodeNameKey(keys.SystemSQLCodec, dbDesc)
+	dbNameKey := catalogkeys.EncodeNameKey(s.Codec(), dbDesc)
 	if gr, err := kvDB.Get(ctx, dbNameKey); err != nil {
 		t.Fatal(err)
 	} else if gr.Exists() {
@@ -267,25 +261,27 @@ CREATE DATABASE t;
 func TestDropDatabaseDeleteData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	// Speed up mvcc queue scan.
 	params.ScanMaxIdleTime = time.Millisecond
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
 	ctx := context.Background()
+	s := srv.ApplicationLayer()
 
-	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	systemDB := srv.SystemLayer().SQLConn(t)
+	_, err := systemDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
 	require.NoError(t, err)
 
 	// Refresh protected timestamp cache immediately to make MVCC GC queue to
 	// process GC immediately.
-	_, err = sqlDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	_, err = systemDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
 	require.NoError(t, err)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
-	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, systemDB)()
 
 	// Fix the column families so the key counts below don't change if the
 	// family heuristics are updated.
@@ -299,16 +295,16 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		t.Fatal(err)
 	}
 
-	tbDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	tb2Desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv2")
+	tbDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "t", "kv")
+	tb2Desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "t", "kv2")
 	var dbDesc catalog.DatabaseDescriptor
 	require.NoError(t, sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
-		dbDesc, err = col.ByID(txn.KV()).Get().Database(ctx, tbDesc.GetParentID())
+		dbDesc, err = col.ByIDWithoutLeased(txn.KV()).Get().Database(ctx, tbDesc.GetParentID())
 		return err
 	}))
 
-	tableSpan := tbDesc.TableSpan(keys.SystemSQLCodec)
-	table2Span := tb2Desc.TableSpan(keys.SystemSQLCodec)
+	tableSpan := tbDesc.TableSpan(s.Codec())
+	table2Span := tb2Desc.TableSpan(s.Codec())
 	tests.CheckKeyCount(t, kvDB, tableSpan, 6)
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
@@ -325,8 +321,8 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		t.Fatal(err)
 	}
 
-	tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 6)
-	tests.CheckKeyCountIncludingTombstoned(t, s, table2Span, 6)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), tableSpan, 6)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), table2Span, 6)
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, 0,
@@ -351,8 +347,8 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	})
 
 	// Table 1 data is deleted.
-	tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 0)
-	tests.CheckKeyCountIncludingTombstoned(t, s, table2Span, 6)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), tableSpan, 0)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), table2Span, 6)
 
 	def := zonepb.DefaultZoneConfig()
 	if err := zoneExists(sqlDB, &def, dbDesc.GetID()); err != nil {
@@ -385,7 +381,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	})
 
 	// Table 2 data is deleted.
-	tests.CheckKeyCountIncludingTombstoned(t, s, table2Span, 0)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), table2Span, 0)
 
 	testutils.SucceedsSoon(t, func() error {
 		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
@@ -408,36 +404,51 @@ func TestDropIndex(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	const chunkSize = 200
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			BackfillChunkSize: chunkSize,
 		},
 	}
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+
+	systemDB := srv.SystemLayer().SQLConn(t)
+
+	_, err := systemDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	require.NoError(t, err)
+
+	// Refresh protected timestamp cache immediately to make MVCC GC queue to
+	// process GC immediately.
+	_, err = systemDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	require.NoError(t, err)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
-	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, systemDB)()
 
+	codec := s.Codec()
 	numRows := 2*chunkSize + 1
 	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 3*numRows)
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
+	if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
+		t.Fatal(err)
+	}
+	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(codec), 3*numRows)
 	idx, err := catalog.MustFindIndexByName(tableDesc, "foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, idx.GetID())
+	indexSpan := tableDesc.IndexSpan(codec, idx.GetID())
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 	if _, err := sqlDB.Exec(`DROP INDEX t.kv@foo`); err != nil {
 		t.Fatal(err)
 	}
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
 	if _, err := catalog.MustFindIndexByName(tableDesc, "foo"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
@@ -466,12 +477,12 @@ func TestDropIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
 	newIdx, err := catalog.MustFindIndexByName(tableDesc, "foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	newIdxSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, newIdx.GetID())
+	newIdxSpan := tableDesc.IndexSpan(codec, newIdx.GetID())
 
 	testutils.SucceedsSoon(t, func() error {
 		if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 2, jobspb.TypeSchemaChangeGC, sql.RunningStatusWaitingForMVCCGC, jobs.Record{
@@ -481,6 +492,16 @@ func TestDropIndex(t *testing.T) {
 				tableDesc.GetID(),
 			},
 		}); err != nil {
+			// If the job is not running, check if it already succeeded.
+			if secondErr := jobutils.VerifySystemJob(t, sqlRun, 2, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
+				Username:    username.NodeUserName(),
+				Description: `GC for CREATE INDEX foo ON t.public.kv (v)`,
+				DescriptorIDs: descpb.IDs{
+					tableDesc.GetID(),
+				},
+			}); secondErr == nil {
+				return nil
+			}
 			return err
 		}
 		return nil
@@ -488,7 +509,7 @@ func TestDropIndex(t *testing.T) {
 
 	tests.CheckKeyCount(t, kvDB, newIdxSpan, numRows)
 	tests.CheckKeyCount(t, kvDB, indexSpan, 0)
-	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(keys.SystemSQLCodec), 3*numRows)
+	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(codec), 3*numRows)
 }
 
 func TestDropIndexWithZoneConfigOSS(t *testing.T) {
@@ -498,24 +519,26 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	const chunkSize = 200
 	const numRows = 2*chunkSize + 1
 
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{BackfillChunkSize: chunkSize},
 	}
-	s, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
+	srv, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
 	sqlDB := sqlutils.MakeSQLRunner(sqlDBRaw)
-	defer s.Stopper().Stop(context.Background())
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+	codec := s.Codec()
 
 	// Create a test table with a secondary index.
 	if err := tests.CreateKVTable(sqlDBRaw, "kv", numRows); err != nil {
 		t.Fatal(err)
 	}
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
 	index, err := catalog.MustFindIndexByName(tableDesc, "foo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, index.GetID())
+	indexSpan := tableDesc.IndexSpan(codec, index.GetID())
 	tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
 	// Hack in zone configs for the primary and secondary indexes. (You need a CCL
@@ -549,7 +572,7 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 	// TODO(benesch): Run scrub here. It can't currently handle the way t.kv
 	// declares column families.
 
-	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
+	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
 	if _, err := catalog.MustFindIndexByName(tableDesc, "foo"); err == nil {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
@@ -561,7 +584,7 @@ func TestDropTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	ctx, cancel := context.WithCancel(context.Background())
 	params.Knobs.GCJob = &sql.GCJobTestingKnobs{
 		RunBeforeResume: func(jobID jobspb.JobID) error {
@@ -569,9 +592,11 @@ func TestDropTable(t *testing.T) {
 			return ctx.Err()
 		},
 	}
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
 	defer cancel()
+	s := srv.ApplicationLayer()
+	codec := s.Codec()
 
 	numRows := 2*row.TableTruncateChunkSize + 1
 	if err := tests.CreateKVTable(sqlDB, "kv", numRows); err != nil {
@@ -581,8 +606,8 @@ func TestDropTable(t *testing.T) {
 	parentDatabaseID := descpb.ID(sqlutils.QueryDatabaseID(t, sqlDB, "t"))
 	parentSchemaID := descpb.ID(sqlutils.QuerySchemaID(t, sqlDB, "t", "public"))
 
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "kv")
-	nameKey := catalogkeys.EncodeNameKey(keys.SystemSQLCodec, &descpb.NameInfo{
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "kv")
+	nameKey := catalogkeys.EncodeNameKey(codec, &descpb.NameInfo{
 		ParentID:       parentDatabaseID,
 		ParentSchemaID: parentSchemaID,
 		Name:           "kv",
@@ -607,7 +632,7 @@ func TestDropTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
+	tableSpan := tableDesc.TableSpan(codec)
 	tests.CheckKeyCount(t, kvDB, tableSpan, 3*numRows)
 	if _, err := sqlDB.Exec(`DROP TABLE t.kv`); err != nil {
 		t.Fatal(err)
@@ -661,71 +686,90 @@ func TestDropTable(t *testing.T) {
 func TestDropTableDeleteData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	// Speed up mvcc queue scan.
 	params.ScanMaxIdleTime = time.Millisecond
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	allowGC := make(chan struct{})
+	params.Knobs.GCJob = &sql.GCJobTestingKnobs{
+		RunBeforePerformGC: func(jobID jobspb.JobID) error {
+			<-allowGC
+			return nil
+		},
+	}
 
-	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	ctx := context.Background()
+	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+	codec := s.Codec()
+	systemDB := srv.SystemLayer().SQLConn(t)
+
+	_, err := systemDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
 	require.NoError(t, err)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
-	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, systemDB)()
 
 	const numRows = 2*row.TableTruncateChunkSize + 1
 	const numKeys = 3 * numRows
 	const numTables = 5
 	var descs []catalog.TableDescriptor
-	for i := 0; i < numTables; i++ {
-		tableName := fmt.Sprintf("test%d", i)
-		if err := tests.CreateKVTable(sqlDB, tableName, numRows); err != nil {
-			t.Fatal(err)
+
+	func() {
+		defer close(allowGC)
+		for i := 0; i < numTables; i++ {
+			tableName := fmt.Sprintf("test%d", i)
+			if err := tests.CreateKVTable(sqlDB, tableName, numRows); err != nil {
+				t.Fatal(err)
+			}
+
+			descs = append(descs, desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", tableName))
+
+			parentDatabaseID := descpb.ID(sqlutils.QueryDatabaseID(t, sqlDB, "t"))
+			parentSchemaID := descpb.ID(sqlutils.QuerySchemaID(t, sqlDB, "t", "public"))
+
+			nameKey := catalogkeys.EncodeNameKey(codec, &descpb.NameInfo{
+				ParentID:       parentDatabaseID,
+				ParentSchemaID: parentSchemaID,
+				Name:           tableName,
+			})
+			gr, err := kvDB.Get(ctx, nameKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !gr.Exists() {
+				t.Fatalf("Name entry %q does not exist", nameKey)
+			}
+
+			tableSpan := descs[i].TableSpan(codec)
+			tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
+
+			if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descs[i].GetID()); err != nil {
+				t.Fatal(err)
+			}
 		}
 
-		descs = append(descs, desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName))
-
-		parentDatabaseID := descpb.ID(sqlutils.QueryDatabaseID(t, sqlDB, "t"))
-		parentSchemaID := descpb.ID(sqlutils.QuerySchemaID(t, sqlDB, "t", "public"))
-
-		nameKey := catalogkeys.EncodeNameKey(keys.SystemSQLCodec, &descpb.NameInfo{
-			ParentID:       parentDatabaseID,
-			ParentSchemaID: parentSchemaID,
-			Name:           tableName,
-		})
-		gr, err := kvDB.Get(ctx, nameKey)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !gr.Exists() {
-			t.Fatalf("Name entry %q does not exist", nameKey)
+		for i := 0; i < numTables; i++ {
+			if _, err := sqlDB.Exec(fmt.Sprintf(`DROP TABLE t.%s`, descs[i].GetName())); err != nil {
+				t.Fatal(err)
+			}
 		}
 
-		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
-		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
-
-		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, descs[i].GetID()); err != nil {
-			t.Fatal(err)
+		// Data hasn't been GC-ed.
+		for i := 0; i < numTables; i++ {
+			if err := descExists(sqlDB, true, descs[i].GetID()); err != nil {
+				t.Fatalf("table (id=%d name=%s) was deleted. error: %v", descs[i].GetID(), descs[i].GetName(), err)
+			}
+			tableSpan := descs[i].TableSpan(codec)
+			tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), tableSpan, numKeys)
 		}
-	}
+	}()
 
-	for i := 0; i < numTables; i++ {
-		if _, err := sqlDB.Exec(fmt.Sprintf(`DROP TABLE t.%s`, descs[i].GetName())); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Data hasn't been GC-ed.
+	// Now verify that the GC job has run.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	for i := 0; i < numTables; i++ {
-		if err := descExists(sqlDB, true, descs[i].GetID()); err != nil {
-			t.Fatal(err)
-		}
-		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
-		tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, numKeys)
-
 		if err := jobutils.VerifySystemJob(t, sqlRun, numTables+i,
 			jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
 				Username:    username.RootUserName(),
@@ -737,19 +781,19 @@ func TestDropTableDeleteData(t *testing.T) {
 
 	// Refresh protected timestamp cache immediately to make MVCC GC queue to
 	// process GC immediately.
-	_, err = sqlDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	_, err = systemDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
 	require.NoError(t, err)
 
 	checkTableGCed := func(i int) {
 		testutils.SucceedsSoon(t, func() error {
 			if err := descExists(sqlDB, false, descs[i].GetID()); err != nil {
-				return err
+				return errors.Wrapf(err, "table (id=%d name=%s) not yet deleted", descs[i].GetID(), descs[i].GetName())
 			}
 			return zoneExists(sqlDB, nil, descs[i].GetID())
 		})
 
-		tableSpan := descs[i].TableSpan(keys.SystemSQLCodec)
-		tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 0)
+		tableSpan := descs[i].TableSpan(codec)
+		tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), tableSpan, 0)
 
 		// Ensure that the job is marked as succeeded.
 		if err := jobutils.VerifySystemJob(t, sqlRun, numTables+i,
@@ -778,14 +822,16 @@ func TestDropTableDeleteData(t *testing.T) {
 	}
 }
 
-func writeTableDesc(ctx context.Context, db *kv.DB, tableDesc *tabledesc.Mutable) error {
+func writeTableDesc(
+	ctx context.Context, db *kv.DB, codec keys.SQLCodec, tableDesc *tabledesc.Mutable,
+) error {
 	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		var err error
 		tableDesc.ModificationTime, err = txn.CommitTimestamp()
 		if err != nil {
 			return err
 		}
-		return txn.Put(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.ID), tableDesc.DescriptorProto())
+		return txn.Put(ctx, catalogkeys.MakeDescMetadataKey(codec, tableDesc.ID), tableDesc.DescriptorProto())
 	})
 }
 
@@ -801,36 +847,41 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 
 	ctx := context.Background()
 
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	params.ScanMaxIdleTime = time.Millisecond
-	s, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDBRaw, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	codec := s.Codec()
+	systemDBRaw := srv.SystemLayer().SQLConn(t)
+	systemDB := sqlutils.MakeSQLRunner(systemDBRaw)
 	sqlDB := sqlutils.MakeSQLRunner(sqlDBRaw)
 
-	sqlDB.Exec(t, `SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	systemDB.Exec(t, `SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
 
 	// Refresh protected timestamp cache immediately to make MVCC GC queue to
 	// process GC immediately.
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	systemDB.Exec(t, `SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
-	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDBRaw)()
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, systemDBRaw)()
 
 	const numRows = 100
 	sqlutils.CreateTable(t, sqlDBRaw, "t", "a INT", numRows, sqlutils.ToRowFn(sqlutils.RowIdxFn))
 
 	// Give the table an old format version.
-	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(kvDB, codec, "test", "t")
 	tableDesc.FormatVersion = descpb.FamilyFormatVersion
 	tableDesc.Version++
-	if err := writeTableDesc(ctx, kvDB, tableDesc); err != nil {
+	if err := writeTableDesc(ctx, kvDB, codec, tableDesc); err != nil {
 		t.Fatal(err)
 	}
 
-	tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
+	tableSpan := tableDesc.TableSpan(codec)
 	testutils.SucceedsSoon(t, func() error {
-		if err := tests.CheckKeyCountIncludingTombstonedE(t, s, tableSpan, numRows); err != nil {
+		if err := tests.CheckKeyCountIncludingTombstonedE(t, srv.StorageLayer(), tableSpan, numRows); err != nil {
 			return errors.Wrap(err, "failed to verify expected amount of keys")
 		}
 		return nil
@@ -841,7 +892,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	// Simulate a migration upgrading the table descriptor's format version after
 	// the table has been dropped but before the truncation has occurred.
 	if err := sql.TestingDescsTxn(ctx, s, func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
-		tbl, err := col.ByID(txn.KV()).Get().Table(ctx, tableDesc.ID)
+		tbl, err := col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, tableDesc.ID)
 		if err != nil {
 			return err
 		}
@@ -855,7 +906,7 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	}
 	tableDesc.FormatVersion = descpb.InterleavedFormatVersion
 	tableDesc.Version++
-	if err := writeTableDesc(ctx, kvDB, tableDesc); err != nil {
+	if err := writeTableDesc(ctx, kvDB, codec, tableDesc); err != nil {
 		t.Fatal(err)
 	}
 
@@ -869,13 +920,13 @@ func TestDropTableWhileUpgradingFormat(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		return descExists(sqlDBRaw, false, tableDesc.ID)
 	})
-	tests.CheckKeyCountIncludingTombstoned(t, s, tableSpan, 0)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), tableSpan, 0)
 }
 
 func TestDropTableInTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -888,6 +939,9 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 
 	tx, err := sqlDB.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -912,7 +966,7 @@ CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
 func TestDropAndCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	params.UseDatabase = "test"
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
@@ -956,7 +1010,7 @@ func TestCommandsWhileTableBeingDropped(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 	// Block schema changers so that the table we're about to DROP is not
 	// actually dropped; it will be left in the "deleted" state.
 	params.Knobs = base.TestingKnobs{
@@ -1009,28 +1063,27 @@ func TestDropIndexHandlesRetriableErrors(t *testing.T) {
 	ctx := context.Background()
 	rf := newDynamicRequestFilter()
 	dropIndexPlanningDoneCh := make(chan struct{})
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				Store: &kvserver.StoreTestingKnobs{
-					TestingRequestFilter: rf.filter,
-				},
-				SQLExecutor: &sql.ExecutorTestingKnobs{
-					BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
-						if strings.Contains(stmt, "DROP INDEX") {
-							// Force release all cached descriptors to force a kv fetch with
-							// the table ID so that we can guarantee the DynamicRequestFilter
-							// would see such relevant request and inject the error we want at
-							// the right time.
-							descriptors.ReleaseAll(ctx)
-							close(dropIndexPlanningDoneCh)
-						}
-					},
+	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingRequestFilter: rf.filter,
+			},
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
+					if strings.Contains(stmt, "DROP INDEX") {
+						// Force release all cached descriptors to force a kv
+						// fetch with the table ID so that we can guarantee the
+						// DynamicRequestFilter would see such relevant request
+						// and inject the error we want at the right time.
+						descriptors.ReleaseAll(ctx)
+						close(dropIndexPlanningDoneCh)
+					}
 				},
 			},
 		},
 	})
-	defer tc.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	// What we want to do is have a transaction which does the planning work to
 	// drop an index. Then we want to expose the execution of the DROP INDEX to
@@ -1038,7 +1091,7 @@ func TestDropIndexHandlesRetriableErrors(t *testing.T) {
 	// injecting a ReadWithinUncertainty error underneath the DROP INDEX
 	// after planning has concluded.
 
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(conn)
 	tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY, j INT, INDEX j_idx (j))")
 
 	var tableID uint32
@@ -1051,12 +1104,15 @@ WHERE
     name = $1 AND database_name = current_database();`,
 		"foo").Scan(&tableID)
 
-	txn, err := tc.ServerConn(0).Begin()
+	codec := s.Codec()
+	txn, err := conn.Begin()
+	require.NoError(t, err)
+	_, err = txn.Exec("SET LOCAL autocommit_before_ddl = false")
 	require.NoError(t, err)
 	// Let's find out our transaction ID for our transaction by running a query.
 	// We'll also use this query to install a refresh span over the table data.
 	// Inject a request filter to snag the transaction ID.
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(tableID)
+	tablePrefix := codec.TablePrefix(tableID)
 	tableSpan := roachpb.Span{
 		Key:    tablePrefix,
 		EndKey: tablePrefix.PrefixEnd(),
@@ -1125,7 +1181,7 @@ WHERE
 		}
 		if getRequest, ok := request.GetArg(kvpb.Get); ok {
 			put := getRequest.(*kvpb.GetRequest)
-			if put.Key.Equal(catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(tableID))) {
+			if put.Key.Equal(catalogkeys.MakeDescMetadataKey(codec, descpb.ID(tableID))) {
 				filterState.txnID = uuid.UUID{}
 				return kvpb.NewError(kvpb.NewReadWithinUncertaintyIntervalError(
 					request.Txn.ReadTimestamp, hlc.ClockTimestamp{}, request.Txn, afterInsert, hlc.ClockTimestamp{}))
@@ -1148,15 +1204,16 @@ func TestDropIndexOnHashShardedIndexWithStoredShardColumn(t *testing.T) {
 
 	// Start a test server and connect to it with notice handler (so we can get and check notices from running queries).
 	ctx := context.Background()
-	params, _ := createTestServerParams()
-	s := serverutils.StartServerOnly(t, params)
-	defer s.Stopper().Stop(ctx)
-	url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+	params, _ := createTestServerParamsAllowTenants()
+	srv := serverutils.StartServerOnly(t, params)
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+	url, cleanup := s.PGUrl(t)
 	defer cleanup()
 	base, err := pq.NewConnector(url.String())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	actualNotices := make([]string, 0)
 	connector := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
 		actualNotices = append(actualNotices, n.Message)
@@ -1185,7 +1242,7 @@ func TestDropIndexOnHashShardedIndexWithStoredShardColumn(t *testing.T) {
 	tdb.QueryRow(t, query).Scan(&tableID)
 	require.NoError(t, sql.TestingDescsTxn(ctx, s,
 		func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
-			tableDesc, err = col.ByID(txn.KV()).Get().Table(ctx, tableID)
+			tableDesc, err = col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, tableID)
 			return err
 		}))
 	shardIdx, err := catalog.MustFindIndexByName(tableDesc, "idx")
@@ -1203,7 +1260,7 @@ func TestDropIndexOnHashShardedIndexWithStoredShardColumn(t *testing.T) {
 	// Assert that the index is dropped but the shard column remains after dropping the index.
 	require.NoError(t, sql.TestingDescsTxn(ctx, s,
 		func(ctx context.Context, txn isql.Txn, col *descs.Collection) (err error) {
-			tableDesc, err = col.ByID(txn.KV()).Get().Table(ctx, tableID)
+			tableDesc, err = col.ByIDWithoutLeased(txn.KV()).Get().Table(ctx, tableID)
 			return err
 		}))
 	_, err = catalog.MustFindIndexByName(tableDesc, "idx")
@@ -1231,18 +1288,22 @@ func TestDropIndexOnHashShardedIndexWithStoredShardColumn(t *testing.T) {
 func TestDropDatabaseWithForeignKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := createTestServerParams()
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	params, _ := createTestServerParamsAllowTenants()
+	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
 
-	defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
+	s := srv.ApplicationLayer()
+	codec := s.Codec()
+	systemDB := srv.SystemLayer().SQLConn(t)
 
-	_, err := sqlDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
+	defer sqltestutils.DisableGCTTLStrictEnforcement(t, systemDB)()
+
+	_, err := systemDB.Exec(`SET CLUSTER SETTING sql.gc_job.wait_for_gc.interval = '1s';`)
 	require.NoError(t, err)
 
 	// Refresh protected timestamp cache immediately to make MVCC GC queue to
 	// process GC immediately.
-	_, err = sqlDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
+	_, err = systemDB.Exec(`SET CLUSTER SETTING kv.protectedts.poll_interval = '1s';`)
 	require.NoError(t, err)
 
 	_, err = sqlDB.Exec(`
@@ -1252,8 +1313,8 @@ CREATE TABLE t.child(k INT PRIMARY KEY REFERENCES t.parent);
 `)
 	require.NoError(t, err)
 
-	parentDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "parent")
-	childDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "child")
+	parentDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "parent")
+	childDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "t", "child")
 
 	_, err = sqlDB.Exec(`DROP DATABASE t CASCADE;`)
 	require.NoError(t, err)
@@ -1278,8 +1339,8 @@ ORDER BY
 	)
 
 	// Check that the data was cleaned up.
-	tests.CheckKeyCountIncludingTombstoned(t, s, parentDesc.TableSpan(keys.SystemSQLCodec), 0)
-	tests.CheckKeyCountIncludingTombstoned(t, s, childDesc.TableSpan(keys.SystemSQLCodec), 0)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), parentDesc.TableSpan(codec), 0)
+	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), childDesc.TableSpan(codec), 0)
 }
 
 // Test that non-physical table deletions like DROP VIEW are immediate instead
@@ -1287,13 +1348,14 @@ ORDER BY
 func TestDropPhysicalTableGC(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	params, _ := createTestServerParams()
+	params, _ := createTestServerParamsAllowTenants()
 
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 	_, err := sqlDB.Exec(`CREATE DATABASE test;`)
 	require.NoError(t, err)
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+	codec := s.ApplicationLayer().Codec()
 
 	type tableInstance struct {
 		name         string
@@ -1312,7 +1374,7 @@ func TestDropPhysicalTableGC(t *testing.T) {
 		_, err := sqlDB.Exec(fmt.Sprintf(`CREATE %s test.%s %s;`, table.sqlType, table.name, table.createClause))
 		require.NoError(t, err)
 		// Fetch table descriptor ID for future system table lookups.
-		tableDescriptor := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", table.name)
+		tableDescriptor := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "test", table.name)
 		require.NotNil(t, tableDescriptor)
 		tableDescriptorId := tableDescriptor.GetID()
 		if table.sqlType != "VIEW" {
@@ -1444,4 +1506,39 @@ func TestDropLargeDatabaseWithDeclarativeSchemaChanger(t *testing.T) {
 			GraphDepth:         2,
 		},
 		true)
+}
+
+func BenchmarkDropLargeDatabaseWithGenerateTestObjects(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	for _, declarative := range []bool{false, true} {
+		for _, tables := range []int{8, 32, 128, 1024} {
+			b.Run(fmt.Sprintf("declarative=%t/tables=%d", declarative, tables), func(b *testing.B) {
+				ctx := context.Background()
+				s, sqlDB, _ := serverutils.StartServer(b, base.TestServerArgs{})
+				sqlConn, err := sqlDB.Conn(ctx)
+				require.NoError(b, err)
+				defer s.Stopper().Stop(ctx)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					tdb := sqlutils.MakeSQLRunner(sqlConn)
+					tdb.Exec(b, "CREATE DATABASE db")
+					tdb.Exec(b, "USE db")
+					tdb.Exec(b, "SELECT crdb_internal.generate_test_objects('test', $1::int)", tables)
+					tdb.Exec(b, "USE system;")
+					if declarative {
+						tdb.Exec(b, "SET use_declarative_schema_changer=unsafe_always")
+					} else {
+						tdb.Exec(b, "SET use_declarative_schema_changer=off")
+					}
+					b.StartTimer()
+					tdb.Exec(b, "DROP DATABASE db CASCADE;")
+					b.StopTimer()
+					tdb.Exec(b, "SET use_declarative_schema_changer=off")
+				}
+			})
+		}
+	}
 }

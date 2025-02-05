@@ -1,19 +1,13 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -59,15 +53,12 @@ import (
 //     replica at a time.
 // (3) rq.processOneChange(..) called by (2), processes a single replication
 //     change for the current replica.
-// (4) rq.preProcessCheck(..) called by (3), ensures that the replica can be
-//     processed. This checks whether the replica is destroyed, has the correct
-//     lease type and holds a valid lease.
-// (5) planner.PlanOneChange(..) called by (3), uses allocator to determine
+// (4) planner.PlanOneChange(..) called by (3), uses allocator to determine
 //     necessary replication changes. This function is separate to the
 //     replicate queue and stateless. The majority of the replication logic
 //     lives within this function and.
-// (6) rq.applyChange(..) called by (3), actually performs snapshot and
-//     replication changes returned from (5). These changes are applied
+// (5) rq.applyChange(..) called by (3), actually performs snapshot and
+//     replication changes returned from (4). These changes are applied
 //     synchronously.
 
 const (
@@ -80,26 +71,6 @@ const (
 	// replicateQueueTimerDuration is the duration between replication of queued
 	// replicas.
 	replicateQueueTimerDuration = 0 // zero duration to process replication greedily
-
-	// replicateQueueLeasePreferencePriority is the priority replicas are
-	// enqueued into the replicate queue with when violating lease preferences.
-	// This priority is lower than any voter up-replication, yet higher than
-	// removal, non-voter addition and rebalancing.
-	// See allocatorimpl.AllocatorAction.Priority.
-	replicateQueueLeasePreferencePriority = 1001
-)
-
-// MinLeaseTransferInterval controls how frequently leases can be transferred
-// for rebalancing. It does not prevent transferring leases in order to allow
-// a replica to be removed from a range.
-var MinLeaseTransferInterval = settings.RegisterDurationSetting(
-	settings.SystemOnly,
-	"kv.allocator.min_lease_transfer_interval",
-	"controls how frequently leases can be transferred for rebalancing. "+
-		"It does not prevent transferring leases in order to allow a "+
-		"replica to be removed from a range.",
-	1*time.Second,
-	settings.NonNegativeDuration,
 )
 
 // EnqueueInReplicateQueueOnSpanConfigUpdateEnabled controls whether replicas
@@ -110,7 +81,23 @@ var EnqueueInReplicateQueueOnSpanConfigUpdateEnabled = settings.RegisterBoolSett
 	"kv.enqueue_in_replicate_queue_on_span_config_update.enabled",
 	"controls whether replicas are enqueued into the replicate queue for "+
 		"processing, when a span config update occurs, which affects the replica",
-	false,
+	true,
+)
+
+// EnqueueProblemRangeInReplicateQueueInterval controls the interval at which
+// problem ranges are enqueued into the replicate queue for processing, outside
+// of the normal scanner interval. A problem range is one which is
+// underreplicated or has a replica on a decommissioning store. The setting is
+// disabled when set to 0. By default, the setting is disabled.
+var EnqueueProblemRangeInReplicateQueueInterval = settings.RegisterDurationSetting(
+	settings.SystemOnly,
+	"kv.enqueue_in_replicate_queue_on_problem.interval",
+	"interval at which problem ranges are enqueued into the replicate queue for "+
+		"processing, outside of the normal scanner interval; a problem range is "+
+		"one which is underreplicated or has a replica on a decommissioning store, "+
+		"disabled when set to 0",
+	0,
+	settings.NonNegativeDuration,
 )
 
 var (
@@ -543,8 +530,7 @@ type replicateQueue struct {
 	purgCh <-chan time.Time
 	// updateCh is signalled every time there is an update to the cluster's store
 	// descriptors.
-	updateCh          chan time.Time
-	lastLeaseTransfer atomic.Value // read and written by scanner & queue goroutines
+	updateCh chan time.Time
 	// logTracesThresholdFunc returns the threshold for logging traces from
 	// processing a replica.
 	logTracesThresholdFunc queueProcessTimeoutFunc
@@ -578,7 +564,7 @@ func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replica
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
 			needsSpanConfigs:     true,
-			acceptsUnsplitRanges: store.TestingKnobs().ReplicateQueueAcceptsUnsplit,
+			acceptsUnsplitRanges: false,
 			// The processing of the replicate queue often needs to send snapshots
 			// so we use the raftSnapshotQueueTimeoutFunc. This function sets a
 			// timeout based on the range size and the sending rate in addition
@@ -629,7 +615,7 @@ func (rq *replicateQueue) shouldQueue(
 ) (shouldQueue bool, priority float64) {
 	// TODO(baptist): Change to Replica.SpanConfig() once the refactor is done to
 	// have that use the confReader.
-	conf, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
+	conf, _, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
 	if err != nil {
 		return false, 0
 	}
@@ -639,14 +625,21 @@ func (rq *replicateQueue) shouldQueue(
 		now,
 		repl,
 		desc,
-		conf,
-		rq.canTransferLeaseFrom,
+		&conf,
+		plan.PlannerOptions{},
 	)
 }
 
 func (rq *replicateQueue) process(
 	ctx context.Context, repl *Replica, confReader spanconfig.StoreReader,
 ) (processed bool, err error) {
+	if tokenErr := repl.allocatorToken.TryAcquire(ctx, rq.name); tokenErr != nil {
+		log.KvDistribution.VEventf(ctx,
+			1, "unable to acquire allocator token to process range: %v", tokenErr)
+		return false, tokenErr
+	}
+	defer repl.allocatorToken.Release(ctx)
+
 	retryOpts := retry.Options{
 		InitialBackoff: 50 * time.Millisecond,
 		MaxBackoff:     1 * time.Second,
@@ -655,7 +648,7 @@ func (rq *replicateQueue) process(
 	}
 	// TODO(baptist): Change to Replica.SpanConfig() once the refactor is done to
 	// have that use the confReader.
-	conf, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
+	conf, _, err := confReader.GetSpanConfigForKey(ctx, repl.startKey)
 	if err != nil {
 		return false, err
 	}
@@ -664,7 +657,7 @@ func (rq *replicateQueue) process(
 	// usually signaling that a rebalancing reservation could not be made with the
 	// selected target.
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-		requeue, err := rq.processOneChangeWithTracing(ctx, repl, desc, conf)
+		requeue, err := rq.processOneChangeWithTracing(ctx, repl, desc, &conf)
 		if isSnapshotError(err) {
 			// If ChangeReplicas failed because the snapshot failed, we attempt to
 			// retry the operation. The most likely causes of the snapshot failing
@@ -748,28 +741,34 @@ func filterTracingSpans(rec tracingpb.Recording, opNamesToFilter ...string) trac
 // logging the resulting traces to the DEV channel in the case of errors or
 // when the configured log traces threshold is exceeded.
 func (rq *replicateQueue) processOneChangeWithTracing(
-	ctx context.Context, repl *Replica, desc *roachpb.RangeDescriptor, conf roachpb.SpanConfig,
+	ctx context.Context, repl *Replica, desc *roachpb.RangeDescriptor, conf *roachpb.SpanConfig,
 ) (requeue bool, _ error) {
 	processStart := timeutil.Now()
-	ctx, sp := tracing.EnsureChildSpan(ctx, rq.Tracer, "process replica",
-		tracing.WithRecording(tracingpb.RecordingVerbose))
+	startTracing := log.ExpensiveLogEnabled(ctx, 1)
+	var opts []tracing.SpanOption
+	if startTracing {
+		// If we enable expensive logging, we also want to record the traces for
+		// the entire operation. We only log the trace below if we both exceed
+		// the timeout and expensive logging is enabled.
+		opts = append(opts, tracing.WithRecording(tracingpb.RecordingVerbose))
+	}
+	ctx, sp := tracing.EnsureChildSpan(ctx, rq.Tracer, "process replica", opts...)
 	defer sp.Finish()
 
-	requeue, err := rq.processOneChange(ctx, repl, desc, conf, rq.canTransferLeaseFrom,
+	requeue, err := rq.processOneChange(ctx, repl, desc, conf,
 		false /* scatter */, false, /* dryRun */
 	)
+	processDuration := timeutil.Since(processStart)
+	loggingThreshold := rq.logTracesThresholdFunc(rq.store.cfg.Settings, repl)
+	exceededDuration := loggingThreshold > time.Duration(0) && processDuration > loggingThreshold
 
-	// Utilize a new background context (properly annotated) to avoid writing
-	// traces from a child context into its parent.
-	{
-		ctx := repl.AnnotateCtx(rq.AnnotateCtx(context.Background()))
+	var traceOutput redact.RedactableString
+	if startTracing {
+		// Utilize a new background context (properly annotated) to avoid writing
+		// traces from a child context into its parent.
+		ctx = repl.AnnotateCtx(rq.AnnotateCtx(context.Background()))
 		var rec tracingpb.Recording
-		processDuration := timeutil.Since(processStart)
-		loggingThreshold := rq.logTracesThresholdFunc(rq.store.cfg.Settings, repl)
-		exceededDuration := loggingThreshold > time.Duration(0) && processDuration > loggingThreshold
-
-		var traceOutput redact.RedactableString
-		traceLoggingNeeded := (err != nil || exceededDuration) && log.ExpensiveLogEnabled(ctx, 1)
+		traceLoggingNeeded := (err != nil || exceededDuration)
 		if traceLoggingNeeded {
 			// If we have tracing spans from execChangeReplicasTxn, filter it from
 			// the recording so that we can render the traces to the log without it,
@@ -779,13 +778,12 @@ func (rq *replicateQueue) processOneChangeWithTracing(
 			)
 			traceOutput = redact.Sprintf("\ntrace:\n%s", rec)
 		}
-
-		if err != nil {
-			log.KvDistribution.Infof(ctx, "error processing replica: %v%s", err, traceOutput)
-		} else if exceededDuration {
-			log.KvDistribution.Infof(ctx, "processing replica took %s, exceeding threshold of %s%s",
-				processDuration, loggingThreshold, traceOutput)
-		}
+	}
+	if err != nil {
+		log.KvDistribution.Infof(ctx, "error processing replica: %v%s", err, traceOutput)
+	} else if exceededDuration {
+		log.KvDistribution.Infof(ctx, "processing replica took %s, exceeding threshold of %s%s",
+			processDuration, loggingThreshold, traceOutput)
 	}
 
 	return requeue, err
@@ -816,7 +814,6 @@ func (rq *replicateQueue) applyChange(
 			replica,
 			op.Chgs,
 			replica.Desc(),
-			op.Priority,
 			op.AllocatorPriority,
 			op.Reason,
 			op.Details,
@@ -831,7 +828,9 @@ func (rq *replicateQueue) applyChange(
 // ShouldRequeue determines whether a replica should be requeued into the
 // replicate queue, using the planned change and error returned from either
 // application or planning.
-func ShouldRequeue(ctx context.Context, change plan.ReplicateChange, conf roachpb.SpanConfig) bool {
+func ShouldRequeue(
+	ctx context.Context, change plan.ReplicateChange, conf *roachpb.SpanConfig,
+) bool {
 	var requeue bool
 
 	if _, ok := change.Op.(plan.AllocationNoop); ok {
@@ -844,13 +843,8 @@ func ShouldRequeue(ctx context.Context, change plan.ReplicateChange, conf roachp
 		// lease was transferred away.
 		requeue = false
 
-	} else if change.Action == allocatorimpl.AllocatorConsiderRebalance &&
-		!change.Replica.LeaseViolatesPreferences(ctx, conf) {
-		// Don't requeue after a successful rebalance operation, when the lease
-		// does not violate any preferences. If the lease does violate preferences,
-		// the next process attempt will either find a target to transfer the lease
-		// or place the replica into purgatory if unable. See
-		// CantTransferLeaseViolatingPreferencesError.
+	} else if change.Action == allocatorimpl.AllocatorConsiderRebalance {
+		// Don't requeue after a successful rebalance operation.
 		requeue = false
 
 	} else {
@@ -867,18 +861,11 @@ func (rq *replicateQueue) processOneChange(
 	ctx context.Context,
 	repl *Replica,
 	desc *roachpb.RangeDescriptor,
-	conf roachpb.SpanConfig,
-	canTransferLeaseFrom plan.CanTransferLeaseFrom,
+	conf *roachpb.SpanConfig,
 	scatter, dryRun bool,
 ) (requeue bool, _ error) {
-	// Ensure that the replica can be processed. The replica must not be
-	// destroyed. The replica must have a valid lease. The lease must be the
-	// correct type.
-	if err := rq.preProcessCheck(ctx, repl); err != nil {
-		return false, err
-	}
-
-	change, err := rq.planner.PlanOneChange(ctx, repl, desc, conf, canTransferLeaseFrom, scatter)
+	change, err := rq.planner.PlanOneChange(
+		ctx, repl, desc, conf, plan.PlannerOptions{Scatter: scatter})
 	// When there is an error planning a change, return the error immediately
 	// and do not requeue. It is unlikely that the range or storepool state
 	// will change quickly enough in order to not get the same error and
@@ -933,41 +920,6 @@ func (rq *replicateQueue) processOneChange(
 	return ShouldRequeue(ctx, change, conf), nil
 }
 
-// preProcessCheck checks the lease  and destroy status of the replica. This is
-// done to ensure that the replica has a valid lease, correct lease type and is
-// not destroyed.
-func (rq *replicateQueue) preProcessCheck(ctx context.Context, repl *Replica) error {
-	// Check lease and destroy status here. The queue does this higher up already, but
-	// adminScatter (and potential other future callers) also call this method and don't
-	// perform this check, which could lead to infinite loops.
-	if _, err := repl.IsDestroyed(); err != nil {
-		return err
-	}
-
-	// Ensure ranges have a lease (returning NLHE if someone else has it), and
-	// switch the lease type if necessary (e.g. due to
-	// kv.expiration_leases_only.enabled).
-	//
-	// TODO(kvoli): This check should fail if not the leaseholder. In the case
-	// where we want to use the replicate queue to acquire leases, this should
-	// occur before planning or as a result. In order to return this in planning,
-	// it is necessary to simulate the prior change having succeeded to then plan
-	// this lease transfer.
-	//
-	// TODO(erikgrinaker): This is also done more eagerly during Raft ticks, but
-	// that doesn't work for quiesced epoch-based ranges, so we have a fallback
-	// here that usually runs within 10 minutes.
-	leaseStatus, pErr := repl.redirectOnOrAcquireLease(ctx)
-	if pErr != nil {
-		return pErr.GoError()
-	}
-	pErr = repl.maybeSwitchLeaseType(ctx, leaseStatus)
-	if pErr != nil {
-		return pErr.GoError()
-	}
-	return nil
-}
-
 func maybeAnnotateDecommissionErr(err error, action allocatorimpl.AllocatorAction) error {
 	if err != nil && isDecommissionAction(action) {
 		err = decommissionPurgatoryError{err}
@@ -989,7 +941,7 @@ func (rq *replicateQueue) shedLease(
 	ctx context.Context,
 	repl *Replica,
 	desc *roachpb.RangeDescriptor,
-	conf roachpb.SpanConfig,
+	conf *roachpb.SpanConfig,
 	opts allocator.TransferLeaseOptions,
 ) (allocator.LeaseTransferOutcome, error) {
 	rangeUsageInfo := repl.RangeUsageInfo()
@@ -1075,7 +1027,6 @@ func (rq *replicateQueue) TransferLease(
 	}
 
 	rq.storePool.UpdateLocalStoresAfterLeaseTransfer(source, target, rangeUsageInfo)
-	rq.lastLeaseTransfer.Store(timeutil.Now())
 	return nil
 }
 
@@ -1100,7 +1051,6 @@ func (rq *replicateQueue) changeReplicas(
 	repl *Replica,
 	chgs kvpb.ReplicationChanges,
 	desc *roachpb.RangeDescriptor,
-	priority kvserverpb.SnapshotRequest_Priority,
 	allocatorPriority float64,
 	reason kvserverpb.RangeLogEventReason,
 	details string,
@@ -1109,33 +1059,10 @@ func (rq *replicateQueue) changeReplicas(
 	// the latter traps tests that try to call it while the replication
 	// queue is active.
 	_, err := repl.changeReplicasImpl(
-		ctx, desc, priority, kvserverpb.SnapshotRequest_REPLICATE_QUEUE, allocatorPriority, reason,
+		ctx, desc, kvserverpb.SnapshotRequest_REPLICATE_QUEUE, allocatorPriority, reason,
 		details, chgs,
 	)
 	return err
-}
-
-// canTransferLeaseFrom checks is a lease can be transferred from the specified
-// replica. It considers two factors if the replica is in -conformance with
-// lease preferences and the last time a transfer occurred to avoid thrashing.
-func (rq *replicateQueue) canTransferLeaseFrom(
-	ctx context.Context, repl plan.LeaseCheckReplica, conf roachpb.SpanConfig,
-) bool {
-	if !repl.OwnsValidLease(ctx, rq.store.cfg.Clock.NowAsClockTimestamp()) {
-		// This replica is not the leaseholder, so it can't transfer the lease.
-		return false
-	}
-	// Do a best effort check to see if this replica conforms to the configured
-	// lease preferences (if any), if it does not we want to encourage more
-	// aggressive lease movement and not delay it.
-	if repl.LeaseViolatesPreferences(ctx, conf) {
-		return true
-	}
-	if lastLeaseTransfer := rq.lastLeaseTransfer.Load(); lastLeaseTransfer != nil {
-		minInterval := MinLeaseTransferInterval.Get(&rq.store.cfg.Settings.SV)
-		return timeutil.Since(lastLeaseTransfer.(time.Time)) > minInterval
-	}
-	return true
 }
 
 func (*replicateQueue) postProcessScheduled(

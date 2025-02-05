@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package grpcinterceptor
 
@@ -51,6 +46,9 @@ func setGRPCErrorTag(sp *tracing.Span, err error) {
 // BatchMethodName is the method name of Internal.Batch RPC.
 const BatchMethodName = "/cockroach.roachpb.Internal/Batch"
 
+// BatchStreamMethodName is the method name of the Internal.BatchStream RPC.
+const BatchStreamMethodName = "/cockroach.roachpb.Internal/BatchStream"
+
 // sendKVBatchMethodName is the method name for adminServer.SendKVBatch.
 const sendKVBatchMethodName = "/cockroach.server.serverpb.Admin/SendKVBatch"
 
@@ -66,6 +64,7 @@ const flowStreamMethodName = "/cockroach.sql.distsqlrun.DistSQL/FlowStream"
 // tracing because it's not worth it.
 func methodExcludedFromTracing(method string) bool {
 	return method == BatchMethodName ||
+		method == BatchStreamMethodName ||
 		method == sendKVBatchMethodName ||
 		method == SetupFlowMethodName ||
 		method == flowStreamMethodName
@@ -147,7 +146,16 @@ func StreamServerInterceptor(tracer *tracing.Tracer) grpc.StreamServerIntercepto
 		if err != nil {
 			return err
 		}
-		if !tracing.SpanInclusionFuncForServer(tracer, spanMeta) {
+		sp := tracing.SpanFromContext(ss.Context())
+		// NB: when this method is called through the local internal client optimization,
+		// we also invoke this interceptor, but don't have spanMeta available. If we then
+		// call straight into the handler below without making a child span, we hit various
+		// use-after-finish conditions. So we also check whether we have a nontrivial `sp`
+		// and if so make sure to go through `StartSpanCtx` below. This can be seen as a
+		// workaround for the following issue:
+		//
+		// https://github.com/cockroachdb/cockroach/issues/135686
+		if sp == nil && !tracing.SpanInclusionFuncForServer(tracer, spanMeta) {
 			return handler(srv, ss)
 		}
 
@@ -349,7 +357,7 @@ func newTracingClientStream(
 	// non-cancellable context here, it's not exactly broken if we never invoke
 	// this function because of context cancellation.  The finishFunc
 	// can still be invoked directly.
-	_ = ctxutil.WhenDone(ctx, func(err error) {
+	_ = ctxutil.WhenDone(ctx, func() {
 		// A streaming RPC can be finished by the caller cancelling the ctx. If
 		// the ctx is cancelled, the caller doesn't necessarily need to interact
 		// with the stream anymore (see [1]), so finishChan might never be

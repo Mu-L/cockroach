@@ -1,4 +1,6 @@
-FROM registry.access.redhat.com/ubi8/ubi-minimal
+# We use a docker image mirror to avoid pulling from 3rd party repos, which sometimes have reliability issues.
+# See https://cockroachlabs.atlassian.net/wiki/spaces/devinf/pages/3462594561/Docker+image+sync for the details.
+FROM us-east1-docker.pkg.dev/crl-docker-sync/registry-access-redhat-com/ubi9/ubi-minimal
 ARG fips_enabled
 
 # For deployment, we need the following additionally installed:
@@ -17,7 +19,7 @@ RUN microdnf update -y \
 RUN if [ "$fips_enabled" == "1" ]; then \
     microdnf install -y openssl && \
     rpm -qa | sort > /before.txt && \
-    microdnf install crypto-policies-scripts && \
+    microdnf install -y crypto-policies-scripts && \
     fips-mode-setup --enable --no-bootcfg && \
     rpm -qa | sort > /after.txt && \
     microdnf remove -y $(comm -13 /before.txt /after.txt) && \
@@ -28,7 +30,7 @@ RUN if [ "$fips_enabled" == "1" ]; then \
 
 RUN mkdir /usr/local/lib/cockroach /cockroach /licenses /docker-entrypoint-initdb.d
 COPY cockroach.sh cockroach /cockroach/
-COPY licenses/* /licenses/
+COPY LICENSE THIRD-PARTY-NOTICES.txt /licenses/
 # Install GEOS libraries.
 COPY libgeos.so libgeos_c.so /usr/local/lib/cockroach/
 

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package install
 
@@ -22,7 +17,8 @@ import (
 )
 
 const (
-	gcsCacheBaseURL = "https://storage.googleapis.com/cockroach-fixtures/tools/"
+	// We store downloadable content in a public bucket to allow for easy curling.
+	gcsCacheBaseURL = "https://storage.googleapis.com/cockroach-test-artifacts"
 )
 
 //go:embed scripts/download.sh
@@ -73,7 +69,7 @@ func Download(
 		dest,
 	)
 	if err := c.Run(ctx, l, l.Stdout, l.Stderr,
-		downloadNodes,
+		WithNodes(downloadNodes),
 		fmt.Sprintf("downloading %s", basename),
 		downloadCmd,
 	); err != nil {
@@ -85,7 +81,7 @@ func Download(
 	if c.IsLocal() && !filepath.IsAbs(dest) {
 		src := filepath.Join(c.localVMDir(downloadNodes[0]), dest)
 		cpCmd := fmt.Sprintf(`cp "%s" "%s"`, src, dest)
-		return c.Run(ctx, l, l.Stdout, l.Stderr, c.Nodes[1:], "copying to remaining nodes", cpCmd)
+		return c.Run(ctx, l, l.Stdout, l.Stderr, WithNodes(c.Nodes[1:]), "copying to remaining nodes", cpCmd)
 	}
 
 	return nil

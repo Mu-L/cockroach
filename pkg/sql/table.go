@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -38,10 +33,10 @@ func (p *planner) getVirtualTabler() VirtualTabler {
 }
 
 func (p *planner) checkDDLAtomicity() error {
-	if !p.ExtendedEvalContext().TxnImplicit &&
+	if (!p.ExtendedEvalContext().TxnImplicit || !p.ExtendedEvalContext().TxnIsSingleStmt) &&
 		p.SessionData().StrictDDLAtomicity {
 		return errors.WithHint(unimplemented.NewWithIssue(42061,
-			"cannot run this DDL statement inside BEGIN..COMMIT as its atomicity cannot be guaranteed"),
+			"cannot run this DDL statement inside a multi-statement transaction as its atomicity cannot be guaranteed"),
 			"You can set the session variable 'strict_ddl_atomicity' to false if you are willing to accept atomicity violations.")
 	}
 	return nil
@@ -274,6 +269,11 @@ func (p *planner) writeSchemaChange(
 		// We don't allow schema changes on a dropped table.
 		return errors.Errorf("no schema changes allowed on table %q as it is being dropped",
 			tableDesc.Name)
+	}
+	// Exit early with an error if the table is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(tableDesc) {
+		return scerrors.ConcurrentSchemaChangeError(tableDesc)
 	}
 	if !tableDesc.IsNew() {
 		if err := p.createOrUpdateSchemaChangeJob(ctx, tableDesc, jobDesc, mutationID); err != nil {

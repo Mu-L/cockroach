@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -69,6 +64,10 @@ func ParseAndRequireString(
 		d, err = ParseDIntervalWithTypeMetadata(intervalStyle(ctx), s, itm)
 	case types.PGLSNFamily:
 		d, err = ParseDPGLSN(s)
+	case types.PGVectorFamily:
+		d, err = ParseDPGVector(s)
+	case types.RefCursorFamily:
+		d = NewDRefCursor(s)
 	case types.Box2DFamily:
 		d, err = ParseDBox2D(s)
 	case types.GeographyFamily:
@@ -78,8 +77,8 @@ func ParseAndRequireString(
 	case types.JsonFamily:
 		d, err = ParseDJSON(s)
 	case types.OidFamily:
-		if t.Oid() != oid.T_oid && s == ZeroOidValue {
-			d = WrapAsZeroOid(t)
+		if t.Oid() != oid.T_oid && s == UnknownOidName {
+			d = NewDOidWithType(UnknownOidValue, t)
 		} else {
 			d, err = ParseDOidAsInt(s)
 		}
@@ -113,7 +112,7 @@ func ParseAndRequireString(
 	case types.VoidFamily:
 		d = DVoidDatum
 	default:
-		return nil, false, errors.AssertionFailedf("unknown type %s (%T)", t, t)
+		return nil, false, errors.AssertionFailedf("unknown type %s", t.SQLStringForError())
 	}
 	if err != nil {
 		return d, dependsOnContext, err
@@ -139,7 +138,8 @@ func ParseDOidAsInt(s string) (*DOid, error) {
 	if err != nil {
 		return nil, MakeParseError(s, types.Oid, err)
 	}
-	return IntToOid(DInt(i))
+	o, err := IntToOid(DInt(i))
+	return NewDOid(o), err
 }
 
 // FormatBitArrayToType formats bit arrays such that they fill the total width
@@ -254,22 +254,18 @@ func ParseAndRequireStringHandler(
 		s = truncateString(s, t)
 		vh.String(s)
 	case types.TimestampTZFamily:
-		// TODO(cucaroach): can we refactor the next 3 case arms to be simpler
+		var ts time.Time
+		if ts, _, err = ParseTimestampTZ(ctx, s, TimeFamilyPrecisionToRoundDuration(t.Precision())); err == nil {
+			vh.TimestampTZ(ts)
+		}
+	case types.TimestampFamily:
+		// TODO(yuzefovich): can we refactor the next 2 case arms to be simpler
 		// and avoid code duplication?
 		now := relativeParseTime(ctx)
 		var ts time.Time
-		if ts, _, err = pgdate.ParseTimestamp(now, dateStyle(ctx), s); err == nil {
+		if ts, _, err = pgdate.ParseTimestampWithoutTimezone(now, dateStyle(ctx), s, dateParseHelper(ctx)); err == nil {
 			// Always normalize time to the current location.
-			if ts, err = checkTimeBounds(ts, TimeFamilyPrecisionToRoundDuration(t.Precision())); err == nil {
-				vh.TimestampTZ(ts)
-			}
-		}
-	case types.TimestampFamily:
-		now := relativeParseTime(ctx)
-		var ts time.Time
-		if ts, _, err = pgdate.ParseTimestampWithoutTimezone(now, dateStyle(ctx), s); err == nil {
-			// Always normalize time to the current location.
-			if ts, err = checkTimeBounds(ts, TimeFamilyPrecisionToRoundDuration(t.Precision())); err == nil {
+			if ts, err = roundAndCheck(ts, TimeFamilyPrecisionToRoundDuration(t.Precision())); err == nil {
 				vh.TimestampTZ(ts)
 			}
 		}

@@ -1,16 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import Long from "long";
 
 import { INodeStatus } from "../../util";
-import Long from "long";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 
 type INodesResponse = cockroach.server.serverpb.INodesResponse;
 
@@ -65,10 +61,10 @@ export const getNodeStatus = (): INodeStatus => {
       "admission.wait_durations.kv-stores-p75": 0,
       "admission.wait_durations.sql-kv-response-p75": 0,
       "admission.wait_durations.sql-sql-response-p75": 0,
-      "admission.wait_sum.kv": 0,
-      "admission.wait_sum.kv-stores": 0,
-      "admission.wait_sum.sql-kv-response": 0,
-      "admission.wait_sum.sql-sql-response": 0,
+      "admission.wait_durations.kv-sum": 0,
+      "admission.wait_durations.kv-stores-sum": 0,
+      "admission.wait_durations.sql-kv-response-sum": 0,
+      "admission.wait_durations.sql-sql-response-sum": 0,
       "build.timestamp": 1610970297,
       "changefeed.buffer_entries.in": 0,
       "changefeed.buffer_entries.out": 0,
@@ -613,8 +609,12 @@ export const getNodeStatus = (): INodeStatus => {
       "sys.host.disk.write.time": 42461472554,
       "sys.host.net.recv.bytes": 89868354,
       "sys.host.net.recv.packets": 26750,
+      "sys.host.net.recv.err": 15,
+      "sys.host.net.recv.dropped": 20,
       "sys.host.net.send.bytes": 89604637,
       "sys.host.net.send.packets": 27605,
+      "sys.host.net.send.err": 1,
+      "sys.host.net.send.dropped": 15,
       "sys.rss": 242069504,
       "sys.uptime": 1790,
       "timeseries.write.bytes": 14810484,
@@ -652,7 +652,6 @@ export const getNodeStatus = (): INodeStatus => {
       "txn.restarts.txnpush": 0,
       "txn.restarts.unknown": 0,
       "txn.restarts.writetooold": 0,
-      "txn.restarts.writetoooldmulti": 0,
     },
     store_statuses: [
       {

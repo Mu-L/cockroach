@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvtenant_test
 
@@ -20,7 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -82,6 +77,7 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 
 	runner := sqlutils.MakeSQLRunner(db)
 	runner.Exec(t, "SET CLUSTER SETTING trace.redactable.enabled = $1", redactable)
+	runner.Exec(t, "SET CLUSTER SETTING trace.redact_at_virtual_cluster_boundary.enabled = $1", true)
 
 	// Queries from the system tenant will receive unredacted traces
 	// since the tracer will not have the redactable flag set.
@@ -106,7 +102,7 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 
 	t.Run("regular-tenant", func(t *testing.T) {
 		_, tenDB := serverutils.StartTenant(t, s, base.TestTenantArgs{
-			TenantID:     roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[0]),
+			TenantID:     roachpb.MustMakeTenantID(securitytest.EmbeddedTenantIDs()[0]),
 			TestingKnobs: args.Knobs,
 		})
 		defer tenDB.Close()

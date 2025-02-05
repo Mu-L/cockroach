@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,7 +10,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -26,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -35,10 +30,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/redact"
 )
 
 // alterRoleNode represents an ALTER ROLE ... [WITH] OPTION... statement.
 type alterRoleNode struct {
+	zeroInputPlanNode
 	roleName    username.SQLUsername
 	ifExists    bool
 	isRole      bool
@@ -47,6 +44,7 @@ type alterRoleNode struct {
 
 // alterRoleSetNode represents an `ALTER ROLE ... SET` statement.
 type alterRoleSetNode struct {
+	zeroInputPlanNode
 	roleName username.SQLUsername
 	ifExists bool
 	isRole   bool
@@ -71,7 +69,7 @@ const (
 )
 
 var changeOwnPasswordEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"sql.auth.change_own_password.enabled",
 	"controls whether a user is allowed to change their own password, even if they have no other privileges",
 	false,
@@ -136,7 +134,7 @@ func (p *planner) checkPasswordOptionConstraints(
 		// NOCREATELOGIN to another role, or set up a password for
 		// authentication, or set up password validity, or enable/disable
 		// LOGIN privilege; even if they have CREATEROLE privilege.
-		if err := p.CheckRoleOption(ctx, roleoption.CREATELOGIN); err != nil {
+		if err := p.CheckGlobalPrivilegeOrRoleOption(ctx, privilege.CREATELOGIN); err != nil {
 			return err
 		}
 	}
@@ -144,7 +142,7 @@ func (p *planner) checkPasswordOptionConstraints(
 }
 
 func (n *alterRoleNode) startExec(params runParams) error {
-	var opName string
+	var opName redact.RedactableString
 	if n.isRole {
 		sqltelemetry.IncIAMAlterCounter(sqltelemetry.Role)
 		opName = "alter-role"
@@ -182,7 +180,7 @@ func (n *alterRoleNode) startExec(params runParams) error {
 		// CockroachDB does not support the superuser role option right now, but we
 		// make it so any member of the ADMIN role can only be edited by another ADMIN
 		// (done after checking for existence of the role).
-		if err := params.p.CheckRoleOption(params.ctx, roleoption.CREATEROLE); err != nil {
+		if err := params.p.CheckGlobalPrivilegeOrRoleOption(params.ctx, privilege.CREATEROLE); err != nil {
 			return err
 		}
 		// Check that the requested combination of password options is
@@ -197,8 +195,8 @@ func (n *alterRoleNode) startExec(params runParams) error {
 		params.ctx,
 		opName,
 		params.p.txn,
-		sessiondata.RootUserSessionDataOverride,
-		fmt.Sprintf("SELECT 1 FROM %s WHERE username = $1", sessioninit.UsersTableName),
+		sessiondata.NodeUserSessionDataOverride,
+		fmt.Sprintf("SELECT 1 FROM system.public.%s WHERE username = $1", catconstants.UsersTableName),
 		n.roleName,
 	)
 	if err != nil {
@@ -216,8 +214,11 @@ func (n *alterRoleNode) startExec(params runParams) error {
 		return err
 	}
 	if isAdmin {
-		if err := params.p.RequireAdminRole(params.ctx, "ALTER ROLE admin"); err != nil {
+		if hasAdmin, err := params.p.HasAdminRole(params.ctx); err != nil {
 			return err
+		} else if !hasAdmin {
+			return pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with the admin role are allowed to alter another admin")
 		}
 	}
 
@@ -278,7 +279,7 @@ func (*alterRoleNode) Values() tree.Datums          { return tree.Datums{} }
 func (*alterRoleNode) Close(context.Context)        {}
 
 // AlterRoleSet represents a `ALTER ROLE ... SET` statement.
-// Privileges: CREATEROLE privilege; or admin-only if `ALTER ROLE ALL`.
+// Privileges: CREATEROLE, MODIFYCLUSTERSETTING, MODIFYSQLCLUSTERSETTING privilege; or admin-only if `ALTER ROLE ALL`.
 func (p *planner) AlterRoleSet(ctx context.Context, n *tree.AlterRoleSet) (planNode, error) {
 	// Note that for Postgres, only superuser can ALTER another superuser.
 	// CockroachDB does not support the superuser role option right now.
@@ -288,44 +289,30 @@ func (p *planner) AlterRoleSet(ctx context.Context, n *tree.AlterRoleSet) (planN
 	// modifying their own defaults unless they have CREATEROLE. This is analogous
 	// to our restriction that prevents a user from modifying their own password.
 	if n.AllRoles {
-		if err := p.RequireAdminRole(ctx, "ALTER ROLE ALL"); err != nil {
+		if hasAdmin, err := p.HasAdminRole(ctx); err != nil {
 			return nil, err
+		} else if !hasAdmin {
+			return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with the admin role are allowed to ALTER ROLE ALL ... SET")
 		}
 	} else {
-		hasModify := false
-		hasSqlModify := false
-		hasCreateRole := false
-		// Check system privileges.
-		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User()); err != nil {
+		canAlterRoleSet, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.CREATEROLE)
+		if err != nil {
 			return nil, err
-		} else if ok {
-			hasModify = true
-			hasSqlModify = true
 		}
-		if !hasModify {
-			if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING, p.User()); err != nil {
+		if !canAlterRoleSet {
+			canAlterRoleSet, err = p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYCLUSTERSETTING)
+			if err != nil {
 				return nil, err
-			} else if ok {
-				hasSqlModify = true
 			}
 		}
-		// Check role options.
-		if !hasSqlModify {
-			if ok, err := p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING); err != nil {
+		if !canAlterRoleSet {
+			canAlterRoleSet, err = p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYSQLCLUSTERSETTING)
+			if err != nil {
 				return nil, err
-			} else if ok {
-				hasModify = true
-				hasSqlModify = true
 			}
 		}
-		if !hasModify && !hasSqlModify {
-			if ok, err := p.HasRoleOption(ctx, roleoption.CREATEROLE); err != nil {
-				return nil, err
-			} else if ok {
-				hasCreateRole = true
-			}
-		}
-		if !hasModify && !hasSqlModify && !hasCreateRole {
+		if !canAlterRoleSet {
 			return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "ALTER ROLE ... SET requires %s, %s or %s", privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, roleoption.CREATEROLE)
 		}
 	}
@@ -427,7 +414,7 @@ func (p *planner) processSetOrResetClause(
 		expr = paramparse.UnresolvedNameToStrVal(expr)
 
 		typedValue, err := p.analyzeExpr(
-			ctx, expr, nil, tree.IndexedVarHelper{}, types.String, false, "ALTER ROLE ... SET ",
+			ctx, expr, tree.IndexedVarHelper{}, types.String, false, "ALTER ROLE ... SET ",
 		)
 		if err != nil {
 			return unknown, "", sessionVar{}, nil, wrapSetVarError(err, varName, expr.String())
@@ -439,10 +426,7 @@ func (p *planner) processSetOrResetClause(
 }
 
 func (n *alterRoleSetNode) startExec(params runParams) error {
-	databaseRoleSettingsHasRoleIDCol := params.p.ExecCfg().Settings.Version.IsActive(params.ctx,
-		clusterversion.V23_1DatabaseRoleSettingsHasRoleIDColumn)
-
-	var opName string
+	var opName redact.RedactableString
 	if n.isRole {
 		sqltelemetry.IncIAMAlterCounter(sqltelemetry.Role)
 		opName = "alter-role"
@@ -461,26 +445,20 @@ func (n *alterRoleSetNode) startExec(params runParams) error {
 	}
 
 	var deleteQuery = fmt.Sprintf(
-		`DELETE FROM %s WHERE database_id = $1 AND role_name = $2`,
-		sessioninit.DatabaseRoleSettingsTableName,
+		`DELETE FROM system.public.%s WHERE database_id = $1 AND role_name = $2`,
+		catconstants.DatabaseRoleSettingsTableName,
 	)
 
-	var upsertQuery = fmt.Sprintf(
-		`UPSERT INTO %s (database_id, role_name, settings) VALUES ($1, $2, $3)`,
-		sessioninit.DatabaseRoleSettingsTableName,
-	)
-	if databaseRoleSettingsHasRoleIDCol {
-		upsertQuery = fmt.Sprintf(`
-UPSERT INTO %s (database_id, role_name, settings, role_id)
+	var upsertQuery = fmt.Sprintf(`
+UPSERT INTO system.public.%s (database_id, role_name, settings, role_id)
 VALUES ($1, $2, $3, (
 	SELECT CASE $2
 		WHEN '%s' THEN %d
 		ELSE (SELECT user_id FROM system.users WHERE username = $2)
 	END
 ))`,
-			sessioninit.DatabaseRoleSettingsTableName, username.EmptyRole, username.EmptyRoleID,
-		)
-	}
+		catconstants.DatabaseRoleSettingsTableName, username.EmptyRole, username.EmptyRoleID,
+	)
 
 	// Instead of inserting an empty settings array, this function will make
 	// sure the row is deleted instead.
@@ -492,7 +470,7 @@ VALUES ($1, $2, $3, (
 				params.ctx,
 				opName,
 				params.p.txn,
-				sessiondata.RootUserSessionDataOverride,
+				sessiondata.NodeUserSessionDataOverride,
 				deleteQuery,
 				n.dbDescID,
 				roleName,
@@ -502,7 +480,7 @@ VALUES ($1, $2, $3, (
 				params.ctx,
 				opName,
 				params.p.txn,
-				sessiondata.RootUserSessionDataOverride,
+				sessiondata.NodeUserSessionDataOverride,
 				upsertQuery,
 				n.dbDescID,
 				roleName,
@@ -585,7 +563,7 @@ func deepEqualIgnoringOrders(s1, s2 []string) bool {
 // getRoleName resolves the roleName and performs additional validation
 // to make sure the role is safe to edit.
 func (n *alterRoleSetNode) getRoleName(
-	params runParams, opName string,
+	params runParams, opName redact.RedactableString,
 ) (needsUpdate bool, retRoleName username.SQLUsername, err error) {
 	if n.allRoles {
 		return true, username.MakeSQLUsernameFromPreNormalizedString(""), nil
@@ -607,8 +585,8 @@ func (n *alterRoleSetNode) getRoleName(
 		params.ctx,
 		opName,
 		params.p.txn,
-		sessiondata.RootUserSessionDataOverride,
-		fmt.Sprintf("SELECT 1 FROM %s WHERE username = $1", sessioninit.UsersTableName),
+		sessiondata.NodeUserSessionDataOverride,
+		fmt.Sprintf("SELECT 1 FROM system.public.%s WHERE username = $1", catconstants.UsersTableName),
 		n.roleName,
 	)
 	if err != nil {
@@ -625,7 +603,17 @@ func (n *alterRoleSetNode) getRoleName(
 		return false, username.SQLUsername{}, err
 	}
 	if isAdmin {
-		if err := params.p.RequireAdminRole(params.ctx, "ALTER ROLE admin"); err != nil {
+		if hasAdmin, err := params.p.HasAdminRole(params.ctx); err != nil {
+			return false, username.SQLUsername{}, err
+		} else if !hasAdmin {
+			return false, username.SQLUsername{}, pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with the admin role are allowed to alter another admin")
+		}
+
+		// Note that admins implicitly have the REPAIRCLUSTER privilege.
+		if err := params.p.CheckPrivilege(
+			params.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+		); err != nil {
 			return false, username.SQLUsername{}, err
 		}
 	}
@@ -648,17 +636,17 @@ func (n *alterRoleSetNode) getRoleName(
 //  2. newSettings = {timezone=America/New_York, statement_timeout=10s}
 //  3. err = nil
 func (n *alterRoleSetNode) makeNewSettings(
-	params runParams, opName string, roleName username.SQLUsername,
+	params runParams, opName redact.RedactableString, roleName username.SQLUsername,
 ) (oldSettings []string, newSettings []string, err error) {
 	var selectQuery = fmt.Sprintf(
-		`SELECT settings FROM %s WHERE database_id = $1 AND role_name = $2`,
-		sessioninit.DatabaseRoleSettingsTableName,
+		`SELECT settings FROM system.public.%s WHERE database_id = $1 AND role_name = $2`,
+		catconstants.DatabaseRoleSettingsTableName,
 	)
 	datums, err := params.p.InternalSQLTxn().QueryRowEx(
 		params.ctx,
 		opName,
 		params.p.txn,
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		selectQuery,
 		n.dbDescID,
 		roleName,

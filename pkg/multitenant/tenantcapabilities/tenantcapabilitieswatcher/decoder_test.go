@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tenantcapabilitieswatcher_test
 
@@ -21,9 +16,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/stretchr/testify/require"
 )
@@ -32,19 +28,18 @@ import (
 // TenantCapabilities stored in the system.tenants table.
 func TestDecodeCapabilities(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			// Capabilities are only available in the system tenant's
-			// system.tenants table.
-			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
-		},
+	ts, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		// Capabilities are only available in the system tenant's
+		// system.tenants table.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
 	})
-	defer tc.Stopper().Stop(ctx)
+	defer ts.Stopper().Stop(ctx)
 
 	const dummyTableName = "dummy_system_tenants"
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(db)
 	tdb.Exec(t, fmt.Sprintf("CREATE TABLE %s (LIKE system.tenants INCLUDING ALL)", dummyTableName))
 
 	var dummyTableID uint32
@@ -68,15 +63,14 @@ func TestDecodeCapabilities(t *testing.T) {
 	)
 
 	// Read the row	.
-	k := keys.SystemSQLCodec.IndexPrefix(dummyTableID, keys.TenantsTablePrimaryKeyIndexID)
-	s := tc.Server(0)
-	rows, err := s.DB().Scan(ctx, k, k.PrefixEnd(), 0 /* maxRows */)
+	k := ts.Codec().IndexPrefix(dummyTableID, keys.TenantsTablePrimaryKeyIndexID)
+	rows, err := kvDB.Scan(ctx, k, k.PrefixEnd(), 0 /* maxRows */)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 
 	// Decode and verify.
 	row := rows[0]
-	got, err := tenantcapabilitieswatcher.TestingDecoderFn(s.ClusterSettings())(ctx, roachpb.KeyValue{
+	got, err := tenantcapabilitieswatcher.TestingDecoderFn(ts.ClusterSettings())(ctx, roachpb.KeyValue{
 		Key:   row.Key,
 		Value: *row.Value,
 	})

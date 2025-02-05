@@ -66,15 +66,16 @@ go_library(
         "//pkg/util/log",
         "//pkg/util/log/eventpb",
         "//pkg/util/log/logmetrics",
+        "//pkg/util/log/severity",
         "//pkg/util/metric",
         "//pkg/util/syncutil",
         "//pkg/util/system",
-        "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_dustin_go_humanize//:go-humanize",
         "@com_github_elastic_gosigar//:gosigar",
         "@com_github_prometheus_client_model//go",
+        "@com_github_prometheus_common//expfmt",
         "@com_github_shirou_gopsutil_v3//cpu",
         "@com_github_shirou_gopsutil_v3//net",
     ] + select({
@@ -111,7 +112,13 @@ go_library(
         "@io_bazel_rules_go//go/platform:openbsd": [
             "@com_github_shirou_gopsutil_v3//disk",
         ],
+        "@io_bazel_rules_go//go/platform:osx": [
+            "@com_github_shirou_gopsutil_v3//disk",
+        ],
         "@io_bazel_rules_go//go/platform:plan9": [
+            "@com_github_shirou_gopsutil_v3//disk",
+        ],
+        "@io_bazel_rules_go//go/platform:qnx": [
             "@com_github_shirou_gopsutil_v3//disk",
         ],
         "@io_bazel_rules_go//go/platform:solaris": [
@@ -136,7 +143,6 @@ go_test(
         "runtime_stats_test.go",
         "runtime_test.go",
     ],
-    args = ["-test.timeout=55s"],
     embed = [":status"],
     deps = [
         "//pkg/base",
@@ -161,6 +167,7 @@ go_test(
         "//pkg/util/timeutil",
         "@com_github_kr_pretty//:pretty",
         "@com_github_prometheus_client_model//go",
+        "@com_github_prometheus_common//expfmt",
         "@com_github_shirou_gopsutil_v3//net",
         "@com_github_stretchr_testify//require",
     ],

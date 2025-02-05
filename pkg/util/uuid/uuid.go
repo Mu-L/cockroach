@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Copyright (C) 2013-2018 by Maxim Bublis <b@codemonkey.ru>
 // Use of this source code is governed by a MIT-style
@@ -24,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
 	"github.com/cockroachdb/errors"
 )
 
@@ -97,9 +93,12 @@ func TimestampFromV1(u UUID) (Timestamp, error) {
 // String parse helpers.
 var urnPrefix = []byte("urn:uuid:")
 
-// Nil is the nil UUID, as specified in RFC-4122, that has all 128 bits set to
+// Nil is the nil UUID, as specified in RFC-4122, which has all 128 bits set to
 // zero.
 var Nil = UUID{}
+
+// Max is the maximum possible UUID, which has all 128 bits set to 1.
+var Max = FromUint128(uint128.FromInts(math.MaxUint64, math.MaxUint64))
 
 // Predefined namespace UUIDs.
 var (

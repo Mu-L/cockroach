@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -375,7 +370,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:    "alter_backup_schedule",
-		replace: map[string]string{"iconst64": "schedule_id", "alter_backup_schedule_cmds": "options ( ',' options )*", "options": "'SET' ( 'LABEL' schedule_label | 'INTO' collectionURI | 'WITH' option | 'RECURRING' crontab | 'FULL BACKUP' ( crontab | 'ALWAYS' ) | 'SCHEDULE OPTION' schedule_option )"},
+		replace: map[string]string{"iconst64": "schedule_id", "alter_backup_schedule_cmds": "options ( ',' options )*", "options": "( 'SET' ( 'LABEL' schedule_label | 'INTO' collectionURI | 'WITH' option | 'RECURRING' crontab | 'FULL BACKUP' ( crontab | 'ALWAYS' ) | 'SCHEDULE OPTION' schedule_option ) | 'EXECUTE' 'FULL'? 'IMMEDIATELY' )"},
 		unlink:  []string{"schedule_id", "options", "option", "schedule_label", "collectionURI", "crontab", "schedule_option"},
 	},
 	{
@@ -516,6 +511,17 @@ var specs = []stmtSpec{
 		nosplit: true,
 	},
 	{
+		name:   "alter_proc",
+		stmt:   "alter_proc_stmt",
+		inline: []string{"alter_proc_rename_stmt", "alter_proc_owner_stmt", "alter_proc_set_schema_stmt", "function_with_paramtypes", "func_params", "func_params_list"},
+		unlink: []string{"proc_name", "proc_new_name"},
+		replace: map[string]string{
+			"db_object_name":     "proc_name",
+			"'RENAME' 'TO' name": "'RENAME' 'TO' proc_new_name",
+		},
+		nosplit: true,
+	},
+	{
 		name:   "alter_role_stmt",
 		inline: []string{"role_or_group_or_user", "opt_role_options", "opt_in_database", "set_or_reset_clause", "opt_with", "role_options", "set_rest", "generic_set", "var_list", "to_or_eq"},
 		replace: map[string]string{
@@ -619,23 +625,27 @@ var specs = []stmtSpec{
 		exclude: []*regexp.Regexp{regexp.MustCompile("'IN'")},
 	},
 	{
-		name: "begin_stmt",
+		name: "legacy_begin_stmt",
 		inline: []string{
 			"opt_transaction",
 			"begin_transaction",
-			"transaction_mode",
-			"transaction_user_priority",
-			"user_priority",
-			"iso_level",
 			"transaction_mode_list",
 			"opt_comma",
+			"transaction_mode",
+			"transaction_user_priority",
 			"transaction_read_mode",
 			"as_of_clause",
 			"transaction_deferrable_mode",
+			"user_priority",
+			"transaction_iso_level",
+			"iso_level",
 		},
-		exclude: []*regexp.Regexp{
-			regexp.MustCompile("'START'"),
-		},
+	},
+	{
+		name:    "call",
+		stmt:    "call_stmt",
+		unlink:  []string{"proc_name", "param_values"},
+		replace: map[string]string{"func_application": "proc_name '(' param_values ')'"},
 	},
 	{
 		name:    "check_column_level",
@@ -680,9 +690,18 @@ var specs = []stmtSpec{
 		match:  []*regexp.Regexp{regexp.MustCompile("'COMMIT'|'END'")},
 	},
 	{
-		name:    "copy_stmt",
-		inline:  []string{"opt_with_copy_options", "copy_options_list", "opt_with", "opt_where_clause", "where_clause"},
+		name:   "copy_stmt",
+		inline: []string{"opt_with_copy_options", "copy_options_list", "opt_with", "opt_where_clause", "where_clause"},
+		replace: map[string]string{
+			"copy_to_stmt":                      "query",
+			"'(' copy_generic_options_list ')'": "",
+		},
 		exclude: []*regexp.Regexp{regexp.MustCompile("'WHERE'")},
+	},
+	{
+		name:    "cancel_all_jobs",
+		stmt:    "cancel_all_jobs_stmt",
+		replace: map[string]string{"name": "( 'BACKUP' | 'CHANGEFEED' | 'RESTORE' | 'IMPORT')"},
 	},
 	{
 		name:    "cancel_job",
@@ -811,15 +830,38 @@ var specs = []stmtSpec{
 		nosplit: true,
 	},
 	{
-		name:   "create_func_stmt",
+		name:   "create_func",
+		stmt:   "create_func_stmt",
 		inline: []string{"opt_or_replace", "opt_routine_param_with_default_list", "opt_return_set", "opt_create_routine_opt_list", "create_routine_opt_list", "common_routine_opt_item", "create_routine_opt_item", "routine_return_stmt", "routine_param_with_default_list", "routine_param_with_default", "routine_as", "opt_link_sym"},
-		unlink: []string{"opt_or_replace", "opt_routine_param_with_default_list", "opt_return_set", "opt_create_routine_opt_list", "create_routine_opt_list", "create_routine_opt_item", "common_routine_opt_item", "routine_return_stmt", "non_reserved_word_or_sconst", "routine_param_with_default_list", "routine_param_with_default", "a_expr", "routine_as"},
+		unlink: []string{"opt_or_replace", "opt_routine_param_with_default_list", "opt_return_set", "opt_create_routine_opt_list", "create_routine_opt_list", "create_routine_opt_item", "common_routine_opt_item", "routine_return_stmt", "non_reserved_word_or_sconst", "routine_param_with_default_list", "routine_param_with_default", "a_expr", "routine_as", "routine_body_str"},
 		replace: map[string]string{
-			"func_as":                     "'SCONST'",
-			"non_reserved_word_or_sconst": "'SQL'",
-			"'DEFAULT'":                   "",
-			"'='":                         "",
-			"a_expr":                      ""},
+			"func_as":                          "'SCONST'",
+			"'AS'":                             "'AS' routine_body_str",
+			"non_reserved_word_or_sconst":      "('SQL' | 'PLPGSQL')",
+			"( 'SCONST' ) ( ',' 'SCONST' |  )": "",
+			"'DEFAULT'":                        "",
+			"'='":                              "",
+			"a_expr":                           "",
+			"opt_routine_body":                 ""},
+		nosplit: true,
+	},
+	{
+		name:   "create_proc",
+		stmt:   "create_proc_stmt",
+		inline: []string{"opt_or_replace", "opt_routine_param_with_default_list", "routine_param_with_default_list", "routine_param_with_default", "opt_create_routine_opt_list", "common_routine_opt_item", "create_routine_opt_list", "create_routine_opt_item", "routine_as", "opt_link_sym", "create_routine_opt_item", "routine_return_stmt"},
+		unlink: []string{"routine_body_str"},
+		replace: map[string]string{
+			"'DEFAULT'":        "",
+			"'AS'":             "'AS' routine_body_str",
+			"opt_routine_body": "",
+			"'CALLED' 'ON' 'NULL' 'INPUT' | 'RETURNS' 'NULL' 'ON' 'NULL' 'INPUT' | 'STRICT' | 'IMMUTABLE' | 'STABLE' | 'VOLATILE' |": "",
+			"| 'LEAKPROOF' | 'NOT' 'LEAKPROOF'": "",
+			"non_reserved_word_or_sconst":       "( 'SQL' | 'PLPGSQL' )",
+			"'RETURN'":                          "",
+			"( 'SCONST' ) ( ',' 'SCONST' |  )":  "",
+			"'='":                               "",
+			"a_expr":                            "",
+			"'ATOMIC'":                          ""},
 		nosplit: true,
 	},
 	{
@@ -827,6 +869,22 @@ var specs = []stmtSpec{
 		inline:  []string{"locality"},
 		replace: map[string]string{" name": "column_name"},
 		unlink:  []string{"column_name"},
+	},
+	{
+		name:   "create_trigger",
+		stmt:   "create_trigger_stmt",
+		inline: []string{"opt_or_replace", "trigger_action_time", "trigger_event_list", "opt_trigger_transition_list", "trigger_for_each", "trigger_when", "function_or_procedure", "trigger_event", "trigger_transition_list", "trigger_for_opt_each", "trigger_for_type", "name_list", "trigger_transition", "transition_is_new", "transition_is_row", "opt_as", "table_alias_name"},
+		unlink: []string{"trigger_create_name"},
+		replace: map[string]string{
+			"'TRIGGER' name":   "'TRIGGER' trigger_create_name",
+			"| 'INSTEAD' 'OF'": "",
+			"( 'REFERENCING' ( ( ( ( 'NEW' | 'OLD' ) ( 'ROW' | 'TABLE' ) ( 'AS' |  ) ( name ) ) ) ( ( ( ( 'NEW' | 'OLD' ) ( 'ROW' | 'TABLE' ) ( 'AS' |  ) ( name ) ) ) )* ) |  )": "",
+			"| 'STATEMENT'":                       "",
+			"( 'OR' 'REPLACE' |  )":               "",
+			"'OF' ( ( name ) ( ( ',' name ) )* )": "",
+			"| 'TRUNCATE'":                        "",
+			"| 'PROCEDURE'":                       ""},
+		nosplit: true,
 	},
 	{
 		name: "create_type",
@@ -926,6 +984,14 @@ var specs = []stmtSpec{
 		replace: map[string]string{"standalone_index_name": "index_name"},
 	},
 	{
+		name:    "drop_proc",
+		stmt:    "drop_proc_stmt",
+		inline:  []string{"function_with_paramtypes_list", "function_with_paramtypes", "opt_drop_behavior", "func_params", "func_params_list"},
+		unlink:  []string{"proc_name"},
+		replace: map[string]string{"db_object_name": "proc_name"},
+		nosplit: true,
+	},
+	{
 		name:    "drop_role_stmt",
 		inline:  []string{"role_or_group_or_user"},
 		replace: map[string]string{"string_or_placeholder_list": "name"},
@@ -950,6 +1016,17 @@ var specs = []stmtSpec{
 		stmt:   "drop_table_stmt",
 		inline: []string{"opt_drop_behavior"},
 		match:  []*regexp.Regexp{regexp.MustCompile("'DROP' 'TABLE'")},
+	},
+	{
+		name:   "drop_trigger",
+		stmt:   "drop_trigger_stmt",
+		inline: []string{"opt_drop_behavior"},
+		unlink: []string{"trigger_name"},
+		replace: map[string]string{
+			" name":        " trigger_name",
+			"'CASCADE' | ": "",
+		},
+		nosplit: true,
 	},
 	{
 		name:    "drop_type",
@@ -1129,9 +1206,15 @@ var specs = []stmtSpec{
 		inline: []string{"storage_parameter_list"},
 	},
 	{
+		name:    "pause_all_jobs",
+		stmt:    "pause_all_jobs_stmt",
+		replace: map[string]string{"name": "( 'BACKUP' | 'CHANGEFEED' | 'RESTORE' | 'IMPORT')"},
+	},
+	{
 		name:    "pause_job",
 		stmt:    "pause_jobs_stmt",
 		replace: map[string]string{"a_expr": "job_id"},
+		inline:  []string{"for_schedules_clause"},
 		unlink:  []string{"job_id"},
 	},
 	{
@@ -1212,6 +1295,11 @@ var specs = []stmtSpec{
 		exclude: []*regexp.Regexp{
 			regexp.MustCompile("'REPLICATION' 'STREAM' 'FROM'"),
 		},
+	},
+	{
+		name:    "resume_all_jobs",
+		stmt:    "resume_all_jobs_stmt",
+		replace: map[string]string{"name": "( 'BACKUP' | 'CHANGEFEED' | 'RESTORE' | 'IMPORT')"},
 	},
 	{
 		name:    "resume_job",
@@ -1334,7 +1422,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name: "set_transaction",
-		stmt: "nonpreparable_set_stmt",
+		stmt: "set_transaction_stmt",
 		inline: []string{
 			"set_transaction_stmt",
 			"transaction_mode",
@@ -1345,6 +1433,8 @@ var specs = []stmtSpec{
 			"as_of_clause",
 			"opt_comma",
 			"transaction_deferrable_mode",
+			"transaction_iso_level",
+			"iso_level",
 		},
 		match: []*regexp.Regexp{regexp.MustCompile("'SET' 'TRANSACTION'")},
 	},
@@ -1398,13 +1488,16 @@ var specs = []stmtSpec{
 	{
 		name:   "show_backup",
 		stmt:   "show_backup_stmt",
-		inline: []string{"opt_with_options"},
+		inline: []string{"opt_with_options", "show_backup_details", "opt_with_show_backup_options", "show_backup_options_list"},
 		replace: map[string]string{
-			"'BACKUPS' 'IN' string_or_placeholder":                      "'BACKUPS' 'IN' location",
-			"'BACKUP' string_or_placeholder 'IN' string_or_placeholder": "'BACKUP' subdirectory 'IN' location",
-			"'BACKUP' 'SCHEMAS' string_or_placeholder":                  "'BACKUP' 'SCHEMAS' location",
+			"'BACKUPS' 'IN' string_or_placeholder_opt_list":                                       "'BACKUPS' 'IN' collectionURI",
+			"'BACKUP' string_or_placeholder 'IN' string_or_placeholder_opt_list":                  "'BACKUP' subdirectory 'IN' collectionURI",
+			"'BACKUP' 'SCHEMAS' string_or_placeholder":                                            "'BACKUP' 'SCHEMAS' collectionURI_path",
+			"'BACKUP' 'SCHEMAS' 'FROM' string_or_placeholder 'IN' string_or_placeholder_opt_list": "'BACKUP' 'SCHEMAS' 'FROM' subdirectory 'IN' collectionURI",
+			"'BACKUP' string_or_placeholder":                                                      "'BACKUP' collectionURI_path",
+			"'BACKUP' 'CONNECTION' string_or_placeholder":                                         "'BACKUP' 'CONNECTION' collectionURI",
 		},
-		unlink: []string{"subdirectory", "location", "location_opt_list"},
+		unlink: []string{"subdirectory", "collectionURI", "collectionURI_path"},
 	},
 	{
 		name:    "show_jobs",

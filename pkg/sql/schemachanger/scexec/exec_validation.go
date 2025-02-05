@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scexec
 
@@ -14,9 +9,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
 )
@@ -37,9 +32,9 @@ func executeValidateUniqueIndex(
 	if err != nil {
 		return err
 	}
-	// Execute the validation operation as a root user.
-	execOverride := sessiondata.RootUserSessionDataOverride
-	if index.GetType() == descpb.IndexDescriptor_FORWARD {
+	// Execute the validation operation as a node user.
+	execOverride := sessiondata.NodeUserSessionDataOverride
+	if index.GetType() == idxtype.FORWARD {
 		err = deps.Validator().ValidateForwardIndexes(ctx, deps.TransactionalJobRegistry().CurrentJob(), table, []catalog.Index{index}, execOverride)
 	} else {
 		err = deps.Validator().ValidateInvertedIndexes(ctx, deps.TransactionalJobRegistry().CurrentJob(), table, []catalog.Index{index}, execOverride)
@@ -67,8 +62,8 @@ func executeValidateConstraint(
 		return err
 	}
 
-	// Execute the validation operation as a root user.
-	execOverride := sessiondata.RootUserSessionDataOverride
+	// Execute the validation operation as a node user.
+	execOverride := sessiondata.NodeUserSessionDataOverride
 	err = deps.Validator().ValidateConstraint(ctx, table, constraint, op.IndexIDForValidation, execOverride)
 	if err != nil {
 		return scerrors.SchemaChangerUserError(err)
@@ -96,8 +91,8 @@ func executeValidateColumnNotNull(
 		}
 	}
 
-	// Execute the validation operation as a root user.
-	execOverride := sessiondata.RootUserSessionDataOverride
+	// Execute the validation operation as a node user.
+	execOverride := sessiondata.NodeUserSessionDataOverride
 	err = deps.Validator().ValidateConstraint(ctx, table, constraint, op.IndexIDForValidation, execOverride)
 	if err != nil {
 		return scerrors.SchemaChangerUserError(err)

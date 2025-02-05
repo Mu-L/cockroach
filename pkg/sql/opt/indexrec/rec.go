@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package indexrec
 
@@ -18,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
@@ -168,7 +164,7 @@ func findBestExistingIndexToReplace(
 			continue
 		}
 		if existingIndex.GetInvisibility() != 0.0 {
-			if hypIndex.hasPrefixOfExplicitCols(existingIndex, hypIndex.IsInverted()) {
+			if hypIndex.hasPrefixOfExplicitCols(existingIndex) {
 				existingIndexAllCols := getAllCols(existingIndex)
 				if newStoredCols.Difference(existingIndexAllCols).Empty() {
 					// There exists an invisible index containing every explicit column in
@@ -191,7 +187,7 @@ func findBestExistingIndexToReplace(
 		// hasSameExplicitCols returns true iff the existing index and hypIndex has
 		// the same explicit columns. If hypIndex is inverted, it also makes sure
 		// that their inverted column comes from the same source column.
-		hasSameExplicitCols := hypIndex.hasSameExplicitCols(existingIndex, hypIndex.IsInverted())
+		hasSameExplicitCols := hypIndex.hasSameExplicitCols(existingIndex)
 		if hasSameExplicitCols {
 			// If hasSameExplicitCols, this existing index is a candidate for
 			// potential index replacement.
@@ -265,11 +261,11 @@ func (ir *indexRecommendation) constructIndexRec(ctx context.Context) (Rec, erro
 	switch recType {
 	case TypeCreateIndex:
 		createCmd := tree.CreateIndex{
-			Table:    tableName,
-			Columns:  indexCols,
-			Storing:  storing,
-			Unique:   false,
-			Inverted: ir.index.IsInverted(),
+			Table:   tableName,
+			Columns: indexCols,
+			Storing: storing,
+			Unique:  false,
+			Type:    ir.index.Type(),
 		}
 		sb.WriteString(createCmd.String())
 		sb.WriteByte(';')
@@ -286,8 +282,8 @@ func (ir *indexRecommendation) constructIndexRec(ctx context.Context) (Rec, erro
 			Columns: indexCols,
 			Storing: storing,
 			// Maintain uniqueness and inverted if the existing index is unique.
-			Unique:   existingIndex.IsUnique(),
-			Inverted: ir.index.IsInverted(),
+			Unique: existingIndex.IsUnique(),
+			Type:   ir.index.Type(),
 		}
 		sb.WriteString(createCmd.String())
 		sb.WriteByte(';')
@@ -450,7 +446,7 @@ func (ir *indexRecommendation) indexCols() []tree.IndexElem {
 		indexCol := ir.index.Column(i)
 		colName := indexCol.Column.ColName()
 
-		if ir.index.IsInverted() && i == len(ir.index.cols)-1 {
+		if ir.index.Type() == idxtype.INVERTED && i == len(ir.index.cols)-1 {
 			colName = ir.index.tab.Column(indexCol.InvertedSourceColumnOrdinal()).ColName()
 		}
 

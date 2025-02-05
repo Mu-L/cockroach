@@ -475,7 +475,7 @@ memo (optimized, ~7KB, required=[presentation: min:7])
 memo
 SELECT min(b) FROM abc
 ----
-memo (optimized, ~7KB, required=[presentation: min:7])
+memo (optimized, ~8KB, required=[presentation: min:7])
  ├── G1: (scalar-group-by G2 G3 cols=()) (scalar-group-by G4 G5 cols=())
  │    └── [presentation: min:7]
  │         ├── best: (scalar-group-by G2 G3 cols=())
@@ -537,7 +537,7 @@ memo (optimized, ~7KB, required=[presentation: max:7])
 memo
 SELECT max(b) FROM abc
 ----
-memo (optimized, ~7KB, required=[presentation: max:7])
+memo (optimized, ~8KB, required=[presentation: max:7])
  ├── G1: (scalar-group-by G2 G3 cols=()) (scalar-group-by G4 G5 cols=())
  │    └── [presentation: max:7]
  │         ├── best: (scalar-group-by G2 G3 cols=())
@@ -650,7 +650,7 @@ scalar-group-by
 memo
 SELECT max(b) FROM abc
 ----
-memo (optimized, ~7KB, required=[presentation: max:7])
+memo (optimized, ~8KB, required=[presentation: max:7])
  ├── G1: (scalar-group-by G2 G3 cols=()) (scalar-group-by G4 G5 cols=())
  │    └── [presentation: max:7]
  │         ├── best: (scalar-group-by G2 G3 cols=())
@@ -722,6 +722,55 @@ project
  │    └── fd: ()-->(3,4)
  └── projections
       └── w:4 [as=max:7, outer=(4)]
+
+# Basic min case with ReduceGroupingCols disabled. By disabling this
+# normalization rule, the constant column w is left in the grouping columns
+# instead of being moved to a constant aggregate. This ensures that
+# ReplaceMinWithLimit handles constant grouping columns correctly.
+opt disable=ReduceGroupingCols expect=ReplaceMinWithLimit
+SELECT min(k) FROM kuvw WHERE w = 5 GROUP BY w
+----
+project
+ ├── columns: min:7!null
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(7)
+ └── project
+      ├── columns: min:7!null w:4!null
+      ├── cardinality: [0 - 1]
+      ├── key: ()
+      ├── fd: ()-->(4,7)
+      ├── scan kuvw@w
+      │    ├── columns: k:1!null w:4!null
+      │    ├── constraint: /4/1: [/5 - /5]
+      │    ├── limit: 1
+      │    ├── key: ()
+      │    └── fd: ()-->(1,4)
+      └── projections
+           └── k:1 [as=min:7, outer=(1)]
+
+# Basic max case with ReduceGroupingCols disabled.
+opt disable=ReduceGroupingCols expect=ReplaceMaxWithLimit
+SELECT max(w) FROM kuvw WHERE v = 5 GROUP BY v
+----
+project
+ ├── columns: max:7
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(7)
+ └── project
+      ├── columns: max:7 v:3!null
+      ├── cardinality: [0 - 1]
+      ├── key: ()
+      ├── fd: ()-->(3,7)
+      ├── scan kuvw@vw,rev
+      │    ├── columns: v:3!null w:4
+      │    ├── constraint: /3/4/1: [/5 - /5]
+      │    ├── limit: 1(rev)
+      │    ├── key: ()
+      │    └── fd: ()-->(3,4)
+      └── projections
+           └── w:4 [as=max:7, outer=(4)]
 
 # Add const_agg function, as well as min function.
 opt expect=ReplaceMinWithLimit
@@ -1075,6 +1124,83 @@ group-by (streaming)
  └── aggregations
       └── min [as=min:7, outer=(4)]
            └── w:4
+
+exec-ddl
+CREATE TABLE t112131 (
+    a INT PRIMARY KEY,
+    b INT NOT NULL
+)
+----
+
+# Regression test for #112131. ReplaceMinWithLimit should project constant
+# grouping columns.
+opt expect=ReplaceMinWithLimit
+SELECT a, min(b) FROM t112131
+WHERE a IN (
+    SELECT min(b) FROM t112131
+)
+GROUP BY a
+----
+project
+ ├── columns: a:1!null min:11!null
+ ├── cardinality: [0 - 1]
+ ├── key: (1)
+ ├── fd: (1)-->(11)
+ ├── inner-join (lookup t112131)
+ │    ├── columns: a:1!null b:2!null min:9!null
+ │    ├── key columns: [9] = [1]
+ │    ├── lookup columns are key
+ │    ├── cardinality: [0 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1,2,9), (1)==(9), (9)==(1)
+ │    ├── scalar-group-by
+ │    │    ├── columns: min:9
+ │    │    ├── cardinality: [1 - 1]
+ │    │    ├── key: ()
+ │    │    ├── fd: ()-->(9)
+ │    │    ├── scan t112131
+ │    │    │    └── columns: b:6!null
+ │    │    └── aggregations
+ │    │         └── min [as=min:9, outer=(6)]
+ │    │              └── b:6
+ │    └── filters (true)
+ └── projections
+      └── b:2 [as=min:11, outer=(2)]
+
+# Regression test for #112131. ReplaceMaxWithLimit should project constant
+# grouping columns.
+opt expect=ReplaceMaxWithLimit
+SELECT a, max(b) FROM t112131
+WHERE a IN (
+    SELECT max(b) FROM t112131
+)
+GROUP BY a
+----
+project
+ ├── columns: a:1!null max:11!null
+ ├── cardinality: [0 - 1]
+ ├── key: (1)
+ ├── fd: (1)-->(11)
+ ├── inner-join (lookup t112131)
+ │    ├── columns: a:1!null b:2!null max:9!null
+ │    ├── key columns: [9] = [1]
+ │    ├── lookup columns are key
+ │    ├── cardinality: [0 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1,2,9), (1)==(9), (9)==(1)
+ │    ├── scalar-group-by
+ │    │    ├── columns: max:9
+ │    │    ├── cardinality: [1 - 1]
+ │    │    ├── key: ()
+ │    │    ├── fd: ()-->(9)
+ │    │    ├── scan t112131
+ │    │    │    └── columns: b:6!null
+ │    │    └── aggregations
+ │    │         └── max [as=max:9, outer=(6)]
+ │    │              └── b:6
+ │    └── filters (true)
+ └── projections
+      └── b:2 [as=max:11, outer=(2)]
 
 # --------------------------------------------------
 # ReplaceScalarMinMaxWithScalarSubqueries
@@ -1575,7 +1701,7 @@ scalar-group-by
 memo
 SELECT array_agg(w) FROM (SELECT * FROM kuvw ORDER BY w) GROUP BY u,v
 ----
-memo (optimized, ~9KB, required=[presentation: array_agg:7])
+memo (optimized, ~10KB, required=[presentation: array_agg:7])
  ├── G1: (project G2 G3 array_agg)
  │    └── [presentation: array_agg:7]
  │         ├── best: (project G2 G3 array_agg)
@@ -1640,7 +1766,7 @@ memo (optimized, ~8KB, required=[presentation: sum:7])
 memo
 SELECT sum(w) FROM kuvw GROUP BY v
 ----
-memo (optimized, ~7KB, required=[presentation: sum:7])
+memo (optimized, ~8KB, required=[presentation: sum:7])
  ├── G1: (project G2 G3 sum)
  │    └── [presentation: sum:7]
  │         ├── best: (project G2 G3 sum)
@@ -1693,7 +1819,7 @@ memo (optimized, ~9KB, required=[presentation: array_agg:7])
 memo
 SELECT array_agg(k) FROM (SELECT * FROM kuvw WHERE u=v ORDER BY u) GROUP BY w
 ----
-memo (optimized, ~15KB, required=[presentation: array_agg:7])
+memo (optimized, ~16KB, required=[presentation: array_agg:7])
  ├── G1: (project G2 G3 array_agg)
  │    └── [presentation: array_agg:7]
  │         ├── best: (project G2 G3 array_agg)
@@ -1766,7 +1892,7 @@ memo (optimized, ~15KB, required=[presentation: array_agg:7])
 memo
 SELECT sum(k) FROM (SELECT * FROM kuvw WHERE u=v) GROUP BY u,w
 ----
-memo (optimized, ~15KB, required=[presentation: sum:7])
+memo (optimized, ~16KB, required=[presentation: sum:7])
  ├── G1: (project G2 G3 sum)
  │    └── [presentation: sum:7]
  │         ├── best: (project G2 G3 sum)
@@ -1840,7 +1966,7 @@ memo (optimized, ~15KB, required=[presentation: sum:7])
 memo
 SELECT array_agg(w) FROM (SELECT * FROM kuvw ORDER BY w DESC) GROUP BY u,v
 ----
-memo (optimized, ~8KB, required=[presentation: array_agg:7])
+memo (optimized, ~9KB, required=[presentation: array_agg:7])
  ├── G1: (project G2 G3 array_agg)
  │    └── [presentation: array_agg:7]
  │         ├── best: (project G2 G3 array_agg)
@@ -1869,7 +1995,7 @@ memo (optimized, ~8KB, required=[presentation: array_agg:7])
 memo
 SELECT DISTINCT u, v, w FROM kuvw
 ----
-memo (optimized, ~6KB, required=[presentation: u:2,v:3,w:4])
+memo (optimized, ~7KB, required=[presentation: u:2,v:3,w:4])
  ├── G1: (distinct-on G2 G3 cols=(2-4)) (distinct-on G2 G3 cols=(2-4),ordering=+2,+3,+4) (distinct-on G2 G3 cols=(2-4),ordering=+4,+3,+2) (distinct-on G2 G3 cols=(2-4),ordering=+3,+4)
  │    └── [presentation: u:2,v:3,w:4]
  │         ├── best: (distinct-on G2="[ordering: +2,+3,+4]" G3 cols=(2-4),ordering=+2,+3,+4)
@@ -1893,7 +2019,7 @@ memo (optimized, ~6KB, required=[presentation: u:2,v:3,w:4])
 memo
 SELECT DISTINCT ON (u, v) u, v, w FROM kuvw
 ----
-memo (optimized, ~6KB, required=[presentation: u:2,v:3,w:4])
+memo (optimized, ~7KB, required=[presentation: u:2,v:3,w:4])
  ├── G1: (distinct-on G2 G3 cols=(2,3)) (distinct-on G2 G3 cols=(2,3),ordering=+2,+3) (distinct-on G2 G3 cols=(2,3),ordering=+3)
  │    └── [presentation: u:2,v:3,w:4]
  │         ├── best: (distinct-on G2="[ordering: +2,+3]" G3 cols=(2,3),ordering=+2,+3)
@@ -2016,7 +2142,7 @@ memo (optimized, ~6KB, required=[presentation: u:2,v:3,w:4] [ordering: +2])
 memo
 SELECT DISTINCT ON (u) u, v, w FROM kuvw ORDER BY u, v, w
 ----
-memo (optimized, ~6KB, required=[presentation: u:2,v:3,w:4] [ordering: +2])
+memo (optimized, ~7KB, required=[presentation: u:2,v:3,w:4] [ordering: +2])
  ├── G1: (distinct-on G2 G3 cols=(2),ordering=+3,+4 opt(2)) (distinct-on G2 G3 cols=(2),ordering=+2,+3,+4) (distinct-on G2 G3 cols=(2),ordering=+3,+4)
  │    ├── [presentation: u:2,v:3,w:4] [ordering: +2]
  │    │    ├── best: (distinct-on G2="[ordering: +2,+3,+4]" G3 cols=(2),ordering=+3,+4 opt(2))
@@ -2172,7 +2298,7 @@ memo (optimized, ~6KB, required=[presentation: u:2,v:3,w:4] [ordering: +4])
 memo
 SELECT (SELECT w FROM kuvw WHERE v=1 AND x=u) FROM xyz ORDER BY x+1, x
 ----
-memo (optimized, ~26KB, required=[presentation: w:12] [ordering: +13,+1])
+memo (optimized, ~28KB, required=[presentation: w:12] [ordering: +13,+1])
  ├── G1: (project G2 G3 x)
  │    ├── [presentation: w:12] [ordering: +13,+1]
  │    │    ├── best: (sort G1)
@@ -2239,77 +2365,78 @@ memo (optimized, ~26KB, required=[presentation: w:12] [ordering: +13,+1])
 memo
 INSERT INTO xyz SELECT v, w, 1.0 FROM kuvw ON CONFLICT (x) DO NOTHING
 ----
-memo (optimized, ~26KB, required=[])
- ├── G1: (insert G2 G3 G4 xyz)
+memo (optimized, ~29KB, required=[])
+ ├── G1: (insert G2 G3 G4 G5 xyz)
  │    └── []
- │         ├── best: (insert G2 G3 G4 xyz)
- │         └── cost: 2196.92
- ├── G2: (upsert-distinct-on G5 G6 cols=(8)) (upsert-distinct-on G5 G6 cols=(8),ordering=+8 opt(12))
+ │         ├── best: (insert G2 G3 G4 G5 xyz)
+ │         └── cost: 7132.30
+ ├── G2: (upsert-distinct-on G6 G7 cols=(8)) (upsert-distinct-on G6 G7 cols=(8),ordering=+8 opt(12))
  │    └── []
- │         ├── best: (upsert-distinct-on G5 G6 cols=(8))
- │         └── cost: 2196.91
+ │         ├── best: (upsert-distinct-on G6 G7 cols=(8))
+ │         └── cost: 7132.29
  ├── G3: (unique-checks)
- ├── G4: (f-k-checks)
- ├── G5: (anti-join G7 G8 G9) (merge-join G7 G8 G10 anti-join,+8,+13) (lookup-join G7 G10 xyz,keyCols=[8],outCols=(8,9,12,13)) (lookup-join G7 G10 xyz@xy,keyCols=[8],outCols=(8,9,12,13))
+ ├── G4: (fast-path-unique-checks)
+ ├── G5: (f-k-checks)
+ ├── G6: (anti-join G8 G9 G10) (merge-join G8 G9 G11 anti-join,+8,+13) (lookup-join G8 G11 xyz,keyCols=[8],outCols=(8,9,12,13)) (lookup-join G8 G11 xyz@xy,keyCols=[8],outCols=(8,9,12,13))
  │    ├── [ordering: +8 opt(12)]
- │    │    ├── best: (merge-join G7="[ordering: +8 opt(12)]" G8="[ordering: +13]" G10 anti-join,+8,+13)
- │    │    └── cost: 2196.88
+ │    │    ├── best: (lookup-join G8="[ordering: +8 opt(12)]" G11 xyz@xy,keyCols=[8],outCols=(8,9,12,13))
+ │    │    └── cost: 7132.26
  │    └── []
- │         ├── best: (merge-join G7="[ordering: +8 opt(12)]" G8="[ordering: +13]" G10 anti-join,+8,+13)
- │         └── cost: 2196.88
- ├── G6: (aggregations G11 G12)
- ├── G7: (project G13 G14 v w)
+ │         ├── best: (lookup-join G8 G11 xyz@xy,keyCols=[8],outCols=(8,9,12,13))
+ │         └── cost: 7132.26
+ ├── G7: (aggregations G12 G13)
+ ├── G8: (project G14 G15 v w)
  │    ├── [ordering: +8 opt(12)]
- │    │    ├── best: (project G13="[ordering: +8]" G14 v w)
+ │    │    ├── best: (project G14="[ordering: +8]" G15 v w)
  │    │    └── cost: 1108.64
  │    └── []
- │         ├── best: (project G13 G14 v w)
+ │         ├── best: (project G14 G15 v w)
  │         └── cost: 1108.64
- ├── G8: (scan xyz,cols=(13)) (scan xyz@xy,cols=(13)) (scan xyz@zyx,cols=(13)) (scan xyz@yy,cols=(13))
+ ├── G9: (scan xyz,cols=(13)) (scan xyz@xy,cols=(13)) (scan xyz@zyx,cols=(13)) (scan xyz@yy,cols=(13))
  │    ├── [ordering: +13]
  │    │    ├── best: (scan xyz@xy,cols=(13))
  │    │    └── cost: 1058.32
  │    └── []
  │         ├── best: (scan xyz@xy,cols=(13))
  │         └── cost: 1058.32
- ├── G9: (filters G15)
- ├── G10: (filters)
- ├── G11: (first-agg G16)
+ ├── G10: (filters G16)
+ ├── G11: (filters)
  ├── G12: (first-agg G17)
- ├── G13: (scan kuvw,cols=(8,9)) (scan kuvw@uvw,cols=(8,9)) (scan kuvw@wvu,cols=(8,9)) (scan kuvw@vw,cols=(8,9)) (scan kuvw@w,cols=(8,9))
+ ├── G13: (first-agg G18)
+ ├── G14: (scan kuvw,cols=(8,9)) (scan kuvw@uvw,cols=(8,9)) (scan kuvw@wvu,cols=(8,9)) (scan kuvw@vw,cols=(8,9)) (scan kuvw@w,cols=(8,9))
  │    ├── [ordering: +8]
  │    │    ├── best: (scan kuvw@vw,cols=(8,9))
  │    │    └── cost: 1088.62
  │    └── []
  │         ├── best: (scan kuvw,cols=(8,9))
  │         └── cost: 1088.62
- ├── G14: (projections G18)
- ├── G15: (eq G19 G20)
- ├── G16: (variable w)
- ├── G17: (variable "?column?")
- ├── G18: (const 1.0)
- ├── G19: (variable v)
- └── G20: (variable x)
+ ├── G15: (projections G19)
+ ├── G16: (eq G20 G21)
+ ├── G17: (variable w)
+ ├── G18: (variable "?column?")
+ ├── G19: (const 1.0)
+ ├── G20: (variable v)
+ └── G21: (variable x)
 
 # Ensure that streaming ensure-upsert-distinct-on will be used.
 memo
 INSERT INTO xyz SELECT v, w, 1.0 FROM kuvw ON CONFLICT (x) DO UPDATE SET z=2.0
 ----
-memo (optimized, ~27KB, required=[])
+memo (optimized, ~29KB, required=[])
  ├── G1: (upsert G2 G3 G4 xyz)
  │    └── []
  │         ├── best: (upsert G2 G3 G4 xyz)
- │         └── cost: 2287.34
+ │         └── cost: 7242.72
  ├── G2: (project G5 G6 v w ?column? x y z)
  │    └── []
  │         ├── best: (project G5 G6 v w ?column? x y z)
- │         └── cost: 2287.33
+ │         └── cost: 7242.71
  ├── G3: (unique-checks)
  ├── G4: (f-k-checks)
  ├── G5: (left-join G7 G8 G9) (right-join G8 G7 G9) (lookup-join G7 G10 xyz,keyCols=[8],outCols=(8,9,12-15)) (lookup-join G11 G10 xyz,keyCols=[13],outCols=(8,9,12-15)) (merge-join G8 G7 G10 right-join,+13,+8)
  │    └── []
- │         ├── best: (merge-join G8="[ordering: +13]" G7="[ordering: +8 opt(12)]" G10 right-join,+13,+8)
- │         └── cost: 2267.31
+ │         ├── best: (lookup-join G7 G10 xyz,keyCols=[8],outCols=(8,9,12-15))
+ │         └── cost: 7222.69
  ├── G6: (projections G12)
  ├── G7: (ensure-upsert-distinct-on G13 G14 cols=(8)) (ensure-upsert-distinct-on G13 G14 cols=(8),ordering=+8 opt(12))
  │    ├── [ordering: +8 opt(12)]
@@ -2577,23 +2704,23 @@ project
       │    │    ├── limit hint: 3.00
       │    │    ├── union-all
       │    │    │    ├── columns: a:2!null rowid:7!null
-      │    │    │    ├── left columns: a:48 rowid:53
-      │    │    │    ├── right columns: a:57 rowid:62
+      │    │    │    ├── left columns: a:30 rowid:35
+      │    │    │    ├── right columns: a:39 rowid:44
       │    │    │    ├── ordering: +2
       │    │    │    ├── limit hint: 3.00
       │    │    │    ├── scan regional@partial_a,partial
-      │    │    │    │    ├── columns: a:48!null rowid:53!null
-      │    │    │    │    ├── constraint: /47/48: [/'east' - /'east']
-      │    │    │    │    ├── key: (53)
-      │    │    │    │    ├── fd: (53)-->(48), (48)-->(53)
-      │    │    │    │    ├── ordering: +48
+      │    │    │    │    ├── columns: a:30!null rowid:35!null
+      │    │    │    │    ├── constraint: /29/30: [/'east' - /'east']
+      │    │    │    │    ├── key: (35)
+      │    │    │    │    ├── fd: (35)-->(30), (30)-->(35)
+      │    │    │    │    ├── ordering: +30
       │    │    │    │    └── limit hint: 3.00
       │    │    │    └── scan regional@partial_a,partial
-      │    │    │         ├── columns: a:57!null rowid:62!null
-      │    │    │         ├── constraint: /56/57: [/'west' - /'west']
-      │    │    │         ├── key: (62)
-      │    │    │         ├── fd: (62)-->(57), (57)-->(62)
-      │    │    │         ├── ordering: +57
+      │    │    │         ├── columns: a:39!null rowid:44!null
+      │    │    │         ├── constraint: /38/39: [/'west' - /'west']
+      │    │    │         ├── key: (44)
+      │    │    │         ├── fd: (44)-->(39), (39)-->(44)
+      │    │    │         ├── ordering: +39
       │    │    │         └── limit hint: 3.00
       │    │    └── aggregations
       │    │         └── count-rows [as=count_rows:10]
@@ -2740,24 +2867,19 @@ upsert xyz
       ├── columns: upsert_z:23 a:7!null b:8!null c:9 x:15 y:16 z:17
       ├── key: (7)
       ├── fd: (7)-->(8,9,15-17,23), (15)-->(16,17)
-      ├── right-join (merge)
+      ├── left-join (lookup xyz)
       │    ├── columns: a:7!null b:8!null c:9 x:15 y:16 z:17
-      │    ├── left ordering: +15
-      │    ├── right ordering: +7
+      │    ├── key columns: [7] = [15]
+      │    ├── lookup columns are key
       │    ├── key: (7)
       │    ├── fd: (7)-->(8,9,15-17), (15)-->(16,17)
-      │    ├── scan xyz
-      │    │    ├── columns: x:15!null y:16 z:17
-      │    │    ├── key: (15)
-      │    │    ├── fd: (15)-->(16,17)
-      │    │    └── ordering: +15
       │    ├── ensure-upsert-distinct-on
       │    │    ├── columns: a:7!null b:8!null c:9
       │    │    ├── grouping columns: a:7!null
+      │    │    ├── internal-ordering: +7
       │    │    ├── error: "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
       │    │    ├── key: (7)
       │    │    ├── fd: (7)-->(8,9)
-      │    │    ├── ordering: +7
       │    │    ├── union-all
       │    │    │    ├── columns: a:7!null b:8!null c:9
       │    │    │    ├── left columns: a:25 b:26 c:27
@@ -2806,24 +2928,19 @@ upsert xyz
       ├── columns: upsert_z:23 a:7!null b:8!null c:9 x:15 y:16 z:17
       ├── key: (7)
       ├── fd: (7)-->(8,9,15-17,23), (15)-->(16,17)
-      ├── right-join (merge)
+      ├── left-join (lookup xyz)
       │    ├── columns: a:7!null b:8!null c:9 x:15 y:16 z:17
-      │    ├── left ordering: +15
-      │    ├── right ordering: +7
+      │    ├── key columns: [7] = [15]
+      │    ├── lookup columns are key
       │    ├── key: (7)
       │    ├── fd: (7)-->(8,9,15-17), (15)-->(16,17)
-      │    ├── scan xyz
-      │    │    ├── columns: x:15!null y:16 z:17
-      │    │    ├── key: (15)
-      │    │    ├── fd: (15)-->(16,17)
-      │    │    └── ordering: +15
       │    ├── ensure-upsert-distinct-on
       │    │    ├── columns: a:7!null b:8!null c:9
       │    │    ├── grouping columns: a:7!null
+      │    │    ├── internal-ordering: +7
       │    │    ├── error: "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
       │    │    ├── key: (7)
       │    │    ├── fd: (7)-->(8,9)
-      │    │    ├── ordering: +7
       │    │    ├── union-all
       │    │    │    ├── columns: a:7!null b:8!null c:9
       │    │    │    ├── left columns: a:25 b:26 c:27
@@ -3089,24 +3206,19 @@ upsert xyz
       ├── columns: upsert_z:21 a:6 b:7 x:13 y:14 z:15
       ├── lax-key: (6,13)
       ├── fd: (6)~~>(7), (13)-->(14,15), (6,13)~~>(7,21)
-      ├── right-join (merge)
+      ├── left-join (lookup xyz)
       │    ├── columns: a:6 b:7 x:13 y:14 z:15
-      │    ├── left ordering: +13
-      │    ├── right ordering: +6
+      │    ├── key columns: [6] = [13]
+      │    ├── lookup columns are key
       │    ├── lax-key: (6,13)
       │    ├── fd: (6)~~>(7), (13)-->(14,15)
-      │    ├── scan xyz
-      │    │    ├── columns: x:13!null y:14 z:15
-      │    │    ├── key: (13)
-      │    │    ├── fd: (13)-->(14,15)
-      │    │    └── ordering: +13
       │    ├── ensure-upsert-distinct-on
       │    │    ├── columns: a:6 b:7
       │    │    ├── grouping columns: a:6
+      │    │    ├── internal-ordering: +6
       │    │    ├── error: "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
       │    │    ├── lax-key: (6)
       │    │    ├── fd: (6)~~>(7)
-      │    │    ├── ordering: +6
       │    │    ├── scan abcd@partial_ab,partial
       │    │    │    ├── columns: a:6 b:7 rowid:10!null
       │    │    │    ├── key: (10)
@@ -3305,7 +3417,7 @@ INDEX gg (g)
 memo
 SELECT d, e, count(*) FROM defg GROUP BY d, e LIMIT 10
 ----
-memo (optimized, ~20KB, required=[presentation: d:1,e:2,count:8])
+memo (optimized, ~21KB, required=[presentation: d:1,e:2,count:8])
  ├── G1: (limit G2 G3) (limit G4 G3) (limit G5 G3) (limit G6 G3)
  │    └── [presentation: d:1,e:2,count:8]
  │         ├── best: (limit G4="[limit hint: 10.00]" G3)
@@ -3535,3 +3647,463 @@ memo (optimized, ~6KB, required=[presentation: d:1,e:2,count:8])
  │         └── cost: 1098.72
  ├── G5: (aggregations G6)
  └── G6: (count-rows)
+
+# Test that SplitGroupByScanIntoUnionScans is not applied unnecessarily.
+
+exec-ddl
+CREATE TABLE t122638 (
+  a INT NOT NULL CHECK (a IN (0, 1, 2)),
+  b INT NOT NULL,
+  c INT NOT NULL,
+  d INT NOT NULL,
+  e INT NOT NULL,
+  PRIMARY KEY (a, b, c, d)
+)
+----
+
+# Inject statistics from:
+#
+#   SET CLUSTER SETTING sql.stats.histogram_collection.enabled = off;
+#
+#   INSERT INTO t122638 (a, b, c, d, e)
+#   SELECT i % 3, i % 10, i, i, i
+#   FROM generate_series(0, 999999) AS s(i);
+#
+exec-ddl
+ALTER TABLE t122638 INJECT STATISTICS '[
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 3,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      },
+      {
+          "avg_size": 2,
+          "columns": [
+              "a",
+              "b"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 30,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      },
+      {
+          "avg_size": 6,
+          "columns": [
+              "a",
+              "b",
+              "c"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 1000000,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      },
+      {
+          "avg_size": 10,
+          "columns": [
+              "a",
+              "b",
+              "c",
+              "d"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 1000000,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "b"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 10,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      },
+      {
+          "avg_size": 4,
+          "columns": [
+              "c"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 1000000,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      },
+      {
+          "avg_size": 4,
+          "columns": [
+              "d"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 1000000,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      },
+      {
+          "avg_size": 4,
+          "columns": [
+              "e"
+          ],
+          "created_at": "2024-04-24 05:39:54.242649",
+          "distinct_count": 1000000,
+          "histo_col_type": "",
+          "null_count": 0,
+          "row_count": 1000000
+      }
+]'
+----
+
+# Group by next column in index: rule should apply.
+opt expect=SplitGroupByScanIntoUnionScans
+SELECT c, count(*) FROM t122638 WHERE b = 0 GROUP BY c ORDER BY c LIMIT 10
+----
+limit
+ ├── columns: c:3!null count:8!null
+ ├── internal-ordering: +3
+ ├── cardinality: [0 - 10]
+ ├── key: (3)
+ ├── fd: (3)-->(8)
+ ├── ordering: +3
+ ├── group-by (streaming)
+ │    ├── columns: c:3!null count_rows:8!null
+ │    ├── grouping columns: c:3!null
+ │    ├── internal-ordering: +3
+ │    ├── key: (3)
+ │    ├── fd: (3)-->(8)
+ │    ├── ordering: +3
+ │    ├── limit hint: 10.00
+ │    ├── union-all
+ │    │    ├── columns: c:3!null
+ │    │    ├── left columns: c:32
+ │    │    ├── right columns: c:25
+ │    │    ├── ordering: +3
+ │    │    ├── limit hint: 10.00
+ │    │    ├── union-all
+ │    │    │    ├── columns: c:32!null
+ │    │    │    ├── left columns: c:11
+ │    │    │    ├── right columns: c:18
+ │    │    │    ├── ordering: +32
+ │    │    │    ├── limit hint: 10.00
+ │    │    │    ├── scan t122638
+ │    │    │    │    ├── columns: c:11!null
+ │    │    │    │    ├── constraint: /9/10/11/12: [/0/0 - /0/0]
+ │    │    │    │    ├── ordering: +11
+ │    │    │    │    └── limit hint: 10.00
+ │    │    │    └── scan t122638
+ │    │    │         ├── columns: c:18!null
+ │    │    │         ├── constraint: /16/17/18/19: [/1/0 - /1/0]
+ │    │    │         ├── ordering: +18
+ │    │    │         └── limit hint: 10.00
+ │    │    └── scan t122638
+ │    │         ├── columns: c:25!null
+ │    │         ├── constraint: /23/24/25/26: [/2/0 - /2/0]
+ │    │         ├── ordering: +25
+ │    │         └── limit hint: 10.00
+ │    └── aggregations
+ │         └── count-rows [as=count_rows:8]
+ └── 10
+
+# Group by next column in index and another column: rule should apply.
+opt expect=SplitGroupByScanIntoUnionScans
+SELECT c, e, count(*) FROM t122638 WHERE b = 0 GROUP BY c, e ORDER BY c, e LIMIT 10
+----
+limit
+ ├── columns: c:3!null e:5!null count:8!null
+ ├── internal-ordering: +3,+5
+ ├── cardinality: [0 - 10]
+ ├── key: (3,5)
+ ├── fd: (3,5)-->(8)
+ ├── ordering: +3,+5
+ ├── group-by (streaming)
+ │    ├── columns: c:3!null e:5!null count_rows:8!null
+ │    ├── grouping columns: c:3!null e:5!null
+ │    ├── internal-ordering: +3,+5
+ │    ├── key: (3,5)
+ │    ├── fd: (3,5)-->(8)
+ │    ├── ordering: +3,+5
+ │    ├── limit hint: 10.00
+ │    ├── union-all
+ │    │    ├── columns: c:3!null e:5!null
+ │    │    ├── left columns: c:32 e:34
+ │    │    ├── right columns: c:25 e:27
+ │    │    ├── ordering: +3,+5
+ │    │    ├── limit hint: 10.00
+ │    │    ├── union-all
+ │    │    │    ├── columns: c:32!null e:34!null
+ │    │    │    ├── left columns: c:11 e:13
+ │    │    │    ├── right columns: c:18 e:20
+ │    │    │    ├── ordering: +32,+34
+ │    │    │    ├── limit hint: 10.00
+ │    │    │    ├── sort (segmented)
+ │    │    │    │    ├── columns: c:11!null e:13!null
+ │    │    │    │    ├── ordering: +11,+13
+ │    │    │    │    ├── limit hint: 10.00
+ │    │    │    │    └── scan t122638
+ │    │    │    │         ├── columns: c:11!null e:13!null
+ │    │    │    │         ├── constraint: /9/10/11/12: [/0/0 - /0/0]
+ │    │    │    │         └── ordering: +11
+ │    │    │    └── sort (segmented)
+ │    │    │         ├── columns: c:18!null e:20!null
+ │    │    │         ├── ordering: +18,+20
+ │    │    │         ├── limit hint: 10.00
+ │    │    │         └── scan t122638
+ │    │    │              ├── columns: c:18!null e:20!null
+ │    │    │              ├── constraint: /16/17/18/19: [/1/0 - /1/0]
+ │    │    │              └── ordering: +18
+ │    │    └── sort (segmented)
+ │    │         ├── columns: c:25!null e:27!null
+ │    │         ├── ordering: +25,+27
+ │    │         ├── limit hint: 10.00
+ │    │         └── scan t122638
+ │    │              ├── columns: c:25!null e:27!null
+ │    │              ├── constraint: /23/24/25/26: [/2/0 - /2/0]
+ │    │              └── ordering: +25
+ │    └── aggregations
+ │         └── count-rows [as=count_rows:8]
+ └── 10
+
+# Group by next column in index, and index provides ordering required by
+# array_agg: rule should apply.
+opt expect=SplitGroupByScanIntoUnionScans
+SELECT c, array_agg(e)
+FROM (SELECT * FROM t122638 ORDER BY d)
+WHERE b = 0
+GROUP BY c ORDER BY c
+LIMIT 10
+----
+limit
+ ├── columns: c:3!null array_agg:8!null
+ ├── internal-ordering: +3
+ ├── cardinality: [0 - 10]
+ ├── key: (3)
+ ├── fd: (3)-->(8)
+ ├── ordering: +3
+ ├── group-by (streaming)
+ │    ├── columns: c:3!null array_agg:8!null
+ │    ├── grouping columns: c:3!null
+ │    ├── internal-ordering: +4 opt(2,3)
+ │    ├── key: (3)
+ │    ├── fd: (3)-->(8)
+ │    ├── ordering: +3
+ │    ├── limit hint: 10.00
+ │    ├── union-all
+ │    │    ├── columns: b:2!null c:3!null d:4!null e:5!null
+ │    │    ├── left columns: b:31 c:32 d:33 e:34
+ │    │    ├── right columns: b:24 c:25 d:26 e:27
+ │    │    ├── ordering: +3,+4
+ │    │    ├── limit hint: 10.00
+ │    │    ├── union-all
+ │    │    │    ├── columns: b:31!null c:32!null d:33!null e:34!null
+ │    │    │    ├── left columns: b:10 c:11 d:12 e:13
+ │    │    │    ├── right columns: b:17 c:18 d:19 e:20
+ │    │    │    ├── ordering: +32,+33
+ │    │    │    ├── limit hint: 10.00
+ │    │    │    ├── scan t122638
+ │    │    │    │    ├── columns: b:10!null c:11!null d:12!null e:13!null
+ │    │    │    │    ├── constraint: /9/10/11/12: [/0/0 - /0/0]
+ │    │    │    │    ├── key: (11,12)
+ │    │    │    │    ├── fd: ()-->(10), (11,12)-->(13)
+ │    │    │    │    ├── ordering: +11,+12 opt(10) [actual: +11,+12]
+ │    │    │    │    └── limit hint: 10.00
+ │    │    │    └── scan t122638
+ │    │    │         ├── columns: b:17!null c:18!null d:19!null e:20!null
+ │    │    │         ├── constraint: /16/17/18/19: [/1/0 - /1/0]
+ │    │    │         ├── key: (18,19)
+ │    │    │         ├── fd: ()-->(17), (18,19)-->(20)
+ │    │    │         ├── ordering: +18,+19 opt(17) [actual: +18,+19]
+ │    │    │         └── limit hint: 10.00
+ │    │    └── scan t122638
+ │    │         ├── columns: b:24!null c:25!null d:26!null e:27!null
+ │    │         ├── constraint: /23/24/25/26: [/2/0 - /2/0]
+ │    │         ├── key: (25,26)
+ │    │         ├── fd: ()-->(24), (25,26)-->(27)
+ │    │         ├── ordering: +25,+26 opt(24) [actual: +25,+26]
+ │    │         └── limit hint: 10.00
+ │    └── aggregations
+ │         └── array-agg [as=array_agg:8, outer=(5)]
+ │              └── e:5
+ └── 10
+
+# Group by next column in index, but index does not provide ordering required by
+# array_agg: rule should not apply.
+opt expect-not=SplitGroupByScanIntoUnionScans
+SELECT c, array_agg(e)
+FROM (SELECT * FROM t122638 ORDER BY e)
+WHERE b = 0
+GROUP BY c ORDER BY c
+LIMIT 10
+----
+limit
+ ├── columns: c:3!null array_agg:8!null
+ ├── internal-ordering: +3
+ ├── cardinality: [0 - 10]
+ ├── key: (3)
+ ├── fd: (3)-->(8)
+ ├── ordering: +3
+ ├── group-by (streaming)
+ │    ├── columns: c:3!null array_agg:8!null
+ │    ├── grouping columns: c:3!null
+ │    ├── internal-ordering: +5 opt(2,3)
+ │    ├── key: (3)
+ │    ├── fd: (3)-->(8)
+ │    ├── ordering: +3
+ │    ├── limit hint: 10.00
+ │    ├── sort
+ │    │    ├── columns: b:2!null c:3!null e:5!null
+ │    │    ├── fd: ()-->(2)
+ │    │    ├── ordering: +3,+5 opt(2) [actual: +3,+5]
+ │    │    ├── limit hint: 10.00
+ │    │    └── scan t122638
+ │    │         ├── columns: b:2!null c:3!null e:5!null
+ │    │         ├── constraint: /1/2/3/4
+ │    │         │    ├── [/0/0 - /0/0]
+ │    │         │    ├── [/1/0 - /1/0]
+ │    │         │    └── [/2/0 - /2/0]
+ │    │         └── fd: ()-->(2)
+ │    └── aggregations
+ │         └── array-agg [as=array_agg:8, outer=(5)]
+ │              └── e:5
+ └── 10
+
+# Group by column after next in index: rule should not apply.
+opt expect-not=SplitGroupByScanIntoUnionScans
+SELECT d, count(*) FROM t122638 WHERE b = 0 GROUP BY d ORDER BY d LIMIT 10
+----
+top-k
+ ├── columns: d:4!null count:8!null
+ ├── internal-ordering: +4
+ ├── k: 10
+ ├── cardinality: [0 - 10]
+ ├── key: (4)
+ ├── fd: (4)-->(8)
+ ├── ordering: +4
+ └── group-by (hash)
+      ├── columns: d:4!null count_rows:8!null
+      ├── grouping columns: d:4!null
+      ├── key: (4)
+      ├── fd: (4)-->(8)
+      ├── scan t122638
+      │    ├── columns: b:2!null d:4!null
+      │    ├── constraint: /1/2/3/4
+      │    │    ├── [/0/0 - /0/0]
+      │    │    ├── [/1/0 - /1/0]
+      │    │    └── [/2/0 - /2/0]
+      │    └── fd: ()-->(2)
+      └── aggregations
+           └── count-rows [as=count_rows:8]
+
+# Group by column after next in index, and index provides ordering required by
+# array_agg: rule should not apply.
+opt expect-not=SplitGroupByScanIntoUnionScans
+SELECT d, array_agg(e)
+FROM (SELECT * FROM t122638 ORDER BY c)
+WHERE b = 0
+GROUP BY d ORDER BY d
+LIMIT 10
+----
+limit
+ ├── columns: d:4!null array_agg:8!null
+ ├── internal-ordering: +4
+ ├── cardinality: [0 - 10]
+ ├── key: (4)
+ ├── fd: (4)-->(8)
+ ├── ordering: +4
+ ├── group-by (streaming)
+ │    ├── columns: d:4!null array_agg:8!null
+ │    ├── grouping columns: d:4!null
+ │    ├── internal-ordering: +3 opt(2,4)
+ │    ├── key: (4)
+ │    ├── fd: (4)-->(8)
+ │    ├── ordering: +4
+ │    ├── limit hint: 10.00
+ │    ├── sort
+ │    │    ├── columns: b:2!null c:3!null d:4!null e:5!null
+ │    │    ├── fd: ()-->(2)
+ │    │    ├── ordering: +4,+3 opt(2) [actual: +4,+3]
+ │    │    ├── limit hint: 10.00
+ │    │    └── scan t122638
+ │    │         ├── columns: b:2!null c:3!null d:4!null e:5!null
+ │    │         ├── constraint: /1/2/3/4
+ │    │         │    ├── [/0/0 - /0/0]
+ │    │         │    ├── [/1/0 - /1/0]
+ │    │         │    └── [/2/0 - /2/0]
+ │    │         └── fd: ()-->(2)
+ │    └── aggregations
+ │         └── array-agg [as=array_agg:8, outer=(5)]
+ │              └── e:5
+ └── 10
+
+# Group by column not in index: rule should not apply.
+opt expect-not=SplitGroupByScanIntoUnionScans
+SELECT e, count(*) FROM t122638 WHERE b = 0 AND c = 0 AND d = 0 GROUP BY e ORDER BY e LIMIT 10
+----
+top-k
+ ├── columns: e:5!null count:8!null
+ ├── internal-ordering: +5
+ ├── k: 10
+ ├── cardinality: [0 - 10]
+ ├── key: (5)
+ ├── fd: (5)-->(8)
+ ├── ordering: +5
+ └── group-by (hash)
+      ├── columns: e:5!null count_rows:8!null
+      ├── grouping columns: e:5!null
+      ├── key: (5)
+      ├── fd: (5)-->(8)
+      ├── scan t122638
+      │    ├── columns: b:2!null c:3!null d:4!null e:5!null
+      │    ├── constraint: /1/2/3/4
+      │    │    ├── [/0/0/0/0 - /0/0/0/0]
+      │    │    ├── [/1/0/0/0 - /1/0/0/0]
+      │    │    └── [/2/0/0/0 - /2/0/0/0]
+      │    └── fd: ()-->(2-4)
+      └── aggregations
+           └── count-rows [as=count_rows:8]
+
+# Group by column not in index, and index provides ordering required by
+# array_agg: rule should not apply.
+opt expect-not=SplitGroupByScanIntoUnionScans
+SELECT e, array_agg(d)
+FROM (SELECT * FROM t122638 ORDER BY d)
+WHERE b = 0 AND c = 0 AND d = 0
+GROUP BY e ORDER BY e
+LIMIT 10
+----
+top-k
+ ├── columns: e:5!null array_agg:8!null
+ ├── internal-ordering: +5
+ ├── k: 10
+ ├── cardinality: [0 - 10]
+ ├── key: (5)
+ ├── fd: (5)-->(8)
+ ├── ordering: +5
+ └── group-by (hash)
+      ├── columns: e:5!null array_agg:8!null
+      ├── grouping columns: e:5!null
+      ├── key: (5)
+      ├── fd: (5)-->(8)
+      ├── scan t122638
+      │    ├── columns: b:2!null c:3!null d:4!null e:5!null
+      │    ├── constraint: /1/2/3/4
+      │    │    ├── [/0/0/0/0 - /0/0/0/0]
+      │    │    ├── [/1/0/0/0 - /1/0/0/0]
+      │    │    └── [/2/0/0/0 - /2/0/0/0]
+      │    └── fd: ()-->(2-4)
+      └── aggregations
+           └── array-agg [as=array_agg:8, outer=(4)]
+                └── d:4

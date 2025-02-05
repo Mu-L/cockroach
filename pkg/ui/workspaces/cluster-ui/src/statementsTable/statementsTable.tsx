@@ -1,28 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import classNames from "classnames/bind";
+import React from "react";
 
-import {
-  FixLong,
-  longToInt,
-  StatementSummary,
-  StatementStatistics,
-  Count,
-  TimestampToNumber,
-  TimestampToMoment,
-  unset,
-  DurationCheckSample,
-} from "src/util";
-import { DATE_FORMAT, Duration } from "src/util/format";
 import {
   countBarChart,
   bytesReadBarChart,
@@ -34,26 +18,38 @@ import {
   retryBarChart,
   workloadPctBarChart,
 } from "src/barCharts";
-import { ActivateDiagnosticsModalRef } from "src/statementsDiagnostics";
+import { BarChartOptions } from "src/barCharts/barChartFactory";
 import {
   ColumnDescriptor,
   longListWithTooltip,
   SortedTable,
 } from "src/sortedtable";
+import { ActivateDiagnosticsModalRef } from "src/statementsDiagnostics";
+import {
+  FixLong,
+  longToInt,
+  StatementSummary,
+  StatementStatistics,
+  Count,
+  TimestampToNumber,
+  TimestampToMoment,
+  unset,
+} from "src/util";
+import { DATE_FORMAT, Duration } from "src/util/format";
 
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { StatementTableCell } from "./statementsTableContent";
+import { StatementDiagnosticsReport } from "../api";
 import {
   statisticsTableTitles,
   StatisticType,
 } from "../statsTableUtil/statsTableUtil";
-import { BarChartOptions } from "src/barCharts/barChartFactory";
+import { Timestamp } from "../timestamp";
+
+import styles from "./statementsTable.module.scss";
+import { StatementTableCell } from "./statementsTableContent";
 
 type ICollectedStatementStatistics =
   cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
-import styles from "./statementsTable.module.scss";
-import { StatementDiagnosticsReport } from "../api";
-import { Timestamp } from "../timestamp";
+
 const cx = classNames.bind(styles);
 
 export interface AggregateStatistics {
@@ -144,7 +140,7 @@ export function makeStatementsColumns(
     {
       classes: defaultBarChartOptions.classes,
       displayNoSamples: (d: ICollectedStatementStatistics) => {
-        return longToInt(d.stats.exec_stats?.count) == 0;
+        return longToInt(d.stats.exec_stats?.count) === 0;
       },
     };
 
@@ -236,32 +232,6 @@ export function makeStatementsColumns(
         FixLong(Number(stmt.stats.exec_stats.cpu_sql_nanos?.mean)),
     },
     {
-      name: "latencyP50",
-      title: statisticsTableTitles.latencyP50(statType),
-      cell: (stmt: AggregateStatistics) =>
-        DurationCheckSample(stmt.stats.latency_info?.p50 * 1e9),
-      sort: (stmt: AggregateStatistics) =>
-        FixLong(Number(stmt.stats.latency_info?.p50)),
-      showByDefault: false,
-    },
-    {
-      name: "latencyP90",
-      title: statisticsTableTitles.latencyP90(statType),
-      cell: (stmt: AggregateStatistics) =>
-        DurationCheckSample(stmt.stats.latency_info?.p90 * 1e9),
-      sort: (stmt: AggregateStatistics) =>
-        FixLong(Number(stmt.stats.latency_info?.p90)),
-      showByDefault: false,
-    },
-    {
-      name: "latencyP99",
-      title: statisticsTableTitles.latencyP99(statType),
-      cell: (stmt: AggregateStatistics) =>
-        DurationCheckSample(stmt.stats.latency_info?.p99 * 1e9),
-      sort: (stmt: AggregateStatistics) =>
-        FixLong(Number(stmt.stats.latency_info?.p99)),
-    },
-    {
       name: "latencyMin",
       title: statisticsTableTitles.latencyMin(statType),
       cell: (stmt: AggregateStatistics) =>
@@ -344,7 +314,7 @@ export function makeStatementsColumns(
     },
   ];
 
-  if (activateDiagnosticsRef && !isTenant && !hasViewActivityRedactedRole) {
+  if (activateDiagnosticsRef && !hasViewActivityRedactedRole) {
     const diagnosticsColumn: ColumnDescriptor<AggregateStatistics> = {
       name: "diagnostics",
       title: statisticsTableTitles.diagnostics(statType),

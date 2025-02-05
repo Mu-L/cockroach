@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -29,6 +25,7 @@ import (
 // alterTenantSetClusterSettingNode represents an
 // ALTER VIRTUAL CLUSTER ... SET CLUSTER SETTING statement.
 type alterTenantSetClusterSettingNode struct {
+	zeroInputPlanNode
 	name       settings.SettingName
 	tenantSpec tenantSpec
 	st         *cluster.Settings
@@ -38,7 +35,7 @@ type alterTenantSetClusterSettingNode struct {
 }
 
 // AlterTenantSetClusterSetting sets tenant level session variables.
-// Privileges: MANAGETENANT.
+// Privileges: MANAGEVIRTUALCLUSTER.
 func (p *planner) AlterTenantSetClusterSetting(
 	ctx context.Context, n *tree.AlterTenantSetClusterSetting,
 ) (planNode, error) {
@@ -56,13 +53,18 @@ func (p *planner) AlterTenantSetClusterSetting(
 	}
 
 	name := settings.SettingName(strings.ToLower(n.Name))
+	// Disallow setting the 'version' setting for any tenant.
+	if name == clusterversion.KeyVersionSetting {
+		return nil, errors.Errorf("cannot set '%s' for tenants", name)
+	}
+
 	st := p.EvalContext().Settings
 	setting, ok, nameStatus := settings.LookupForLocalAccess(name, true /* forSystemTenant - checked above already */)
 	if !ok {
 		return nil, errors.Errorf("unknown cluster setting '%s'", name)
 	}
 	if nameStatus != settings.NameActive {
-		p.BufferClientNotice(ctx, settingNameDeprecationNotice(name, setting.Name()))
+		p.BufferClientNotice(ctx, settingAlternateNameNotice(name, setting.Name()))
 		name = setting.Name()
 	}
 	// Error out if we're trying to set a system-only variable.
@@ -120,7 +122,7 @@ func (n *alterTenantSetClusterSettingNode) startExec(params runParams) error {
 		reportedValue = "DEFAULT"
 		if _, err := params.p.InternalSQLTxn().ExecEx(
 			params.ctx, "reset-tenant-setting", params.p.Txn(),
-			sessiondata.RootUserSessionDataOverride,
+			sessiondata.NodeUserSessionDataOverride,
 			"DELETE FROM system.tenant_settings WHERE tenant_id = $1 AND name = $2", tenantID, n.setting.InternalKey(),
 		); err != nil {
 			return err
@@ -137,7 +139,7 @@ func (n *alterTenantSetClusterSettingNode) startExec(params runParams) error {
 		}
 		if _, err := params.p.InternalSQLTxn().ExecEx(
 			params.ctx, "update-tenant-setting", params.p.Txn(),
-			sessiondata.RootUserSessionDataOverride,
+			sessiondata.NodeUserSessionDataOverride,
 			`UPSERT INTO system.tenant_settings (tenant_id, name, value, last_updated, value_type) VALUES ($1, $2, $3, now(), $4)`,
 			tenantID, n.setting.InternalKey(), encoded, n.setting.Typ(),
 		); err != nil {
@@ -162,28 +164,28 @@ func (n *alterTenantSetClusterSettingNode) Values() tree.Datums            { ret
 func (n *alterTenantSetClusterSettingNode) Close(_ context.Context)        {}
 
 // ShowTenantClusterSetting shows the value of a cluster setting for a tenant.
-// Privileges: super user.
+// Privileges: MANAGEVIRTUALCLUSTER
 func (p *planner) ShowTenantClusterSetting(
 	ctx context.Context, n *tree.ShowTenantClusterSetting,
 ) (planNode, error) {
-	// Viewing cluster settings for other tenants is a more
-	// privileged operation than viewing local cluster settings. So we
-	// shouldn't be allowing with just the role option
-	// VIEWCLUSTERSETTINGS.
-	//
-	// TODO(knz): Using admin authz for now; we may want to introduce a
-	// more specific role option later.
-	if err := p.RequireAdminRole(ctx, "view a tenant cluster setting"); err != nil {
+	// Viewing cluster settings for other tenants is a more privileged operation
+	// than viewing local cluster settings. So we shouldn't be allowing with just
+	// the role option VIEWCLUSTERSETTING. We use MANAGEVIRTUALCLUSTER instead.
+	// That privilege implicitly gives the ability to view non-redacted values for
+	// sensitive cluster settings.
+	if err := CanManageTenant(ctx, p); err != nil {
 		return nil, err
 	}
 
 	name := settings.SettingName(strings.ToLower(n.Name))
+	// NB: We use LookupForLocalAccess since the displayed value is computed in
+	// the crdb_internal.decode_cluster_setting builtin function.
 	setting, ok, nameStatus := settings.LookupForLocalAccess(name, p.ExecCfg().Codec.ForSystemTenant())
 	if !ok {
 		return nil, errors.Errorf("unknown setting: %q", name)
 	}
 	if nameStatus != settings.NameActive {
-		p.BufferClientNotice(ctx, settingNameDeprecationNotice(name, setting.Name()))
+		p.BufferClientNotice(ctx, settingAlternateNameNotice(name, setting.Name()))
 		name = setting.Name()
 	}
 
@@ -227,12 +229,13 @@ WITH
   setting AS (
    SELECT $1 AS variable
   )
-SELECT COALESCE(
-   tenantspecific.value,
-   overrideall.value,
-   -- NB: we can't compute the actual value here, see discussion on issue #77935.
-   NULL
-   )
+SELECT crdb_internal.decode_cluster_setting(setting.variable,
+     COALESCE(tenantspecific.value,
+              overrideall.value,
+              -- NB: we can't compute the actual value here, which is the entry in the tenant's settings table.
+              -- See discussion on issue #77935.
+              NULL)
+  ) AS value
 FROM
   setting
   LEFT JOIN tenantspecific
@@ -242,7 +245,7 @@ FROM
 
 			datums, err := p.InternalSQLTxn().QueryRowEx(
 				ctx, "get-tenant-setting-value", p.txn,
-				sessiondata.RootUserSessionDataOverride,
+				sessiondata.NoSessionDataOverride,
 				lookupEncodedTenantSetting,
 				setting.InternalKey(), rec.ID)
 			if err != nil {

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
@@ -31,19 +26,18 @@ func BuildQuery(
 ) {
 	stmt, err := parser.ParseOne(sql)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%+v", err)
 	}
 
 	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext()
-	if err := semaCtx.Placeholders.Init(stmt.NumPlaceholders, nil /* typeHints */); err != nil {
-		t.Fatal(err)
-	}
+	semaCtx := tree.MakeSemaContext(catalog)
+	semaCtx.SearchPath = &evalCtx.SessionData().SearchPath
+	semaCtx.Placeholders.Init(stmt.NumPlaceholders, nil /* typeHints */)
 	semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
 	o.Init(ctx, evalCtx, catalog)
 	err = optbuilder.New(ctx, &semaCtx, evalCtx, catalog, o.Factory(), stmt.AST).Build()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%+v", err)
 	}
 }
 
@@ -53,7 +47,7 @@ func BuildScalar(
 ) opt.ScalarExpr {
 	expr, err := parser.ParseExpr(input)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%+v", err)
 	}
 
 	b := optbuilder.NewScalar(context.Background(), semaCtx, evalCtx, f)

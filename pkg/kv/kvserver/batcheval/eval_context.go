@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
@@ -103,9 +99,10 @@ type EvalContext interface {
 	GetMaxSplitCPU(context.Context) (float64, bool)
 
 	GetGCThreshold() hlc.Timestamp
-	ExcludeDataFromBackup() bool
+	ExcludeDataFromBackup(context.Context, roachpb.Span) (bool, error)
 	GetLastReplicaGCTimestamp(context.Context) (hlc.Timestamp, error)
 	GetLease() (roachpb.Lease, roachpb.Lease)
+	GetRangeLeaseDuration() time.Duration
 	GetRangeInfo(context.Context) roachpb.RangeInfo
 
 	// GetCurrentReadSummary returns a new ReadSummary reflecting all reads
@@ -126,11 +123,11 @@ type EvalContext interface {
 
 	// GetResponseMemoryAccount returns a memory account to be used when
 	// generating BatchResponses. Currently only used for MVCC scans, and only
-	// non-nil on those paths (a nil account is safe to use since it functions
-	// as an unlimited account).
+	// non-nil on those paths (a nil account is replaced with standalone
+	// unlimited one later).
 	GetResponseMemoryAccount() *mon.BoundAccount
 
-	GetMaxBytes() int64
+	GetMaxBytes(context.Context) int64
 
 	// GetEngineCapacity returns the store's underlying engine capacity; other
 	// StoreCapacity fields not related to engine capacity are not populated.
@@ -145,6 +142,9 @@ type EvalContext interface {
 	// calling RevokeLease or WatchForMerge) to freeze further progression of the
 	// closed timestamp before calling this method.
 	GetCurrentClosedTimestamp(ctx context.Context) hlc.Timestamp
+
+	// AdmissionHeader returns the AdmissionHeader specified for the batch.
+	AdmissionHeader() kvpb.AdmissionHeader
 
 	// Release returns the memory allocated by the EvalContext implementation to a
 	// sync.Pool.
@@ -162,27 +162,29 @@ type ImmutableEvalContext interface {
 // MockEvalCtx is a dummy implementation of EvalContext for testing purposes.
 // For technical reasons, the interface is implemented by a wrapper .EvalContext().
 type MockEvalCtx struct {
-	ClusterSettings      *cluster.Settings
-	Desc                 *roachpb.RangeDescriptor
-	StoreID              roachpb.StoreID
-	NodeID               roachpb.NodeID
-	Clock                *hlc.Clock
-	Stats                enginepb.MVCCStats
-	QPS                  float64
-	CPU                  float64
-	AbortSpan            *abortspan.AbortSpan
-	GCThreshold          hlc.Timestamp
-	Term                 kvpb.RaftTerm
-	FirstIndex           kvpb.RaftIndex
-	CanCreateTxnRecordFn func() (bool, kvpb.TransactionAbortedReason)
-	MinTxnCommitTSFn     func() hlc.Timestamp
-	Lease                roachpb.Lease
-	CurrentReadSummary   rspb.ReadSummary
-	ClosedTimestamp      hlc.Timestamp
-	RevokedLeaseSeq      roachpb.LeaseSequence
-	MaxBytes             int64
-	ApproxDiskBytes      uint64
-	EvalKnobs            kvserverbase.BatchEvalTestingKnobs
+	ClusterSettings        *cluster.Settings
+	Desc                   *roachpb.RangeDescriptor
+	StoreID                roachpb.StoreID
+	NodeID                 roachpb.NodeID
+	Clock                  *hlc.Clock
+	Stats                  enginepb.MVCCStats
+	QPS                    float64
+	CPU                    float64
+	AbortSpan              *abortspan.AbortSpan
+	GCThreshold            hlc.Timestamp
+	Term                   kvpb.RaftTerm
+	FirstIndex             kvpb.RaftIndex
+	CanCreateTxnRecordFn   func() (bool, kvpb.TransactionAbortedReason)
+	MinTxnCommitTSFn       func() hlc.Timestamp
+	LastReplicaGCTimestamp hlc.Timestamp
+	Lease                  roachpb.Lease
+	RangeLeaseDuration     time.Duration
+	CurrentReadSummary     rspb.ReadSummary
+	ClosedTimestamp        hlc.Timestamp
+	RevokedLeaseSeq        roachpb.LeaseSequence
+	MaxBytes               int64
+	ApproxDiskBytes        uint64
+	EvalKnobs              kvserverbase.BatchEvalTestingKnobs
 }
 
 // EvalContext returns the MockEvalCtx as an EvalContext. It will reflect future
@@ -273,14 +275,17 @@ func (m *mockEvalCtxImpl) MinTxnCommitTS(
 func (m *mockEvalCtxImpl) GetGCThreshold() hlc.Timestamp {
 	return m.GCThreshold
 }
-func (m *mockEvalCtxImpl) ExcludeDataFromBackup() bool {
-	return false
+func (m *mockEvalCtxImpl) ExcludeDataFromBackup(context.Context, roachpb.Span) (bool, error) {
+	return false, nil
 }
 func (m *mockEvalCtxImpl) GetLastReplicaGCTimestamp(context.Context) (hlc.Timestamp, error) {
-	panic("unimplemented")
+	return m.LastReplicaGCTimestamp, nil
 }
 func (m *mockEvalCtxImpl) GetLease() (roachpb.Lease, roachpb.Lease) {
 	return m.Lease, roachpb.Lease{}
+}
+func (m *mockEvalCtxImpl) GetRangeLeaseDuration() time.Duration {
+	return m.RangeLeaseDuration
 }
 func (m *mockEvalCtxImpl) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 	return roachpb.RangeInfo{Desc: *m.Desc(), Lease: m.Lease}
@@ -305,7 +310,7 @@ func (m *mockEvalCtxImpl) GetResponseMemoryAccount() *mon.BoundAccount {
 	// No limits.
 	return nil
 }
-func (m *mockEvalCtxImpl) GetMaxBytes() int64 {
+func (m *mockEvalCtxImpl) GetMaxBytes(context.Context) int64 {
 	if m.MaxBytes != 0 {
 		return m.MaxBytes
 	}
@@ -317,4 +322,9 @@ func (m *mockEvalCtxImpl) GetEngineCapacity() (roachpb.StoreCapacity, error) {
 func (m *mockEvalCtxImpl) GetApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
 	return m.ApproxDiskBytes, nil
 }
+
+func (m *mockEvalCtxImpl) AdmissionHeader() kvpb.AdmissionHeader {
+	return kvpb.AdmissionHeader{}
+}
+
 func (m *mockEvalCtxImpl) Release() {}

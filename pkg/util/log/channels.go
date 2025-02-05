@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -59,12 +54,15 @@ func logfDepthInternal(
 	if sev == severity.FATAL {
 		// Timeout logic should stay at the top of this call to capture all
 		// writes that happen afterwards.
-		logging.mu.Lock()
-		exitFunc := func(x exit.Code, _ error) { exit.WithCode(x) }
-		if logging.mu.exitOverride.f != nil {
-			exitFunc = logging.mu.exitOverride.f
-		}
-		logging.mu.Unlock()
+		exitFunc := func() (exitFunc func(exit.Code, error)) {
+			exitFunc = func(x exit.Code, _ error) { exit.WithCode(x) }
+			logging.mu.Lock()
+			defer logging.mu.Unlock()
+			if logging.mu.exitOverride.f != nil {
+				exitFunc = logging.mu.exitOverride.f
+			}
+			return exitFunc
+		}()
 
 		// Fatal error handling later already tries to exit even if I/O should
 		// block, but crash reporting might also be in the way.
@@ -98,10 +96,10 @@ func logfDepthInternal(
 	entry := makeUnstructuredEntry(
 		ctx, sev, ch,
 		depth+1, true /* redactable */, format, args...)
-	if sp, el, ok := getSpanOrEventLog(ctx); ok {
+	if sp := getSpan(ctx); sp != nil {
 		// Prevent `entry` from moving to the heap if this branch isn't taken.
 		heapEntry := entry
-		eventInternal(sp, el, sev >= severity.ERROR, &heapEntry)
+		eventInternal(sp, sev >= severity.ERROR, &heapEntry)
 	}
 	logger.outputLogEntry(entry)
 }

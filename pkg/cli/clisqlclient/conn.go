@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient
 
@@ -25,10 +20,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
 	"github.com/cockroachdb/cockroach/pkg/security/pprompt"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/otan/gopgkrb5"
 )
 
@@ -79,6 +75,11 @@ type sqlConn struct {
 	// (re)connects.
 	clusterID           string
 	clusterOrganization string
+
+	// virtualClusterName is the last known virtual cluster name from the
+	// server, used to report any changes upon (re)connects. Empty if no
+	// application VCs have been defined.
+	virtualClusterName string
 
 	// isSystemTenantUnderSecondaryTenants is true if the current
 	// connection is to the system tenant and there are secondary
@@ -160,8 +161,12 @@ func (c *sqlConn) SetMissingPassword(missing bool) {
 }
 
 // SetAlwaysInferResultTypes implements the Conn interface.
-func (c *sqlConn) SetAlwaysInferResultTypes(b bool) {
+func (c *sqlConn) SetAlwaysInferResultTypes(b bool) func() {
+	oldVal := c.alwaysInferResultTypes
 	c.alwaysInferResultTypes = b
+	return func() {
+		c.alwaysInferResultTypes = oldVal
+	}
 }
 
 // EnsureConn (re-)establishes the connection to the server.
@@ -285,6 +290,7 @@ func (c *sqlConn) GetServerMetadata(
 	if err != nil {
 		return 0, "", "", err
 	}
+	foundSecondaryTenants := false
 	// We use toString() instead of casting val[0] to string because we
 	// get either a go string or bool depending on the SQL driver in
 	// use.
@@ -300,6 +306,7 @@ func (c *sqlConn) GetServerMetadata(
 			return 0, "", "", err
 		}
 		c.isSystemTenantUnderSecondaryTenants = toString(val[0])[0] == 't'
+		foundSecondaryTenants = c.isSystemTenantUnderSecondaryTenants
 	}
 
 	// Retrieve the node ID and server build info.
@@ -337,6 +344,17 @@ func (c *sqlConn) GetServerMetadata(
 				return 0, "", "", errors.Wrap(err, "incorrect data while retrieving node id")
 			}
 			nodeID = int32(id)
+		case "VirtualClusterName":
+			vcName := row[2]
+			if vcName == catconstants.SystemTenantName {
+				if !foundSecondaryTenants {
+					// Skip setting the virtual cluster name if the current
+					// connection is to the system VC and there are no
+					// application VCs defined.
+					continue
+				}
+			}
+			c.virtualClusterName = vcName
 
 			// Fields for v1.0 compatibility.
 		case "Distribution":
@@ -490,6 +508,7 @@ func (c *sqlConn) GetServerInfo() ServerInfo {
 		ServerExecutableVersion: c.serverBuild,
 		ClusterID:               c.clusterID,
 		Organization:            c.clusterOrganization,
+		VirtualClusterName:      c.virtualClusterName,
 	}
 }
 
@@ -595,20 +614,27 @@ func (c *sqlConn) ExecTxn(
 }
 
 func (c *sqlConn) Exec(ctx context.Context, query string, args ...interface{}) error {
+	_, err := c.ExecWithRowsAffected(ctx, query, args...)
+	return err
+}
+
+func (c *sqlConn) ExecWithRowsAffected(
+	ctx context.Context, query string, args ...interface{},
+) (int64, error) {
 	if err := c.EnsureConn(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	if c.connCtx.Echo {
 		fmt.Fprintln(c.errw, ">", query)
 	}
-	_, err := c.conn.Exec(ctx, query, args...)
+	r, err := c.conn.Exec(ctx, query, args...)
 	c.flushNotices()
 	if c.conn.IsClosed() {
 		c.reconnecting = true
 		c.silentClose()
-		return MarkWithConnectionClosed(err)
+		return r.RowsAffected(), MarkWithConnectionClosed(err)
 	}
-	return err
+	return r.RowsAffected(), err
 }
 
 func (c *sqlConn) Query(ctx context.Context, query string, args ...interface{}) (Rows, error) {
@@ -633,7 +659,7 @@ func (c *sqlConn) Query(ctx context.Context, query string, args ...interface{}) 
 		if err != nil {
 			return nil, err
 		}
-		return &sqlRows{rows: rows, connInfo: c.conn.ConnInfo(), conn: c}, nil
+		return &sqlRows{rows: rows, typeMap: c.conn.TypeMap(), conn: c}, nil
 	}
 
 	// Otherwise, we use pgconn. This allows us to add support for multiple
@@ -645,9 +671,9 @@ func (c *sqlConn) Query(ctx context.Context, query string, args ...interface{}) 
 		return nil, MarkWithConnectionClosed(multiResultReader.Close())
 	}
 	rs := &sqlRowsMultiResultSet{
-		rows:     multiResultReader,
-		connInfo: c.conn.ConnInfo(),
-		conn:     c,
+		rows:    multiResultReader,
+		typeMap: c.conn.TypeMap(),
+		conn:    c,
 	}
 	if _, err := rs.NextResultSet(); err != nil {
 		return nil, err

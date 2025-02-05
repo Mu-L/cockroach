@@ -1,20 +1,13 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobutils
 
 import (
 	"context"
 	gosql "database/sql"
-	"fmt"
-	"sort"
 	"testing"
 	"time"
 
@@ -23,12 +16,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
-	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -68,14 +59,21 @@ func WaitForJobReverting(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobI
 	waitForJobToHaveStatus(t, db, jobID, jobs.StatusReverting)
 }
 
-// InternalSystemJobsBaseQuery runs the query against an empty database string.
-// Since crdb_internal.system_jobs is a virtual table, by default, the query
-// will take a lease on the current database the SQL session is connected to. If
-// this database has been dropped or is unavailable then the query on the
-// virtual table will fail. The "" prefix prevents this lease acquisition.
-var InternalSystemJobsBaseQuery = `
-SELECT status, payload, progress FROM "".crdb_internal.system_jobs WHERE id = $1
-`
+const (
+	// InternalSystemJobsBaseQuery runs the query against an empty database string.
+	// Since crdb_internal.system_jobs is a virtual table, by default, the query
+	// will take a lease on the current database the SQL session is connected to. If
+	// this database has been dropped or is unavailable then the query on the
+	// virtual table will fail. The "" prefix prevents this lease acquisition.
+	//
+	// NB: Until the crdb_internal.system_jobs is turned into a
+	// view structured such that unnecessary joins can be elided,
+	// some users may prefer JobPayloadByIDQuery or
+	// JobPayloadByIDQuery
+	InternalSystemJobsBaseQuery = `SELECT status, payload, progress FROM "".crdb_internal.system_jobs WHERE id = $1`
+	JobProgressByIDQuery        = "SELECT value FROM system.job_info WHERE job_id = $1 AND info_key::string = 'legacy_progress' ORDER BY written DESC LIMIT 1"
+	JobPayloadByIDQuery         = "SELECT value FROM system.job_info WHERE job_id = $1 AND info_key::string = 'legacy_payload' ORDER BY written DESC LIMIT 1"
+)
 
 func waitForJobToHaveStatus(
 	t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID, expectedStatus jobs.Status,
@@ -83,18 +81,13 @@ func waitForJobToHaveStatus(
 	t.Helper()
 	testutils.SucceedsWithin(t, func() error {
 		var status string
-		var payloadBytes []byte
-		query := fmt.Sprintf("SELECT status, payload FROM (%s)", InternalSystemJobsBaseQuery)
-		db.QueryRow(t, query, jobID).Scan(&status, &payloadBytes)
+		db.QueryRow(t, "SELECT status FROM system.jobs WHERE id = $1", jobID).Scan(&status)
 		if jobs.Status(status) == jobs.StatusFailed {
 			if expectedStatus == jobs.StatusFailed {
 				return nil
 			}
-			payload := &jobspb.Payload{}
-			if err := protoutil.Unmarshal(payloadBytes, payload); err == nil {
-				t.Fatalf("job failed: %s", payload.Error)
-			}
-			t.Fatalf("job failed")
+			payload := GetJobPayload(t, db, jobID)
+			t.Fatalf("job failed: %s", payload.Error)
 		}
 		if e, a := expectedStatus, jobs.Status(status); e != a {
 			return errors.Errorf("expected job status %s, but got %s", e, a)
@@ -103,56 +96,18 @@ func waitForJobToHaveStatus(
 	}, 2*time.Minute)
 }
 
-// RunJob runs the provided job control statement, initializing, notifying and
-// closing the chan at the passed pointer (see below for why) and returning the
-// jobID and error result. PAUSE JOB and CANCEL JOB are racy in that it's hard
-// to guarantee that the job is still running when executing a PAUSE or
-// CANCEL--or that the job has even started running. To synchronize, we can
-// install a store response filter which does a blocking receive for one of the
-// responses used by our job (for example, Export for a BACKUP). Later, when we
-// want to guarantee the job is in progress, we do exactly one blocking send.
-// When this send completes, we know the job has started, as we've seen one
-// expected response. We also know the job has not finished, because we're
-// blocking all future responses until we close the channel, and our operation
-// is large enough that it will generate more than one of the expected response.
-func RunJob(
-	t *testing.T,
-	db *sqlutils.SQLRunner,
-	allowProgressIota *chan struct{},
-	ops []string,
-	query string,
-	args ...interface{},
-) (jobspb.JobID, error) {
-	*allowProgressIota = make(chan struct{})
-	errCh := make(chan error)
-	go func() {
-		_, err := db.DB.ExecContext(context.TODO(), query, args...)
-		errCh <- err
-	}()
-	select {
-	case *allowProgressIota <- struct{}{}:
-	case err := <-errCh:
-		return 0, errors.Wrapf(err, "query returned before expected: %s", query)
-	}
-	var jobID jobspb.JobID
-	db.QueryRow(t, `SELECT id FROM system.jobs ORDER BY created DESC LIMIT 1`).Scan(&jobID)
-	for _, op := range ops {
-		db.Exec(t, fmt.Sprintf("%s JOB %d", op, jobID))
-		*allowProgressIota <- struct{}{}
-	}
-	close(*allowProgressIota)
-	return jobID, <-errCh
-}
-
 // BulkOpResponseFilter creates a blocking response filter for the responses
 // related to bulk IO/backup/restore/import: Export, Import and AddSSTable. See
 // discussion on RunJob for where this might be useful.
 func BulkOpResponseFilter(allowProgressIota *chan struct{}) kvserverbase.ReplicaResponseFilter {
-	return func(_ context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
+	return func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 		for _, ru := range br.Responses {
 			switch ru.GetInner().(type) {
 			case *kvpb.ExportResponse, *kvpb.AddSSTableResponse:
-				<-*allowProgressIota
+				select {
+				case <-*allowProgressIota:
+				case <-ctx.Done():
+				}
 			}
 		}
 		return nil
@@ -174,7 +129,6 @@ func verifySystemJob(
 	expected jobs.Record,
 ) error {
 	var actual jobs.Record
-	var rawDescriptorIDs pq.Int64Array
 	var statusString string
 	var runningStatus gosql.NullString
 	var runningStatusString string
@@ -183,12 +137,12 @@ func verifySystemJob(
 	// because job-generating SQL queries (e.g. BACKUP) do not currently return
 	// the job ID.
 	db.QueryRow(t, `
-		SELECT description, user_name, descriptor_ids, status, running_status
+		SELECT description, user_name, status, running_status
 		FROM crdb_internal.jobs WHERE job_type = $1 ORDER BY created LIMIT 1 OFFSET $2`,
 		filterType.String(),
 		offset,
 	).Scan(
-		&actual.Description, &usernameString, &rawDescriptorIDs,
+		&actual.Description, &usernameString,
 		&statusString, &runningStatus,
 	)
 	actual.Username = username.MakeSQLUsernameFromPreNormalizedString(usernameString)
@@ -196,11 +150,7 @@ func verifySystemJob(
 		runningStatusString = runningStatus.String
 	}
 
-	for _, id := range rawDescriptorIDs {
-		actual.DescriptorIDs = append(actual.DescriptorIDs, descpb.ID(id))
-	}
-	sort.Sort(actual.DescriptorIDs)
-	sort.Sort(expected.DescriptorIDs)
+	expected.DescriptorIDs = nil
 	expected.Details = nil
 	if e, a := expected, actual; !assert.Equal(logT{t}, e, a) {
 		return errors.Errorf("job %d did not match:\n%s",
@@ -245,26 +195,17 @@ func VerifySystemJob(
 // GetJobID gets a particular job's ID.
 func GetJobID(t testing.TB, db *sqlutils.SQLRunner, offset int) jobspb.JobID {
 	var jobID jobspb.JobID
-	db.QueryRow(t, `
-	SELECT job_id FROM crdb_internal.jobs ORDER BY created LIMIT 1 OFFSET $1`, offset,
-	).Scan(&jobID)
-	return jobID
-}
-
-// GetLastJobID gets the most recent job's ID.
-func GetLastJobID(t testing.TB, db *sqlutils.SQLRunner) jobspb.JobID {
-	var jobID jobspb.JobID
-	db.QueryRow(
-		t, `SELECT id FROM system.jobs ORDER BY created DESC LIMIT 1`,
+	db.QueryRow(t,
+		"SELECT id FROM system.jobs ORDER BY created LIMIT 1 OFFSET $1", offset,
 	).Scan(&jobID)
 	return jobID
 }
 
 // GetJobProgress loads the Progress message associated with the job.
-func GetJobProgress(t *testing.T, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jobspb.Progress {
+func GetJobProgress(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jobspb.Progress {
 	ret := &jobspb.Progress{}
 	var buf []byte
-	db.QueryRow(t, `SELECT progress FROM crdb_internal.system_jobs WHERE id = $1`, jobID).Scan(&buf)
+	db.QueryRow(t, JobProgressByIDQuery, jobID).Scan(&buf)
 	if err := protoutil.Unmarshal(buf, ret); err != nil {
 		t.Fatal(err)
 	}
@@ -272,11 +213,10 @@ func GetJobProgress(t *testing.T, db *sqlutils.SQLRunner, jobID jobspb.JobID) *j
 }
 
 // GetJobPayload loads the Payload message associated with the job.
-func GetJobPayload(t *testing.T, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jobspb.Payload {
+func GetJobPayload(t testing.TB, db *sqlutils.SQLRunner, jobID jobspb.JobID) *jobspb.Payload {
 	ret := &jobspb.Payload{}
-	query := fmt.Sprintf(`SELECT payload FROM (%s)`, InternalSystemJobsBaseQuery)
 	var buf []byte
-	db.QueryRow(t, query, jobID).Scan(&buf)
+	db.QueryRow(t, JobPayloadByIDQuery, jobID).Scan(&buf)
 	if err := protoutil.Unmarshal(buf, ret); err != nil {
 		t.Fatal(err)
 	}

@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
@@ -59,16 +54,20 @@ func TestDeleteRangeTombstone(t *testing.T) {
 		t.Helper()
 		var localTS hlc.ClockTimestamp
 
-		txn := roachpb.MakeTransaction("test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority, hlc.Timestamp{WallTime: 5e9}, 0, 0)
-		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("b"), hlc.Timestamp{WallTime: 2e9}, roachpb.MakeValueFromString("b2"), storage.MVCCWriteOptions{}))
-		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("c"), hlc.Timestamp{WallTime: 4e9}, roachpb.MakeValueFromString("c4"), storage.MVCCWriteOptions{}))
-		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("d"), hlc.Timestamp{WallTime: 2e9}, roachpb.MakeValueFromString("d2"), storage.MVCCWriteOptions{}))
-		_, err := storage.MVCCDelete(ctx, rw, roachpb.Key("d"), hlc.Timestamp{WallTime: 3e9}, storage.MVCCWriteOptions{})
+		txn := roachpb.MakeTransaction("test", nil /* baseKey */, isolation.Serializable, roachpb.NormalUserPriority, hlc.Timestamp{WallTime: 5e9}, 0, 0, 0, false /* omitInRangefeeds */)
+		_, err := storage.MVCCPut(ctx, rw, roachpb.Key("b"), hlc.Timestamp{WallTime: 2e9}, roachpb.MakeValueFromString("b2"), storage.MVCCWriteOptions{})
 		require.NoError(t, err)
-		require.NoError(t, storage.MVCCPut(ctx, rw, roachpb.Key("i"), hlc.Timestamp{WallTime: 5e9}, roachpb.MakeValueFromString("i5"), storage.MVCCWriteOptions{Txn: &txn}))
-		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("f"), roachpb.Key("h"), hlc.Timestamp{WallTime: 3e9}, localTS, nil, nil, false, 0, nil))
-		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("Z"), roachpb.Key("a"), hlc.Timestamp{WallTime: 100e9}, localTS, nil, nil, false, 0, nil))
-		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("z"), roachpb.Key("|"), hlc.Timestamp{WallTime: 100e9}, localTS, nil, nil, false, 0, nil))
+		_, err = storage.MVCCPut(ctx, rw, roachpb.Key("c"), hlc.Timestamp{WallTime: 4e9}, roachpb.MakeValueFromString("c4"), storage.MVCCWriteOptions{})
+		require.NoError(t, err)
+		_, err = storage.MVCCPut(ctx, rw, roachpb.Key("d"), hlc.Timestamp{WallTime: 2e9}, roachpb.MakeValueFromString("d2"), storage.MVCCWriteOptions{})
+		require.NoError(t, err)
+		_, _, err = storage.MVCCDelete(ctx, rw, roachpb.Key("d"), hlc.Timestamp{WallTime: 3e9}, storage.MVCCWriteOptions{})
+		require.NoError(t, err)
+		_, err = storage.MVCCPut(ctx, rw, roachpb.Key("i"), hlc.Timestamp{WallTime: 5e9}, roachpb.MakeValueFromString("i5"), storage.MVCCWriteOptions{Txn: &txn})
+		require.NoError(t, err)
+		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("f"), roachpb.Key("h"), hlc.Timestamp{WallTime: 3e9}, localTS, nil, nil, false, 0, 0, nil))
+		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("Z"), roachpb.Key("a"), hlc.Timestamp{WallTime: 100e9}, localTS, nil, nil, false, 0, 0, nil))
+		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, rw, nil, roachpb.Key("z"), roachpb.Key("|"), hlc.Timestamp{WallTime: 100e9}, localTS, nil, nil, false, 0, 0, nil))
 	}
 
 	now := hlc.ClockTimestamp{Logical: 9}
@@ -198,10 +197,12 @@ func TestDeleteRangeTombstone(t *testing.T) {
 
 					writeInitialData(t, ctx, engine)
 
+					ts := hlc.Timestamp{WallTime: tc.ts}
 					rangeKey := storage.MVCCRangeKey{
-						StartKey:  roachpb.Key(tc.start),
-						EndKey:    roachpb.Key(tc.end),
-						Timestamp: hlc.Timestamp{WallTime: tc.ts},
+						StartKey:               roachpb.Key(tc.start),
+						EndKey:                 roachpb.Key(tc.end),
+						Timestamp:              ts,
+						EncodedTimestampSuffix: storage.EncodeMVCCTimestampSuffix(ts),
 					}
 
 					// Prepare the request and environment.
@@ -217,8 +218,7 @@ func TestDeleteRangeTombstone(t *testing.T) {
 						Timestamp: rangeKey.Timestamp,
 					}
 					if tc.txn {
-						txn := roachpb.MakeTransaction(
-							"txn", nil, isolation.Serializable, roachpb.NormalUserPriority, rangeKey.Timestamp, 0, 0)
+						txn := roachpb.MakeTransaction("txn", nil, isolation.Serializable, roachpb.NormalUserPriority, rangeKey.Timestamp, 0, 0, 0, false /* omitInRangefeeds */)
 						h.Txn = &txn
 					}
 					var predicates kvpb.DeleteRangePredicates
@@ -255,7 +255,9 @@ func TestDeleteRangeTombstone(t *testing.T) {
 					// bounds.
 					var latchSpans spanset.SpanSet
 					var lockSpans lockspanset.LockSpanSet
-					declareKeysDeleteRange(evalCtx.Desc, &h, req, &latchSpans, &lockSpans, 0)
+					require.NoError(t,
+						declareKeysDeleteRange(evalCtx.Desc, &h, req, &latchSpans, &lockSpans, 0),
+					)
 					batch := spanset.NewBatchAt(engine.NewBatch(), &latchSpans, h.Timestamp)
 					defer batch.Close()
 
@@ -308,7 +310,7 @@ func TestDeleteRangeTombstone(t *testing.T) {
 // operated on. The command should not have written an actual rangekey!
 func checkPredicateDeleteRange(t *testing.T, engine storage.Reader, rKeyInfo storage.MVCCRangeKey) {
 
-	iter, err := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	iter, err := engine.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		LowerBound: rKeyInfo.StartKey,
 		UpperBound: rKeyInfo.EndKey,
@@ -348,7 +350,7 @@ func checkDeleteRangeTombstone(
 	written bool,
 	now hlc.ClockTimestamp,
 ) {
-	iter, err := engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	iter, err := engine.NewMVCCIterator(context.Background(), storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		KeyTypes:   storage.IterKeyTypeRangesOnly,
 		LowerBound: rangeKey.StartKey,
 		UpperBound: rangeKey.EndKey,
@@ -408,7 +410,7 @@ func computeStats(
 	if len(to) == 0 {
 		to = keys.MaxKey
 	}
-	ms, err := storage.ComputeStats(reader, from, to, nowNanos)
+	ms, err := storage.ComputeStats(context.Background(), reader, from, to, nowNanos)
 	require.NoError(t, err)
 	return ms
 }

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -53,7 +48,8 @@ func runTerm(cmd *cobra.Command, args []string) (resErr error) {
 		fmt.Print(welcomeMessage)
 	}
 
-	conn, err := makeSQLClient(catconstants.InternalSQLAppName, useDefaultDb)
+	ctx := context.Background()
+	conn, err := makeSQLClient(ctx, catconstants.InternalSQLAppName, useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -61,5 +57,5 @@ func runTerm(cmd *cobra.Command, args []string) (resErr error) {
 
 	sqlCtx.ShellCtx.CertsDir = baseCfg.SSLCertsDir
 	sqlCtx.ShellCtx.ParseURL = clienturl.MakeURLParserFn(cmd, cliCtx.clientOpts)
-	return sqlCtx.Run(context.Background(), conn)
+	return sqlCtx.Run(ctx, conn)
 }

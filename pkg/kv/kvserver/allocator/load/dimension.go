@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package load
 
@@ -15,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/redact"
 )
 
 // Dimension is a singe dimension of load that a component may track.
@@ -42,13 +38,16 @@ func (d Dimension) String() string {
 	}
 }
 
-// Format returns a formatted string for a value.
-func (d Dimension) Format(value float64) string {
+// SafeValue implements the redact.SafeValue interface.
+func (d Dimension) SafeValue() {}
+
+// format returns a formatted string for a value.
+func (d Dimension) format(value float64) redact.SafeString {
 	switch d {
 	case Queries:
-		return fmt.Sprintf("%.1f", value)
+		return redact.SafeString(fmt.Sprintf("%.1f", value))
 	case CPU:
-		return string(humanizeutil.Duration(time.Duration(int64(value))))
+		return humanizeutil.Duration(time.Duration(int64(value)))
 	default:
 		panic(fmt.Sprintf("cannot format value: unknown dimension with ordinal %d", d))
 	}

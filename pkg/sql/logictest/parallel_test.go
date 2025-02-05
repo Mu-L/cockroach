@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // The parallel_test adds an orchestration layer on top of the logic_test code
 // with the capability of running multiple test data files in parallel.
@@ -88,7 +83,7 @@ func (t *parallelTest) processTestFile(path string, nodeIdx int, db *gosql.DB, c
 
 func (t *parallelTest) getClient(nodeIdx, clientIdx int) *gosql.DB {
 	for len(t.clients[nodeIdx]) <= clientIdx {
-		db := t.cluster.Server(nodeIdx).SQLConn(t, "")
+		db := t.cluster.ApplicationLayer(nodeIdx).SQLConn(t)
 		sqlutils.MakeSQLRunner(db).Exec(t, "SET DATABASE = test")
 		t.clients[nodeIdx] = append(t.clients[nodeIdx], db)
 	}
@@ -177,7 +172,7 @@ func (t *parallelTest) setup(ctx context.Context, spec *parTestSpec) {
 		mode := sessiondatapb.DistSQLOff
 		st := server.ClusterSettings()
 		st.Manual.Store(true)
-		sql.DistSQLClusterExecMode.Override(ctx, &st.SV, int64(mode))
+		sql.DistSQLClusterExecMode.Override(ctx, &st.SV, mode)
 		// Disable automatic stats - they can interfere with the test shutdown.
 		stats.AutomaticStatisticsClusterMode.Override(ctx, &st.SV, false)
 		stats.UseStatisticsOnSystemTables.Override(ctx, &st.SV, false)
@@ -186,7 +181,7 @@ func (t *parallelTest) setup(ctx context.Context, spec *parTestSpec) {
 
 	t.clients = make([][]*gosql.DB, spec.ClusterSize)
 	for i := range t.clients {
-		t.clients[i] = append(t.clients[i], t.cluster.ServerConn(i))
+		t.clients[i] = append(t.clients[i], t.cluster.ApplicationLayer(i).SQLConn(t))
 	}
 	r0 := sqlutils.MakeSQLRunner(t.clients[0][0])
 
@@ -208,7 +203,9 @@ func (t *parallelTest) setup(ctx context.Context, spec *parTestSpec) {
 	// Disable the circuit breakers on this cluster because they can lead to
 	// rare test flakes since the machine is likely to be overloaded when
 	// running TestParallel.
-	r0.Exec(t, `SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '0s'`)
+	sqlutils.MakeSQLRunner(t.cluster.Server(0).SystemLayer().SQLConn(t)).Exec(
+		t, `SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '0s'`,
+	)
 
 	if testing.Verbose() || log.V(1) {
 		log.Infof(t.ctx, "Creating database")
@@ -228,11 +225,7 @@ func TestParallel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	skip.UnderRace(t, "takes >1 min under race")
-	// Note: there is special code in teamcity-trigger/main.go to run this package
-	// with less concurrency in the nightly stress runs. If you see problems
-	// please make adjustments there.
-	// As of 6/4/2019, the logic tests never complete under race.
-	skip.UnderStressRace(t, "logic tests and race detector don't mix: #37993")
+	skip.UnderDeadlock(t, "too slow")
 
 	glob := *paralleltestdata
 	paths, err := filepath.Glob(glob)
@@ -246,6 +239,7 @@ func TestParallel(t *testing.T) {
 	failed := 0
 	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
+			defer log.Scope(t).Close(t)
 			pt := parallelTest{T: t, ctx: context.Background()}
 			pt.run(path)
 			total++

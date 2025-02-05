@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colserde
 
@@ -160,6 +155,7 @@ func (c *ArrowBatchConverter) BatchToArrow(
 			//
 			// dataHeader is the reflect.SliceHeader of the coldata.Vec's
 			// underlying data slice that we are casting to bytes.
+			//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 			var dataHeader *reflect.SliceHeader
 			// datumSize is the size of one datum that we are casting to a byte
 			// slice.
@@ -167,20 +163,24 @@ func (c *ArrowBatchConverter) BatchToArrow(
 			switch f {
 			case types.BoolFamily:
 				bools := vec.Bool()[:n]
+				//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 				dataHeader = (*reflect.SliceHeader)(unsafe.Pointer(&bools))
 				datumSize = 1
 			case types.IntFamily:
 				switch typ.Width() {
 				case 16:
 					ints := vec.Int16()[:n]
+					//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 					dataHeader = (*reflect.SliceHeader)(unsafe.Pointer(&ints))
 					datumSize = memsize.Int16
 				case 32:
 					ints := vec.Int32()[:n]
+					//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 					dataHeader = (*reflect.SliceHeader)(unsafe.Pointer(&ints))
 					datumSize = memsize.Int32
 				case 0, 64:
 					ints := vec.Int64()[:n]
+					//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 					dataHeader = (*reflect.SliceHeader)(unsafe.Pointer(&ints))
 					datumSize = memsize.Int64
 				default:
@@ -188,11 +188,13 @@ func (c *ArrowBatchConverter) BatchToArrow(
 				}
 			case types.FloatFamily:
 				floats := vec.Float64()[:n]
+				//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 				dataHeader = (*reflect.SliceHeader)(unsafe.Pointer(&floats))
 				datumSize = memsize.Float64
 			}
 			// Update values to point to the underlying slices while keeping the
 			// offsetBytes unset.
+			//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 			valuesHeader := (*reflect.SliceHeader)(unsafe.Pointer(&values))
 			valuesHeader.Data = dataHeader.Data
 			valuesHeader.Len = dataHeader.Len * int(datumSize)
@@ -342,7 +344,9 @@ func (c *ArrowBatchConverter) BatchToArrow(
 // the data inside of the int32 offsets slice.
 func unsafeCastOffsetsArray(offsetsInt32 []int32, offsetsBytes *[]byte) {
 	// Cast int32Offsets to []byte.
+	//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 	int32Header := (*reflect.SliceHeader)(unsafe.Pointer(&offsetsInt32))
+	//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 	bytesHeader := (*reflect.SliceHeader)(unsafe.Pointer(offsetsBytes))
 	bytesHeader.Data = int32Header.Data
 	bytesHeader.Len = int32Header.Len * int(memsize.Int32)
@@ -498,8 +502,10 @@ func (c *ArrowBatchConverter) ArrowToBatch(
 				// need to unsafely cast from []byte to []bool.
 				nullsBitmap, bytes := buffers[0].Bytes(), buffers[1].Bytes()
 				vec.Nulls().SetNullBitmap(nullsBitmap, batchLength)
+				//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 				bytesHeader := (*reflect.SliceHeader)(unsafe.Pointer(&bytes))
 				var bools coldata.Bools
+				//lint:ignore SA1019 SliceHeader is deprecated, but no clear replacement
 				boolsHeader := (*reflect.SliceHeader)(unsafe.Pointer(&bools))
 				boolsHeader.Data = bytesHeader.Data
 				boolsHeader.Len = batchLength
@@ -567,11 +573,9 @@ func getValueBytesAndOffsets(
 	return valueBytes, offsets[:batchLength+1]
 }
 
-// Release should be called once the converter is no longer needed so that its
+// Close should be called once the converter is no longer needed so that its
 // memory could be GCed.
-// TODO(yuzefovich): consider renaming this to Close in order to not be confused
-// with execreleasable.Releasable interface.
-func (c *ArrowBatchConverter) Release(ctx context.Context) {
+func (c *ArrowBatchConverter) Close(ctx context.Context) {
 	if c.acc != nil {
 		c.acc.Shrink(ctx, c.accountedFor)
 	}

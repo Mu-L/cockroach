@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keyvisjob
 
@@ -86,6 +81,11 @@ func (r *resumer) OnFailOrCancel(ctx context.Context, _ interface{}, jobErr erro
 			"key visualizer job is not cancelable")
 		log.Infof(ctx, "%v", err)
 	}
+	return nil
+}
+
+// CollectProfile implements the jobs.Resumer interface.
+func (r *resumer) CollectProfile(_ context.Context, _ interface{}) error {
 	return nil
 }
 

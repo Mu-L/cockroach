@@ -20,7 +20,6 @@ go_test(
         "scan_test.go",
         ":gen-token-names",  # keep
     ],
-    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":scanner"],
     deps = [
@@ -44,7 +43,7 @@ genrule(
      awk '{printf("%d: \\"%s\\",\\n", $$4, $$2)}'; \
      echo "}" )> $@
     """,
-    exec_tools = [
+    tools = [
         "//pkg/sql/parser:sql-goyacc",
     ],
     visibility = [

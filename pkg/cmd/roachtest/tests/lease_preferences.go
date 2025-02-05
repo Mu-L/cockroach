@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -19,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -80,10 +76,10 @@ func makeTransferLeasesEventFn(gateway, target int) leasePreferencesEventFn {
 		conn := c.Conn(ctx, t.L(), gateway)
 		defer conn.Close()
 		_, err := conn.ExecContext(ctx, fmt.Sprintf(`
-      ALTER RANGE RELOCATE LEASE TO %d 
-      FOR SELECT range_id 
+      ALTER RANGE RELOCATE LEASE TO %d
+      FOR SELECT range_id
       FROM [SHOW RANGES FROM DATABASE kv WITH DETAILS]
-      WHERE lease_holder <> %d 
+      WHERE lease_holder <> %d
       `,
 			target, target,
 		))
@@ -103,6 +99,8 @@ func registerLeasePreferences(r registry.Registry) {
 		// validation.
 		SkipPostValidations: registry.PostValidationNoDeadNodes,
 		Cluster:             r.MakeClusterSpec(5, spec.CPU(4)),
+		CompatibleClouds:    registry.OnlyGCE,
+		Suites:              registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runLeasePreferences(ctx, t, c, leasePreferencesSpec{
 				preferences:           `[+dc=1],[+dc=2]`,
@@ -110,13 +108,13 @@ func registerLeasePreferences(r registry.Registry) {
 				replFactor:            5,
 				checkNodes:            []int{1, 3, 4, 5},
 				eventFn:               makeStopNodesEventFn(2 /* targets */),
-				waitForLessPreferred:  false,
-				postEventWaitDuration: 10 * time.Minute,
+				waitForLessPreferred:  true,
+				postEventWaitDuration: 5 * time.Minute,
 			})
 		},
 	})
 	r.Add(registry.TestSpec{
-		// NB: This test takes down 2(/2) nodes in the most preferred locality. Th
+		// NB: This test takes down 2(/2) nodes in the most preferred locality. The
 		// leases on the stopped node will be acquired by node's which are not in
 		// the most preferred locality. This test waits until all the leases are on
 		// the secondary preference.
@@ -127,6 +125,8 @@ func registerLeasePreferences(r registry.Registry) {
 		// validation.
 		SkipPostValidations: registry.PostValidationNoDeadNodes,
 		Cluster:             r.MakeClusterSpec(5, spec.CPU(4)),
+		CompatibleClouds:    registry.OnlyGCE,
+		Suites:              registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runLeasePreferences(ctx, t, c, leasePreferencesSpec{
 				preferences:           `[+dc=1],[+dc=2]`,
@@ -135,7 +135,7 @@ func registerLeasePreferences(r registry.Registry) {
 				eventFn:               makeStopNodesEventFn(1, 2 /* targets */),
 				checkNodes:            []int{3, 4, 5},
 				waitForLessPreferred:  false,
-				postEventWaitDuration: 10 * time.Minute,
+				postEventWaitDuration: 5 * time.Minute,
 			})
 		},
 	})
@@ -143,10 +143,12 @@ func registerLeasePreferences(r registry.Registry) {
 		// NB: This test manually transfers leases onto [+dc=3], which violates the
 		// lease preferences. This test then waits until all the leases are back on
 		// the most preferred locality.
-		Name:    "lease-preferences/manual-violating-transfer",
-		Owner:   registry.OwnerKV,
-		Timeout: 30 * time.Minute,
-		Cluster: r.MakeClusterSpec(5, spec.CPU(4)),
+		Name:             "lease-preferences/manual-violating-transfer",
+		Owner:            registry.OwnerKV,
+		Timeout:          30 * time.Minute,
+		Cluster:          r.MakeClusterSpec(5, spec.CPU(4)),
+		CompatibleClouds: registry.OnlyGCE,
+		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runLeasePreferences(ctx, t, c, leasePreferencesSpec{
 				preferences: `[+dc=1],[+dc=2]`,
@@ -155,8 +157,8 @@ func registerLeasePreferences(r registry.Registry) {
 				eventFn: makeTransferLeasesEventFn(
 					5 /* gateway */, 5 /* target */),
 				checkNodes:            []int{1, 2, 3, 4, 5},
-				waitForLessPreferred:  false,
-				postEventWaitDuration: 10 * time.Minute,
+				waitForLessPreferred:  true,
+				postEventWaitDuration: 5 * time.Minute,
 			})
 		},
 	})
@@ -195,7 +197,7 @@ func runLeasePreferences(
 				// ...
 				// dc=N: n2N-1 n2N
 				fmt.Sprintf("--locality=region=fake-region,zone=fake-zone,dc=%d", (node-1)/2+1),
-				"--vmodule=replica_proposal=2,replicate_queue=3,replicate=3")
+				"--vmodule=replica_proposal=2,lease_queue=3,lease=3")
 			c.Start(ctx, t.L(), opts, settings, c.Node(node))
 
 		}
@@ -207,25 +209,11 @@ func runLeasePreferences(
 		spec.ranges = 100
 	}
 
-	c.Put(ctx, t.Cockroach(), "./cockroach")
 	t.Status("starting cluster")
 	startNodes(allNodes...)
 
 	conn := c.Conn(ctx, t.L(), numNodes)
 	defer conn.Close()
-
-	setLeasePreferences := func(ctx context.Context, preferences string) {
-		_, err := conn.ExecContext(ctx, fmt.Sprintf(
-			`ALTER database kv CONFIGURE ZONE USING 
-        num_replicas = %d, 
-        num_voters = %d,
-        voter_constraints='[]',
-        lease_preferences='[%s]'
-      `,
-			spec.replFactor, spec.replFactor, spec.preferences,
-		))
-		require.NoError(t, err)
-	}
 
 	checkLeasePreferenceConformance := func(ctx context.Context) {
 		result, err := waitForLeasePreferences(
@@ -250,24 +238,27 @@ func runLeasePreferences(
 	// Wait for the existing ranges (not kv) to be up-replicated. That way,
 	// creating the splits and waiting for up-replication on kv will be much
 	// quicker.
-	require.NoError(t, WaitForReplication(ctx, t, conn, spec.replFactor))
-	c.Run(ctx, c.Node(numNodes), fmt.Sprintf(
+	require.NoError(t, roachtestutil.WaitForReplication(ctx, t.L(), conn, spec.replFactor, roachtestutil.AtLeastReplicationFactor))
+	c.Run(ctx, option.WithNodes(c.Node(numNodes)), fmt.Sprintf(
 		`./cockroach workload init kv --scatter --splits %d {pgurl:%d}`,
 		spec.ranges, numNodes))
 	// Wait for under-replicated ranges before checking lease preference
 	// enforcement.
-	require.NoError(t, WaitForReplication(ctx, t, conn, spec.replFactor))
+	require.NoError(t, roachtestutil.WaitForReplication(ctx, t.L(), conn, spec.replFactor, roachtestutil.AtLeastReplicationFactor))
 
 	// Set a lease preference for the liveness range, to be on n5. This test
 	// would occasionally fail due to the liveness heartbeat failures, when the
 	// liveness lease is on a stopped node. This is not ideal behavior, #108512.
 	configureZone(t, ctx, conn, "RANGE liveness", zoneConfig{
-		replicas:  spec.replFactor,
-		leaseNode: 5,
+		replicas:        spec.replFactor,
+		leasePreference: "[+node5]",
 	})
 
 	t.L().Printf("setting lease preferences: %s", spec.preferences)
-	setLeasePreferences(ctx, spec.preferences)
+	configureZone(t, ctx, conn, "DATABASE kv", zoneConfig{
+		replicas:        spec.replFactor,
+		leasePreference: spec.preferences,
+	})
 	t.L().Printf("waiting for initial lease preference conformance")
 	checkLeasePreferenceConformance(ctx)
 
@@ -371,11 +362,12 @@ func waitForLeasePreferences(
 	var ret leasePreferencesResult
 	ret.nodes = nodes
 	start := timeutil.Now()
+	maxWaitC := time.After(maxWaitDuration)
 	for {
 		select {
 		case <-ctx.Done():
 			return ret, ctx.Err()
-		case <-time.After(maxWaitDuration):
+		case <-maxWaitC:
 			return ret, errors.Errorf("timed out before lease preferences satisfied")
 		case <-checkTimer.C:
 			checkTimer.Read = true

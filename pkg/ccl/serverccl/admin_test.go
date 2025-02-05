@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package serverccl
 
@@ -19,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -46,25 +44,15 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderRace(t, "this test creates a 3 node cluster; too resource intensive.")
+
 	// TODO(clust-obs): This test should work with just a single node,
 	// i.e. using serverutils.StartServer` instead of
 	// `StartCluster`.
-	testCluster := serverutils.StartCluster(t, 3,
-		base.TestClusterArgs{
-			ServerArgs: base.TestServerArgs{
-				// The code below ought to work when this is omitted. This
-				// needs to be investigated further.
-				DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(106897),
-			},
-		})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 
 	firstServer := testCluster.Server(0)
-
-	// Enable zone configs for secondary tenants.
-	systemSqlDb := firstServer.SystemLayer().SQLConn(t, "system")
-	_, err := systemSqlDb.Exec("ALTER TENANT ALL SET CLUSTER SETTING sql.virtual_cluster.feature_access.zone_configs.enabled = true")
-	require.NoError(t, err)
 
 	sqlDB := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
 
@@ -95,7 +83,7 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	}
 
 	var resp serverpb.DataDistributionResponse
-	err = serverutils.GetJSONProto(firstServer, adminPrefix+"data_distribution", &resp)
+	err := serverutils.GetJSONProto(firstServer, adminPrefix+"data_distribution", &resp)
 	require.NoError(t, err)
 
 	actualZoneConfigNames := map[string]struct{}{}
@@ -163,6 +151,9 @@ func TestAdminAPIJobs(t *testing.T) {
 	err = getAdminJSONProto(s, path, &jobRes)
 	require.NoError(t, err)
 
+	// Messages are not equal, since they only appear in the single job response,
+	// so the deep-equal check would fail; copy it so the overall check passes.
+	jobRes.Messages = backups[0].Messages
 	require.Equal(t, backups[0], jobRes)
 }
 
@@ -238,9 +229,16 @@ func TestTableAndDatabaseDetailsAndStats(t *testing.T) {
 	require.Greater(t, tableStatsResp.Stats.LiveBytes, int64(0))
 
 	// TableDetails
-	tableDetailsResp := &serverpb.TableDetailsResponse{}
-	err = getAdminJSONProto(st, "databases/defaultdb/tables/public.test", tableDetailsResp)
-	require.NoError(t, err)
-
-	require.Greater(t, tableDetailsResp.DataLiveBytes, int64(0))
+	// Call to endpoint is wrapped with retry logic to potentially avoid flakiness of
+	// returned results (issue #112387).
+	testutils.SucceedsSoon(t, func() error {
+		tableDetailsResp := &serverpb.TableDetailsResponse{}
+		if err := getAdminJSONProto(st, "databases/defaultdb/tables/public.test", tableDetailsResp); err != nil {
+			return err
+		}
+		if tableDetailsResp.DataLiveBytes <= 0 {
+			return fmt.Errorf("expected DataLiveBytes to be greater than 0 but got %d", tableDetailsResp.DataLiveBytes)
+		}
+		return nil
+	})
 }

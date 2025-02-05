@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package serverpb
 
@@ -46,6 +41,10 @@ type SQLStatusServer interface {
 	LogFile(context.Context, *LogFileRequest) (*LogEntriesResponse, error)
 	Logs(context.Context, *LogsRequest) (*LogEntriesResponse, error)
 	NodesUI(context.Context, *NodesRequest) (*NodesResponseExternal, error)
+	RequestJobProfilerExecutionDetails(context.Context, *RequestJobProfilerExecutionDetailsRequest) (*RequestJobProfilerExecutionDetailsResponse, error)
+	TenantServiceStatus(context.Context, *TenantServiceStatusRequest) (*TenantServiceStatusResponse, error)
+	UpdateTableMetadataCache(context.Context, *UpdateTableMetadataCacheRequest) (*UpdateTableMetadataCacheResponse, error)
+	GetUpdateTableMetadataCacheSignal() chan struct{}
 }
 
 // OptionalNodesStatusServer is a StatusServer that is only optionally present
@@ -79,6 +78,7 @@ type NodesStatusServer interface {
 //
 // It is available for all tenants.
 type TenantStatusServer interface {
+	Ranges(context.Context, *RangesRequest) (*RangesResponse, error)
 	TenantRanges(context.Context, *TenantRangesRequest) (*TenantRangesResponse, error)
 	Regions(context.Context, *RegionsRequest) (*RegionsResponse, error)
 	HotRangesV2(context.Context, *HotRangesRequest) (*HotRangesResponseV2, error)
@@ -86,15 +86,18 @@ type TenantStatusServer interface {
 	// SpanStats is used to access MVCC stats from KV
 	SpanStats(context.Context, *roachpb.SpanStatsRequest) (*roachpb.SpanStatsResponse, error)
 	Nodes(context.Context, *NodesRequest) (*NodesResponse, error)
+	// TODO(adityamaru): DownloadSpan has the side effect of telling the engine to
+	// download remote files. A method that mutates state should not be on the
+	// status server and so in the long run we should move it.
+	DownloadSpan(ctx context.Context, request *DownloadSpanRequest) (*DownloadSpanResponse, error)
+	NetworkConnectivity(context.Context, *NetworkConnectivityRequest) (*NetworkConnectivityResponse, error)
 }
 
 // OptionalNodesStatusServer returns the wrapped NodesStatusServer, if it is
 // available. If it is not, an error referring to the optionally supplied issues
 // is returned.
-func (s *OptionalNodesStatusServer) OptionalNodesStatusServer(
-	issue int,
-) (NodesStatusServer, error) {
-	v, err := s.w.OptionalErr(issue)
+func (s *OptionalNodesStatusServer) OptionalNodesStatusServer() (NodesStatusServer, error) {
+	v, err := s.w.OptionalErr(errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
 	if err != nil {
 		return nil, err
 	}

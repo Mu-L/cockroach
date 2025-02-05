@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlstatsutil
 
@@ -36,7 +31,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	t.Run("statement_statistics", func(t *testing.T) {
-		data := genRandomData()
+		data := GenRandomData()
 		input := appstatspb.CollectedStatementStatistics{}
 
 		expectedMetadataStrTemplate := `
@@ -46,7 +41,6 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
   "querySummary": "{{.String}}",
   "db":           "{{.String}}",
   "distsql": {{.Bool}},
-  "failed":  {{.Bool}},
   "implicitTxn": {{.Bool}},
   "vec":         {{.Bool}},
   "fullScan":    {{.Bool}}
@@ -58,6 +52,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
        "statistics": {
          "cnt": {{.Int64}},
          "firstAttemptCnt": {{.Int64}},
+         "failureCount":    {{.Int64}},
          "maxRetries":      {{.Int64}},
          "lastExecAt":      "{{stringifyTime .Time}}",
          "numRows": {
@@ -101,15 +96,14 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
            "sqDiff": {{.Float}}
          },
          "nodes": [{{joinInts .IntArray}}],
+         "kvNodeIds": [{{joinInt32s .Int32Array}}],
          "regions": [{{joinStrings .StringArray}}],
+         "usedFollowerRead": {{.Bool}},
          "planGists": [{{joinStrings .StringArray}}],
          "indexes": [{{joinStrings .StringArray}}],
          "latencyInfo": {
            "min": {{.Float}},
-           "max": {{.Float}},
-           "p50": {{.Float}},
-           "p90": {{.Float}},
-           "p99": {{.Float}}
+           "max": {{.Float}}
          },
          "lastErrorCode": "{{.String}}"
        },
@@ -200,7 +194,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 
 		expectedMetadataStr := fillTemplate(t, expectedMetadataStrTemplate, data)
 		expectedStatisticsStr := fillTemplate(t, expectedStatisticsStrTemplate, data)
-		fillObject(t, reflect.ValueOf(&input), &data)
+		FillObject(t, reflect.ValueOf(&input), &data)
 
 		actualMetadataJSON, err := BuildStmtMetadataJSON(&input)
 		require.NoError(t, err)
@@ -218,6 +212,10 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 		// Strip the monononic part of timestamps, as it doesn't roundtrip. UTC()
 		// has that stripping side-effect.
 		input.Stats.LastExecTimestamp = input.Stats.LastExecTimestamp.UTC()
+		// We are no longer setting the latency percentiles.
+		input.Stats.LatencyInfo.P50 = 0
+		input.Stats.LatencyInfo.P90 = 0
+		input.Stats.LatencyInfo.P99 = 0
 
 		err = DecodeStmtStatsStatisticsJSON(actualStatisticsJSON, &actualJSONUnmarshalled.Stats)
 		require.NoError(t, err)
@@ -228,7 +226,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 	// new parameter, so this test is to confirm that all other parameters will be set and
 	// the new one will be empty, without breaking the decoding process.
 	t.Run("statement_statistics with new parameter", func(t *testing.T) {
-		data := genRandomData()
+		data := GenRandomData()
 		expectedStatistics := appstatspb.CollectedStatementStatistics{}
 
 		expectedMetadataStrTemplate := `
@@ -288,13 +286,12 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
            "sqDiff": {{.Float}}
          },
          "nodes": [{{joinInts .IntArray}}],
+         "kvNodeIds": [{{joinInt32s .Int32Array}}],
+         "usedFollowerRead": {{.Bool}},
          "planGists": [{{joinStrings .StringArray}}],
          "latencyInfo": {
            "min": {{.Float}},
-           "max": {{.Float}},
-           "p50": {{.Float}},
-           "p90": {{.Float}},
-           "p99": {{.Float}},
+           "max": {{.Float}}
          },
          "errorCode": "{{.String}}"
        },
@@ -385,7 +382,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 
 		fillTemplate(t, expectedMetadataStrTemplate, data)
 		fillTemplate(t, expectedStatisticsStrTemplate, data)
-		fillObject(t, reflect.ValueOf(&expectedStatistics), &data)
+		FillObject(t, reflect.ValueOf(&expectedStatistics), &data)
 
 		actualMetadataJSON, err := BuildStmtMetadataJSON(&expectedStatistics)
 		require.NoError(t, err)
@@ -405,6 +402,10 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 		// Strip the monononic part of timestamps, as it doesn't roundtrip. UTC()
 		// has that stripping side-effect.
 		expectedStatistics.Stats.LastExecTimestamp = expectedStatistics.Stats.LastExecTimestamp.UTC()
+		// We no longer set the percentile latencies.
+		expectedStatistics.Stats.LatencyInfo.P50 = 0
+		expectedStatistics.Stats.LatencyInfo.P90 = 0
+		expectedStatistics.Stats.LatencyInfo.P99 = 0
 
 		err = DecodeStmtStatsStatisticsJSON(actualStatisticsJSON, &actualJSONUnmarshalled.Stats)
 		require.NoError(t, err)
@@ -412,7 +413,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 	})
 
 	t.Run("transaction_statistics", func(t *testing.T) {
-		data := genRandomData()
+		data := GenRandomData()
 
 		input := appstatspb.CollectedTransactionStatistics{
 			StatementFingerprintIDs: []appstatspb.StmtFingerprintID{
@@ -552,7 +553,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 }
 		 `
 		expectedStatisticsStr := fillTemplate(t, expectedStatisticsStrTemplate, data)
-		fillObject(t, reflect.ValueOf(&input), &data)
+		FillObject(t, reflect.ValueOf(&input), &data)
 
 		actualMetadataJSON, err := BuildTxnMetadataJSON(&input)
 		require.NoError(t, err)
@@ -574,7 +575,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 	})
 
 	t.Run("statement aggregated metadata", func(t *testing.T) {
-		data := genRandomData()
+		data := GenRandomData()
 
 		input := appstatspb.AggregatedStatementMetadata{}
 
@@ -586,7 +587,6 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
   "querySummary": "{{.String}}",
   "implicitTxn": {{.Bool}},
   "distSQLCount": {{.Int64}},
-  "failedCount": {{.Int64}},
   "vecCount": {{.Int64}},
   "fullScanCount": {{.Int64}},
   "totalCount": {{.Int64}},
@@ -596,7 +596,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 }
 		 `
 		expectedAggregatedMetadataStr := fillTemplate(t, expectedAggregatedMetadataStrTemplate, data)
-		fillObject(t, reflect.ValueOf(&input), &data)
+		FillObject(t, reflect.ValueOf(&input), &data)
 
 		actualMetadataJSON, err := BuildStmtDetailsMetadataJSON(&input)
 		require.NoError(t, err)
@@ -607,6 +607,15 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 		err = DecodeAggregatedMetadataJSON(actualMetadataJSON, &actualJSONUnmarshalled)
 		require.NoError(t, err)
 		require.Equal(t, input, actualJSONUnmarshalled)
+	})
+
+	t.Run("random metadata JSON structure and values", func(t *testing.T) {
+		input := `{"HcEN0pht": null, "bar": [false, "foobar", true], "c": {"8r8qmK": 1.4687388461922657, "vbF3TH0I": null, "yNNmkGr6": 2.0887609844362762}, "db": {"KKDmambo": 0.10124464952424544}, "foobar": {"LM8G": {"zniUw24Z": 0.14422951431111297}, "bar": "lp7jfTq2"}, "r0O": false}`
+		value, err := json.ParseJSON(input)
+		require.NoError(t, err)
+		var actualJSONUnmarshalled appstatspb.AggregatedStatementMetadata
+		err = DecodeAggregatedMetadataJSON(value, &actualJSONUnmarshalled)
+		require.NoError(t, err)
 	})
 }
 

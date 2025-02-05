@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+# Copyright 2022 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 #
 # This script is run by the Pebble Nightly Metamorphic Race - TeamCity build
 # configuration.
@@ -16,7 +22,7 @@ mkdir -p artifacts
 # against the tip of the 'master' branch. We do this by `go get`ting the
 # latest version of the module, and then running `mirror` to update `DEPS.bzl`
 # accordingly.
-bazel run @go_sdk//:bin/go get github.com/cockroachdb/pebble@latest
+bazel run @go_sdk//:bin/go get github.com/cockroachdb/pebble@master
 # Just dump the diff to see what, if anything, has changed.
 git diff
 NEW_DEPS_BZL_CONTENT=$(bazel run //pkg/cmd/mirror/go:mirror)

@@ -16,8 +16,7 @@ write *eventpb.CreateFunction to event log:
   functionName: defaultdb.public.t
   sql:
     descriptorId: 105
-    statement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS INT8\n\tLANGUAGE
-      SQL\n\tAS $$SELECT ‹1›;$$"
+    statement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
     tag: CREATE FUNCTION
     user: root
 ## StatementPhase stage 1 of 1 with 11 MutationType ops
@@ -44,7 +43,7 @@ upsert descriptor #105
   +    - privileges: "2"
   +      userProto: root
   +      withGrantOption: "2"
-  +    version: 2
+  +    version: 3
   +  returnType:
   +    type:
   +      family: IntFamily
@@ -67,7 +66,7 @@ upsert descriptor #101
      modificationTime: {}
   ...
          withGrantOption: "2"
-       version: 2
+       version: 3
   -  version: "1"
   +  version: "2"
 checking for feature: CREATE INDEX
@@ -109,6 +108,7 @@ upsert descriptor #104
   +      sharded: {}
   +      storeColumnNames: []
   +      unique: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: BACKFILLING
@@ -134,6 +134,7 @@ upsert descriptor #104
   +      storeColumnNames: []
   +      unique: true
   +      useDeletePreservingEncoding: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: DELETE_ONLY
@@ -170,10 +171,8 @@ upsert descriptor #105
   +      name: t
   +    relevantStatements:
   +    - statement:
-  +        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
-  +          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
-  +        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
-  +          1 $$"
+  +        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
+  +        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT 1 $$"
   +        statementTag: CREATE FUNCTION
   +    revertible: true
   +    targetRanks: <redacted>
@@ -198,7 +197,7 @@ upsert descriptor #105
   +    - privileges: "2"
   +      userProto: root
   +      withGrantOption: "2"
-  +    version: 2
+  +    version: 3
   +  returnType:
   +    type:
   +      family: IntFamily
@@ -222,7 +221,7 @@ upsert descriptor #101
      modificationTime: {}
   ...
          withGrantOption: "2"
-       version: 2
+       version: 3
   -  version: "1"
   +  version: "2"
 upsert descriptor #104
@@ -238,6 +237,8 @@ upsert descriptor #104
   +      columns:
   +        "1": a
   +        "2": b
+  +        "4294967292": crdb_internal_origin_timestamp
+  +        "4294967293": crdb_internal_origin_id
   +        "4294967294": tableoid
   +        "4294967295": crdb_internal_mvcc_timestamp
   +      families:
@@ -249,10 +250,8 @@ upsert descriptor #104
   +      name: t
   +    relevantStatements:
   +    - statement:
-  +        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
-  +          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
-  +        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
-  +          1 $$"
+  +        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
+  +        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT 1 $$"
   +        statementTag: CREATE FUNCTION
   +    - statement:
   +        redactedStatement: CREATE UNIQUE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹b›)
@@ -290,6 +289,7 @@ upsert descriptor #104
   +      sharded: {}
   +      storeColumnNames: []
   +      unique: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: BACKFILLING
@@ -315,6 +315,7 @@ upsert descriptor #104
   +      storeColumnNames: []
   +      unique: true
   +      useDeletePreservingEncoding: true
+  +      vecConfig: {}
   +      version: 4
   +    mutationId: 1
   +    state: DELETE_ONLY
@@ -477,6 +478,8 @@ upsert descriptor #104
   -      columns:
   -        "1": a
   -        "2": b
+  -        "4294967292": crdb_internal_origin_timestamp
+  -        "4294967293": crdb_internal_origin_id
   -        "4294967294": tableoid
   -        "4294967295": crdb_internal_mvcc_timestamp
   -      families:
@@ -488,10 +491,8 @@ upsert descriptor #104
   -      name: t
   -    relevantStatements:
   -    - statement:
-  -        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
-  -          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
-  -        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
-  -          1 $$"
+  -        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
+  -        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT 1 $$"
   -        statementTag: CREATE FUNCTION
   -    - statement:
   -        redactedStatement: CREATE UNIQUE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹b›)
@@ -527,6 +528,7 @@ upsert descriptor #104
   +    sharded: {}
   +    storeColumnNames: []
   +    unique: true
+  +    vecConfig: {}
   +    version: 4
      modificationTime: {}
   -  mutations:
@@ -552,6 +554,7 @@ upsert descriptor #104
   -      sharded: {}
   -      storeColumnNames: []
   -      unique: true
+  -      vecConfig: {}
   -      version: 4
   -    mutationId: 1
   -    state: WRITE_ONLY
@@ -577,6 +580,7 @@ upsert descriptor #104
   -      storeColumnNames: []
   -      unique: true
   -      useDeletePreservingEncoding: true
+  -      vecConfig: {}
   -      version: 4
   -    mutationId: 1
   -    state: DELETE_ONLY
@@ -600,10 +604,8 @@ upsert descriptor #105
   -      name: t
   -    relevantStatements:
   -    - statement:
-  -        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
-  -          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
-  -        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
-  -          1 $$"
+  -        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
+  -        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT 1 $$"
   -        statementTag: CREATE FUNCTION
   -    revertible: true
   -    targetRanks: <redacted>

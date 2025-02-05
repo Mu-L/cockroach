@@ -1,16 +1,13 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package multitenant
 
 import (
+	"time"
+
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 )
@@ -30,13 +27,12 @@ var DefaultTenantSelect = settings.RegisterStringSetting(
 	settings.WithName(DefaultClusterSelectSettingName),
 )
 
-// VerifyTenantService determines whether there should be an advisory
-// interlock between changes to the tenant service and changes to the
-// above cluster setting.
-var VerifyTenantService = settings.RegisterBoolSetting(
+// WaitForClusterStartTimeout is the amount of time the tenant
+// controller will wait for the default virtual cluster to have an
+// active SQL server.
+var WaitForClusterStartTimeout = settings.RegisterDurationSetting(
 	settings.SystemOnly,
-	"server.controller.default_tenant.check_service.enabled",
-	"verify that the service mode is coherently set with the value of "+DefaultClusterSelectSettingName,
-	true,
-	settings.WithName(DefaultClusterSelectSettingName+".check_service.enabled"),
+	"server.controller.mux_virtual_cluster_wait.timeout",
+	"amount of time to wait for a default virtual cluster to become available when serving SQL connections (0 to disable)",
+	10*time.Second,
 )

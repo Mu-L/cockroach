@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgtest
 
@@ -243,6 +238,13 @@ func (p *PGTest) Until(
 			return nil, err
 		}
 		msg := x.Interface().(pgproto3.BackendMessage)
+		if notice, ok := msg.(*pgproto3.NoticeResponse); ok {
+			// The line number can change frequently, so to reduce churn, we always
+			// ignore it.
+			notice.Line = 0
+			msgs = append(msgs, notice)
+			continue
+		}
 		msgs = append(msgs, msg)
 	}
 	return msgs, nil

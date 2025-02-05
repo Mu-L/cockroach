@@ -1,28 +1,24 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package bulk
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 )
 
 // TracingAggregatorEvent describes an event that can be aggregated and stored by the
 // TracingAggregator. A TracingAggregatorEvent also implements the tracing.LazyTag interface
 // to render its information on the associated tracing span.
 type TracingAggregatorEvent interface {
-	tracing.LazyTag
-
 	// Identity returns a TracingAggregatorEvent that when combined with another
 	// event returns the other TracingAggregatorEvent unchanged.
 	Identity() TracingAggregatorEvent
@@ -38,8 +34,6 @@ type TracingAggregatorEvent interface {
 // A TracingAggregator can be used to aggregate and render AggregatorEvents that
 // are emitted as part of its tracing spans' recording.
 type TracingAggregator struct {
-	// sp is the tracing span managed by the TracingAggregator.
-	sp *tracing.Span
 	mu struct {
 		syncutil.Mutex
 		// aggregatedEvents is a mapping from the name identifying the
@@ -77,38 +71,39 @@ func (b *TracingAggregator) Notify(event tracing.Structured) tracing.EventConsum
 	eventName := bulkEvent.ProtoName()
 	if _, ok := b.mu.aggregatedEvents[bulkEvent.ProtoName()]; !ok {
 		b.mu.aggregatedEvents[eventName] = bulkEvent.Identity()
-		b.sp.SetLazyTagLocked(eventName, b.mu.aggregatedEvents[eventName])
 	}
 	b.mu.aggregatedEvents[eventName].Combine(bulkEvent)
 	return tracing.EventNotConsumed
 }
 
-// Close is responsible for finishing the TracingAggregator's tracing span.
-//
-// NOTE: it must be called exactly once.
-func (b *TracingAggregator) Close() {
-	b.sp.Finish()
+// TracingAggregatorEventToBytes marshals an event into a byte slice.
+func TracingAggregatorEventToBytes(
+	_ context.Context, event TracingAggregatorEvent,
+) ([]byte, error) {
+	msg, ok := event.(protoutil.Message)
+	if !ok {
+		// This should never happen but if it does skip the aggregated event.
+		return nil, errors.Newf("event is not a protoutil.Message: %T", event)
+	}
+	data := make([]byte, msg.Size())
+	if _, err := msg.MarshalTo(data); err != nil {
+		// This should never happen but if it does skip the aggregated event.
+		return nil, errors.Newf("event is not a protoutil.Message: %T", event)
+	}
+
+	return data, nil
 }
 
 var _ tracing.EventListener = &TracingAggregator{}
 
-// MakeTracingAggregatorWithSpan returns an instance of an TracingAggregator along with a
-// newly created child context. The TracingAggregator is registered as a
-// tracing.EventListener on the span associated with newly created context.
-//
-// The TracingAggregator instance is responsible for finishing the returned span, and
-// so the user must call Close().
-func MakeTracingAggregatorWithSpan(
-	ctx context.Context, aggregatorName string, tracer *tracing.Tracer,
-) (context.Context, *TracingAggregator) {
+// TracingAggregatorForContext creates a TracingAggregator if the provided
+// context has a tracing span.
+func TracingAggregatorForContext(ctx context.Context) *TracingAggregator {
+	if tracing.SpanFromContext(ctx) == nil {
+		log.Warning(ctx, "tracing aggregator cannot be created without a tracing span")
+		return nil
+	}
 	agg := &TracingAggregator{}
-	aggCtx, aggSpan := tracing.EnsureChildSpan(ctx, tracer, aggregatorName,
-		tracing.WithEventListeners(agg))
-
-	agg.mu.Lock()
-	defer agg.mu.Unlock()
 	agg.mu.aggregatedEvents = make(map[string]TracingAggregatorEvent)
-	agg.sp = aggSpan
-
-	return aggCtx, agg
+	return agg
 }

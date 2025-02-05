@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tabledesc_test
 
@@ -19,10 +14,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
@@ -33,20 +27,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
 func TestIndexInterface(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// This server is only used to turn a CREATE TABLE statement into a
 	// catalog.TableDescriptor.
-	s, conn, db := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, conn, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 	if _, err := conn.Exec(`CREATE DATABASE d`); err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -59,17 +58,19 @@ func TestIndexInterface(t *testing.T) {
 			c5 VARCHAR,
 			c6 JSONB,
 			c7 GEOGRAPHY(GEOMETRY,4326) NULL,
+			c8 VECTOR(3),
 			CONSTRAINT pk PRIMARY KEY (c1 ASC, c2 ASC, c3 ASC),
 			INDEX s1 (c4 DESC, c5 DESC),
 			INVERTED INDEX s2 (c6),
 			INDEX s3 (c2, c3) STORING (c5, c6),
 			INDEX s4 (c5) USING HASH WITH (bucket_count=8),
 			UNIQUE INDEX s5 (c1, c4) WHERE c4 = 'x',
-			INVERTED INDEX s6 (c7) WITH (s2_level_mod=2)
+			INVERTED INDEX s6 (c7) WITH (s2_level_mod=2),
+			VECTOR INDEX s7 (c8)
 		);
 	`)
 
-	indexNames := []string{"pk", "s1", "s2", "s3", "s4", "s5", "s6"}
+	indexNames := []string{"pk", "s1", "s2", "s3", "s4", "s5", "s6", "s7"}
 	indexColumns := [][]string{
 		{"c1", "c2", "c3"},
 		{"c4", "c5"},
@@ -78,6 +79,7 @@ func TestIndexInterface(t *testing.T) {
 		{"crdb_internal_c5_shard_8", "c5"},
 		{"c1", "c4"},
 		{"c7"},
+		{"c8"},
 	}
 	extraColumnsAsPkColOrdinals := [][]int{
 		{},
@@ -87,9 +89,10 @@ func TestIndexInterface(t *testing.T) {
 		{0, 1, 2},
 		{1, 2},
 		{0, 1, 2},
+		{0, 1, 2},
 	}
 
-	immutable := desctestutils.TestingGetPublicTableDescriptor(db, keys.SystemSQLCodec, "d", "t")
+	immutable := desctestutils.TestingGetPublicTableDescriptor(db, s.Codec(), "d", "t")
 	require.NotNil(t, immutable)
 	var tableI = immutable
 	require.NotNil(t, tableI)
@@ -112,6 +115,7 @@ func TestIndexInterface(t *testing.T) {
 	s4 := indexes[4]
 	s5 := indexes[5]
 	s6 := indexes[6]
+	s7 := indexes[7]
 
 	// Check that GetPrimaryIndex returns the primary index.
 	require.Equal(t, pk, tableI.GetPrimaryIndex())
@@ -267,6 +271,7 @@ func TestIndexInterface(t *testing.T) {
 	require.Equal(t, "c4 = 'x':::STRING", s5.GetPredicate())
 	require.Equal(t, "crdb_internal_c5_shard_8", s4.GetShardColumnName())
 	require.Equal(t, int32(2), s6.GetGeoConfig().S2Geography.S2Config.LevelMod)
+	require.Equal(t, int32(3), s7.GetVecConfig().Dims)
 	for _, idx := range indexes {
 		require.Equalf(t, idx == s5, idx.IsPartial(),
 			errMsgFmt, "IsPartial", idx.GetName())
@@ -274,11 +279,11 @@ func TestIndexInterface(t *testing.T) {
 			errMsgFmt, "GetPredicate", idx.GetName())
 		require.Equal(t, idx == s5 || idx == pk, idx.IsUnique(),
 			errMsgFmt, "IsUnique", idx.GetName())
-		require.Equal(t, idx == s2 || idx == s6, idx.GetType() == descpb.IndexDescriptor_INVERTED,
+		require.Equal(t, idx == s2 || idx == s6, idx.GetType() == idxtype.INVERTED,
 			errMsgFmt, "GetType", idx.GetName())
 		require.Equal(t, idx == s4, idx.IsSharded(),
 			errMsgFmt, "IsSharded", idx.GetName())
-		require.Equal(t, idx == s6, !(&geoindex.Config{}).Equal(idx.GetGeoConfig()),
+		require.Equal(t, idx == s6, !(&geopb.Config{}).Equal(idx.GetGeoConfig()),
 			errMsgFmt, "GetGeoConfig", idx.GetName())
 		require.Equal(t, idx == s4, idx.GetShardColumnName() != "",
 			errMsgFmt, "GetShardColumnName", idx.GetName())
@@ -286,6 +291,9 @@ func TestIndexInterface(t *testing.T) {
 			errMsgFmt, "GetSharded", idx.GetName())
 		require.Equalf(t, idx != s3, idx.NumSecondaryStoredColumns() == 0,
 			errMsgFmt, "NumSecondaryStoredColumns", idx.GetName())
+		vecConfig := idx.GetVecConfig()
+		require.Equal(t, idx == s7, !(&vecpb.Config{}).Equal(&vecConfig),
+			errMsgFmt, "GetVecConfig", idx.GetName())
 	}
 
 	// Check index columns.
@@ -328,6 +336,8 @@ func TestIndexInterface(t *testing.T) {
 	require.Equal(t, 2, s3.NumSecondaryStoredColumns())
 	require.Equal(t, "c5", s3.GetStoredColumnName(0))
 	require.Equal(t, "c6", s3.GetStoredColumnName(1))
+	require.Equal(t, s7.GetKeyColumnID(0), s7.VectorColumnID())
+	require.Equal(t, "c8", s7.VectorColumnName())
 }
 
 // TestIndexStrictColumnIDs tests that the index format version value
@@ -335,11 +345,14 @@ func TestIndexInterface(t *testing.T) {
 // redundant column IDs in descpb.IndexDescriptor.
 func TestIndexStrictColumnIDs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	// Create a regular table with a secondary index.
-	s, conn, db := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, conn, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	codec := srv.ApplicationLayer().Codec()
 	_, err := conn.Exec(`
 		CREATE DATABASE d;
 		CREATE TABLE d.t (
@@ -353,7 +366,7 @@ func TestIndexStrictColumnIDs(t *testing.T) {
 
 	// Mess with the table descriptor to add redundant columns in the secondary
 	// index while still passing validation.
-	mut := desctestutils.TestingGetMutableExistingTableDescriptor(db, keys.SystemSQLCodec, "d", "t")
+	mut := desctestutils.TestingGetMutableExistingTableDescriptor(db, codec, "d", "t")
 	idx := &mut.Indexes[0]
 	id := idx.KeyColumnIDs[0]
 	name := idx.KeyColumnNames[0]
@@ -367,7 +380,7 @@ func TestIndexStrictColumnIDs(t *testing.T) {
 	// Store the corrupted table descriptor.
 	err = db.Put(
 		ctx,
-		catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, mut.GetID()),
+		catalogkeys.MakeDescMetadataKey(codec, mut.GetID()),
 		mut.DescriptorProto(),
 	)
 	require.NoError(t, err)
@@ -381,14 +394,18 @@ func TestIndexStrictColumnIDs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Retrieve KV trace and check for redundant values.
-	rows, err := conn.Query(`SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE message LIKE 'InitPut%'`)
+	rows, err := conn.Query(`SELECT message FROM [SHOW KV TRACE FOR SESSION] WHERE message LIKE 'CPut%/Table/%/2% ->%'`)
 	require.NoError(t, err)
 	defer rows.Close()
 	require.True(t, rows.Next())
 	var msg string
 	err = rows.Scan(&msg)
 	require.NoError(t, err)
-	expected := fmt.Sprintf(`InitPut /Table/%d/2/0/0/0/0/0/0 -> /BYTES/0x2300030003000300`, mut.GetID())
+	var tenantPrefix string
+	if srv.TenantController().StartedDefaultTestTenant() {
+		tenantPrefix = codec.TenantPrefix().String()
+	}
+	expected := fmt.Sprintf(`CPut %s/Table/%d/2/0/0/0/0/0/0 -> /BYTES/0x2300030003000300`, tenantPrefix, mut.GetID())
 	require.Equal(t, expected, msg)
 
 	// Test that with the strict guarantees, this table descriptor would have been
@@ -425,8 +442,9 @@ func TestLatestIndexDescriptorVersionValues(t *testing.T) {
 			},
 		},
 	}
-	s, sqlDB, kvDB := serverutils.StartServer(t, args)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, args)
+	defer srv.Stopper().Stop(ctx)
+	codec := srv.ApplicationLayer().Codec()
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 
 	// Test relies on legacy schema changer testing knobs.
@@ -557,7 +575,7 @@ func TestLatestIndexDescriptorVersionValues(t *testing.T) {
 
 	// Test again but with RunPostDeserializationChanges.
 	for _, name := range []string{`t`, `s`, `v`} {
-		desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "defaultdb", name)
+		desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "defaultdb", name)
 		test(desc)
 	}
 

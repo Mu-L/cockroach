@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -61,32 +56,6 @@ func TestErrorCounts(t *testing.T) {
 
 	if count3-count2 != 1 {
 		t.Fatalf("expected 1 syntax error, got %d", count3-count2)
-	}
-}
-
-func TestUnimplementedCounts(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
-
-	params, _ := createTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
-
-	if _, err := db.Exec(`
-CREATE TABLE t(x INT8); 
-SET enable_experimental_alter_column_type_general = true;
-BEGIN;
-`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec("ALTER TABLE t ALTER COLUMN x SET DATA TYPE STRING"); err == nil {
-		t.Fatal("expected error, got no error")
-	}
-
-	if telemetry.GetRawFeatureCounts()["unimplemented.#49351"] == 0 {
-		t.Fatal("expected unimplemented telemetry, got nothing")
 	}
 }
 

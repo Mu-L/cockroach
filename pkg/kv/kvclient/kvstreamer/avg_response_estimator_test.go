@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvstreamer
 
@@ -85,10 +80,10 @@ func TestAvgResponseSizeForPartialResponses(t *testing.T) {
 	}
 	// We started with the TargetBytes equal to the initial estimate of 1KiB,
 	// and then with each update the estimate should have grown. In particular,
-	// we expect 7 BatchRequests total that fetch 1, 1, 3, 7, 18, 45, 25 rows
-	// respectively (note that the growth is faster than 2x because we use 1.5
-	// multiple on top of the average).
-	require.Equal(t, 7, batchRequestsCount)
+	// we expect 5 BatchRequests total that fetch 1, 3, 12, 48, 36 rows
+	// respectively (note that the growth is 3-4x because we use 3.0 multiple on
+	// top of the average).
+	require.Equal(t, 5, batchRequestsCount)
 	// From the perspective of the response estimator, we received only one
 	// response (that happened to be paginated across BatchRequests), so our
 	// estimate should match exactly the total size.

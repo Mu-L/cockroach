@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package bench
 
@@ -42,6 +37,14 @@ var runSepProcessTenant = flag.Bool("run-sep-process-tenant", false, "run separa
 // BenchmarkFn is a function that runs a benchmark using the given SQLRunner.
 type BenchmarkFn func(b *testing.B, db *sqlutils.SQLRunner)
 
+// timerUtil is a helper method that should be called right before the
+// invocation of BenchmarkFn and the returned function should be deferred.
+func timerUtil(b *testing.B) func() {
+	b.ResetTimer()
+	b.StartTimer()
+	return b.StopTimer
+}
+
 func benchmarkCockroach(b *testing.B, f BenchmarkFn) {
 	s, db, _ := serverutils.StartServer(
 		b, base.TestServerArgs{
@@ -54,6 +57,7 @@ func benchmarkCockroach(b *testing.B, f BenchmarkFn) {
 		b.Fatal(err)
 	}
 
+	defer timerUtil(b)()
 	f(b, sqlutils.MakeSQLRunner(db))
 }
 
@@ -103,6 +107,7 @@ func benchmarkSharedProcessTenantCockroach(b *testing.B, f BenchmarkFn) {
 	_, err = tenantDB.Exec(`CREATE DATABASE bench`)
 	require.NoError(b, err)
 
+	defer timerUtil(b)()
 	f(b, sqlutils.MakeSQLRunner(tenantDB))
 }
 
@@ -127,12 +132,13 @@ func benchmarkSepProcessTenantCockroach(b *testing.B, f BenchmarkFn) {
 	// The benchmarks sometime hit the default span limit, so we increase it.
 	// NOTE(andrei): Benchmarks drop the tables they're creating, so I'm not sure
 	// if hitting this limit is expected.
-	_, err := db.Exec(`ALTER TENANT ALL SET CLUSTER SETTING "spanconfig.virtual_cluster.max_spans" = 10000000`)
+	_, err := db.Exec(`SET CLUSTER SETTING spanconfig.virtual_cluster.max_spans = 10000000`)
 	require.NoError(b, err)
 
 	_, err = tenantDB.Exec(`CREATE DATABASE bench`)
 	require.NoError(b, err)
 
+	defer timerUtil(b)()
 	f(b, sqlutils.MakeSQLRunner(tenantDB))
 }
 
@@ -150,6 +156,7 @@ func benchmarkMultinodeCockroach(b *testing.B, f BenchmarkFn) {
 	}
 	defer tc.Stopper().Stop(context.TODO())
 
+	defer timerUtil(b)()
 	f(b, sqlutils.MakeRoundRobinSQLRunner(tc.Conns[0], tc.Conns[1], tc.Conns[2]))
 }
 
@@ -198,6 +205,7 @@ func benchmarkPostgres(b *testing.B, f BenchmarkFn) {
 	r := sqlutils.MakeSQLRunner(db)
 	r.Exec(b, `CREATE SCHEMA IF NOT EXISTS bench`)
 
+	defer timerUtil(b)()
 	f(b, r)
 }
 
@@ -218,6 +226,7 @@ func benchmarkMySQL(b *testing.B, f BenchmarkFn) {
 	r := sqlutils.MakeSQLRunner(db)
 	r.Exec(b, `CREATE DATABASE IF NOT EXISTS bench`)
 
+	defer timerUtil(b)()
 	f(b, r)
 }
 

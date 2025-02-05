@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -22,14 +18,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
-const asyncpgRunTestCmd = `
-source venv/bin/activate && 
-cd /mnt/data1/asyncpg && 
-PGPORT=26257 PGHOST=localhost PGUSER=root PGDATABASE=defaultdb python3 setup.py test > asyncpg.stdout
-`
+var asyncpgWarningArgs = "ignore::ResourceWarning"
+
+var asyncpgRunTestCmd = fmt.Sprintf(`
+source venv/bin/activate &&
+cd /mnt/data1/asyncpg &&
+PGPORT={pgport:1} PGHOST=localhost PGUSER=%s PGPASSWORD=%s PGSSLROOTCERT=$HOME/%s/ca.crt PGSSLMODE=require PGDATABASE=defaultdb python3 -W%q setup.py test > asyncpg.stdout
+`, install.DefaultUser, install.DefaultPassword, install.CockroachNodeCertsDir, asyncpgWarningArgs,
+)
 
 var asyncpgReleaseTagRegex = regexp.MustCompile(`^(?P<major>v\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
 
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
 var asyncpgSupportedTag = "v0.24.0"
 
 func registerAsyncpg(r registry.Registry) {
@@ -43,8 +44,8 @@ func registerAsyncpg(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+
+		c.Start(ctx, t.L(), option.NewStartOpts(sqlClientsInMemoryDB), install.MakeClusterSettings(), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
@@ -80,12 +81,41 @@ func registerAsyncpg(r registry.Registry) {
 		}
 
 		if err := repeatRunE(
+			ctx, t, c, node, "patch test to workaround flaky cleanup logic",
+			`sed -e "s/CREATE TYPE enum_t AS ENUM ('abc', 'def', 'ghi');/CREATE TYPE IF NOT EXISTS enum_t AS ENUM ('abc', 'def', 'ghi');/g" -i /mnt/data1/asyncpg/tests/test_codecs.py`,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := repeatRunE(
+			ctx, t, c, node, "update apt-get",
+			`sudo apt-get -qq update`,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := repeatRunE(
 			ctx,
 			t,
 			c,
 			node,
 			"install python and pip",
-			`sudo apt-get -qq install python3.7 python3-pip libpq-dev python-dev python3-virtualenv`,
+			`sudo apt-get -qq install python3.10 python3-pip libpq-dev python3.10-dev python3-virtualenv python3.10-distutils python3-apt python3-setuptools python-setuptools`,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := repeatRunE(
+			ctx, t, c, node, "set python3.10 as default", `
+    		sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+    		sudo update-alternatives --config python3`,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := repeatRunE(
+			ctx, t, c, node, "install pip",
+			`curl https://bootstrap.pypa.io/get-pip.py | sudo -H python3.10`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -116,14 +146,14 @@ func registerAsyncpg(r registry.Registry) {
 
 		t.Status("Running asyncpg tests ")
 		result, err := c.RunWithDetailsSingleNode(
-			ctx, t.L(), node, asyncpgRunTestCmd)
+			ctx, t.L(), option.WithNodes(node), asyncpgRunTestCmd)
 		if err != nil {
 			t.L().Printf("error during asyncpg run (may be ok): %v\n", err)
 		}
 		t.L().Printf("Test results for asyncpg: %s", result.Stdout+result.Stderr)
 		t.L().Printf("Test stdout for asyncpg")
 		if err := c.RunE(
-			ctx, node, "cd /mnt/data1/asyncpg && cat asyncpg.stdout",
+			ctx, option.WithNodes(node), "cd /mnt/data1/asyncpg && cat asyncpg.stdout",
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -138,11 +168,12 @@ func registerAsyncpg(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "asyncpg",
-		Owner:   registry.OwnerSQLFoundations,
-		Cluster: r.MakeClusterSpec(1, spec.CPU(16)),
-		Tags:    registry.Tags(`default`, `orm`),
-		Leases:  registry.MetamorphicLeases,
+		Name:             "asyncpg",
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1, spec.CPU(16)),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly, registry.ORM),
+		Leases:           registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runAsyncpg(ctx, t, c)
 		},

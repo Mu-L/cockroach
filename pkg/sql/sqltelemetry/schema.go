@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -90,6 +85,15 @@ var (
 	// index is created. This includes both regular and inverted expression
 	// indexes.
 	ExpressionIndexCounter = telemetry.GetCounterOnce("sql.schema.expression_index")
+
+	// VectorIndexCounter is to be incremented every time a vector index is
+	// created. This includes single-column vector indexes, multi-column vector
+	// indexes, and partial vector indexes.
+	VectorIndexCounter = telemetry.GetCounterOnce("sql.schema.vector_index")
+
+	// MultiColumnVectorIndexCounter is to be incremented every time a
+	// multi-column vector index is created.
+	MultiColumnVectorIndexCounter = telemetry.GetCounterOnce("sql.schema.multi_column_vector_index")
 )
 
 // SchemaChangeIndexCounter is to be incremented for certain CREATE
@@ -203,3 +207,19 @@ var DeclarativeSchemaChangerCounter = telemetry.GetCounterOnce("sql.schema.schem
 // LegacySchemaChangerCounter is incremented whenever the legacy schema changer
 // is used.
 var LegacySchemaChangerCounter = telemetry.GetCounterOnce("sql.schema.schema_changer_mode.legacy")
+
+// MixedDDLDMLTransactionSuccessCounter is incremented whenever an explicit
+// transaction that has both DDL and DML statements succeeds.
+var MixedDDLDMLTransactionSuccessCounter = telemetry.GetCounterOnce("sql.schema.transaction.mixed_ddl_dml.success")
+
+// MixedDDLDMLTransactionFailureCounter is incremented whenever an explicit
+// transaction that has both DDL and DML statements fails.
+var MixedDDLDMLTransactionFailureCounter = telemetry.GetCounterOnce("sql.schema.transaction.mixed_ddl_dml.failure")
+
+// DDLOnlyTransactionSuccessCounter is incremented whenever an explicit
+// transaction that has only DDL statements succeeds.
+var DDLOnlyTransactionSuccessCounter = telemetry.GetCounterOnce("sql.schema.transaction.ddl_only.success")
+
+// DDLOnlyTransactionFailureCounter is incremented whenever an explicit
+// transaction that has only DDL statements fails.
+var DDLOnlyTransactionFailureCounter = telemetry.GetCounterOnce("sql.schema.transaction.ddl_only.failure")

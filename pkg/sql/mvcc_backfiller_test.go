@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -62,8 +57,7 @@ func TestIndexBackfillMergeRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStressRace(t, "TODO(ssd) test times outs under race")
-	skip.UnderRace(t, "TODO(ssd) test times outs under race")
+	skip.UnderDuress(t, "this test fails under duress")
 
 	params, _ := createTestServerParams()
 
@@ -203,8 +197,13 @@ func TestIndexBackfillFractionTracking(t *testing.T) {
 		require.NoError(t, splitIndex(tc, tableDesc, idx, sps))
 	}
 
+	// Chunks are processed concurrently, so we need to synchronize access to
+	// lastPercentage.
+	var mu syncutil.Mutex
 	var lastPercentage float32
 	assertFractionBetween := func(op string, min float32, max float32) {
+		mu.Lock()
+		defer mu.Unlock()
 		var fraction float32
 		sqlRunner.QueryRow(t, "SELECT fraction_completed FROM [SHOW JOBS] WHERE job_id = $1", jobID).Scan(&fraction)
 		t.Logf("fraction during %s: %f", op, fraction)
@@ -273,7 +272,7 @@ func TestRaceWithIndexBackfillMerge(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStressRace(t, "TODO(ssd) test times outs under race")
+	skip.UnderDuress(t, "TODO(ssd) test times outs under race")
 
 	// protects mergeNotification, writesPopulated
 	var mu syncutil.Mutex
@@ -457,14 +456,13 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, x DECIMAL DEFAULT (DECIMAL '1.4')
 		var val int
 		var x float64
 		if err := rows.Scan(&val, &x); err != nil {
-			t.Errorf("row %d scan failed: %s", count, err)
-			continue
+			t.Fatalf("row %d scan failed: %s", count, err)
 		}
 		if count != val {
-			t.Errorf("e = %d, v = %d", count, val)
+			t.Fatalf("wrong index contents: expected %d, found %d", count, val)
 		}
 		if x != 1.4 {
-			t.Errorf("e = %f, v = %f", 1.4, x)
+			t.Fatalf("wrong index contents: expected %f, found %f", 1.4, x)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -672,10 +670,11 @@ func splitIndex(
 			return err
 		}
 
-		holder, err := tc.FindRangeLeaseHolder(rangeDesc, nil)
+		li, _, err := tc.FindRangeLeaseEx(ctx, rangeDesc, nil)
 		if err != nil {
 			return err
 		}
+		holder := li.CurrentOrProspective().Replica
 
 		_, rightRange, err := tc.Server(int(holder.NodeID) - 1).SplitRange(pik)
 		if err != nil {

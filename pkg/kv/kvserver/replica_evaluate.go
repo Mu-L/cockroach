@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -27,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -46,7 +42,7 @@ import (
 // the input slice, or has been shallow-copied appropriately to avoid
 // mutating the original requests).
 func optimizePuts(
-	reader storage.Reader, origReqs []kvpb.RequestUnion, distinctSpans bool,
+	ctx context.Context, reader storage.Reader, origReqs []kvpb.RequestUnion, distinctSpans bool,
 ) ([]kvpb.RequestUnion, error) {
 	var minKey, maxKey roachpb.Key
 	var unique map[string]struct{}
@@ -100,11 +96,12 @@ func optimizePuts(
 	// iter is being used to find the parts of the key range that is empty. We
 	// don't need to see intents for this purpose since intents also have
 	// provisional values that we will see.
-	iter, err := reader.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+	iter, err := reader.NewMVCCIterator(ctx, storage.MVCCKeyIterKind, storage.IterOptions{
 		KeyTypes: storage.IterKeyTypePointsAndRanges,
 		// We want to include maxKey in our scan. Since UpperBound is exclusive, we
 		// need to set it to the key after maxKey.
-		UpperBound: maxKey.Next(),
+		UpperBound:   maxKey.Next(),
+		ReadCategory: fs.BatchEvalReadCategory,
 	})
 	if err != nil {
 		return nil, err
@@ -166,6 +163,7 @@ func evaluateBatch(
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 	evalPath batchEvalPath,
+	omitInRangefeeds bool, // only relevant for transactional writes
 ) (_ *kvpb.BatchResponse, _ result.Result, retErr *kvpb.Error) {
 	defer func() {
 		// Ensure that errors don't carry the WriteTooOld flag set. The client
@@ -190,7 +188,7 @@ func evaluateBatch(
 
 	// Optimize any contiguous sequences of put and conditional put ops.
 	if len(baReqs) >= optimizePutThreshold && evalPath == readWrite {
-		baReqs, err = optimizePuts(readWriter, baReqs, baHeader.DistinctSpans)
+		baReqs, err = optimizePuts(ctx, readWriter, baReqs, baHeader.DistinctSpans)
 	}
 	if err != nil {
 		pErr := kvpb.NewErrorWithTxn(err, baHeader.Txn)
@@ -240,6 +238,9 @@ func evaluateBatch(
 		defer func() {
 			if ss.NumGets != 0 || ss.NumScans != 0 || ss.NumReverseScans != 0 {
 				// Only record non-empty ScanStats.
+				ss.NodeID = rec.NodeID()
+				locality := rec.GetNodeLocality()
+				ss.Region, _ = locality.Find("region")
 				sp.RecordStructured(ss)
 			}
 		}()
@@ -301,7 +302,7 @@ func evaluateBatch(
 		// may carry a response transaction and in the case of WriteTooOldError
 		// (which is sometimes deferred) it is fully populated.
 		curResult, err := evaluateCommand(
-			ctx, readWriter, rec, ms, ss, baHeader, args, reply, g, st, ui, evalPath,
+			ctx, readWriter, rec, ms, ss, baHeader, args, reply, g, st, ui, evalPath, omitInRangefeeds,
 		)
 
 		if filter := rec.EvalKnobs().TestingPostEvalFilter; filter != nil {
@@ -459,6 +460,7 @@ func evaluateCommand(
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 	evalPath batchEvalPath,
+	omitInRangefeeds bool,
 ) (result.Result, error) {
 	var err error
 	var pd result.Result
@@ -478,6 +480,7 @@ func evaluateCommand(
 			Concurrency:           g,
 			Uncertainty:           ui,
 			DontInterleaveIntents: evalPath == readOnlyWithoutInterleavedIntents,
+			OmitInRangefeeds:      omitInRangefeeds,
 		}
 
 		if cmd.EvalRW != nil {
@@ -539,13 +542,13 @@ func canDoServersideRetry(
 	ba *kvpb.BatchRequest,
 	g *concurrency.Guard,
 	deadline hlc.Timestamp,
-) bool {
+) (*kvpb.BatchRequest, bool) {
 	if pErr == nil {
 		log.Fatalf(ctx, "canDoServersideRetry called without error")
 	}
 	if ba.Txn != nil {
 		if !ba.CanForwardReadTimestamp {
-			return false
+			return ba, false
 		}
 		if !deadline.IsEmpty() {
 			log.Fatal(ctx, "deadline passed for transactional request")
@@ -561,7 +564,7 @@ func canDoServersideRetry(
 		var ok bool
 		ok, newTimestamp = kvpb.TransactionRefreshTimestamp(pErr)
 		if !ok {
-			return false
+			return ba, false
 		}
 	} else {
 		switch tErr := pErr.GetDetail().(type) {
@@ -572,12 +575,12 @@ func canDoServersideRetry(
 			newTimestamp = tErr.RetryTimestamp()
 
 		default:
-			return false
+			return ba, false
 		}
 	}
 
 	if batcheval.IsEndTxnExceedingDeadline(newTimestamp, deadline) {
-		return false
+		return ba, false
 	}
 	return tryBumpBatchTimestamp(ctx, ba, g, newTimestamp)
 }

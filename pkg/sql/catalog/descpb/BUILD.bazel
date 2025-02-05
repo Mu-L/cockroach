@@ -26,11 +26,13 @@ go_library(
         "//pkg/sql/protoreflect",
         "//pkg/sql/sem/catconstants",
         "//pkg/sql/sem/catid",
+        "//pkg/sql/sem/idxtype",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/errorutil/unimplemented",
         "//pkg/util/hlc",
         "//pkg/util/intsets",
+        "//pkg/util/uuid",  # keep
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
@@ -39,7 +41,6 @@ go_test(
     name = "descpb_test",
     size = "small",
     srcs = ["structured_test.go"],
-    args = ["-test.timeout=55s"],
     embed = [":descpb"],
 )
 
@@ -47,6 +48,7 @@ proto_library(
     name = "descpb_proto",
     srcs = [
         "join_type.proto",
+        "lease.proto",
         "locking.proto",
         "structured.proto",
     ],
@@ -54,12 +56,15 @@ proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/config/zonepb:zonepb_proto",
-        "//pkg/geo/geoindex:geoindex_proto",
+        "//pkg/geo/geopb:geopb_proto",
+        "//pkg/roachpb:roachpb_proto",
         "//pkg/sql/catalog/catenumpb:catenumpb_proto",
         "//pkg/sql/catalog/catpb:catpb_proto",
         "//pkg/sql/schemachanger/scpb:scpb_proto",
+        "//pkg/sql/sem/idxtype:idxtype_proto",
         "//pkg/sql/sem/semenumpb:semenumpb_proto",
         "//pkg/sql/types:types_proto",
+        "//pkg/sql/vecindex/vecpb:vecpb_proto",
         "//pkg/util/hlc:hlc_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
     ],
@@ -73,13 +78,15 @@ go_proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/config/zonepb",
-        "//pkg/geo/geoindex",
+        "//pkg/geo/geopb",
         "//pkg/roachpb",  # keep
         "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/schemachanger/scpb",
+        "//pkg/sql/sem/idxtype",
         "//pkg/sql/sem/semenumpb",
         "//pkg/sql/types",
+        "//pkg/sql/vecindex/vecpb",
         "//pkg/util/hlc",
         "@com_github_gogo_protobuf//gogoproto",
     ],

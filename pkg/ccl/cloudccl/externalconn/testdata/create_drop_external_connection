@@ -25,6 +25,18 @@ CREATE EXTERNAL CONNECTION foo AS 'nodelocal://1/foo';
 ----
 pq: failed to create external connection: external connection with connection name 'foo' already exists
 
+# Trying to create another External Connection with the same name using
+# IF NOT EXISTS should not fail and should leave the existing
+# connection unmodified.
+exec-sql
+CREATE EXTERNAL CONNECTION IF NOT EXISTS foo AS 'nodelocal://1/nope';
+----
+
+inspect-system-table
+----
+foo STORAGE {"provider": "nodelocal", "simpleUri": {"uri": "nodelocal://1/foo/bar"}} root 1
+
+
 # Create another External Connection with a unique name.
 exec-sql
 CREATE EXTERNAL CONNECTION bar123 AS 'nodelocal://1/baz';
@@ -99,7 +111,7 @@ disable-check-external-storage
 ----
 
 exec-sql
-CREATE EXTERNAL CONNECTION "foo-s3" AS 's3://foo/bar?AUTH=implicit&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456&ASSUME_ROLE=ronaldo,rashford,bruno';
+CREATE EXTERNAL CONNECTION "foo-s3" AS 's3://foo/bar?AUTH=specified&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456&AWS_REGION=us-east-1&ASSUME_ROLE=ronaldo,rashford,bruno';
 ----
 
 # Reject invalid S3 URIs.
@@ -115,7 +127,7 @@ pq: failed to construct External Connection details: failed to create s3 externa
 
 inspect-system-table
 ----
-foo-s3 STORAGE {"provider": "s3", "simpleUri": {"uri": "s3://foo/bar?AUTH=implicit&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456&ASSUME_ROLE=ronaldo,rashford,bruno"}} root 1
+foo-s3 STORAGE {"provider": "s3", "simpleUri": {"uri": "s3://foo/bar?AUTH=specified&AWS_ACCESS_KEY_ID=123&AWS_SECRET_ACCESS_KEY=456&AWS_REGION=us-east-1&ASSUME_ROLE=ronaldo,rashford,bruno"}} root 1
 
 exec-sql
 DROP EXTERNAL CONNECTION "foo-s3";
@@ -229,6 +241,14 @@ exec-sql
 CREATE EXTERNAL CONNECTION "foo-azure" AS 'azure-storage://bucket/path?AZURE_ACCOUNT_NAME=foo&AZURE_ACCOUNT_KEY=Zm9vCg==&AZURE_ENVIRONMENT=AzureUSGovernmentCloud'
 ----
 
+exec-sql
+CREATE EXTERNAL CONNECTION "bar-azure" AS 'azure-blob://bucket/path?AZURE_ACCOUNT_NAME=foo&AZURE_ACCOUNT_KEY=Zm9vCg==&AZURE_ENVIRONMENT=AzureUSGovernmentCloud'
+----
+
+exec-sql
+CREATE EXTERNAL CONNECTION "baz-azure" AS 'azure://bucket/path?AZURE_ACCOUNT_NAME=foo&AZURE_ACCOUNT_KEY=Zm9vCg==&AZURE_ENVIRONMENT=AzureUSGovernmentCloud'
+----
+
 # Reject invalid azure external connections.
 exec-sql
 CREATE EXTERNAL CONNECTION "invalid-param-azure" AS 'azure-storage://bucket/path?INVALIDPARAM=baz'
@@ -247,13 +267,55 @@ pq: failed to construct External Connection details: failed to create azure exte
 
 inspect-system-table
 ----
+bar-azure STORAGE {"provider": "azure_storage", "simpleUri": {"uri": "azure-blob://bucket/path?AZURE_ACCOUNT_NAME=foo&AZURE_ACCOUNT_KEY=Zm9vCg==&AZURE_ENVIRONMENT=AzureUSGovernmentCloud"}} root 1
+baz-azure STORAGE {"provider": "azure_storage", "simpleUri": {"uri": "azure://bucket/path?AZURE_ACCOUNT_NAME=foo&AZURE_ACCOUNT_KEY=Zm9vCg==&AZURE_ENVIRONMENT=AzureUSGovernmentCloud"}} root 1
 foo-azure STORAGE {"provider": "azure_storage", "simpleUri": {"uri": "azure-storage://bucket/path?AZURE_ACCOUNT_NAME=foo&AZURE_ACCOUNT_KEY=Zm9vCg==&AZURE_ENVIRONMENT=AzureUSGovernmentCloud"}} root 1
 
 exec-sql
 DROP EXTERNAL CONNECTION "foo-azure";
 ----
 
+exec-sql
+DROP EXTERNAL CONNECTION "bar-azure";
+----
+
+exec-sql
+DROP EXTERNAL CONNECTION "baz-azure";
+----
+
 enable-check-external-storage
+----
+
+disable-check-kms
+----
+
+exec-sql
+CREATE EXTERNAL CONNECTION "foo-kms" AS 'azure-kms:///cmk/id?AUTH=specified&AZURE_VAULT_NAME=vault&AZURE_CLIENT_ID=client&AZURE_CLIENT_SECRET=secret&AZURE_TENANT_ID=tenant';
+----
+
+# Reject invalid KMS URIs.
+exec-sql
+CREATE EXTERNAL CONNECTION "missing-cmk-kms" AS 'azure-kms:///?AUTH=implicit&CREDENTIALS=baz&ASSUME_ROLE=ronaldo,rashford,bruno&BEARER_TOKEN=foo';
+----
+pq: failed to construct External Connection details: failed to create Azure KMS external connection: path component of the KMS cannot be empty; must contain the Customer Managed Key
+
+exec-sql
+CREATE EXTERNAL CONNECTION "invalid-params-kms" AS 'azure-kms:///cmk?AUTH=implicit&INVALIDPARAM=baz';
+----
+pq: failed to construct External Connection details: failed to create Azure KMS external connection: unknown KMS query parameters: INVALIDPARAM
+
+inspect-system-table
+----
+foo-kms KMS {"provider": "azure_kms", "simpleUri": {"uri": "azure-kms:///cmk/id?AUTH=specified&AZURE_VAULT_NAME=vault&AZURE_CLIENT_ID=client&AZURE_CLIENT_SECRET=secret&AZURE_TENANT_ID=tenant"}} root 1
+
+exec-sql
+DROP EXTERNAL CONNECTION "foo-kms";
+----
+
+inspect-system-table
+----
+
+enable-check-kms
 ----
 
 subtest end

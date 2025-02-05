@@ -1,18 +1,15 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvpb
 
 import (
 	"context"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	_ "github.com/cockroachdb/cockroach/pkg/kv/kvnemesis/kvnemesisutil" // see RequestHeader
@@ -28,7 +25,7 @@ import (
 	"github.com/dustin/go-humanize"
 )
 
-//go:generate mockgen -package=kvpbmock -destination=kvpbmock/mocks_generated.go . InternalClient,Internal_RangeFeedClient,Internal_MuxRangeFeedClient
+//go:generate mockgen -package=kvpbmock -destination=kvpbmock/mocks_generated.go . InternalClient,Internal_MuxRangeFeedClient
 
 // SupportsBatch determines whether the methods in the provided batch
 // are supported by the ReadConsistencyType, returning an error if not.
@@ -73,15 +70,19 @@ const (
 	canSkipLocked                                             // commands which can evaluate under the SkipLocked wait policy
 	bypassesReplicaCircuitBreaker                             // commands which bypass the replica circuit breaker, i.e. opt out of fail-fast
 	requiresClosedTSOlderThanStorageSnapshot                  // commands which read a replica's closed timestamp that is older than the state of the storage engine
+	canPipeline                                               // commands which can be pipelined
+	canParallelCommit                                         // commands which can be part of a parallel commit batch
 )
 
 // flagDependencies specifies flag dependencies, asserted by TestFlagCombinations.
 var flagDependencies = map[flag][]flag{
-	isAdmin:         {isAlone},
-	isLocking:       {isTxn},
-	isIntentWrite:   {isWrite, isLocking},
-	appliesTSCache:  {isWrite},
-	skipsLeaseCheck: {isAlone},
+	isAdmin:           {isAlone},
+	isLocking:         {isTxn},
+	isIntentWrite:     {isWrite, isLocking},
+	canPipeline:       {isLocking},
+	canParallelCommit: {canPipeline, isIntentWrite},
+	appliesTSCache:    {isWrite},
+	skipsLeaseCheck:   {isAlone},
 }
 
 // flagExclusions specifies flag incompatibilities, asserted by TestFlagCombinations.
@@ -91,8 +92,8 @@ var flagExclusions = map[flag][]flag{
 
 // IsReadOnly returns true iff the request is read-only. A request is
 // read-only if it does not go through raft, meaning that it cannot
-// change any replicated state. However, read-only requests may still
-// acquire locks with an unreplicated durability level; see IsLocking.
+// change any replicated state. However, read-only requests may still acquire
+// locks, but only with unreplicated durability.
 func IsReadOnly(args Request) bool {
 	flags := args.flags()
 	return (flags&isRead) != 0 && (flags&isWrite) == 0
@@ -178,6 +179,17 @@ func BypassesReplicaCircuitBreaker(args Request) bool {
 	return (args.flags() & bypassesReplicaCircuitBreaker) != 0
 }
 
+// CanPipeline returns true iff the command can be pipelined.
+func CanPipeline(args Request) bool {
+	return (args.flags() & canPipeline) != 0
+}
+
+// CanParallelCommit returns true iff the command can be part of a batch that is
+// committed in parallel.
+func CanParallelCommit(args Request) bool {
+	return (args.flags() & canParallelCommit) != 0
+}
+
 // Request is an interface for RPC requests.
 type Request interface {
 	protoutil.Message
@@ -192,32 +204,112 @@ type Request interface {
 	flags() flag
 }
 
+// SafeFormatterRequest is an optional extension interface used to allow request to do custom formatting.
+type SafeFormatterRequest interface {
+	Request
+	redact.SafeFormatter
+}
+
+var _ SafeFormatterRequest = (*GetRequest)(nil)
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (gr *GetRequest) SafeFormat(s redact.SafePrinter, _ rune) {
+	s.Print(gr.Method())
+	if gr.KeyLockingStrength == lock.None {
+		return
+	}
+	s.Printf("(%s,%s)", gr.KeyLockingStrength, gr.KeyLockingDurability)
+}
+
+var _ SafeFormatterRequest = (*ScanRequest)(nil)
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (sr *ScanRequest) SafeFormat(s redact.SafePrinter, _ rune) {
+	s.Print(sr.Method())
+	if sr.KeyLockingStrength == lock.None {
+		return
+	}
+	s.Printf("(%s,%s)", sr.KeyLockingStrength, sr.KeyLockingDurability)
+}
+
+var _ SafeFormatterRequest = (*ReverseScanRequest)(nil)
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (rsr *ReverseScanRequest) SafeFormat(s redact.SafePrinter, _ rune) {
+	s.Print(rsr.Method())
+	if rsr.KeyLockingStrength == lock.None {
+		return
+	}
+	s.Printf("(%s,%s)", rsr.KeyLockingStrength, rsr.KeyLockingDurability)
+}
+
+var _ SafeFormatterRequest = (*EndTxnRequest)(nil)
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (etr *EndTxnRequest) SafeFormat(s redact.SafePrinter, _ rune) {
+	s.Printf("%s(", etr.Method())
+	if etr.Commit {
+		if etr.IsParallelCommit() {
+			s.Printf("parallel commit")
+		} else {
+			s.Printf("commit")
+		}
+	} else {
+		s.Printf("abort")
+	}
+	if etr.InternalCommitTrigger != nil {
+		s.Printf(" %s", etr.InternalCommitTrigger.Kind())
+	}
+	s.Printf(")")
+}
+
+var _ SafeFormatterRequest = (*RecoverTxnRequest)(nil)
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (rtr *RecoverTxnRequest) SafeFormat(s redact.SafePrinter, _ rune) {
+	s.Printf("%s(%s, ", rtr.Method(), rtr.Txn.Short())
+	if rtr.ImplicitlyCommitted {
+		s.Printf("commit")
+	} else {
+		s.Printf("abort")
+	}
+	s.Printf(")")
+}
+
+var _ SafeFormatterRequest = (*PushTxnRequest)(nil)
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (ptr *PushTxnRequest) SafeFormat(s redact.SafePrinter, _ rune) {
+	s.Printf("PushTxn(%s,%s->%s)",
+		ptr.PushType, ptr.PusherTxn.Short(), ptr.PusheeTxn.Short())
+}
+
 // LockingReadRequest is an interface used to expose the key-level locking
 // strength of a read-only request.
 type LockingReadRequest interface {
 	Request
-	KeyLockingStrength() lock.Strength
+	KeyLocking() (lock.Strength, lock.Durability)
 }
 
 var _ LockingReadRequest = (*GetRequest)(nil)
 
-// KeyLockingStrength implements the LockingReadRequest interface.
-func (gr *GetRequest) KeyLockingStrength() lock.Strength {
-	return gr.KeyLocking
+// KeyLocking implements the LockingReadRequest interface.
+func (gr *GetRequest) KeyLocking() (lock.Strength, lock.Durability) {
+	return gr.KeyLockingStrength, gr.KeyLockingDurability
 }
 
 var _ LockingReadRequest = (*ScanRequest)(nil)
 
-// KeyLockingStrength implements the LockingReadRequest interface.
-func (sr *ScanRequest) KeyLockingStrength() lock.Strength {
-	return sr.KeyLocking
+// KeyLocking implements the LockingReadRequest interface.
+func (sr *ScanRequest) KeyLocking() (lock.Strength, lock.Durability) {
+	return sr.KeyLockingStrength, sr.KeyLockingDurability
 }
 
 var _ LockingReadRequest = (*ReverseScanRequest)(nil)
 
-// KeyLockingStrength implements the LockingReadRequest interface.
-func (rsr *ReverseScanRequest) KeyLockingStrength() lock.Strength {
-	return rsr.KeyLocking
+// KeyLocking implements the LockingReadRequest interface.
+func (rsr *ReverseScanRequest) KeyLocking() (lock.Strength, lock.Durability) {
+	return rsr.KeyLockingStrength, rsr.KeyLockingDurability
 }
 
 // SizedWriteRequest is an interface used to expose the number of bytes a
@@ -276,6 +368,8 @@ type Response interface {
 	Header() ResponseHeader
 	// SetHeader sets the response header.
 	SetHeader(ResponseHeader)
+	// ShallowCopy returns a shallow copy of the receiver.
+	ShallowCopy() Response
 	// Verify verifies response integrity, as applicable.
 	Verify(req Request) error
 }
@@ -581,6 +675,12 @@ func (r *BarrierResponse) combine(_ context.Context, c combinable, _ *BatchReque
 			return err
 		}
 		r.Timestamp.Forward(otherR.Timestamp)
+		if r.LeaseAppliedIndex != 0 || otherR.LeaseAppliedIndex != 0 {
+			return errors.AssertionFailedf("can't combine BarrierResponses with LeaseAppliedIndex")
+		}
+		if r.RangeDesc.NextReplicaID != 0 || otherR.RangeDesc.NextReplicaID != 0 {
+			return errors.AssertionFailedf("can't combine BarrierResponses with RangeDesc")
+		}
 	}
 	return nil
 }
@@ -713,6 +813,46 @@ func (sr *ReverseScanResponse) Verify(req Request) error {
 	return nil
 }
 
+// TruncatedRequestsString formats a slice of RequestUnions for printing,
+// limited to maxBytes bytes.
+func TruncatedRequestsString(reqs []RequestUnion, maxBytes int) string {
+	if maxBytes < len("<nil>") {
+		panic(errors.AssertionFailedf("maxBytes too low: %d", maxBytes))
+	}
+	if reqs == nil {
+		return "<nil>"
+	}
+	if len(reqs) == 0 {
+		return "[]"
+	}
+	var b strings.Builder
+	b.WriteRune('[')
+	b.WriteString(reqs[0].String())
+	for i := 1; i < len(reqs); i++ {
+		if b.Len() > maxBytes {
+			break
+		}
+		b.WriteRune(' ')
+		b.WriteString(reqs[i].String())
+	}
+	b.WriteRune(']')
+	str := b.String()
+	if len(str) > maxBytes {
+		str = str[:maxBytes-len("…]")]
+		// Check whether we truncated in the middle of a rune.
+		for len(str) > 1 {
+			if r, _ := utf8.DecodeLastRuneInString(str); r == utf8.RuneError {
+				// Shave off another byte and check again.
+				str = str[:len(str)-1]
+			} else {
+				break
+			}
+		}
+		return str + "…]"
+	}
+	return str
+}
+
 // Method implements the Request interface.
 func (*GetRequest) Method() Method { return Get }
 
@@ -826,6 +966,9 @@ func (*AdminScatterRequest) Method() Method { return AdminScatter }
 
 // Method implements the Request interface.
 func (*AddSSTableRequest) Method() Method { return AddSSTable }
+
+// Method implements the Request interface.
+func (*LinkExternalSSTableRequest) Method() Method { return LinkExternalSSTable }
 
 // Method implements the Request interface.
 func (*MigrateRequest) Method() Method { return Migrate }
@@ -1088,6 +1231,12 @@ func (r *AddSSTableRequest) ShallowCopy() Request {
 }
 
 // ShallowCopy implements the Request interface.
+func (r *LinkExternalSSTableRequest) ShallowCopy() Request {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Request interface.
 func (r *MigrateRequest) ShallowCopy() Request {
 	shallowCopy := *r
 	return &shallowCopy
@@ -1147,15 +1296,321 @@ func (r *IsSpanEmptyRequest) ShallowCopy() Request {
 	return &shallowCopy
 }
 
-// NewGet returns a Request initialized to get the value at key. If
-// forUpdate is true, an unreplicated, exclusive lock is acquired on on
-// the key, if it exists.
-func NewGet(key roachpb.Key, forUpdate bool) Request {
+// ShallowCopy implements the Response interface.
+func (gr *GetResponse) ShallowCopy() Response {
+	shallowCopy := *gr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (pr *PutResponse) ShallowCopy() Response {
+	shallowCopy := *pr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (cpr *ConditionalPutResponse) ShallowCopy() Response {
+	shallowCopy := *cpr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (pr *InitPutResponse) ShallowCopy() Response {
+	shallowCopy := *pr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (ir *IncrementResponse) ShallowCopy() Response {
+	shallowCopy := *ir
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (dr *DeleteResponse) ShallowCopy() Response {
+	shallowCopy := *dr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (drr *DeleteRangeResponse) ShallowCopy() Response {
+	shallowCopy := *drr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (crr *ClearRangeResponse) ShallowCopy() Response {
+	shallowCopy := *crr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (crr *RevertRangeResponse) ShallowCopy() Response {
+	shallowCopy := *crr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (sr *ScanResponse) ShallowCopy() Response {
+	shallowCopy := *sr
+	shallowCopy.BatchResponses = append([][]byte(nil), sr.BatchResponses...)
+	shallowCopy.ColBatches.ColBatches = append([]coldata.Batch(nil), sr.ColBatches.ColBatches...)
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (rsr *ReverseScanResponse) ShallowCopy() Response {
+	shallowCopy := *rsr
+	shallowCopy.BatchResponses = append([][]byte(nil), rsr.BatchResponses...)
+	shallowCopy.ColBatches.ColBatches = append([]coldata.Batch(nil), rsr.ColBatches.ColBatches...)
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (ccr *CheckConsistencyResponse) ShallowCopy() Response {
+	shallowCopy := *ccr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (etr *EndTxnResponse) ShallowCopy() Response {
+	shallowCopy := *etr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (asr *AdminSplitResponse) ShallowCopy() Response {
+	shallowCopy := *asr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (aur *AdminUnsplitResponse) ShallowCopy() Response {
+	shallowCopy := *aur
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (amr *AdminMergeResponse) ShallowCopy() Response {
+	shallowCopy := *amr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (atlr *AdminTransferLeaseResponse) ShallowCopy() Response {
+	shallowCopy := *atlr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (acrr *AdminChangeReplicasResponse) ShallowCopy() Response {
+	shallowCopy := *acrr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (acrr *AdminRelocateRangeResponse) ShallowCopy() Response {
+	shallowCopy := *acrr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (htr *HeartbeatTxnResponse) ShallowCopy() Response {
+	shallowCopy := *htr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (gcr *GCResponse) ShallowCopy() Response {
+	shallowCopy := *gcr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (ptr *PushTxnResponse) ShallowCopy() Response {
+	shallowCopy := *ptr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (rtr *RecoverTxnResponse) ShallowCopy() Response {
+	shallowCopy := *rtr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (qtr *QueryTxnResponse) ShallowCopy() Response {
+	shallowCopy := *qtr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (pir *QueryIntentResponse) ShallowCopy() Response {
+	shallowCopy := *pir
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (pir *QueryLocksResponse) ShallowCopy() Response {
+	shallowCopy := *pir
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (rir *ResolveIntentResponse) ShallowCopy() Response {
+	shallowCopy := *rir
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (rirr *ResolveIntentRangeResponse) ShallowCopy() Response {
+	shallowCopy := *rirr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (mr *MergeResponse) ShallowCopy() Response {
+	shallowCopy := *mr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (tlr *TruncateLogResponse) ShallowCopy() Response {
+	shallowCopy := *tlr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (rlr *RequestLeaseResponse) ShallowCopy() Response {
+	shallowCopy := *rlr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *ProbeResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (lt *LeaseInfoResponse) ShallowCopy() Response {
+	shallowCopy := *lt
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (ccr *ComputeChecksumResponse) ShallowCopy() Response {
+	shallowCopy := *ccr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (ekr *ExportResponse) ShallowCopy() Response {
+	shallowCopy := *ekr
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *AdminScatterResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *AddSSTableResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *LinkExternalSSTableResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *MigrateResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *RecomputeStatsResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *RefreshResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *RefreshRangeResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *SubsumeResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *RangeStatsResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *AdminVerifyProtectedTimestampResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *QueryResolvedTimestampResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *BarrierResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// ShallowCopy implements the Response interface.
+func (r *IsSpanEmptyResponse) ShallowCopy() Response {
+	shallowCopy := *r
+	return &shallowCopy
+}
+
+// NewLockingGet returns a Request initialized to get the value at key. A lock
+// corresponding to the supplied lock strength and durability is acquired on the
+// key, if it exists.
+func NewLockingGet(
+	key roachpb.Key, str KeyLockingStrengthType, dur KeyLockingDurabilityType,
+) Request {
 	return &GetRequest{
 		RequestHeader: RequestHeader{
 			Key: key,
 		},
-		KeyLocking: scanLockStrength(forUpdate),
+		KeyLockingStrength:   scanLockStrength(str),
+		KeyLockingDurability: scanLockDurability(dur),
+	}
+}
+
+// NewGet returns a Request initialized to get the value at key. No lock is
+// acquired on the key, even if it exists.
+func NewGet(key roachpb.Key) Request {
+	return &GetRequest{
+		RequestHeader: RequestHeader{
+			Key: key,
+		},
+		KeyLockingStrength: lock.None,
 	}
 }
 
@@ -1235,22 +1690,6 @@ func NewConditionalPutInline(
 	}
 }
 
-// NewInitPut returns a Request initialized to put the value at key, as long as
-// the key doesn't exist, returning a ConditionFailedError if the key exists and
-// the existing value is different from value. If failOnTombstones is set to
-// true, tombstones count as mismatched values and will cause a
-// ConditionFailedError.
-func NewInitPut(key roachpb.Key, value roachpb.Value, failOnTombstones bool) Request {
-	value.InitChecksum(key)
-	return &InitPutRequest{
-		RequestHeader: RequestHeader{
-			Key: key,
-		},
-		Value:            value,
-		FailOnTombstones: failOnTombstones,
-	}
-}
-
 // NewDelete returns a Request initialized to delete the value at key.
 func NewDelete(key roachpb.Key) Request {
 	return &DeleteRequest{
@@ -1272,37 +1711,138 @@ func NewDeleteRange(startKey, endKey roachpb.Key, returnKeys bool) Request {
 	}
 }
 
-// NewScan returns a Request initialized to scan from start to end keys.
-// If forUpdate is true, unreplicated, exclusive locks are acquired on
-// each of the resulting keys.
-func NewScan(key, endKey roachpb.Key, forUpdate bool) Request {
+// NewLockingScan returns a Request initialized to scan from start to end keys.
+// A lock corresponding to the supplied lock strength and durability will be
+// acquired on each of the resulting keys.
+func NewLockingScan(
+	key, endKey roachpb.Key, str KeyLockingStrengthType, dur KeyLockingDurabilityType,
+) Request {
 	return &ScanRequest{
 		RequestHeader: RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},
-		KeyLocking: scanLockStrength(forUpdate),
+		KeyLockingStrength:   scanLockStrength(str),
+		KeyLockingDurability: scanLockDurability(dur),
 	}
 }
 
-// NewReverseScan returns a Request initialized to reverse scan from end.
-// If forUpdate is true, unreplicated, exclusive locks are acquired on
-// each of the resulting keys.
-func NewReverseScan(key, endKey roachpb.Key, forUpdate bool) Request {
+// NewScan returns a Request initialized to scan from start to end keys. No
+// locks will be acquired on the resulting keys.
+func NewScan(key, endKey roachpb.Key) Request {
+	return &ScanRequest{
+		RequestHeader: RequestHeader{
+			Key:    key,
+			EndKey: endKey,
+		},
+		KeyLockingStrength: lock.None,
+	}
+}
+
+// NewLockingReverseScan returns a Request initialized to reverse scan from end.
+// A lock corresponding to the supplied lock strength and durability will be
+// acquired on each of the resulting keys.
+func NewLockingReverseScan(
+	key, endKey roachpb.Key, str KeyLockingStrengthType, dur KeyLockingDurabilityType,
+) Request {
 	return &ReverseScanRequest{
 		RequestHeader: RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},
-		KeyLocking: scanLockStrength(forUpdate),
+		KeyLockingStrength:   scanLockStrength(str),
+		KeyLockingDurability: scanLockDurability(dur),
 	}
 }
 
-func scanLockStrength(forUpdate bool) lock.Strength {
-	if forUpdate {
-		return lock.Exclusive
+// NewReverseScan returns a Request initialized to reverse scan from end. No
+// locks will be acquired on each of the resulting keys.
+func NewReverseScan(key, endKey roachpb.Key) Request {
+	return &ReverseScanRequest{
+		RequestHeader: RequestHeader{
+			Key:    key,
+			EndKey: endKey,
+		},
+		KeyLockingStrength: lock.None,
 	}
-	return lock.None
+}
+
+// KeyLockingStrengthType is used to describe per-key locking strengths
+// associated with Get, Scan, and ReverseScan requests.
+type KeyLockingStrengthType int8
+
+const (
+	_ KeyLockingStrengthType = iota
+	// NonLocking indicates any keys returned will not be locked.
+	NonLocking
+	// ForShare indicates any keys returned will be locked for share; this means
+	// concurrent requests will be able to read the key or lock it ForShare
+	// themselves. Requests will not be allowed to write to the key. The semantics
+	// here correspond to acquiring a Read lock for a ReadWrite mutex.
+	ForShare
+	// ForUpdate indicates any keys returned will be locked for update; the
+	// transaction that holds the lock will have exclusive write access to the
+	// key. No other transaction is able to acquire a lock on the key; note that
+	// locking a key ForUpdate does not impact concurrent non-locking requests.
+	// The semantics here correspond to acquiring a Write lock in a ReadWrite
+	// mutex.
+	ForUpdate
+)
+
+// KeyLockingDurabilityType is used to describe the durability goals of per-key
+// locks acquired by locking Get, Scan, and ReverseScan requests.
+type KeyLockingDurabilityType int8
+
+const (
+	// Invalid is meant to be used in places where supplying lock durability does
+	// not make sense. Notably, it's used by non-locking requests.
+	Invalid KeyLockingDurabilityType = iota
+	// BestEffort makes a best-effort attempt to hold any locks acquired until
+	// commit time. Locks are held in-memory on the leaseholder of the locked key;
+	// locks may be lost because of things like lease transfers, node restarts,
+	// range splits, and range merges. However, the unreplicated nature of these
+	// locks makes lock acquisition fast, making this a great choice for
+	// transactions that do not require locks for correctness -- serializable
+	// transactions.
+	BestEffort
+	// GuaranteedDurability guarantees that if the transaction commits then any
+	// locks acquired by it will be held until commit time. On commit, once the
+	// locks are released, no subsequent writers will be able to write at or below
+	// the transaction's commit timestamp -- regardless of the timestamp at which
+	// the lock was acquired. Simply put, once acquired, locks are guaranteed to
+	// provide protection until commit time.
+	//
+	// To provide this guarantee, locks are replicated -- which means they come
+	// with the performance penalties of doing so. They're attractive choices for
+	// transactions that require locks for correctness (read: read-committed,
+	// snapshot isolation).
+	GuaranteedDurability
+)
+
+func scanLockStrength(str KeyLockingStrengthType) lock.Strength {
+	switch str {
+	case NonLocking:
+		panic(fmt.Sprintf("unexpected strength %d", str))
+	case ForShare:
+		return lock.Shared
+	case ForUpdate:
+		return lock.Exclusive
+	default:
+		panic(fmt.Sprintf("unknown strength type: %d", str))
+	}
+}
+
+func scanLockDurability(dur KeyLockingDurabilityType) lock.Durability {
+	switch dur {
+	case Invalid:
+		panic("invalid lock durability")
+	case BestEffort:
+		return lock.Unreplicated
+	case GuaranteedDurability:
+		return lock.Replicated
+	default:
+		panic(fmt.Sprintf("unknown durability type: %d", dur))
+	}
 }
 
 func flagForLockStrength(l lock.Strength) flag {
@@ -1312,13 +1852,22 @@ func flagForLockStrength(l lock.Strength) flag {
 	return 0
 }
 
+func flagForLockDurability(d lock.Durability) flag {
+	if d == lock.Replicated {
+		return isWrite | canPipeline
+	}
+	return 0
+}
+
 func (gr *GetRequest) flags() flag {
-	maybeLocking := flagForLockStrength(gr.KeyLocking)
-	return isRead | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
+	maybeLocking := flagForLockStrength(gr.KeyLockingStrength)
+	maybeWrite := flagForLockDurability(gr.KeyLockingDurability)
+	return isRead | maybeWrite | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
 }
 
 func (*PutRequest) flags() flag {
-	return isWrite | isTxn | isLocking | isIntentWrite | appliesTSCache | canBackpressure
+	return isWrite | isTxn | isLocking | isIntentWrite | appliesTSCache | canBackpressure |
+		canPipeline | canParallelCommit
 }
 
 // ConditionalPut effectively reads without writing if it hits a
@@ -1328,7 +1877,8 @@ func (*PutRequest) flags() flag {
 // transaction to be retried at end transaction.
 func (*ConditionalPutRequest) flags() flag {
 	return isRead | isWrite | isTxn | isLocking | isIntentWrite |
-		appliesTSCache | updatesTSCache | updatesTSCacheOnErr | canBackpressure
+		appliesTSCache | updatesTSCache | updatesTSCacheOnErr | canBackpressure | canPipeline |
+		canParallelCommit
 }
 
 // InitPut, like ConditionalPut, effectively reads without writing if it hits a
@@ -1338,7 +1888,8 @@ func (*ConditionalPutRequest) flags() flag {
 // to be retried at end transaction.
 func (*InitPutRequest) flags() flag {
 	return isRead | isWrite | isTxn | isLocking | isIntentWrite |
-		appliesTSCache | updatesTSCache | updatesTSCacheOnErr | canBackpressure
+		appliesTSCache | updatesTSCache | updatesTSCacheOnErr | canBackpressure |
+		canPipeline | canParallelCommit
 }
 
 // Increment reads the existing value, but always leaves an intent so
@@ -1347,7 +1898,8 @@ func (*InitPutRequest) flags() flag {
 // error immediately instead of continuing a serializable transaction
 // to be retried at end transaction.
 func (*IncrementRequest) flags() flag {
-	return isRead | isWrite | isTxn | isLocking | isIntentWrite | appliesTSCache | canBackpressure
+	return isRead | isWrite | isTxn | isLocking | isIntentWrite | appliesTSCache | canBackpressure |
+		canPipeline | canParallelCommit
 }
 
 func (*DeleteRequest) flags() flag {
@@ -1355,7 +1907,8 @@ func (*DeleteRequest) flags() flag {
 	// an existing key was deleted at the read timestamp. isIntentWrite allows
 	// omitting needsRefresh. For background, see:
 	// https://github.com/cockroachdb/cockroach/pull/89375
-	return isRead | isWrite | isTxn | isLocking | isIntentWrite | appliesTSCache | canBackpressure
+	return isRead | isWrite | isTxn | isLocking | isIntentWrite | appliesTSCache | canBackpressure |
+		canPipeline | canParallelCommit
 }
 
 func (drr *DeleteRangeRequest) flags() flag {
@@ -1371,6 +1924,10 @@ func (drr *DeleteRangeRequest) flags() flag {
 	// transaction by TxnCoordSender, which can occur if the command spans
 	// multiple ranges.
 	//
+	// As inline deletes cannot be part of a transaction, and don't go through the
+	// TxnCoordSender stack, there's no pipelining to speak of. As such, they
+	// don't set the canPipeline flag as well.
+	//
 	// TODO(mrtracy): The behavior of DeleteRangeRequest with "inline" set has
 	// likely diverged enough that it should be promoted into its own command.
 	// However, it is complicated to plumb a new command through the system,
@@ -1380,6 +1937,22 @@ func (drr *DeleteRangeRequest) flags() flag {
 	if drr.Inline {
 		return isRead | isWrite | isRange | isAlone
 	}
+
+	maybeCanPipeline := flag(0)
+	// DeleteRange requests operate over a range of keys. As such, we only
+	// know the actual keys that were deleted on the response path, not on the
+	// request path. This prevents them from being part of a batch that can be
+	// committed using parallel commits -- that's because for parallel commit
+	// recovery we need the entire in-flight write set to plop on the txn record,
+	// and we don't have that on the request path if the batch contains a
+	// DeleteRange request.
+	//
+	// We'll only know the actual keys that were deleted on the response path if
+	// they're returned to us. This is contingent on the ReturnKeys flag being set
+	// on the request.
+	if drr.ReturnKeys {
+		maybeCanPipeline = canPipeline
+	}
 	// DeleteRange updates the timestamp cache as it doesn't leave intents or
 	// tombstones for keys which don't yet exist or keys that already have
 	// tombstones on them, but still wants to prevent anybody from writing under
@@ -1387,7 +1960,7 @@ func (drr *DeleteRangeRequest) flags() flag {
 	// that exist would not be lost (since the DeleteRange leaves intents on
 	// those keys), but deletes of "empty space" would.
 	return isRead | isWrite | isTxn | isLocking | isIntentWrite | isRange |
-		appliesTSCache | updatesTSCache | needsRefresh | canBackpressure
+		appliesTSCache | updatesTSCache | needsRefresh | canBackpressure | maybeCanPipeline
 }
 
 // Note that ClearRange commands cannot be part of a transaction as
@@ -1403,13 +1976,15 @@ func (*RevertRangeRequest) flags() flag {
 }
 
 func (sr *ScanRequest) flags() flag {
-	maybeLocking := flagForLockStrength(sr.KeyLocking)
-	return isRead | isRange | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
+	maybeLocking := flagForLockStrength(sr.KeyLockingStrength)
+	maybeWrite := flagForLockDurability(sr.KeyLockingDurability)
+	return isRead | maybeWrite | isRange | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
 }
 
 func (rsr *ReverseScanRequest) flags() flag {
-	maybeLocking := flagForLockStrength(rsr.KeyLocking)
-	return isRead | isRange | isReverse | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
+	maybeLocking := flagForLockStrength(rsr.KeyLockingStrength)
+	maybeWrite := flagForLockDurability(rsr.KeyLockingDurability)
+	return isRead | maybeWrite | isRange | isReverse | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
 }
 
 // EndTxn updates the timestamp cache to prevent replays.
@@ -1455,8 +2030,8 @@ func (*QueryIntentRequest) flags() flag {
 	return isRead | isPrefix | updatesTSCache | updatesTSCacheOnErr
 }
 func (*QueryLocksRequest) flags() flag         { return isRead | isRange }
-func (*ResolveIntentRequest) flags() flag      { return isWrite }
-func (*ResolveIntentRangeRequest) flags() flag { return isWrite | isRange }
+func (*ResolveIntentRequest) flags() flag      { return isWrite | updatesTSCache }
+func (*ResolveIntentRangeRequest) flags() flag { return isWrite | isRange | updatesTSCache }
 func (*TruncateLogRequest) flags() flag        { return isWrite }
 func (*MergeRequest) flags() flag              { return isWrite | canBackpressure }
 func (*RequestLeaseRequest) flags() flag {
@@ -1504,6 +2079,13 @@ func (r *AddSSTableRequest) flags() flag {
 	}
 	return flags
 }
+func (r *LinkExternalSSTableRequest) flags() flag {
+	flags := isWrite | isRange | isAlone | isUnsplittable | canBackpressure | bypassesReplicaCircuitBreaker
+	if r.ExternalFile.UseSyntheticSuffix {
+		flags |= appliesTSCache
+	}
+	return flags
+}
 func (*MigrateRequest) flags() flag { return isWrite | isRange | isAlone }
 
 // RefreshRequest and RefreshRangeRequest both determine which timestamp cache
@@ -1515,12 +2097,18 @@ func (r *RefreshRangeRequest) flags() flag {
 	return isRead | isTxn | isRange | updatesTSCache
 }
 
-func (*SubsumeRequest) flags() flag    { return isRead | isAlone | updatesTSCache }
+func (*SubsumeRequest) flags() flag    { return isWrite | isAlone | updatesTSCache }
 func (*RangeStatsRequest) flags() flag { return isRead }
 func (*QueryResolvedTimestampRequest) flags() flag {
 	return isRead | isRange | requiresClosedTSOlderThanStorageSnapshot
 }
-func (*BarrierRequest) flags() flag     { return isWrite | isRange }
+func (r *BarrierRequest) flags() flag {
+	flags := isWrite | isRange | isAlone
+	if r.WithLeaseAppliedIndex {
+		flags |= isUnsplittable // the LAI is only valid for a single range
+	}
+	return flags
+}
 func (*IsSpanEmptyRequest) flags() flag { return isRead | isRange }
 
 // IsParallelCommit returns whether the EndTxn request is attempting to perform
@@ -1540,8 +2128,6 @@ func BulkOpSummaryID(tableID, indexID uint64) uint64 {
 func (b *BulkOpSummary) Add(other BulkOpSummary) {
 	b.DataSize += other.DataSize
 	b.SSTDataSize += other.SSTDataSize
-	b.DeprecatedRows += other.DeprecatedRows
-	b.DeprecatedIndexEntries += other.DeprecatedIndexEntries
 
 	if other.EntryCounts != nil && b.EntryCounts == nil {
 		b.EntryCounts = make(map[uint64]int64, len(other.EntryCounts))
@@ -1684,6 +2270,21 @@ func (acrr *AdminChangeReplicasRequest) Changes() []ReplicationChange {
 	return sl
 }
 
+// StrengthOrDefault returns the strength of the lock being queried by the
+// QueryIntentRequest.
+func (qir *QueryIntentRequest) StrengthOrDefault() lock.Strength {
+	// TODO(arul): the Strength field on QueryIntentRequest was introduced in
+	// v24.1. Prior to that, rather unsurprisingly, QueryIntentRequest would only
+	// query replicated locks with strength. To maintain compatibility between
+	// v23.2 <-> v24.1 nodes, if this field is unset, we assume it's lock.Intent.
+	// In the future, once compatibility with v23.2 is no longer a concern, we
+	// should be able to get rid of this logic.
+	if qir.Strength == lock.None {
+		return lock.Intent
+	}
+	return qir.Strength
+}
+
 // AsLockUpdate creates a lock update message corresponding to the given resolve
 // intent request.
 func (rir *ResolveIntentRequest) AsLockUpdate() roachpb.LockUpdate {
@@ -1766,6 +2367,8 @@ func (c *TenantConsumption) Add(other *TenantConsumption) {
 	c.PGWireEgressBytes += other.PGWireEgressBytes
 	c.ExternalIOIngressBytes += other.ExternalIOIngressBytes
 	c.ExternalIOEgressBytes += other.ExternalIOEgressBytes
+	c.CrossRegionNetworkRU += other.CrossRegionNetworkRU
+	c.EstimatedCPUSeconds += other.EstimatedCPUSeconds
 }
 
 // Sub subtracts consumption, making sure no fields become negative.
@@ -1841,33 +2444,54 @@ func (c *TenantConsumption) Sub(other *TenantConsumption) {
 	} else {
 		c.ExternalIOIngressBytes -= other.ExternalIOIngressBytes
 	}
+
+	if c.CrossRegionNetworkRU < other.CrossRegionNetworkRU {
+		c.CrossRegionNetworkRU = 0
+	} else {
+		c.CrossRegionNetworkRU -= other.CrossRegionNetworkRU
+	}
+
+	if c.EstimatedCPUSeconds < other.EstimatedCPUSeconds {
+		c.EstimatedCPUSeconds = 0
+	} else {
+		c.EstimatedCPUSeconds -= other.EstimatedCPUSeconds
+	}
 }
 
-func humanizePointCount(n uint64) redact.SafeString {
-	return redact.SafeString(humanize.SI(float64(n), ""))
+func humanizeCount(n uint64) redact.SafeString {
+	value, prefix := humanize.ComputeSI(float64(n))
+	return redact.SafeString(humanize.Ftoa(value) + prefix)
 }
 
 // SafeFormat implements redact.SafeFormatter.
 func (s *ScanStats) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf("scan stats: stepped %d times (%d internal); seeked %d times (%d internal); "+
-		"block-bytes: (total %s, cached %s); "+
+	w.Printf("n%d scan stats: stepped %s times (%s internal); seeked %s times (%s internal); "+
+		"block-bytes: (total %s, cached %s, duration %v); "+
 		"points: (count %s, key-bytes %s, value-bytes %s, tombstoned: %s) "+
 		"ranges: (count %s), (contained-points %s, skipped-points %s) "+
-		"evaluated requests: %d gets, %d scans, %d reverse scans",
-		s.NumInterfaceSteps, s.NumInternalSteps, s.NumInterfaceSeeks, s.NumInternalSeeks,
+		"evaluated requests: %s gets, %s scans, %s reverse scans",
+		s.NodeID,
+		humanizeCount(s.NumInterfaceSteps),
+		humanizeCount(s.NumInternalSteps),
+		humanizeCount(s.NumInterfaceSeeks),
+		humanizeCount(s.NumInternalSeeks),
 		humanizeutil.IBytes(int64(s.BlockBytes)),
 		humanizeutil.IBytes(int64(s.BlockBytesInCache)),
-		humanizePointCount(s.PointCount),
+		s.BlockReadDuration,
+		humanizeCount(s.PointCount),
 		humanizeutil.IBytes(int64(s.KeyBytes)),
 		humanizeutil.IBytes(int64(s.ValueBytes)),
-		humanizePointCount(s.PointsCoveredByRangeTombstones),
-		humanizePointCount(s.RangeKeyCount),
-		humanizePointCount(s.RangeKeyContainedPoints),
-		humanizePointCount(s.RangeKeySkippedPoints),
-		s.NumGets, s.NumScans, s.NumReverseScans)
+		humanizeCount(s.PointsCoveredByRangeTombstones),
+		humanizeCount(s.RangeKeyCount),
+		humanizeCount(s.RangeKeyContainedPoints),
+		humanizeCount(s.RangeKeySkippedPoints),
+		humanizeCount(s.NumGets),
+		humanizeCount(s.NumScans),
+		humanizeCount(s.NumReverseScans),
+	)
 	if s.SeparatedPointCount != 0 {
 		w.Printf(" separated: (count: %s, bytes: %s, bytes-fetched: %s)",
-			humanizePointCount(s.SeparatedPointCount),
+			humanizeCount(s.SeparatedPointCount),
 			humanizeutil.IBytes(int64(s.SeparatedPointValueBytes)),
 			humanizeutil.IBytes(int64(s.SeparatedPointValueBytesFetched)))
 	}
@@ -1880,8 +2504,13 @@ func (s *ScanStats) String() string {
 
 // RangeFeedEventSink is an interface for sending a single rangefeed event.
 type RangeFeedEventSink interface {
-	Context() context.Context
-	Send(*RangeFeedEvent) error
+	// SendUnbuffered blocks until it sends the RangeFeedEvent, the stream is
+	// done, or the stream breaks. Send must be safe to call on the same stream in
+	// different goroutines.
+	SendUnbuffered(*RangeFeedEvent) error
+	// SendUnbufferedIsThreadSafe is a no-op declaration method. It is a contract
+	// that the interface has a thread-safe Send method.
+	SendUnbufferedIsThreadSafe()
 }
 
 // RangeFeedEventProducer is an adapter for receiving rangefeed events with either
@@ -1890,4 +2519,30 @@ type RangeFeedEventProducer interface {
 	// Recv receives the next rangefeed event. an io.EOF error indicates that the
 	// range needs to be restarted.
 	Recv() (*RangeFeedEvent, error)
+}
+
+// SafeValue implements the redact.SafeValue interface.
+func (PushTxnType) SafeValue() {}
+
+func (writeOptions *WriteOptions) GetOriginID() uint32 {
+	if writeOptions == nil {
+		return 0
+	}
+	return writeOptions.OriginID
+}
+
+func (writeOptions *WriteOptions) GetOriginTimestamp() hlc.Timestamp {
+	if writeOptions == nil {
+		return hlc.Timestamp{}
+	}
+	return writeOptions.OriginTimestamp
+}
+
+func (r *ConditionalPutRequest) Validate() error {
+	if !r.OriginTimestamp.IsEmpty() {
+		if r.AllowIfDoesNotExist {
+			return errors.AssertionFailedf("invalid ConditionalPutRequest: AllowIfDoesNotExist and non-empty OriginTimestamp are incompatible")
+		}
+	}
+	return nil
 }

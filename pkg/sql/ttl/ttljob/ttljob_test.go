@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ttljob_test
 
@@ -28,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -37,9 +31,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -59,7 +55,6 @@ type ttlServer interface {
 type rowLevelTTLTestJobTestHelper struct {
 	server           ttlServer
 	env              *jobstest.JobSchedulerTestEnv
-	cfg              *scheduledjobs.JobExecutionConfig
 	testCluster      serverutils.TestClusterInterface
 	sqlDB            *sqlutils.SQLRunner
 	kvDB             *kv.DB
@@ -86,12 +81,10 @@ func newRowLevelTTLTestJobTestHelper(
 			JobSchedulerEnv: th.env,
 			TakeOverJobsScheduling: func(fn func(ctx context.Context, maxSchedules int64) error) {
 				th.executeSchedules = func() error {
+					th.env.SetTime(timeutil.Now().Add(time.Hour * 24))
 					defer th.server.JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
 					return fn(context.Background(), 0 /* allSchedules */)
 				}
-			},
-			CaptureJobExecutionConfig: func(config *scheduledjobs.JobExecutionConfig) {
-				th.cfg = config
 			},
 		},
 		TTL: testingKnobs,
@@ -102,16 +95,10 @@ func newRowLevelTTLTestJobTestHelper(
 		replicationMode = base.ReplicationManual
 	}
 
-	var defaultTestTenant base.DefaultTestTenantOptions
-	// Disable the default test tenant when running multi-tenant tests.
-	if testMultiTenant {
-		defaultTestTenant = base.TODOTestTenantDisabled
-	}
-
 	testCluster := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ReplicationMode: replicationMode,
 		ServerArgs: base.TestServerArgs{
-			DefaultTestTenant: defaultTestTenant,
+			DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(109391),
 			Knobs:             baseTestingKnobs,
 			InsecureWebAccess: true,
 		},
@@ -130,11 +117,10 @@ func newRowLevelTTLTestJobTestHelper(
 		th.sqlDB = sqlutils.MakeSQLRunner(db)
 		th.server = tenantServer
 	} else {
-		db := ts.SystemLayer().SQLConn(t, "")
+		db := ts.SystemLayer().SQLConn(t)
 		th.sqlDB = sqlutils.MakeSQLRunner(db)
 		th.server = ts
 	}
-	require.NotNil(t, th.cfg)
 
 	th.kvDB = ts.DB()
 
@@ -146,7 +132,6 @@ func newRowLevelTTLTestJobTestHelper(
 func (h *rowLevelTTLTestJobTestHelper) waitForScheduledJob(
 	t *testing.T, expectedStatus jobs.Status, expectedErrorRe string,
 ) {
-	h.env.SetTime(timeutil.Now().Add(time.Hour * 24))
 	require.NoError(t, h.executeSchedules())
 
 	query := fmt.Sprintf(
@@ -229,7 +214,7 @@ func (h *rowLevelTTLTestJobTestHelper) verifyExpiredRowsJobOnly(
 		var progress jobspb.Progress
 		require.NoError(t, protoutil.Unmarshal(progressBytes, &progress))
 
-		actualNumExpiredRows := progress.UnwrapDetails().(jobspb.RowLevelTTLProgress).JobRowCount
+		actualNumExpiredRows := progress.UnwrapDetails().(jobspb.RowLevelTTLProgress).JobDeletedRowCount
 		require.Equal(t, int64(expectedNumExpiredRows), actualNumExpiredRows)
 		jobCount++
 	}
@@ -285,8 +270,9 @@ func (h *rowLevelTTLTestJobTestHelper) verifyExpiredRows(
 			require.Equal(t, expectedProcessorRowCount, processorProgress.ProcessorRowCount)
 			expectedJobRowCount += expectedProcessorRowCount
 		}
-		require.Equal(t, expectedJobSpanCount, rowLevelTTLProgress.JobSpanCount)
-		require.Equal(t, expectedJobRowCount, rowLevelTTLProgress.JobRowCount)
+		require.Equal(t, expectedJobSpanCount, rowLevelTTLProgress.JobProcessedSpanCount)
+		require.Equal(t, expectedJobSpanCount, rowLevelTTLProgress.JobTotalSpanCount)
+		require.Equal(t, expectedJobRowCount, rowLevelTTLProgress.JobDeletedRowCount)
 		jobCount++
 	}
 	require.Equal(t, 1, jobCount)
@@ -582,10 +568,13 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderDuress(t, "this test is very slow")
+
 	rng, _ := randutil.NewTestRand()
 
+	collatedStringType := types.MakeCollatedString(types.String, "en" /* locale */)
 	var indexableTyps []*types.T
-	for _, typ := range types.Scalar {
+	for _, typ := range append(types.Scalar, collatedStringType) {
 		// TODO(#76419): DateFamily has a broken `-infinity` case.
 		// TODO(#99432): JsonFamily has broken cases. This is because the test is wrapping JSON
 		//   objects in multiple single quotes which causes parsing errors.
@@ -696,7 +685,7 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 	"quote-kw-col" TIMESTAMPTZ,
 	text TEXT,
 	PRIMARY KEY (id, other_col, "quote-kw-col")
-) WITH (ttl_expire_after = '30 days', ttl_delete_rate_limit = 350)`,
+) WITH (ttl_expire_after = '30 days', ttl_select_rate_limit = 350, ttl_delete_rate_limit = 350)`,
 			numExpiredRows:    1001,
 			numNonExpiredRows: 5,
 		},
@@ -748,8 +737,29 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 			},
 		},
 	}
-	// Also randomly generate random PKs.
+	// Also randomly generate random PKs and families.
+	generateFamilyClauses := func(colNames []string) string {
+		familyClauses := strings.Builder{}
+		numFamilies := rng.Intn(len(colNames))
+		for fam := 0; fam < numFamilies && len(colNames) > 0; fam++ {
+			rng.Shuffle(len(colNames), func(i, j int) {
+				colNames[i], colNames[j] = colNames[j], colNames[i]
+			})
+			familySize := 1 + rng.Intn(len(colNames))
+			familyClauses.WriteString(fmt.Sprintf("FAMILY fam%d (", fam))
+			for col := 0; col < familySize; col++ {
+				if col > 0 {
+					familyClauses.WriteString(", ")
+				}
+				familyClauses.WriteString(colNames[col])
+			}
+			colNames = colNames[familySize:]
+			familyClauses.WriteString("), ")
+		}
+		return familyClauses.String()
+	}
 	for i := 0; i < 5; i++ {
+		familyClauses := generateFamilyClauses([]string{"id", "rand_col_1", "rand_col_2", "t", "i"})
 		testCases = append(
 			testCases,
 			testCase{
@@ -759,13 +769,16 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 	id UUID DEFAULT gen_random_uuid(),
 	rand_col_1 %s,
 	rand_col_2 %s,
-	text TEXT,
+	t TEXT NULL,
+	i INT8 NULL,
+	%s
 	PRIMARY KEY (id, rand_col_1, rand_col_2)
 ) WITH (ttl_expire_after = '30 days', ttl_select_batch_size = %d, ttl_delete_batch_size = %d)`,
 					randgen.RandTypeFromSlice(rng, indexableTyps).SQLString(),
 					randgen.RandTypeFromSlice(rng, indexableTyps).SQLString(),
-					1+rng.Intn(100),
-					1+rng.Intn(100),
+					familyClauses,
+					10+rng.Intn(100),
+					10+rng.Intn(100),
 				),
 				numSplits:         1 + rng.Intn(9),
 				numExpiredRows:    rng.Intn(2000),
@@ -789,10 +802,15 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 				lexbase.EncodeRestrictedSQLIdent(&b, string(def.Name), lexbase.EncNoFlags)
 				insertColumns = append(insertColumns, b.String())
 
-				d := randgen.RandDatum(rng, def.Type.(*types.T), false /* nullOk */)
-				f := tree.NewFmtCtx(tree.FmtBareStrings)
-				d.Format(f)
-				values = append(values, f.CloseAndGetString())
+				nullOK := def.Nullable.Nullability == tree.Null
+				d := randgen.RandDatum(rng, def.Type.(*types.T), nullOK)
+				if d == tree.DNull {
+					values = append(values, nil)
+				} else {
+					f := tree.NewFmtCtx(tree.FmtBareStrings)
+					d.Format(f)
+					values = append(values, f.CloseAndGetString())
+				}
 			}
 		}
 
@@ -815,8 +833,7 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 			th, cleanupFunc := newRowLevelTTLTestJobTestHelper(
 				t,
 				&sql.TTLTestingKnobs{
-					AOSTDuration:     &zeroDuration,
-					ReturnStatsError: true,
+					AOSTDuration: &zeroDuration,
 				},
 				tc.numSplits == 0 && !tc.forceNonMultiTenant, // SPLIT AT does not work with multi-tenant
 				1, /* numNodes */
@@ -907,6 +924,41 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 			th.verifyExpiredRowsJobOnly(t, tc.numExpiredRows)
 		})
 	}
+}
+
+func TestRowLevelTTLCancelStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	th, cleanupFunc := newRowLevelTTLTestJobTestHelper(
+		t,
+		&sql.TTLTestingKnobs{
+			AOSTDuration:     &zeroDuration,
+			ReturnStatsError: true,
+			ExtraStatsQuery:  "SELECT pg_sleep(100)",
+		},
+		false, /* testMultiTenant */
+		1,     /* numNodes */
+	)
+	defer cleanupFunc()
+
+	th.sqlDB.Exec(t, `
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  expire_at TIMESTAMPTZ
+) WITH (
+  ttl_expiration_expression = 'expire_at',
+  ttl_row_stats_poll_interval = '1 minute'
+)`)
+	th.sqlDB.Exec(t, `INSERT INTO t (id, expire_at) VALUES (1, '2020-01-01')`)
+
+	// Force the schedule to execute. Normally, the job would not fail due to a
+	// stats error, but we have set the ReturnStatsError knob to true in this
+	// test.
+	th.waitForScheduledJob(t, jobs.StatusFailed, "cancelling TTL stats query because TTL job completed")
+
+	results := th.sqlDB.QueryStr(t, "SELECT * FROM t")
+	require.Empty(t, results)
 }
 
 func TestOutboundForeignKey(t *testing.T) {
@@ -1032,4 +1084,64 @@ func TestInboundForeignKeyOnDeleteRestrictNull(t *testing.T) {
 
 	results = sqlDB.QueryStr(t, "SELECT * FROM child")
 	require.Len(t, results, 1)
+}
+
+func TestMakeTTLJobDescription(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		desc                 string
+		tableSelectBatchSize int
+		jobSelectBatchSize   int
+	}{
+		{
+			desc:                 "default ttl_select_batch_size",
+			tableSelectBatchSize: 0,
+			jobSelectBatchSize:   ttlbase.DefaultSelectBatchSizeValue,
+		},
+		{
+			desc:                 "override ttl_select_batch_size",
+			tableSelectBatchSize: 1,
+			jobSelectBatchSize:   1,
+		},
+	}
+
+	getCreateTable := func(selectBatchSize int) string {
+		const createTable = `CREATE TABLE t (
+    id INT PRIMARY KEY,
+    expire_at TIMESTAMPTZ
+) WITH (
+    %s
+    ttl_expiration_expression = 'expire_at',
+    ttl_job_cron = '* * * * *'
+)`
+		selectBatchSizeClause := ""
+		if selectBatchSize > 0 {
+			selectBatchSizeClause = fmt.Sprintf("ttl_select_batch_size = %d,", selectBatchSize)
+		}
+		return fmt.Sprintf(createTable, selectBatchSizeClause)
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.desc, func(t *testing.T) {
+			th, cleanupFunc := newRowLevelTTLTestJobTestHelper(
+				t,
+				&sql.TTLTestingKnobs{
+					AOSTDuration: &zeroDuration,
+				},
+				false, /* testMultiTenant */
+				1,     /* numNodes */
+			)
+			defer cleanupFunc()
+			createTable := getCreateTable(testCase.tableSelectBatchSize)
+			th.sqlDB.Exec(t, createTable)
+			th.waitForScheduledJob(t, jobs.StatusSucceeded, "")
+			rows := th.sqlDB.QueryStr(t, "SELECT description FROM [SHOW JOBS SELECT id FROM system.jobs WHERE job_type = 'ROW LEVEL TTL']")
+			t.Log(rows)
+			require.Len(t, rows, 1)
+			row := rows[0]
+			require.Contains(t, row[0], fmt.Sprintf("LIMIT %d", testCase.jobSelectBatchSize))
+		})
+	}
 }

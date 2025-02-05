@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -69,9 +64,15 @@ func (r *traceSpanResumer) OnFailOrCancel(ctx context.Context, execCtx interface
 	return errors.New("unimplemented")
 }
 
+// CollectProfile implements the jobs.Resumer interface.
+func (r *traceSpanResumer) CollectProfile(_ context.Context, _ interface{}) error {
+	return nil
+}
+
 func TestDebugJobTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer jobs.ResetConstructors()()
 
 	ctx := context.Background()
 	argsFn := func(args *base.TestServerArgs) {
@@ -91,7 +92,7 @@ func TestDebugJobTrace(t *testing.T) {
 	defer close(completeResumerCh)
 	defer close(recordedSpanCh)
 
-	jobs.RegisterConstructor(
+	defer jobs.TestingRegisterConstructor(
 		jobspb.TypeBackup,
 		func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return &traceSpanResumer{
@@ -101,7 +102,7 @@ func TestDebugJobTrace(t *testing.T) {
 			}
 		},
 		jobs.UsesTenantCostControl,
-	)
+	)()
 
 	// Create a "backup job" but we have overridden the resumer constructor above
 	// to inject our traceSpanResumer.

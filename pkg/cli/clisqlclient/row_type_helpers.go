@@ -1,24 +1,19 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient
 
 import (
 	"strings"
 
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // databaseTypeName returns the database type name for the given type OID.
-func databaseTypeName(ci *pgtype.ConnInfo, typeOID uint32) string {
-	dataType, ok := ci.DataTypeForOID(typeOID)
+func databaseTypeName(tm *pgtype.Map, typeOID uint32) string {
+	dataType, ok := tm.TypeForOID(typeOID)
 	if !ok {
 		// TODO(rafi): remove special logic once jackc/pgtype includes these types.
 		switch typeOID {

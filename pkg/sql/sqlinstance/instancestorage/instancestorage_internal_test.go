@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package instancestorage
 
@@ -18,7 +13,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -51,17 +45,14 @@ func TestGetAvailableInstanceIDForRegion(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	getAvailableInstanceID := func(storage *Storage, region []byte) (id base.SQLInstanceID, err error) {
 		err = storage.db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
-			version, err := storage.versionGuard(ctx, txn)
-			if err != nil {
-				return err
-			}
-
-			id, err = storage.getAvailableInstanceIDForRegion(ctx, region, txn, &version)
+			var err error
+			id, err = storage.getAvailableInstanceIDForRegion(ctx, region, txn)
 			return err
 		})
 		return
@@ -99,6 +90,8 @@ func TestGetAvailableInstanceIDForRegion(t *testing.T) {
 				sessionExpiry,
 				roachpb.Locality{},
 				roachpb.Version{},
+				/* encodeIsDraining */ true,
+				/* isDraining */ false,
 			))
 		}
 
@@ -294,8 +287,9 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	const expiration = time.Minute
 	const preallocatedCount = 5
@@ -347,6 +341,8 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 				sessionExpiry,
 				roachpb.Locality{},
 				roachpb.Version{},
+				/* encodeIsDraining */ true,
+				/* isDraining */ false,
 			))
 		}
 		for _, i := range []int{2, 3} {
@@ -447,7 +443,7 @@ func sortInstancesForTest(instances []sqlinstance.InstanceInfo) {
 }
 
 func setup(
-	t *testing.T, sqlDB *gosql.DB, s serverutils.TestServerInterface,
+	t *testing.T, sqlDB *gosql.DB, s serverutils.ApplicationLayerInterface,
 ) (*stop.Stopper, *Storage, *slstorage.FakeStorage, *hlc.Clock) {
 	dbName := t.Name()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
@@ -459,7 +455,7 @@ func setup(
 	stopper := stop.NewStopper()
 	slStorage := slstorage.NewFakeStorage()
 	f := s.RangeFeedFactory().(*rangefeed.Factory)
-	storage := NewTestingStorage(s.DB(), keys.SystemSQLCodec, table, slStorage, s.ClusterSettings(), clock, f, s.SettingsWatcher().(*settingswatcher.SettingsWatcher))
+	storage := NewTestingStorage(s.DB(), s.Codec(), table, slStorage, s.ClusterSettings(), clock, f, s.SettingsWatcher().(*settingswatcher.SettingsWatcher))
 	return stopper, storage, slStorage, clock
 }
 
@@ -479,6 +475,9 @@ func claim(
 	require.NoError(t, err)
 	require.NoError(t, slStorage.Insert(ctx, sessionID, sessionExpiration))
 	require.NoError(t, storage.CreateInstanceDataForTest(
-		ctx, region, instanceID, rpcAddr, sqlAddr, sessionID, sessionExpiration, roachpb.Locality{}, roachpb.Version{},
+		ctx, region, instanceID, rpcAddr, sqlAddr, sessionID,
+		sessionExpiration, roachpb.Locality{}, roachpb.Version{},
+		/* encodeIsDraining */ true,
+		/* isDraining */ false,
 	))
 }

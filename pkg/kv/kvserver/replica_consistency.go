@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -23,14 +18,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -390,7 +389,7 @@ func (r *Replica) getChecksum(ctx context.Context, id uuid.UUID) (CollectChecksu
 
 	// Wait for the checksum computation to start.
 	dur := r.checksumInitialWait(ctx)
-	t := timeutil.NewTimer()
+	var t timeutil.Timer
 	t.Reset(dur)
 	defer t.Stop()
 	var taskCancel context.CancelFunc
@@ -476,13 +475,15 @@ func CalcReplicaDigest(
 	snap storage.Reader,
 	mode kvpb.ChecksumMode,
 	limiter *quotapool.RateLimiter,
+	settings *cluster.Settings,
 ) (*ReplicaDigest, error) {
 	statsOnly := mode == kvpb.ChecksumMode_CHECK_STATS
 
 	// Iterate over all the data in the range.
 	var intBuf [8]byte
-	var legacyTimestamp hlc.LegacyTimestamp
+	var timestamp hlc.Timestamp
 	var timestampBuf []byte
+	var uuidBuf [uuid.Size]byte
 	hasher := sha512.New()
 
 	// Request quota from the limiter in chunks of at least targetBatchSize, to
@@ -498,7 +499,9 @@ func CalcReplicaDigest(
 		return limiter.WaitN(ctx, tokens)
 	}
 
-	pointKeyVisitor := func(unsafeKey storage.MVCCKey, unsafeValue []byte) error {
+	var visitors storage.ComputeStatsVisitors
+
+	visitors.PointKey = func(unsafeKey storage.MVCCKey, unsafeValue []byte) error {
 		// Rate limit the scan through the range.
 		if err := wait(int64(len(unsafeKey.Key) + len(unsafeValue))); err != nil {
 			return err
@@ -512,26 +515,28 @@ func CalcReplicaDigest(
 		if _, err := hasher.Write(intBuf[:]); err != nil {
 			return err
 		}
+		// Encode the key.
 		if _, err := hasher.Write(unsafeKey.Key); err != nil {
 			return err
 		}
-		legacyTimestamp = unsafeKey.Timestamp.ToLegacyTimestamp()
-		if size := legacyTimestamp.Size(); size > cap(timestampBuf) {
+		timestamp = unsafeKey.Timestamp
+		if size := timestamp.Size(); size > cap(timestampBuf) {
 			timestampBuf = make([]byte, size)
 		} else {
 			timestampBuf = timestampBuf[:size]
 		}
-		if _, err := protoutil.MarshalToSizedBuffer(&legacyTimestamp, timestampBuf); err != nil {
+		if _, err := protoutil.MarshalToSizedBuffer(&timestamp, timestampBuf); err != nil {
 			return err
 		}
 		if _, err := hasher.Write(timestampBuf); err != nil {
 			return err
 		}
+		// Encode the value.
 		_, err := hasher.Write(unsafeValue)
 		return err
 	}
 
-	rangeKeyVisitor := func(rangeKV storage.MVCCRangeKeyValue) error {
+	visitors.RangeKey = func(rangeKV storage.MVCCRangeKeyValue) error {
 		// Rate limit the scan through the range.
 		err := wait(
 			int64(len(rangeKV.RangeKey.StartKey) + len(rangeKV.RangeKey.EndKey) + len(rangeKV.Value)))
@@ -551,25 +556,66 @@ func CalcReplicaDigest(
 		if _, err := hasher.Write(intBuf[:]); err != nil {
 			return err
 		}
+		// Encode the key.
 		if _, err := hasher.Write(rangeKV.RangeKey.StartKey); err != nil {
 			return err
 		}
 		if _, err := hasher.Write(rangeKV.RangeKey.EndKey); err != nil {
 			return err
 		}
-		legacyTimestamp = rangeKV.RangeKey.Timestamp.ToLegacyTimestamp()
-		if size := legacyTimestamp.Size(); size > cap(timestampBuf) {
+		timestamp = rangeKV.RangeKey.Timestamp
+		if size := timestamp.Size(); size > cap(timestampBuf) {
 			timestampBuf = make([]byte, size)
 		} else {
 			timestampBuf = timestampBuf[:size]
 		}
-		if _, err := protoutil.MarshalToSizedBuffer(&legacyTimestamp, timestampBuf); err != nil {
+		if _, err := protoutil.MarshalToSizedBuffer(&timestamp, timestampBuf); err != nil {
 			return err
 		}
 		if _, err := hasher.Write(timestampBuf); err != nil {
 			return err
 		}
+		// Encode the value.
 		_, err = hasher.Write(rangeKV.Value)
+		return err
+	}
+
+	visitors.LockTableKey = func(unsafeKey storage.LockTableKey, unsafeValue []byte) error {
+		// Assert that the lock is not an intent. Intents are handled by the
+		// PointKey visitor function, not by the LockTableKey visitor function.
+		if unsafeKey.Strength == lock.Intent {
+			return errors.AssertionFailedf("unexpected intent lock in LockTableKey visitor: %s", unsafeKey)
+		}
+		// Rate limit the scan through the lock table.
+		if err := wait(int64(len(unsafeKey.Key) + len(unsafeValue))); err != nil {
+			return err
+		}
+		// Encode the length of the key and value.
+		binary.LittleEndian.PutUint64(intBuf[:], uint64(len(unsafeKey.Key)))
+		if _, err := hasher.Write(intBuf[:]); err != nil {
+			return err
+		}
+		binary.LittleEndian.PutUint64(intBuf[:], uint64(len(unsafeValue)))
+		if _, err := hasher.Write(intBuf[:]); err != nil {
+			return err
+		}
+		// Encode the key.
+		if _, err := hasher.Write(unsafeKey.Key); err != nil {
+			return err
+		}
+		// NOTE: this is not the same strength encoding that the actual lock
+		// table version uses. For that, see getByteForReplicatedLockStrength.
+		strengthBuf := intBuf[:1]
+		strengthBuf[0] = byte(unsafeKey.Strength)
+		if _, err := hasher.Write(strengthBuf); err != nil {
+			return err
+		}
+		copy(uuidBuf[:], unsafeKey.TxnUUID.GetBytes())
+		if _, err := hasher.Write(uuidBuf[:]); err != nil {
+			return err
+		}
+		// Encode the value.
+		_, err := hasher.Write(unsafeValue)
 		return err
 	}
 
@@ -577,8 +623,8 @@ func CalcReplicaDigest(
 	// all of the replicated key space.
 	var result ReplicaDigest
 	if !statsOnly {
-		ms, err := rditer.ComputeStatsForRangeWithVisitors(&desc, snap, 0, /* nowNanos */
-			pointKeyVisitor, rangeKeyVisitor)
+		ms, err := rditer.ComputeStatsForRangeWithVisitors(
+			ctx, &desc, snap, 0 /* nowNanos */, visitors)
 		// Consume the remaining quota borrowed in the visitors. Do it even on
 		// iteration error, but prioritize returning the latter if it occurs.
 		if wErr := limiter.WaitN(ctx, batchSize); wErr != nil && err == nil {
@@ -635,7 +681,20 @@ func (r *Replica) computeChecksumPostApply(
 
 	// Caller is holding raftMu, so an engine snapshot is automatically
 	// Raft-consistent (i.e. not in the middle of an AddSSTable).
-	snap := r.store.TODOEngine().NewSnapshot()
+	spans := rditer.MakeReplicatedKeySpans(&desc)
+	var snap storage.Reader
+	if r.store.cfg.SharedStorageEnabled || storage.ShouldUseEFOS(&r.ClusterSettings().SV) {
+		efos := r.store.TODOEngine().NewEventuallyFileOnlySnapshot(spans)
+		if util.RaceEnabled {
+			ss := rditer.MakeReplicatedKeySpanSet(&desc)
+			defer ss.Release()
+			snap = spanset.NewEventuallyFileOnlySnapshot(efos, ss)
+		} else {
+			snap = efos
+		}
+	} else {
+		snap = r.store.TODOEngine().NewSnapshot()
+	}
 	if cc.Checkpoint {
 		sl := stateloader.Make(r.RangeID)
 		as, err := sl.LoadRangeAppliedState(ctx, snap)
@@ -695,7 +754,7 @@ func (r *Replica) computeChecksumPostApply(
 		); err != nil {
 			log.Errorf(ctx, "checksum collection did not join: %v", err)
 		} else {
-			result, err := CalcReplicaDigest(ctx, desc, snap, cc.Mode, r.store.consistencyLimiter)
+			result, err := CalcReplicaDigest(ctx, desc, snap, cc.Mode, r.store.consistencyLimiter, r.ClusterSettings())
 			if err != nil {
 				log.Errorf(ctx, "checksum computation failed: %v", err)
 				result = nil
@@ -719,7 +778,7 @@ func (r *Replica) computeChecksumPostApply(
 		// certain of completing the check. Since we're already in a goroutine
 		// that's about to end, just sleep for a few seconds and then terminate.
 		auxDir := r.store.TODOEngine().GetAuxiliaryDir()
-		_ = r.store.TODOEngine().MkdirAll(auxDir, os.ModePerm)
+		_ = r.store.TODOEngine().Env().MkdirAll(auxDir, os.ModePerm)
 		path := base.PreventedStartupFile(auxDir)
 
 		const attentionFmt = `ATTENTION:
@@ -762,7 +821,7 @@ creation. These directories should be deleted, or inspected with caution.
 `
 		attentionArgs := []any{r, desc.Replicas(), redact.Safe(auxDir), redact.Safe(path)}
 		preventStartupMsg := fmt.Sprintf(attentionFmt, attentionArgs...)
-		if err := fs.WriteFile(r.store.TODOEngine(), path, []byte(preventStartupMsg)); err != nil {
+		if err := fs.WriteFile(r.store.TODOEngine().Env(), path, []byte(preventStartupMsg), fs.UnspecifiedWriteCategory); err != nil {
 			log.Warningf(ctx, "%v", err)
 		}
 

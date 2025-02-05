@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -14,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -23,16 +19,26 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
 var rubyPGTestFailureRegex = regexp.MustCompile(`^rspec ./.*# .*`)
 var testFailureFilenameRegexp = regexp.MustCompile("^rspec .*.rb.*([0-9]|]) # ")
 var testSummaryRegexp = regexp.MustCompile("^([0-9]+) examples, [0-9]+ failures")
-var rubyPGVersion = "v1.3.5"
+
+// WARNING: DO NOT MODIFY the name of the below constant/variable without approval from the docs team.
+// This is used by docs automation to produce a list of supported versions for ORM's.
+var rubyPGVersion = "v1.4.6"
+
+// Embed the helper file, so we don't need to know where it is
+// relative to the roachtest runner, just relative to this test.
+// This way we can still find it if roachtest changes paths.
+//
+//go:embed ruby_pg_helpers.rb
+var rubyPGHelpersFile string
 
 // This test runs Ruby PG's full test suite against a single cockroach node.
 func registerRubyPG(r registry.Registry) {
@@ -46,8 +52,11 @@ func registerRubyPG(r registry.Registry) {
 		}
 		node := c.Node(1)
 		t.Status("setting up cockroach")
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
+		startOpts := option.NewStartOpts(sqlClientsInMemoryDB)
+		startOpts.RoachprodOpts.SQLPort = config.DefaultSQLPort
+		// TODO(darrylwong): ruby-pg is currently being updated to run on Ubuntu 22.04.
+		// Once complete, fix up ruby_pg_helpers to accept a tls connection.
+		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(install.SecureOption(false)), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
 		if err != nil {
@@ -113,6 +122,23 @@ func registerRubyPG(r registry.Registry) {
 			t.Fatal(err)
 		}
 
+		for original, replacement := range map[string]string{
+			"CREATE FUNCTION errfunc()":    "DROP FUNCTION IF EXISTS errfunc(); CREATE FUNCTION errfunc()",
+			"CREATE TEMP TABLE copytable":  "DROP TABLE IF EXISTS copytable; CREATE TEMP TABLE copytable",
+			"CREATE TEMP TABLE copytable2": "DROP TABLE IF EXISTS copytable2; CREATE TEMP TABLE copytable2",
+			"CREATE TABLE fmodtest":        "DROP TABLE IF EXISTS fmodtest; CREATE TABLE fmodtest",
+			"CREATE TABLE ftablecoltest":   "DROP TABLE IF EXISTS ftablecoltest; CREATE TABLE ftablecoltest",
+			"CREATE TABLE ftabletest":      "DROP TABLE IF EXISTS ftabletest; CREATE TABLE ftabletest",
+			"CREATE TABLE students":        "DROP TABLE IF EXISTS students; CREATE TABLE students",
+		} {
+			if err := repeatRunE(
+				ctx, t, c, node, "patch test to workaround flaky cleanup logic",
+				fmt.Sprintf(`find /mnt/data1/ruby-pg/spec/pg/ -name "*_spec.rb" | xargs sed -i -e "s/%s/%s/g"`, original, replacement),
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+
 		t.Status("installing bundler")
 		if err := repeatRunE(
 			ctx,
@@ -120,7 +146,7 @@ func registerRubyPG(r registry.Registry) {
 			c,
 			node,
 			"installing bundler",
-			`cd /mnt/data1/ruby-pg/ && sudo gem install bundler:2.1.4`,
+			`cd /mnt/data1/ruby-pg/ && sudo gem install bundler:2.4.9`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -144,20 +170,19 @@ func registerRubyPG(r registry.Registry) {
 		}
 
 		// Write the cockroach config into the test suite to use.
-		rubyPGHelpersFile := "./pkg/cmd/roachtest/tests/ruby_pg_helpers.rb"
-		err = c.PutE(ctx, t.L(), rubyPGHelpersFile, "/mnt/data1/ruby-pg/spec/helpers.rb", c.All())
+		err = c.PutString(ctx, rubyPGHelpersFile, "/mnt/data1/ruby-pg/spec/helpers.rb", 0755, c.All())
 		require.NoError(t, err)
 
 		t.Status("running ruby-pg test suite")
 		// Note that this is expected to return an error, since the test suite
 		// will fail. And it is safe to swallow it here.
-		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node,
+		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(node),
 			`cd /mnt/data1/ruby-pg/ && bundle exec rake compile test`,
 		)
 
-		// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+		// Fatal for a roachprod or transient error. A roachprod error is when result.Err==nil.
 		// Proceed for any other (command) errors
-		if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+		if err != nil && (result.Err == nil || rperrors.IsTransient(err)) {
 			t.Fatal(err)
 		}
 
@@ -166,7 +191,6 @@ func registerRubyPG(r registry.Registry) {
 
 		// Find all the failed and errored tests.
 		results := newORMTestsResults()
-		blocklistName, expectedFailures := "rubyPGBlocklist", rubyPGBlocklist
 
 		scanner := bufio.NewScanner(bytes.NewReader(rawResults))
 		totalTests := int64(0)
@@ -199,8 +223,12 @@ func registerRubyPG(r registry.Registry) {
 			}
 			test = strs[1]
 
-			issue, expectedFailure := expectedFailures[test]
+			issue, expectedFailure := rubyPGBlocklist[test]
+			ignoredReason, expectedIgnored := rubyPGIgnorelist[test]
 			switch {
+			case expectedIgnored:
+				results.results[test] = fmt.Sprintf("--- SKIP: %s due to %s (expected)", test, ignoredReason)
+				results.ignoredCount++
 			case expectedFailure:
 				results.results[test] = fmt.Sprintf("--- FAIL: %s - %s (expected)",
 					test, maybeAddGithubLink(issue),
@@ -221,20 +249,22 @@ func registerRubyPG(r registry.Registry) {
 			t.Fatalf("failed to find total number of tests run")
 		}
 		totalPasses := int(totalTests) - (results.failUnexpectedCount + results.failExpectedCount)
-		results.passUnexpectedCount = len(expectedFailures) - results.failExpectedCount
+		results.passUnexpectedCount = len(rubyPGBlocklist) - results.failExpectedCount
 		results.passExpectedCount = totalPasses - results.passUnexpectedCount
 
-		results.summarizeAll(t, "ruby-pg", blocklistName, expectedFailures, version, rubyPGVersion)
+		const blocklistName = "rubyPGBlocklist"
+		results.summarizeAll(t, "ruby-pg", blocklistName, rubyPGBlocklist, version, rubyPGVersion)
 	}
 
 	r.Add(registry.TestSpec{
-		Name:       "ruby-pg",
-		Timeout:    1 * time.Hour,
-		Owner:      registry.OwnerSQLFoundations,
-		Cluster:    r.MakeClusterSpec(1),
-		Leases:     registry.MetamorphicLeases,
-		NativeLibs: registry.LibGEOS,
-		Tags:       registry.Tags(`default`, `orm`),
+		Name:             "ruby-pg",
+		Timeout:          1 * time.Hour,
+		Owner:            registry.OwnerSQLFoundations,
+		Cluster:          r.MakeClusterSpec(1),
+		Leases:           registry.MetamorphicLeases,
+		NativeLibs:       registry.LibGEOS,
+		CompatibleClouds: registry.OnlyGCE,
+		Suites:           registry.Suites(registry.Nightly, registry.Driver),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runRubyPGTest(ctx, t, c)
 		},

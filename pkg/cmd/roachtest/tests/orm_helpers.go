@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -18,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 )
 
@@ -30,6 +26,11 @@ const (
 	statusFail
 	statusSkip
 )
+
+// This `startOpts` option configures in-memory databases to use a
+// fixed (30%) amount of memory and is used in a variety of client
+// library tests.
+var sqlClientsInMemoryDB = option.InMemoryDB(0.3)
 
 // alterZoneConfigAndClusterSettings changes the zone configurations so that GC
 // occurs more quickly and jobs are retained for less time. This is useful for
@@ -45,7 +46,14 @@ func alterZoneConfigAndClusterSettings(
 	}
 	defer db.Close()
 
+	createUserStmt := `CREATE USER test_admin`
+	if c.IsSecure() {
+		createUserStmt = `CREATE USER test_admin WITH PASSWORD 'testpw'`
+	}
+
 	for _, cmd := range []string{
+		createUserStmt,
+		`GRANT admin TO test_admin`,
 		`ALTER RANGE default CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
 		`ALTER TABLE system.public.jobs CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
 		`ALTER RANGE meta CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
@@ -53,7 +61,6 @@ func alterZoneConfigAndClusterSettings(
 		`ALTER RANGE liveness CONFIGURE ZONE USING num_replicas = 1, gc.ttlseconds = 30;`,
 
 		`SET CLUSTER SETTING kv.range_merge.queue_interval = '50ms'`,
-		`SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = 'true'`,
 		`SET CLUSTER SETTING jobs.registry.interval.cancel = '180s';`,
 		`SET CLUSTER SETTING jobs.registry.interval.gc = '30s';`,
 		`SET CLUSTER SETTING jobs.retention_time = '15s';`,
@@ -63,8 +70,13 @@ func alterZoneConfigAndClusterSettings(
 		// Test with SCRAM password authentication.
 		`SET CLUSTER SETTING server.user_login.password_encryption = 'scram-sha-256';`,
 
-		// Enable experimental features.
+		// Enable experimental/preview/compatibility features.
 		`SET CLUSTER SETTING sql.defaults.experimental_temporary_tables.enabled = 'true';`,
+		`ALTER ROLE ALL SET multiple_active_portals_enabled = 'true';`,
+		`ALTER ROLE ALL SET serial_normalization = 'sql_sequence_cached'`,
+		`ALTER ROLE ALL SET statement_timeout = '60s'`,
+		`ALTER ROLE ALL SET default_transaction_isolation = 'read committed'`,
+		`ALTER ROLE ALL SET autocommit_before_ddl = 'true'`,
 	} {
 		if _, err := db.ExecContext(ctx, cmd); err != nil {
 			return err

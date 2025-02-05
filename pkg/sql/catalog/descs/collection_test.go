@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package descs_test
 
@@ -21,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -43,14 +37,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 	"github.com/stretchr/testify/require"
 )
@@ -60,23 +55,21 @@ func TestCollectionWriteDescToBatch(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	s0 := tc.Server(0)
-
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
 	tdb.Exec(t, `CREATE TABLE db.schema.table()`)
 
-	db := s0.DB()
-	descriptors := s0.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(ctx)
+	descriptors := s.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(ctx)
 
 	// Note this transaction abuses the mechanisms normally required for updating
 	// tables and is just for testing what this test intends to exercise.
-	require.NoError(t, db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		defer descriptors.ReleaseAll(ctx)
 		tn := tree.MakeTableNameWithSchema("db", "schema", "table")
 		_, mut, err := descs.PrefixAndMutableTable(ctx, descriptors.MutableByName(txn), &tn)
@@ -152,17 +145,15 @@ func TestTxnClearsCollectionOnRetry(t *testing.T) {
 
 	const txnName = "descriptor update"
 	var serverArgs base.TestServerArgs
-	params := base.TestClusterArgs{ServerArgs: serverArgs}
 	filterFunc, _ := testutils.TestingRequestFilterRetryTxnWithPrefix(t, txnName, 1)
-	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
+	serverArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: filterFunc,
 	}
-	tc := testcluster.StartTestCluster(t, 1, params)
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, serverArgs)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	s := tc.Server(0)
-
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
@@ -197,17 +188,17 @@ func TestAddUncommittedDescriptorAndMutableResolution(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	s0 := tc.Server(0)
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, "CREATE DATABASE db")
 	tdb.Exec(t, "USE db")
 	tdb.Exec(t, "CREATE SCHEMA db.sc")
 	tdb.Exec(t, "CREATE TABLE db.sc.tab (i INT PRIMARY KEY)")
 	tdb.Exec(t, "CREATE TYPE db.sc.typ AS ENUM ('foo')")
-	execCfg := s0.ExecutorConfig().(sql.ExecutorConfig)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	t.Run("database descriptors", func(t *testing.T) {
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 			ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
@@ -263,6 +254,10 @@ func TestAddUncommittedDescriptorAndMutableResolution(t *testing.T) {
 			immByIDAfter, err := descriptors.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Database(ctx, dbID)
 			require.NoError(t, err)
 			require.Same(t, immByNameAfter, immByIDAfter)
+
+			// The name must be non-empty.
+			_, err = descriptors.ByNameWithLeased(txn.KV()).Get().Database(ctx, "")
+			require.Equal(t, sqlerrors.ErrEmptyDatabaseName, err)
 
 			return nil
 		}))
@@ -342,12 +337,11 @@ func TestSyntheticDescriptorResolution(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	s0 := tc.Server(0)
-
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE TABLE tbl(foo INT)`)
@@ -355,7 +349,7 @@ func TestSyntheticDescriptorResolution(t *testing.T) {
 	var tableID descpb.ID
 	row.Scan(&tableID)
 
-	execCfg := s0.ExecutorConfig().(sql.ExecutorConfig)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
@@ -401,12 +395,11 @@ func TestDistSQLTypeResolver_GetTypeDescriptor_FromTable(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	s := tc.Server(0)
-
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE TABLE t(a INT PRIMARY KEY, b STRING)`)
 	var id descpb.ID
 	tdb.QueryRow(t, "SELECT $1::regclass::int", "t").Scan(&id)
@@ -442,13 +435,11 @@ func TestMaybeFixSchemaPrivilegesIntegration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	conn, err := db.Conn(ctx)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, `
+	_, err := sqlDB.ExecContext(ctx, `
 CREATE DATABASE test;
 CREATE SCHEMA test.schema;
 CREATE USER testuser;
@@ -489,7 +480,7 @@ CREATE TABLE test.schema.t(x INT);
 
 	// Make sure using the schema is fine and we don't encounter a
 	// privilege validation error.
-	_, err = db.Query("GRANT USAGE ON SCHEMA test.schema TO testuser;")
+	_, err = sqlDB.Query("GRANT USAGE ON SCHEMA test.schema TO testuser;")
 	require.NoError(t, err)
 }
 
@@ -502,8 +493,9 @@ func TestCollectionPreservesPostDeserializationChanges(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, "CREATE DATABASE db")
@@ -541,7 +533,7 @@ func TestCollectionPreservesPostDeserializationChanges(t *testing.T) {
 	require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 		ctx context.Context, txn isql.Txn, col *descs.Collection,
 	) error {
-		immuts, err := col.ByID(txn.KV()).WithoutNonPublic().Get().Descs(ctx, []descpb.ID{dbID, scID, typID, tabID})
+		immuts, err := col.ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Descs(ctx, []descpb.ID{dbID, scID, typID, tabID})
 		if err != nil {
 			return err
 		}
@@ -592,26 +584,29 @@ func TestCollectionProperlyUsesMemoryMonitoring(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
-	txn := tc.Server(0).DB().NewTxn(ctx, "test txn")
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+	txn := kvDB.NewTxn(ctx, "test txn")
 
 	// Create a lot of descriptors.
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	numTblsToInsert := 100
 	for i := 0; i < numTblsToInsert; i++ {
 		tdb.Exec(t, fmt.Sprintf("CREATE TABLE table_%v()", i))
 	}
 
 	// Create a monitor to be used to track memory usage in a Collection.
-	monitor := mon.NewMonitor("test_monitor", mon.MemoryResource,
-		nil, nil, -1, 0, cluster.MakeTestingClusterSettings())
+	monitor := mon.NewMonitor(mon.Options{
+		Name:     mon.MakeMonitorName("test_monitor"),
+		Settings: cluster.MakeTestingClusterSettings(),
+	})
 
 	// Start the monitor with unlimited budget.
 	monitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 
 	// Create a `Collection` with monitor hooked up.
-	col := tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(
+	col := s.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(
 		ctx, descs.WithMonitor(monitor),
 	)
 	require.Equal(t, int64(0), monitor.AllocBytes())
@@ -631,7 +626,7 @@ func TestCollectionProperlyUsesMemoryMonitoring(t *testing.T) {
 	require.Equal(t, int64(0), monitor.AllocBytes())
 
 	// Repeat the process again and assert this time memory allocation will err out.
-	col = tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(
+	col = s.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory.NewCollection(
 		ctx, descs.WithMonitor(monitor),
 	)
 	_, err2 := col.GetAllDescriptors(ctx, txn)
@@ -650,17 +645,17 @@ func TestDescriptorCache(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
 	tdb.Exec(t, `CREATE TABLE db.schema.table()`)
 
-	s0 := tc.Server(0)
-	execCfg := s0.ExecutorConfig().(sql.ExecutorConfig)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	t.Run("all descriptors", func(t *testing.T) {
 		require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
 			ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
@@ -780,18 +775,18 @@ func TestGetAllDescriptorsInDatabase(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
 	tdb.Exec(t, `CREATE TABLE db.public.table()`)
 	tdb.Exec(t, `CREATE TABLE db.schema.table()`)
 
-	s0 := tc.Server(0)
-	tm := s0.InternalDB().(descs.DB)
+	tm := s.InternalDB().(descs.DB)
 
 	run := func(
 		ctx context.Context, txn descs.Txn,
@@ -843,7 +838,7 @@ parent schema name   id  kind     version dropped public
 `, formatCatalog(allDescs.OrderedDescriptors()))
 		return nil
 	}
-	sd := sql.NewInternalSessionData(ctx, s0.ClusterSettings(), "TestGetAllDescriptorsInDatabase")
+	sd := sql.NewInternalSessionData(ctx, s.ClusterSettings(), "TestGetAllDescriptorsInDatabase")
 	sd.Database = "db"
 	require.NoError(t, tm.DescsTxn(ctx, run, isql.WithSessionData(sd)))
 }
@@ -896,17 +891,17 @@ func TestCollectionTimeTravelLookingTooFarBack(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
 	tdb.Exec(t, `CREATE TABLE db.schema.table()`)
 
-	s0 := tc.Server(0)
-	execCfg := s0.ExecutorConfig().(sql.ExecutorConfig)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 
 	goFarBackInTime := func(fn func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error) error {
 		return sql.DescsTxn(ctx, &execCfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
@@ -947,12 +942,11 @@ func TestHydrateCatalog(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	s := tc.Server(0)
-
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `CREATE DATABASE db`)
 	tdb.Exec(t, `USE db`)
 	tdb.Exec(t, `CREATE SCHEMA schema`)
@@ -1030,7 +1024,7 @@ func TestHydrateCatalog(t *testing.T) {
 			}
 			mc := nstree.MutableCatalog{Catalog: cat}
 			require.NoError(t, descs.HydrateCatalog(ctx, mc))
-			tbl := desctestutils.TestingGetTableDescriptor(txn.KV().DB(), keys.SystemSQLCodec, "db", "schema", "table")
+			tbl := desctestutils.TestingGetTableDescriptor(txn.KV().DB(), s.Codec(), "db", "schema", "table")
 			tblDesc := cat.LookupDescriptor(tbl.GetID()).(catalog.TableDescriptor)
 			expectedEnum := types.UserDefinedTypeMetadata{
 				Name: &types.UserDefinedTypeName{
@@ -1075,12 +1069,11 @@ func TestSyntheticDescriptors(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
-	s := tc.Server(0)
-
-	tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
 	tdb.Exec(t, "CREATE SCHEMA sc")
 	tdb.Exec(t, `CREATE DATABASE "otherDB"`)
@@ -1228,6 +1221,63 @@ SELECT id
 		require.NoError(t, txn.Descriptors().AddUncommittedDescriptor(ctx, scDesc))
 		return nil
 	}))
+}
+
+func TestDescriptorErrorWrap(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	tdb.Exec(t, `CREATE DATABASE db`)
+	tdb.Exec(t, `USE db`)
+	tdb.Exec(t, `CREATE SCHEMA schema`)
+	tdb.Exec(t, `CREATE TABLE db.schema.table()`)
+
+	monitor := mon.NewMonitor(mon.Options{
+		Name:     mon.MakeMonitorName("test_monitor"),
+		Settings: cluster.MakeTestingClusterSettings(),
+	})
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(1))
+	ba := monitor.MakeBoundAccount()
+
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+	for _, tc := range []struct {
+		desc        string
+		err         error
+		isAssertion bool
+	}{
+		{"bare error", errors.New("bare error is treated as an assertion"), true},
+		{"out of memory", ba.Grow(ctx, monitor.Limit()), false},
+		{"pgcode error", sqlerrors.NewAlterColTypeInCombinationNotSupportedError(), false},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			require.NoError(t, sql.DescsTxn(ctx, &execCfg, func(
+				ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
+			) error {
+				tn := tree.MakeTableNameWithSchema("db", "schema", "table")
+				_, mut, err := descs.PrefixAndMutableTable(ctx, descriptors.MutableByName(txn.KV()), &tn)
+				if err != nil {
+					return err
+				}
+
+				require.False(t, errors.HasAssertionFailure(tc.err))
+				err = descs.DecorateDescriptorError(mut, tc.err)
+				// Ensure err is still an error
+				require.Error(t, err)
+				// Ensure descriptor info is wrapped in the error
+				require.Contains(t, err.Error(), mut.GetName())
+				// Ensure error is promoted to assertion as expected
+				require.Equal(t, tc.isAssertion, errors.HasAssertionFailure(err))
+				return nil
+			}))
+		})
+	}
+	monitor.Stop(ctx)
 }
 
 func getSchemaNames(defaultDBSchemaNames map[descpb.ID]string) []string {

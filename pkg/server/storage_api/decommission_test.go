@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
@@ -26,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/decommissioning"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -47,6 +43,9 @@ func TestDecommissionPreCheckInvalid(t *testing.T) {
 	// Set up test cluster.
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 4, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual,
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: decommissionTsArgs("a", "n1"),
@@ -91,6 +90,9 @@ func TestDecommissionPreCheckEvaluation(t *testing.T) {
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: tsArgs("ns1", "origin"),
 			1: tsArgs("ns2", "west"),
@@ -211,6 +213,9 @@ func TestDecommissionPreCheckOddToEven(t *testing.T) {
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 	})
 	defer tc.Stopper().Stop(ctx)
 
@@ -314,7 +319,7 @@ func waitForSpanConfig(
 			if err != nil {
 				return errors.Wrapf(err, "missing store on server %d", i)
 			}
-			conf, err := store.GetStoreConfig().SpanConfigSubscriber.GetSpanConfigForKey(context.Background(), key)
+			conf, _, err := store.GetStoreConfig().SpanConfigSubscriber.GetSpanConfigForKey(context.Background(), key)
 			if err != nil {
 				return errors.Wrapf(err, "missing span config for %s on server %d", key, i)
 			}
@@ -335,6 +340,9 @@ func TestDecommissionPreCheckBasicReadiness(t *testing.T) {
 
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -359,6 +367,9 @@ func TestDecommissionPreCheckUnready(t *testing.T) {
 
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -507,6 +518,9 @@ func TestDecommissionPreCheckMultiple(t *testing.T) {
 
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -573,6 +587,9 @@ func TestDecommissionPreCheckInvalidNode(t *testing.T) {
 
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -635,10 +652,14 @@ func TestDecommissionSelf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	skip.UnderRace(t) // can't handle 7-node clusters
+	skip.UnderDeadlockWithIssue(t, 112918)
 
 	// Set up test cluster.
 	ctx := context.Background()
 	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -712,7 +733,7 @@ func TestDecommissionEnqueueReplicas(t *testing.T) {
 	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
-			Insecure: true, // allows admin client without setting up certs
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					EnqueueReplicaInterceptor: func(
@@ -777,18 +798,15 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 		ServerArgs: base.TestServerArgs{
-			// Disable the default test tenant for now as this tests fails
-			// with it enabled. Tracked with #81590.
-			DefaultTestTenant: base.TODOTestTenantDisabled,
-			Insecure:          true, // allows admin client without setting up certs
+			DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(81590),
 		},
 	})
 	defer tc.Stopper().Stop(ctx)
 
 	// Configure drain to immediately cancel SQL queries and jobs to speed up the
 	// test and avoid timeouts.
-	serverutils.SetClusterSetting(t, tc, "server.shutdown.query_wait", 0)
-	serverutils.SetClusterSetting(t, tc, "server.shutdown.jobs_wait", 0)
+	serverutils.SetClusterSetting(t, tc, string(server.QueryShutdownTimeout.Name()), 0)
+	serverutils.SetClusterSetting(t, tc, string(server.JobShutdownTimeout.Name()), 0)
 
 	scratchKey := tc.ScratchRange(t)
 	scratchRange := tc.LookupRangeOrFatal(t, scratchKey)
@@ -834,15 +852,15 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.Cluster(ctx, &serverpb.ClusterRequest{})
 			return err
 		}},
-		{"Databases", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"Databases", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Databases(ctx, &serverpb.DatabasesRequest{})
 			return err
 		}},
-		{"DatabaseDetails", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"DatabaseDetails", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.DatabaseDetails(ctx, &serverpb.DatabaseDetailsRequest{Database: "foo"})
 			return err
 		}},
-		{"DataDistribution", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"DataDistribution", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.DataDistribution(ctx, &serverpb.DataDistributionRequest{})
 			return err
 		}},
@@ -853,20 +871,20 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			})
 			return err
 		}},
-		{"DecommissionStatus", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"DecommissionStatus", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.DecommissionStatus(ctx, &serverpb.DecommissionStatusRequest{
 				NodeIDs: []roachpb.NodeID{srv.NodeID(), decomSrv.NodeID()},
 			})
 			return err
 		}},
-		{"EnqueueRange", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"EnqueueRange", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.EnqueueRange(ctx, &serverpb.EnqueueRangeRequest{
 				RangeID: scratchRange.RangeID,
 				Queue:   "replicaGC",
 			})
 			return err
 		}},
-		{"Events", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"Events", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Events(ctx, &serverpb.EventsRequest{})
 			return err
 		}},
@@ -874,19 +892,19 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.Health(ctx, &serverpb.HealthRequest{})
 			return err
 		}},
-		{"Jobs", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"Jobs", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Jobs(ctx, &serverpb.JobsRequest{})
 			return err
 		}},
-		{"Liveness", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"Liveness", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Liveness(ctx, &serverpb.LivenessRequest{})
 			return err
 		}},
-		{"Locations", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"Locations", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Locations(ctx, &serverpb.LocationsRequest{})
 			return err
 		}},
-		{"NonTableStats", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"NonTableStats", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.NonTableStats(ctx, &serverpb.NonTableStatsRequest{})
 			return err
 		}},
@@ -894,7 +912,7 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.QueryPlan(ctx, &serverpb.QueryPlanRequest{Query: "SELECT 1"})
 			return err
 		}},
-		{"RangeLog", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"RangeLog", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.RangeLog(ctx, &serverpb.RangeLogRequest{})
 			return err
 		}},
@@ -902,20 +920,20 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			_, err := c.Settings(ctx, &serverpb.SettingsRequest{})
 			return err
 		}},
-		{"TableStats", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"TableStats", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.TableStats(ctx, &serverpb.TableStatsRequest{Database: "foo", Table: "bar"})
 			return err
 		}},
-		{"TableDetails", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"TableDetails", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.TableDetails(ctx, &serverpb.TableDetailsRequest{Database: "foo", Table: "bar"})
 			return err
 		}},
-		{"Users", codes.Internal, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"Users", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			_, err := c.Users(ctx, &serverpb.UsersRequest{})
 			return err
 		}},
 		// We drain at the end, since it may evict us.
-		{"Drain", codes.Unknown, func(ctx context.Context, c serverpb.AdminClient) error {
+		{"Drain", codes.PermissionDenied, func(ctx context.Context, c serverpb.AdminClient) error {
 			stream, err := c.Drain(ctx, &serverpb.DrainRequest{DoDrain: true})
 			if err != nil {
 				return err

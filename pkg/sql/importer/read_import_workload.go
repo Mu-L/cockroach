@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package importer
 
@@ -69,7 +64,8 @@ func makeDatumFromColOffset(
 	alloc *tree.DatumAlloc,
 	hint *types.T,
 	evalCtx *eval.Context,
-	col coldata.Vec,
+	semaCtx *tree.SemaContext,
+	col *coldata.Vec,
 	rowIdx int,
 ) (tree.Datum, error) {
 	if col.Nulls().NullAt(rowIdx) {
@@ -122,7 +118,19 @@ func makeDatumFromColOffset(
 		default:
 			data := col.Bytes().Get(rowIdx)
 			str := *(*string)(unsafe.Pointer(&data))
-			return rowenc.ParseDatumStringAs(ctx, hint, str, evalCtx)
+			return rowenc.ParseDatumStringAs(ctx, hint, str, evalCtx, semaCtx)
+		}
+	case types.TimestampFamily, types.TimestampTZFamily:
+		switch hint.Family() {
+		case types.TimestampFamily:
+			// workloads are responsible for rounding their timestamp(s) so skip
+			// MakeDTimestamp here and just directly construct it.
+			return alloc.NewDTimestamp(tree.DTimestamp{Time: col.Timestamp()[rowIdx]}), nil
+
+		case types.TimestampTZFamily:
+			// workloads are responsible for rounding their timestamp(s) so skip
+			// MakeDTimestamp here and just directly construct it.
+			return alloc.NewDTimestampTZ(tree.DTimestampTZ{Time: col.Timestamp()[rowIdx]}), nil
 		}
 	}
 	return nil, errors.Errorf(
@@ -238,8 +246,10 @@ func NewWorkloadKVConverter(
 func (w *WorkloadKVConverter) Worker(
 	ctx context.Context, evalCtx *eval.Context, semaCtx *tree.SemaContext,
 ) error {
-	conv, err := row.NewDatumRowConverter(ctx, semaCtx, w.tableDesc, nil, /* targetColNames */
-		evalCtx, w.kvCh, nil /* seqChunkProvider */, nil /* metrics */, w.db)
+	conv, err := row.NewDatumRowConverter(
+		ctx, semaCtx, w.tableDesc, nil, /* targetColNames */
+		evalCtx, w.kvCh, nil /* seqChunkProvider */, nil /* metrics */, w.db,
+	)
 	if err != nil {
 		return err
 	}
@@ -263,7 +273,8 @@ func (w *WorkloadKVConverter) Worker(
 				// TODO(dan): This does a type switch once per-datum. Reduce this to
 				// a one-time switch per column.
 				converted, err := makeDatumFromColOffset(
-					ctx, &alloc, conv.VisibleColTypes[colIdx], evalCtx, col, rowIdx)
+					ctx, &alloc, conv.VisibleColTypes[colIdx], conv.EvalCtx, conv.SemaCtx, col, rowIdx,
+				)
 				if err != nil {
 					return err
 				}

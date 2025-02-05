@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package exec contains execution-related utilities. (See README.md.)
 package exec
@@ -31,11 +26,70 @@ import (
 // (currently maps to sql.planNode).
 type Node interface{}
 
-// Plan represents the plan for a query (currently maps to sql.planTop).
+// Plan represents the plan for a query (currently maps to sql.planComponents).
 // For simple queries, the plan is associated with a single Node tree.
 // For queries containing subqueries, the plan is associated with multiple Node
 // trees (see ConstructPlan).
 type Plan interface{}
+
+// PlanFlags tracks various properties of the built plan.
+type PlanFlags uint32
+
+const (
+	// PlanFlagIsDDL is set if the statement contains DDL.
+	PlanFlagIsDDL = (1 << iota)
+
+	// PlanFlagContainsFullTableScan is set if the statement contains an
+	// unconstrained primary index scan. This could be a full scan of any
+	// cardinality. Full scans of virtual tables are ignored.
+	PlanFlagContainsFullTableScan
+
+	// PlanFlagContainsFullIndexScan is set if the statement contains an
+	// unconstrained non-partial secondary index scan. This could be a full scan
+	// of any cardinality. Full scans of virtual tables are ignored.
+	PlanFlagContainsFullIndexScan
+
+	// PlanFlagContainsLargeFullTableScan is set if the statement contains an
+	// unconstrained primary index scan estimated to read more than
+	// large_full_scan_rows (or without available stats). Large scans of virtual
+	// tables are ignored.
+	PlanFlagContainsLargeFullTableScan
+
+	// PlanFlagContainsLargeFullIndexScan is set if the statement contains an
+	// unconstrained non-partial secondary index scan estimated to read more than
+	// large_full_scan_rows (or without available stats). Large scans of virtual
+	// tables are ignored.
+	PlanFlagContainsLargeFullIndexScan
+
+	// PlanFlagContainsMutation is set if the whole plan contains any mutations.
+	PlanFlagContainsMutation
+
+	// PlanFlagContainsLocking is set if at least one node in the plan uses
+	// locking. (Examples of plans using locking include SELECT FOR UPDATE and
+	// SELECT FOR SHARE, UPDATE, UPSERT, and FK checks under read committed
+	// isolation.)
+	PlanFlagContainsLocking
+
+	// PlanFlagCheckContainsLocking is set if at least one node in at least one
+	// check plan uses locking. Typically this is set for plans with FK checks
+	// under read committed isolation.
+	PlanFlagCheckContainsLocking
+)
+
+// IsSet returns true if the receiver has all of the given flags set.
+func (pf PlanFlags) IsSet(flags PlanFlags) bool {
+	return (pf & flags) == flags
+}
+
+// Set sets all of the given flags in the receiver.
+func (pf *PlanFlags) Set(flags PlanFlags) {
+	*pf |= flags
+}
+
+// Unset unsets all of the given flags in the receiver.
+func (pf *PlanFlags) Unset(flags PlanFlags) {
+	*pf &^= flags
+}
 
 // ScanParams contains all the parameters for a table scan.
 type ScanParams struct {
@@ -66,7 +120,9 @@ type ScanParams struct {
 	// Row-level locking properties.
 	Locking opt.Locking
 
-	EstimatedRowCount float64
+	// EstimatedRowCount, if set, is the estimated number of rows that will be
+	// scanned, rounded up.
+	EstimatedRowCount uint64
 
 	// If true, we are performing a locality optimized search. In order for this
 	// to work correctly, the execution engine must create a local DistSQL plan
@@ -119,6 +175,10 @@ const (
 	// SubqueryAllRows - the subquery is an argument to ARRAY. The result is a
 	// tuple of rows.
 	SubqueryAllRows
+	// SubqueryDiscardAllRows - the subquery is executed for its side effects
+	// (e.g. it is adding to a bufferNode). The result is empty, and will never be
+	// used.
+	SubqueryDiscardAllRows
 )
 
 // TableColumnOrdinal is the 0-based ordinal index of a cat.Table column.
@@ -154,6 +214,10 @@ type AggInfo struct {
 	// Filter is the index of the column, if any, which should be used as the
 	// FILTER condition for the aggregate. If there is no filter, Filter is -1.
 	Filter NodeColumnOrdinal
+
+	// DistsqlBlocklist is set to true when this aggregate function cannot be
+	// evaluated in distributed fashion.
+	DistsqlBlocklist bool
 }
 
 // WindowInfo represents the information about a window function that must be
@@ -211,20 +275,25 @@ type RecursiveCTEIterationFn func(ef Factory, bufferRef Node) (Plan, error)
 // rightColumns passed to ConstructApplyJoin (in order).
 type ApplyJoinPlanRightSideFn func(ctx context.Context, ef Factory, leftRow tree.Datums) (Plan, error)
 
-// Cascade describes a cascading query. The query uses a node created by
-// ConstructBuffer as an input; it should only be triggered if this buffer is
-// not empty.
-type Cascade struct {
-	// FKName is the name of the foreign key constraint.
-	FKName string
+// PostQuery describes a cascading query or an AFTER trigger action. The query
+// uses a node created by ConstructBuffer as an input; it should only be
+// triggered if this buffer is not empty.
+type PostQuery struct {
+	// FKConstraint is used for logging and EXPLAIN purposes. It is nil if this
+	// PostQuery describes a set of AFTER triggers.
+	FKConstraint cat.ForeignKeyConstraint
+
+	// Triggers is used for logging and EXPLAIN purposes. It is nil if this
+	// PostQuery describes a foreign-key cascade action.
+	Triggers []cat.Trigger
 
 	// Buffer is the Node returned by ConstructBuffer which stores the input to
 	// the mutation. It is nil if the cascade does not require a buffer.
 	Buffer Node
 
-	// PlanFn builds the cascade query and creates the plan for it.
-	// Note that the generated Plan can in turn contain more cascades (as well as
-	// checks, which should run after all cascades are executed).
+	// PlanFn builds the cascade/trigger query and creates the plan for it.
+	// Note that the generated Plan can in turn contain more cascades, triggers,
+	// and checks.
 	//
 	// The bufferRef is a reference that can be used with ConstructWithBuffer to
 	// read the mutation input. It is conceptually the same as the Buffer field;
@@ -232,8 +301,8 @@ type Cascade struct {
 	// implementation of the node (e.g. to facilitate early cleanup of the
 	// original plan).
 	//
-	// If the cascade does not require input buffering (Buffer is nil), then
-	// bufferRef should be nil and numBufferedRows should be 0.
+	// If the cascade/trigger does not require input buffering (Buffer is nil),
+	// then bufferRef should be nil and numBufferedRows should be 0.
 	//
 	// This method does not mutate any captured state; it is ok to call PlanFn
 	// methods concurrently (provided that they don't use a single non-thread-safe
@@ -247,24 +316,44 @@ type Cascade struct {
 		numBufferedRows int,
 		allowAutoCommit bool,
 	) (Plan, error)
+
+	// GetExplainPlan returns the explain plan for the cascade or trigger query.
+	// It will always return a cached plan if there is one, and the boolean
+	// argument controls whether this function can create a new plan (which will
+	// be cached going forward). If createPlanIfMissing is false and there is no
+	// cached plan, then nil, nil is returned.
+	GetExplainPlan func(_ context.Context, createPlanIfMissing bool) (Plan, error)
 }
 
-// InsertFastPathFKCheck contains information about a foreign key check to be
-// performed by the insert fast-path (see ConstructInsertFastPath). It
-// identifies the index into which we can perform the lookup.
-type InsertFastPathFKCheck struct {
+// InsertFastPathCheck contains information about a foreign key or
+// uniqueness check to be performed by the insert fast-path (see
+// ConstructInsertFastPath). It identifies the index into which we can perform
+// the lookup.
+type InsertFastPathCheck struct {
 	ReferencedTable cat.Table
 	ReferencedIndex cat.Index
 
-	// InsertCols contains the FK columns from the origin table, in the order of
-	// the ReferencedIndex columns. For each, the value in the array indicates the
-	// index of the column in the input table.
+	// This is the ordinal of the check in the table's unique constraints.
+	CheckOrdinal int
+
+	// InsertCols contains the table column ordinals of the referenced index key
+	// columns. The position in this slice corresponds with the ordinal of the
+	// referenced index column (its position in the index key).
 	InsertCols []TableColumnOrdinal
 
 	MatchMethod tree.CompositeKeyMatchMethod
 
 	// Row-level locking properties of the check.
 	Locking opt.Locking
+
+	// DatumsFromConstraint contains constant values from the insert row for the
+	// columns in the unique constraint. Columns not available directly from the
+	// insert row or computed from insert row values (computed column) may be
+	// filled in from a CHECK constraint on the column. The number of entries
+	// corresponds with the number of KV lookups. For example, when built from
+	// analyzing a locality-optimized operation accessing 1 local region and 2
+	// remote regions, the resulting DatumsFromConstraint would have 3 entries.
+	DatumsFromConstraint []tree.Datums
 
 	// MkErr is called when a violation is detected (i.e. the index has no entries
 	// for a given inserted row). The values passed correspond to InsertCols
@@ -420,12 +509,17 @@ type ExecutionStats struct {
 	MaxAllocatedDisk optional.Uint
 	SQLCPUTime       optional.Duration
 
-	// Nodes on which this operator was executed.
-	Nodes []string
-
-	// Regions on which this operator was executed.
+	// SQLNodes on which this operator was executed.
+	SQLNodes []string
+	// KVNodes that served read requests.
+	KVNodes []string
+	// Regions on which this operator was executed. Includes both KV and SQL
+	// processing.
 	// Only being generated on EXPLAIN ANALYZE.
 	Regions []string
+	// UsedFollowerRead indicates whether at least some reads were served by the
+	// follower replicas.
+	UsedFollowerRead bool
 }
 
 // BuildPlanForExplainFn builds an execution plan against the given

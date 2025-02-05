@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -38,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -260,7 +256,7 @@ INSERT INTO foo VALUES (1, 2), (2, 3), (3, 4);
 					KeySuffixColumnIDs: []descpb.ColumnID{
 						mut.Columns[0].ID,
 					},
-					Type:         descpb.IndexDescriptor_FORWARD,
+					Type:         idxtype.FORWARD,
 					EncodingType: catenumpb.SecondaryIndexEncoding,
 				}
 				mut.NextIndexID++
@@ -344,7 +340,7 @@ INSERT INTO foo VALUES (1), (10), (100);
 						columnWithDefault.ID,
 						computedColumnNotInPrimaryIndex.ID,
 					},
-					Type:         descpb.IndexDescriptor_FORWARD,
+					Type:         idxtype.FORWARD,
 					EncodingType: catenumpb.PrimaryIndexEncoding,
 				}
 				mut.NextIndexID++

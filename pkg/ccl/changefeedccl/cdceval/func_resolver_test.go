@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdceval
 
@@ -18,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
@@ -27,8 +25,9 @@ func TestResolveFunction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	sqlDB.Exec(t, `
@@ -80,14 +79,17 @@ $$`)
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
 			var funcDef *tree.ResolvedFunctionDefinition
-			err := withPlanner(
-				context.Background(), &execCfg, username.RootUserName(),
-				s.Clock().Now(), defaultDBSessionData,
+			err := withPlanner(context.Background(), &execCfg, hlc.Timestamp{},
+				username.RootUserName(), s.Clock().Now(), defaultDBSessionData,
 				func(ctx context.Context, execCtx sql.JobExecContext, cleanup func()) (err error) {
 					defer cleanup()
 					semaCtx := execCtx.SemaCtx()
 					r := newCDCFunctionResolver(semaCtx.FunctionResolver)
-					funcDef, err = r.ResolveFunction(context.Background(), &tc.fnName, semaCtx.SearchPath)
+					funcDef, err = r.ResolveFunction(
+						context.Background(),
+						tree.MakeUnresolvedFunctionName(&tc.fnName),
+						semaCtx.SearchPath,
+					)
 					return err
 				})
 

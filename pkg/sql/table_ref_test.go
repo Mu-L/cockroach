@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -58,8 +53,6 @@ CREATE INDEX bc ON test.t(b, c);
 			cID = c.GetID()
 		}
 	}
-	pkID := tableDesc.GetPrimaryIndexID()
-	secID := tableDesc.PublicNonPrimaryIndexes()[0].GetID()
 
 	// Retrieve the numeric descriptors.
 	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "hidden")
@@ -73,6 +66,8 @@ CREATE INDEX bc ON test.t(b, c);
 	}
 
 	// Make some schema changes meant to shuffle the ID/name mapping.
+	// Note: index IDs will change since the declarative schema changer implements
+	// DROP COLUMN with an index swap.
 	stmt = `
 ALTER TABLE test.t RENAME COLUMN b TO d;
 ALTER TABLE test.t RENAME COLUMN a TO p;
@@ -82,6 +77,10 @@ ALTER TABLE test.t DROP COLUMN xx;
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	pkID := tableDesc.GetPrimaryIndexID()
+	secID := tableDesc.PublicNonPrimaryIndexes()[0].GetID()
 
 	// Check the table references.
 	testData := []struct {

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // The admission package contains abstractions for admission control for
 // CockroachDB nodes, both for single-tenant and multi-tenant (aka serverless)
@@ -269,16 +264,18 @@ type granterWithIOTokens interface {
 	// provided by tokens. This method needs to be called periodically.
 	// {io, elasticDiskBandwidth}TokensCapacity is the ceiling up to which we allow
 	// elastic or disk bandwidth tokens to accumulate. The return value is the
-	// number of used tokens in the interval since the prior call to this method.
-	// Note that tokensUsed can be negative, though that will be rare, since it is
-	// possible for tokens to be returned.
+	// number of used tokens in the interval since the prior call to this method
+	// (and the tokens used by elastic work). Note that tokensUsed* can be
+	// negative, though that will be rare, since it is possible for tokens to be
+	// returned.
 	setAvailableTokens(
-		ioTokens int64, elasticDiskBandwidthTokens int64,
-		ioTokensCapacity int64, elasticDiskBandwidthTokensCapacity int64,
-	) (tokensUsed int64)
-	// getDiskTokensUsedAndReset returns the disk bandwidth tokens used
-	// since the last such call.
-	getDiskTokensUsedAndReset() [admissionpb.NumWorkClasses]int64
+		ioTokens int64, elasticIOTokens int64, elasticDiskWriteTokens int64, elasticDiskReadTokens int64,
+		ioTokensCapacity int64, elasticIOTokenCapacity int64, elasticDiskWriteTokensCapacity int64,
+		lastTick bool,
+	) (tokensUsed int64, tokensUsedByElasticWork int64)
+	// getDiskTokensUsedAndReset returns the disk bandwidth tokens used since the
+	// last such call.
+	getDiskTokensUsedAndReset() [admissionpb.NumStoreWorkTypes]diskTokens
 	// setLinearModels supplies the models to use when storeWriteDone or
 	// storeReplicatedWorkAdmittedLocked is called, to adjust token consumption.
 	// Note that these models are not used for token adjustment at admission
@@ -286,7 +283,7 @@ type granterWithIOTokens interface {
 	// granter. This asymmetry is due to the need to use all the functionality
 	// of WorkQueue at admission time. See the long explanatory comment at the
 	// beginning of store_token_estimation.go, regarding token estimation.
-	setLinearModels(l0WriteLM, l0IngestLM, ingestLM tokensLinearModel)
+	setLinearModels(l0WriteLM, l0IngestLM, ingestLM, writeAmpLM tokensLinearModel)
 }
 
 // granterWithStoreReplicatedWorkAdmitted is used to abstract
@@ -524,8 +521,12 @@ const (
 	numWorkKinds
 )
 
-func workKindString(workKind WorkKind) string {
-	switch workKind {
+// SafeValue implements the redact.SafeValue interface.
+func (WorkKind) SafeValue() {}
+
+// String implements the fmt.Stringer interface.
+func (wk WorkKind) String() string {
+	switch wk {
 	case KVWork:
 		return "kv"
 	case SQLKVResponseWork:
@@ -540,6 +541,16 @@ func workKindString(workKind WorkKind) string {
 		panic(errors.AssertionFailedf("unknown WorkKind"))
 	}
 }
+
+// QueueKind is used to track the specific WorkQueue an item of KVWork is in.
+// The options are one of: "kv-regular-cpu-queue", "kv-elastic-cpu-queue",
+// "kv-regular-store-queue", "kv-elastic-store-queue".
+//
+// It is left empty for SQL types of WorkKind.
+type QueueKind string
+
+// SafeValue implements the redact.SafeValue interface.
+func (QueueKind) SafeValue() {}
 
 // storeAdmissionStats are stats maintained by a storeRequester. The non-test
 // implementation of storeRequester is StoreWorkQueue. StoreWorkQueue updates
@@ -567,13 +578,33 @@ type storeAdmissionStats struct {
 	// that PR is closer to the final solution, and this is a step in that
 	// direction).
 	statsToIgnore struct {
-		pebble.IngestOperationStats
+		// Stats for ingests.
+		ingestStats pebble.IngestOperationStats
+		// Stats for regular writes. These roughly correspond to what the writes
+		// will turn into when written to a flushed sstable.
+		writeBytes uint64
+	}
+	// aboveRaftStats is a subset of the top-level storeAdmissionStats that
+	// represents admission that happened above-raft for which we deducted
+	// tokens prior to proposal evaluation. Replication admission/flow control
+	// happens below-raft, so those stats are *not* here. Only above-raft
+	// request stats are used to estimate tokens to deduct prior to evaluation.
+	// Since large write requests (often ingested) use the below-raft admission
+	// path as part of replication admission control, not ignoring such requests
+	// inflates estimates and results in under-admission. See
+	// https://github.com/cockroachdb/cockroach/issues/113711.
+	aboveRaftStats struct {
+		workCount              uint64
+		writeAccountedBytes    uint64
+		ingestedAccountedBytes uint64
 	}
 	// aux represents additional information carried for informational purposes
 	// (e.g. for logging).
 	aux struct {
 		// These bypassed numbers are already included in the corresponding
-		// {workCount, writeAccountedBytes, ingestedAccountedBytes}.
+		// {workCount, writeAccountedBytes, ingestedAccountedBytes}. These are a
+		// subset of the below-raft stats (those that were not subject to
+		// replication admission control).
 		bypassedCount                  uint64
 		writeBypassedAccountedBytes    uint64
 		ingestedBypassedAccountedBytes uint64

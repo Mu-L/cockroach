@@ -1,4 +1,10 @@
 #!/bin/bash
+
+# Copyright 2021 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 set -euo pipefail
 
 # This script is used by run_proxy_indirect_crdb.sh to start a new tenant sql process. It can be customized to do
@@ -53,8 +59,11 @@ $COCKROACH mt start-sql --certs-dir="$TENANT" --store="$TENANT"/$TENANT_ID/"$ORD
 
 if [ "$PASSWORD_UNSET" -eq "1" ]
 then
+  echo Create root user cert for the tenant
+  COCKROACH_CA_KEY=$TENANT/ca.key COCKROACH_CERTS_DIR=$TENANT cockroach cert create-client root --tenant-scope=$TENANT_ID
+  mv $TENANT/client.root.* $TENANT/$TENANT_ID/
   echo Set the password
-  COCKROACH_CA_KEY=$TENANT/ca.key COCKROACH_CERTS_DIR=$TENANT $COCKROACH sql --host=$SQL_ADDR -e "alter user root with password 'secret'" > "$TENANT"/$TENANT_ID/alter_root.log
+  COCKROACH_CERTS_DIR=$TENANT/$TENANT_ID $COCKROACH sql --url="postgres://root@$SQL_ADDR?sslmode=verify-full&sslrootcert=$TENANT/ca.crt" -e "alter user root with password 'secret'" > "$TENANT"/$TENANT_ID/alter_root.log 2>&1
 fi
 
 wait

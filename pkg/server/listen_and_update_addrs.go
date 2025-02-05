@@ -1,21 +1,20 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
 	"context"
 	"net"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
+	"github.com/pires/go-proxyproto"
 )
 
 // ListenError is returned from Start when we fail to start listening on either
@@ -32,18 +31,93 @@ func (l *ListenError) Error() string { return l.cause.Error() }
 // Unwrap is because ListenError is a wrapper.
 func (l *ListenError) Unwrap() error { return l.cause }
 
+// ListenerFactoryForConfig return an RPCListenerFactory for the given
+// configuration. If the configuration does not specify any secondary
+// tenant port configuration, no factory is returned.
+func ListenerFactoryForConfig(cfg *BaseConfig, portStartHint int) RPCListenerFactory {
+	if cfg.Config.ApplicationInternalRPCPortMin > 0 {
+		rlf := &rangeListenerFactory{
+			startHint:  portStartHint,
+			lowerBound: cfg.Config.ApplicationInternalRPCPortMin,
+			upperBound: cfg.Config.ApplicationInternalRPCPortMax,
+		}
+		return rlf.ListenAndUpdateAddrs
+	}
+	return nil
+}
+
+// The rangeListenerFactory tries to listen on a port between
+// lowerBound and upperBound.  The provided startHint allows the
+// caller to specify an offset into the range to speed up port
+// selection.
+type rangeListenerFactory struct {
+	startHint  int
+	lowerBound int
+	upperBound int
+}
+
+func (rlf *rangeListenerFactory) ListenAndUpdateAddrs(
+	ctx context.Context,
+	listenAddr, advertiseAddr *string,
+	connName string,
+	acceptProxyProtocolHeaders bool,
+) (net.Listener, error) {
+	h, _, err := addr.SplitHostPort(*listenAddr, "0")
+	if err != nil {
+		return nil, err
+	}
+
+	if rlf.lowerBound > rlf.upperBound {
+		return nil, errors.AssertionFailedf("lower bound %d greater than upper bound %d", rlf.lowerBound, rlf.upperBound)
+	}
+
+	numCandidates := (rlf.upperBound - rlf.lowerBound) + 1
+	nextPort := rlf.lowerBound + (rlf.startHint % numCandidates)
+
+	var ln net.Listener
+	for numAttempts := 0; numAttempts < numCandidates; numCandidates++ {
+		nextAddr := net.JoinHostPort(h, strconv.Itoa(nextPort))
+		ln, err = net.Listen("tcp", nextAddr)
+		if err == nil {
+			if acceptProxyProtocolHeaders {
+				ln = &proxyproto.Listener{
+					Listener: ln,
+				}
+			}
+			if err := UpdateAddrs(ctx, listenAddr, advertiseAddr, ln.Addr()); err != nil {
+				return nil, errors.Wrapf(err, "internal error: cannot parse %s listen address", connName)
+			}
+			return ln, nil
+		}
+		if !sysutil.IsAddrInUse(err) {
+			return nil, err
+		}
+
+		nextPort = ((nextPort - rlf.lowerBound + 1) % numCandidates) + rlf.lowerBound
+	}
+	return nil, errors.Wrapf(err, "port range (%d, %d) exhausted", rlf.lowerBound, rlf.upperBound)
+}
+
 // ListenAndUpdateAddrs starts a TCP listener on the specified address
 // then updates the address and advertised address fields based on the
 // actual interface address resolved by the OS during the Listen()
 // call.
 func ListenAndUpdateAddrs(
-	ctx context.Context, addr, advertiseAddr *string, connName string,
+	ctx context.Context,
+	addr, advertiseAddr *string,
+	connName string,
+	acceptProxyProtocolHeaders bool,
 ) (net.Listener, error) {
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return nil, &ListenError{
 			cause: err,
 			Addr:  *addr,
+		}
+	}
+	if acceptProxyProtocolHeaders {
+		ln = &proxyproto.Listener{
+			Listener: ln,
 		}
 	}
 	if err := UpdateAddrs(ctx, addr, advertiseAddr, ln.Addr()); err != nil {

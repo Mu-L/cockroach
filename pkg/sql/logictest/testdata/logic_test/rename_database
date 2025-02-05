@@ -44,7 +44,9 @@ ALTER DATABASE test RENAME TO u
 
 statement ok
 SET sql_safe_updates = FALSE;
- ALTER DATABASE test RENAME TO u
+
+statement ok
+ALTER DATABASE test RENAME TO u
 
 statement error pgcode 3D000 database "test" does not exist
 SELECT * FROM kv
@@ -163,7 +165,7 @@ ALTER DATABASE u RENAME TO v
 statement ok
 CREATE VIEW v.v AS SELECT k,v FROM v.kv
 
-statement error cannot rename database because relation "v.public.v" depends on relation "v.public.kv"\s.*you can drop "v.public.v" instead
+statement error pq: cannot rename database because relation "v.public.v" depends on relation "v.public.kv"\s.*consider dropping "v.public.v" first
 ALTER DATABASE v RENAME TO u
 
 # Check that the default databases can be renamed like any other.
@@ -270,4 +272,31 @@ statement ok
 ALTER DATABASE db2 RENAME TO db1
 
 statement ok
-USE defaultdb; DROP DATABASE db1 CASCADE
+USE defaultdb
+
+statement ok
+DROP DATABASE db1 CASCADE
+
+statement ok
+CREATE FUNCTION identity1(n INT) RETURNS INT LANGUAGE SQL AS $$
+  SELECT n;
+$$
+
+statement ok
+CREATE FUNCTION identity2(n INT) RETURNS INT LANGUAGE SQL AS $$
+  SELECT identity1(n);
+$$
+
+statement ok
+ALTER DATABASE defaultdb RENAME TO db;
+USE db;
+
+query I
+SELECT identity1(2);
+----
+2
+
+query I
+SELECT identity2(2);
+----
+2
