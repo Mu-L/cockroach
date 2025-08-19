@@ -40,6 +40,7 @@ variable                                                         value
 allow_create_trigger_function_with_argv_references               off
 allow_ordinal_column_references                                  off
 allow_role_memberships_to_change_during_transaction              off
+allow_unsafe_internals                                           on
 alter_primary_region_super_region_override                       off
 always_distribute_full_scans                                     off
 application_name                                                 ·
@@ -509,7 +510,7 @@ query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM CURRENT_CATALOG WITH DETAILS]
 ----
 start_key  end_key  replicas  lease_holder
-/Table/72  /Max     {1}       1
+/Table/73  /Max     {1}       1
 
 query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE system.descriptor WITH DETAILS]

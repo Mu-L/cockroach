@@ -2771,6 +2771,11 @@ Note: these events are not written to `system.eventlog`, even
 when the cluster setting `system.eventlog.enabled` is set. They
 are only emitted via external logging.
 
+In version 26.1, these events will be moved to the `SQL_EXEC` channel.
+To test compatability before this, set the cluster setting
+`log.channel_compatibility_mode.enabled` to false. This will send the
+events to `SQL_EXEC` instead of `SQL_PERF`.
+
 Events in this category are logged to the `SQL_PERF` channel.
 
 
@@ -2900,6 +2905,11 @@ SQL statements.
 Note: these events are not written to `system.eventlog`, even
 when the cluster setting `system.eventlog.enabled` is set. They
 are only emitted via external logging.
+
+In version 26.1, these events will be moved to the `SQL_EXEC` channel.
+To test compatability before this, set the cluster setting
+`log.channel_compatibility_mode.enabled` to false. This will send the
+events to `SQL_EXEC` instead of `SQL_INTERNAL_PERF`.
 
 Events in this category are logged to the `SQL_INTERNAL_PERF` channel.
 
@@ -3364,6 +3374,11 @@ Fields in this struct should be updated in sync with apps_stats.proto.
 An event of type `sampled_query` is the SQL query event logged to the telemetry channel. It
 contains common SQL event/execution details.
 
+Note: in version 26.1, these events will be moved to the `SQL_EXEC` channel.
+To test compatability before this, set the cluster setting
+`log.channel_compatibility_mode.enabled` to false. This will send the
+events to `SQL_EXEC` instead of `TELEMETRY`.
+
 
 | Field | Description | Sensitive |
 |--|--|--|
@@ -3471,6 +3486,11 @@ contains common SQL event/execution details.
 ### `sampled_transaction`
 
 An event of type `sampled_transaction` is the event logged to telemetry at the end of transaction execution.
+
+Note: in version 26.1, these events will be moved to the `SQL_EXEC` channel.
+To test compatability before this, set the cluster setting
+`log.channel_compatibility_mode.enabled` to false. This will send the
+events to `SQL_EXEC` instead of `TELEMETRY`.
 
 
 | Field | Description | Sensitive |
